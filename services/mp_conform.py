@@ -690,6 +690,14 @@ def strip_unknown(spec: dict, ospec: dict, visible: dict, orderable: dict
 
     spec 的 additionalProperties=false:多一个字段整条被拒
     (EXT_DATA_ERROR_60670554076755,如 Orderable.productName)。
+
+    **没有例外**:spec 里没有的 Orderable 字段一律剔。此前有一条
+    `ORDERABLE_SYSTEM_SWITCHES = ("SkuUpdate",)` 的放行分支(SKU 改造批次 3 地基,
+    给"形态 B = MP_ITEM 全量 + SkuUpdate 改码"用),**2026-09-06 随改码通道定案
+    删除**:改码走 MP_ITEM_MATCH 的「同 GTIN + 新 SKU + REPLACE」原地换码,
+    载荷里根本没有 SkuUpdate,连同 `mp_mapper.build_sku_update_item` /
+    `build_orderable(sku_update=)` 一起清掉 —— 留着就是第二条改码路径
+    (conventions §六 双轨禁止),而它是**不会报错**的那一种。
     """
     vkeys, okeys = set(_props(spec)), set(_props(ospec))
     dropped: list[str] = []

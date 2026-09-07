@@ -189,3 +189,16 @@ def ensure_data_root() -> list[str]:
             p.mkdir(parents=True, exist_ok=True)
             created.append(name)
     return created
+
+
+def match_spec_file() -> Path:
+    """输入:无 → 输出:MP_ITEM_MATCH 官方 feed 规范原件的绝对路径(refdata/specs/)。
+
+    所有者 2026-09-07 从开发者门户下载的 `MP_ITEM_MATCH_Consolidated_Schema.zip`
+    里的那份 JSON,版本 5.0.20260607-22_38_54-api。消费方两个:
+    services/match_feed(按原件 Item.properties 过滤 SPEC 预填模板里规范外的键)与
+    tests/test_match_spec_v5.py(守门:header/Item/inventory 形状逐项对原件)。
+    换版把文件换掉、这里改名,别处不动(铁律 3:路径只从 registry 取)。
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    return repo_root / "refdata" / "specs" / "MP_ITEM_MATCH_5.0.20260607-22_38_54-api.json"

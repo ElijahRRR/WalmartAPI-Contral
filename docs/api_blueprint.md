@@ -22,8 +22,8 @@
 | 6 | POST /v3/items/catalog/search | items | 本店目录精确查询 | safe_post_ex | 产品查询 |
 | 7 | POST /v3/items/spec | items | 拉 PT 上架模板(≤20 PT/次) | safe_post_ex | auto_listing |
 | 8 | POST /v3/feeds?feedType=MP_ITEM | feeds | 新品上架 | safe_post_ex | auto_listing |
-| 9 | POST /v3/feeds?feedType=MP_ITEM_MATCH | feeds | 跟卖(v4.2 旧规范) | safe_post_ex | match_listing |
-| 10 | POST /v3/feeds?feedType=MP_MAINTENANCE | feeds | 改标题/属性/endDate | safe_post_ex | 4 个模块 |
+| 9 | POST /v3/feeds?feedType=MP_ITEM_MATCH | feeds | 跟卖 + **改码**(v5,2026-09-07 升版;v4.2 退役) | safe_post_ex | match_listing / sku_migrate |
+| 10 | POST /v3/feeds?feedType=MP_MAINTENANCE | feeds | 改标题/属性/endDate / **改 SKU**(SkuUpdate=Yes,按 Product ID 匹配) | safe_post_ex | 5 个模块 |
 | 11 | POST /v3/feeds?feedType=DELETE_ITEM | feeds | **永久删除**(最高危) | **裸 httpx×3 处** | 批量下架/问题清理 |
 | 12 | POST /v3/feeds?feedType=RETIRE_ITEM | feeds | 可恢复下架 | 混合 | 问题清理/auto_listing |
 | 13 | POST /v3/feeds?feedType=PRICE_AND_PROMOTION | feeds | 批量改价(三件套共享 10/hour) | safe_post_ex | auto_listing |
@@ -95,6 +95,7 @@ marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁�
 | 8 problem_product_cleanup | 10, 11, 12, 17 | 反补(MP_MAINTENANCE)+删除+停用;定性决策拆在 problem_scan(零沃尔玛调用),删除是否生效靠 catalog_sync 的 2 观测,本工作流不调 2/25 |
 | 9 catalog_sync | 2(fast 两轮), 3(offset 超限补漏), 21, 22, 31(itemId 回填) | sync_online_products 的接口面 |
 | 10 list_new | 8, 30, 16, (33) | 主链只发 MP_ITEM(+ partnerprofile;反查/延后结算用 GET /v3/feeds);上架仓 FC ID 走 33 校验(未配置店仍用 30,多仓批次 3);跟卖的 9 与 5(SPEC) 在 match_listing;7 未用(spec 读本地 <DATA_ROOT>/specs),18 不可用(见 §5.3) |
+| 11 sku_migrate | 10(形态 A;形态 B 是 8);16 由 api/feeds 内部反查三态时用 | **存量改码**(SKU 改造批次 3,手动、永不进调度):载荷 `{Orderable:{sku 新码, productIdentifiers, SkuUpdate:'Yes'}}`,feedType 的唯一出生地是 `workflows/sku_migrate.FEED_TYPE`。**本工作流自己不调 17**:回执由 `feed_poll` 统一轮询落 `ops.feed_items`,改码只读那张台账(而且回执**不入病历、不反哺黑名单**);定案靠 2(catalog_sync)的观测,回执成功单独不定案。形态若改判为 B(MP_ITEM 全量),须先让 `mp_conform` 放行 SkuUpdate(否则被静默剔掉 ⇒ 每一行都双挂),且吃的是 list_new 的 MP_ITEM 桶 |
 | backup | 无沃尔玛调用 | — |
 
 ## 3. 配额表(三源对照,官方已核验)
@@ -135,10 +136,10 @@ docs/legacy_survey.md 的"共享桶"结论与 CLAUDE.md 相应表述据此**修�
 | feedType / 端点 | 官方配额 | 官方大小/条数上限 | vs 旧认知 | 定稿 |
 |---|---|---|---|---|
 | MP_ITEM | 10/hour | 25MB;≤10000 条 | 一致(大小旧记 10MB 过时) | 8/hour |
-| MP_MAINTENANCE | 10/hour | 25MB;≤10000 条 | 一致 | 8/hour |
+| MP_MAINTENANCE | 10/hour | 25MB;≤10000 条 | 一致 | 8/hour(**桶与维护链共享**:`maintenance` 的改标题/endDate、`problem_product_cleanup` 的反补走同一个 `feeds.post.MP_MAINTENANCE`。~~`sku_migrate` 的改码 + 单店单轮硬顶 2 个 feed(`FEEDS_PER_STORE_PER_RUN`)~~ **已作废**:改码 2026-09-06 起走 MP_ITEM_MATCH,那两个自设常量 2026-09-07 删除,见 docs/sku_plan.md §9.12) |
 | DELETE_ITEM | 10/hour("代码零依据"的 10/hour 现已获官方背书) | **0.4MB(400KB)**;条数未单列(按 ≤10000 推定) | 旧 100KB 字节上限过于保守但方向对 | 6/hour;单 feed ≤350KB 且 ≤2500 条 |
 | RETIRE_ITEM | **官方限流表无此行;guide 页已消失**;itembulkuploads 页仍保留 feedType 枚举**及 RetireItemHeader 请求示例**(仍可用的正面证据) | 未知 | 旧系统在用且实际零限速 | **6/hour**(实际落地值:按 DELETE_ITEM 同档保守;原定稿 10/day 未进代码)+ **迁移前实测是否仍被接受** |
-| MP_ITEM_MATCH | **20/hour**(比 item 类宽一倍) | 25MB | 旧未登记 | 15/hour |
+| MP_ITEM_MATCH | **20/hour**(比 item 类宽一倍) | 25MB | 旧未登记 | 15/hour(**桶与跟卖链共享**:`match_listing` 的跟卖、`sku_migrate` 的改码同一个 `feeds.post.MP_ITEM_MATCH`;两条链都**整批一次 submit_feed**,条数由切片 1000 条/24MB 定,工作流层不再自设每轮上限 —— 2026-09-07,见 docs/sku_plan.md §9.12。⚠ 版本备注:载荷 2026-09-07 起是 **v5**(`5.0.20260607-22_38_54-api`,§5.1 分发表那行;v4.2 同日退役),**配额与桶不随版本变** —— 官方 20/hour、仓内 15/hour 照旧,升版不新增桶) |
 | PRICE_AND_PROMOTION | **10/hour(价格三件套共享)** | 硬限 10000 条;建议 1000 条/<10MB(413 口径官方标 Not applicable) | **tsv 的 6/day 是错的**(6/day 属 legacy promo feed);官方页内 promo* 行自相矛盾 | **8/hour**(2026-08-26 三源复核:三处官方一致 10/hour;6/day 确证只挂 feedType=promo 行且本仓无该路径;promo 行内矛盾官方未修,与三件套无关) |
 | price(Legacy) | 10/hour(三件套共享) | 10MB;硬限 10000 条(1000 条/<10MB 是官方 "we recommend" 建议值,2026-08-26 核) | 一致 | 与 PRICE_AND_PROMOTION 同桶 |
 | inventory | 10/hour | 10MB(旧记 ≤10000 item/ship node 无美区官方出处——属 DSV 文档,2026-08-26 降级为自设批次上限) | 旧 50/hr vs 10/hr 之争:**官方 10/hour** | 8/hour |
@@ -187,7 +188,7 @@ docs/legacy_survey.md 的"共享桶"结论与 CLAUDE.md 相应表述据此**修�
 |---|---|---|---|---|
 | MP_ITEM | MPItemFeedHeader{businessUnit,locale,version} **只准 3 字段** | 5.0.20260608-18_15_07-api(2026-08-20 换版,完整时间戳,"5.0"拒收) | MPItem[{Visible:{PT:{}},Orderable:{}}] | 2000 条+24MB(单店打包后按此切片) |
 | MP_MAINTENANCE | 同上 | 同上 | 同上(Visible 可空) | 1000 条+24MB |
-| MP_ITEM_MATCH | MPItemFeedHeader{processMode:REPLACE,subset:EXTERNAL,locale,sellingChannel:mpsetupbymatch,version} | 4.2(sellingChannel 制,与 v5 businessUnit 制不同套) | MPItem[{Item:{}}] | 1000 条 |
+| MP_ITEM_MATCH | MPItemFeedHeader{businessUnit,locale,version} **只准 3 字段**(v5 原件 required 三个 + `additionalProperties:false`) | **5.0.20260607-22_38_54-api**(2026-09-07 升 v5,v4.2 同日退役;出处 = 官方规范原件 `refdata/specs/MP_ITEM_MATCH_5.0.20260607-22_38_54-api.json` 的 version enum)| MPItem[{Item:{}}] —— **仍是 Item 包装**,不是 MP_ITEM 的 Orderable/Visible 分段;Item required = productIdentifiers/sku/condition/ShippingWeight/price,可选 inventory[{quantity,fulfillmentCenterID}] / productName / mainImageUrl / externalProductIdentifier / stateRestrictions / productSecondaryImageURL / restoredProductIdentifier | 1000 条 |
 | DELETE_ITEM | ItemFeedHeader{locale,version,businessUnit}(官方示例同名,已核验) | 5.0.20250919-16_45_47-api(**仍是官方现值**) | Item[{Deletable:{sku}}] | 官方 400KB;定稿 350KB+2500 条双约束 |
 | RETIRE_ITEM | RetireItemHeader{feedDate,version} | 1.0(不是 1.5;feedDate 必须真 UTC)⚠官方 guide 已消失,仅存枚举,**迁移前实测** | RetireItem[{sku}] | 1000 条+350KB(按 DELETE_ITEM 同档保守) |
 | PRICE_AND_PROMOTION | MPItemFeedHeader | 2.0.20240126-12_25_52-api(独立版本线) | MPItem[{"Promo&Discount":{sku,price}}] | 10000 条 |
@@ -200,6 +201,10 @@ version 字符串全部进 registry(不准散落硬编码),且**必须定期核�
 数值字段一律 round 到 ≤2 位小数(sanitize 兜底,Walmart 拒收 >2 位)。
 endDate/日期字段必须 ISO DateTime(spec 声称 yyyy-mm-dd 实际拒收)。
 MP_MAINTENANCE 官方明确限制:**COO(原产国)不可改**;必填仅 SKU+GTIN,其余可选(partial update)。
+**SkuUpdate(改 SKU)的官方出处**(2026-09-02 查证,SKU 改造批次 3 登记):CA 侧 [Manage items](https://developer.walmart.com/ca-marketplace/docs/manage-items) 明写「look for the SkuUpdate attribute in the payload and set it to Yes … provide the new SKU」;匹配键是 **Product ID 不是 SKU**([CA Update an item's SKU](https://marketplacelearn.walmart.com/ca/guides/Catalog%20management/Item%20management/update-an-item-s-sku):「Enter the correct SKU for that Product ID」「You are not allowed to submit two SKUs with the same Product Identifier」),生效 15 分钟~4 小时,WFS 的 item 不能改 SKU。US 侧 [Update my existing items](https://developer.walmart.com/us-marketplace/docs/update-my-existing-items) 只讲 MP_MAINTENANCE 做部分更新(「requires only the SKU and GTIN attributes」),**未点名 SkuUpdate** ——所以「US 的 MP_MAINTENANCE 最小载荷能否改码」列为**待单品实测**(docs/sku_plan.md §4 六件之 1、2);实测前 `sku_migrate` 只许 --dry-run。
+**2026-09-05 定案(官方 spec 原件 + 生产实测)**:US MP_MAINTENANCE 5.0(20260501/0608/0703 三版)的 Orderable **没有 `SkuUpdate`**(20 个属性,additionalProperties=false),`SkuUpdate`/`ProductIdUpdate` 只在 **MP_ITEM** 的 Orderable 里;MP_MAINTENANCE 与 MP_ITEM 是**两份独立 spec、布局不同**(仓内只下载 MP_ITEM 一份,看不出差别)。带 SkuUpdate 的维护 feed 回执 SUCCESS 但被静默丢弃(2026-09-04 两条生产实证)。**改码必须走 setup 类 feed**(MP_ITEM 全量 + SkuUpdate=Yes,或 Seller Center「Match items」底层的 MP_ITEM_MATCH),见 docs/sku_plan.md §9.10。
+**2026-09-06 改码通道定案:`MP_ITEM_MATCH`**(所有者 Seller Center 实测,feed `18D2A25BB3895D7096CF1357C17C2A36@AYYBBwA`;详见 docs/sku_plan.md §9.12)。机制是「**同 GTIN + 新 SKU + `processMode=REPLACE`**」在**同一个 item 上原地换码** —— 探针:新旧码 wpid 相同、库存跟着过来(模板库存列为空)、价格不变、旧码 GET 404、feed 1 条 SUCCESS。**载荷里没有 `SkuUpdate`**:换码是 REPLACE 的机械后果不是开关,所以 `SkuUpdate` 在本仓已全部删除(`mp_mapper.build_sku_update_item` / `build_orderable(sku_update=)` / `mp_conform` 的放行分支)。⚠ REPLACE 会**覆盖**载荷里给到的每个字段,所以 `price` 必须把**现挂价原样发回去**,采不到现价的行不许发(判据在 `workflows/sku_migrate._CONDS` 的「有现挂价格」);`ShippingWeight`(单位**磅**,后台那一栏是 Shipping Weight (lbs))则**有意重写**成 `mp_mapper.shipping_weight_ex` 的新口径值 —— 单位从采集数据里读、不猜,解析不出或 > 11 磅写 1 磅(所有者 2026-09-06 定稿,详见 sku_plan §9.12)。配额吃 `feeds.post.MP_ITEM_MATCH`(15/h,与跟卖链 match_listing 共享)。模板顺带给出**沃尔玛 SKU 规格:Alphanumeric, 50 characters**。~~⚠ 仓里这条通道是 **v4.2**(sellingChannel header),模板是 v5.0;v4.2 能否同样换码由第一级投放(limit=1)实测定。~~ **已结**:v4.2 实测能原地换码(2026-09-06 第一级投放),但载荷里没有库存字段、REPLACE 把「没带」当 0 写。
+**2026-09-07 升 v5(v4.2 退役,跟卖链与改码链一起升,不留双轨)**:依据是所有者从开发者门户下载、已放进仓的**官方规范原件** `refdata/specs/MP_ITEM_MATCH_5.0.20260607-22_38_54-api.json`(draft-07)。三件事:① header 换成 businessUnit 制**三字段封闭**(v4.2 的 `{processMode, subset, sellingChannel}` 在 v5 规范里根本不存在 —— REPLACE 语义没变,只是不再由 header 的开关表达);② 条目仍是 `{Item:{}}` 包装;③ Item 多了可选 `inventory[{quantity, fulfillmentCenterID}]`(array,minItems 1,项两字段闭集)⇒ **改码 feed 自己把库存带过去**,FC 走 `services/store_limits.listing_fc`(上架链同一入口)——**这是改码链写库存的唯一一条路**,定案时那条 `_restore_inventory` 起初降为兜底、2026-09-07 由所有者定稿**整段删除**(同一份数据不走第二条写路径,见 docs/sku_plan.md §9.12「定案不再回写库存」);跟卖链**不带**(行为逐字不变)。版本串取原件 version enum(只有这一个值,与 MP_ITEM 一样带 `-api` 后缀);所有者 2026-09-06 用 Seller Center 模板(版本串 `5.0.20260703-18_22_27`)上传成功过,但可下载的 API 原件是 0607 版,**以原件为准,试点若被拒再议**。守门:`tests/test_match_spec_v5.py` 现读原件校 header/Item/inventory 的键集合与 enum(`additionalProperties:false` 靠它拦)。
 
 ### 5.2 提交防重(三层,缺一不可)
 
@@ -232,6 +237,18 @@ MP_MAINTENANCE 官方明确限制:**COO(原产国)不可改**;必填仅 SKU+GTIN
 
 SKU_LOCKED=ERR_EXT_DATA_0101211(解法:RETIRE→24h→新 UPC 重上)、
 UPC 冲突=ERR_EXT_DATA_0101119、异步审核、可重试类、PROHIBITED 类——集中进 registry 常量。
+
+**feed 级错误码**(挂在 head 的 `ingestionErrors` 上,**没有任何逐条明细**;
+与上面那些 SKU 级的码不是一回事——整个 feed 被退回,`itemsReceived=0`):
+
+| 码 | 原文 | 含义与处置 |
+|---|---|---|
+| `EXT_DATA_ERROR_50575703577001` | "You have exceeded your item setup limit of 5000. … Please resubmit your file to ensure that the total number of items in your catalog is below your designated limit." | 每店 **item setup limit**:沃尔玛按「店内现有 item 数 + 本 feed 条数」判,超了**整 feed 拒收**(MP_ITEM_MATCH 的改码在它眼里先算新增)。2026-09-07 A131吕灿荣 整店改码 2740 条实证(三个 feed 全中)。上限缺省 `resources.WALMART_ITEM_SETUP_LIMIT_DEFAULT`=5000、逐店可在限额表「商品上限」列覆盖;闸在 `sku_migrate._stage_cap`(余量 = 上限 − 现观测在架 item 数),详见 `docs/sku_plan.md` §9.12 |
+
+⚠ **零明细的终态 ERROR 不是"查无"**:`services/feed_track.poll_feed` 对这种 feed
+把 feed 级第一条 ingestionError 当作**每个台账 SKU 的 failed 回执**落账
+(旧仓同款路径,重写时丢过一次);落成 `missing` 会让改码等满 24h 观测期、
+上架/维护链把"整批没进去"读成"查无"。
 
 ## 6. 横切能力(api/_client.py 增强,Phase 1 落地)
 
@@ -327,9 +344,15 @@ api/settings.py
    MP_ITEM/MP_MAINTENANCE/DELETE_ITEM 各 10/hour、MP_ITEM_MATCH 20/hour;
    唯一共享桶是价格三件套 10/hour。"DELETE_ITEM 10/hour"从"零依据"变为官方背书。
 3. **feedStatus 无 COMPLETE**(官方四值枚举三处文档一致);itemIngestionStatus 官方五值(含 INPROGRESS)。
-4. **retire 语义**:官方 API 层面 retire = 单品 DELETE /v3/items/{sku}(900/min,"permanently retire",
-   catalog 更新至多 48h);Seller Center 侧 retire 保留数据且可通过改 Site End Date 复活,
-   API 侧无 reactivate 端点。DELETE_ITEM feed 官方明文"Deletions are permanent;
+4. **retire 语义**(2026-09-02 更正,依据 docs/sku_plan.md §4 的官方查证):官方 API 层面
+   retire = 单品 DELETE /v3/items/{sku}(900/min,"permanently retire",catalog 更新至多 48h)——
+   它**只退役不删除**,item 留在目录、lifecycle=RETIRED、内容/历史/评论保留,本质是把 end date 置过去。
+   **unretire = 把 end date 改成未来**(官方 Item inventory FAQ:"To unretire an item, change the end
+   date to the future … this API only retires the item, it does not delete it"),API 侧**没有专用的
+   reactivate/unretire 端点** —— 原稿"API 无 reactivate"这句话本身没错,但读起来像"退役不可逆",
+   而真正的口径是"可逆,只是没有专用端点,走 MP_MAINTENANCE 改 endDate"。
+   ⚠ 退役 item 的 SKU 与 Product ID **不能给别的 item 用**(CA retireanitem)。
+   DELETE_ITEM feed 官方明文"Deletions are permanent;
    需要可逆先 unpublish 或库存归零"。→ **批量下架工作流的设计选择**:
    若业务语义是"可逆下架"应走库存归零/RETIRE;若真要永久删除才走 DELETE_ITEM。
 5. **枚举核验**:items/count 的 status 枚举含 SYSTEM_PROBLEM/IN_PROGRESS 但**无 STAGE**;
@@ -376,7 +399,13 @@ rate-limiting / error-codes),四条结论:
 ### 遗留问题(官方文档查不到,按保守处理并择机实测)
 
 1. RETIRE_ITEM feed 是否仍被接受(guide 已消失、限流表无行、仅存枚举)——迁移 daily_cleanup 前实测。
-2. DELETE_ITEM 删除后同 SKU 能否重建/等待期(仅 1P 文档有"48h 后可重建",非 Marketplace 结论)。
+2. **已核**(2026-09-02,SKU 改造批次 3 复核):DELETE_ITEM 删除后同 SKU 的重建等待期
+   ——「wait for a 48-hour interval, and then set up a new item … using the same or a different
+   SKU number」出自 **Marketplace 文档**
+   ([Update my existing items](https://developer.walmart.com/us-marketplace/docs/update-my-existing-items)),
+   不是原稿以为的"仅 1P 文档"。口径:**48h 后同 SKU 可重建**;GTIN 侧另记 24h 后可复用。
+   本仓仍不复用旧码(码是免费的,复用只会把三条护栏的计数搅乱),这条记录的价值是
+   「撞库/重上失败时不必怀疑是等待期没到」。
 3. **已结案**(2026-08-26 三源复核,四代理交叉裁决):价格三件套共享桶三处官方一致 = 10/hour(rate-limiting 页脚注 + update-bulk-prices 页 + update-promotional-pricing 页逐字相同);6/day 只挂 feedType=promo 行(本仓无该路径)。promo 行内矛盾(单元格 6/day vs 脚注共享 10/hour)官方仍未修,但与三件套无关。生产从 6/day 上调为 **8/hour** 留余量;⚠ 将来若引入 feedType=promo 路径,须单独按 6/day 限流,不得并入共享桶计数。
 4. GET /v3/feeds/{id} 明细 limit 50 vs 1000 官方两页矛盾——保守按 50。
 5. **已核**(2026-08-26):被弃用的是 "Price management" **API 族/文档集**(Status 2025-10-24,

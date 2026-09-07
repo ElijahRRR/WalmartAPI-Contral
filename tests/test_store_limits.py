@@ -45,6 +45,41 @@ def test_zero_or_blank_is_treated_as_not_configured(monkeypatch):
     assert sl.lead_day_caps() == {"A": 5}
 
 
+def test_setup_limits_reads_the_item_ceiling_column(monkeypatch):
+    """「商品上限」= 沃尔玛每店的 item setup limit(2026-09-07 A131吕灿荣 实证:
+    店内现有 item 数 + 本 feed 条数 超了它,**整个 feed 被拒收**)。
+
+    ⚠ 与「单店最大在线数」是两回事:那是我们自己给店定的经营容量(分配引擎读),
+    这是沃尔玛的硬限。合成一列的表现是分配目标一改,改码就开始整批被拒。
+    """
+    from api import feishu
+    from registry import resources
+    assert resources.RETIRE_LIMITS.fields.item_setup_limit == "商品上限"
+    assert resources.RETIRE_LIMITS.fields.max_online == "单店最大在线数"
+    assert resources.WALMART_ITEM_SETUP_LIMIT_DEFAULT == 5000
+    monkeypatch.setattr(feishu, "list_records", lambda t, field_names=None: [
+        {"fields": {"店铺": "A131吕灿荣", "商品上限": "5000"}},
+        {"fields": {"店铺": "A085朱丽霖", "商品上限": ""}},      # 没填 ⇒ 走缺省
+    ])
+    monkeypatch.setattr(feishu, "_plain_text",
+                        lambda v: "" if v is None else str(v))
+    caps = sl.setup_limits()
+    assert caps == {"A131吕灿荣": 5000}
+    # 没填 / 表整个读不到 ⇒ 调用方回落缺省(不知道 ≠ 限死)
+    assert sl.cap_for(caps, "A085朱丽霖",
+                      resources.WALMART_ITEM_SETUP_LIMIT_DEFAULT) == 5000
+
+
+def test_setup_limits_survives_an_unregistered_table(monkeypatch):
+    """列还没建 / 表没登记 ⇒ 空字典,全船队走缺省 5000(不许把改码整条链拖垮)。"""
+    from api import feishu
+
+    def _boom(t, field_names=None):
+        raise LookupError("未登记")
+    monkeypatch.setattr(feishu, "list_records", _boom)
+    assert sl.setup_limits() == {}
+
+
 def test_table_unregistered_degrades_to_empty(monkeypatch):
     """表没登记不许把整条链拖垮:返回空字典,调用方全店回落默认上限。"""
     from api import feishu

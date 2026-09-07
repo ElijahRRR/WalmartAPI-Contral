@@ -265,3 +265,18 @@ stockzero 静默失效(P0)、库存永久重写循环 + settle 恒 ineffective(P
   feed-file-structure-overview(fulfillmentCenterID 定义、"up to five" 原文)
 - marketplacelearn.walmart.com:add-a-seller-managed-fulfillment-center /
   Shipping-templates: Assign SKUs(三元组映射、4 小时等待期原文)
+
+## 2026-09-07 生产缺陷:MP_INVENTORY 的 SKU 级台账落的是 str(dict)
+
+维护记录反哺(services/maint_sheet.sync_from_ledger)对谭总12 的库存 feed
+`18D2A5D5D3425B38B19FA5E0933F74C0@AUoBBgA` 逐行报「台账查无,跳过」,表上永远
+「处理中」。根因:`api/feeds._chunk_skus` 的 dict 类型表漏了 `MP_INVENTORY`(多仓批次 2
+加 feedType 时没同步这张表),条目走了 `str(s)` ⇒ `ops.feed_items.sku` 存的是
+`{'sku': 'B0…', 'qty': 260, 'ship_node': '…'}` 整串。后果三条,全部静默:
+① 反哺器按 (feed_id, sku) 找不到行 ⇒ 表上永远「处理中」,超 3 天判「未查到」;
+② feed_poll 的逐 SKU 回执对不上 ⇒ 台账行永远 submitted;
+③ ops.dispositions 的 executing 靠回执落定 ⇒ 只能等 expire_executing 判 ineffective。
+只影响受管仓的店(走 MP_INVENTORY 的),其它店走 legacy inventory 不受影响。
+修:表里补 `MP_INVENTORY`,守门测试钉「每种 dict 条目的 feedType 台账 sku 不得以 { 开头」。
+存量脏行由所有者核对后处置(`SELECT count(*) FROM ops.feed_items WHERE
+feed_type='MP_INVENTORY' AND sku LIKE '{%'`),本仓不自动清理。

@@ -34,7 +34,7 @@
 
 import logging
 
-from services.sku_asin import extract_asin
+from services import sku_asin
 
 logger = logging.getLogger("services.error_source")
 
@@ -70,7 +70,7 @@ ORDER BY sku, updated_at DESC
 #: 按 `sku_asin` 规则折成 asin 再索引一份。**是全表扫**,所以要显式开 ——
 #: 分批调用的消费方(`error_reclass` 有精确的 `src_sku`)不该付这个代价。
 SRC_ITEMS_ANY = """
-SELECT sku, unpublished_reasons FROM catalog.walmart_items
+SELECT store, sku, unpublished_reasons FROM catalog.walmart_items
 WHERE coalesce(unpublished_reasons, '') <> ''
 """
 
@@ -163,25 +163,47 @@ def dispositions_map(conn, skus: list[str]) -> dict:
     return out
 
 
+#: 按 asin 折 items 时的反查批大小(`resolve_many` 一批一条 SQL)。
+_RESOLVE_CHUNK = 5000
+
+
 def items_by_asin_map(conn) -> dict:
-    """输入:连接 → 输出:{asin: 下架原因}(扫一遍有下架原因的行,按 sku_asin 折)。
+    """输入:连接 → 输出:{asin: 下架原因}(扫一遍有下架原因的行,经登记簿折成 asin)。
 
     ⚠ **是全表扫**,分批跑的调用方要在循环外调一次、跨批复用,别每批扫一遍。
     查不到就返回空:少一级原文是判得糙一点,炸掉是一条都判不了。
+
+    ⚠ **身份走登记簿,不是裸形态提取**(SKU 改造收口,所有者 2026-09-04 拍板):
+    原写法只认**形态**(裸的形态提取腿)。新码是 12 位不透明随机码,形态
+    提取对它**一律返回 None**,于是新码那批行永远进不了 items 这一级外源,
+    而且**不报错**:表现只是"判得糙一点",没有任何信号说明少了一整类行。
+    `sku_asin.resolve_many` 是登记簿优先、形态兜底的那块积木(批次 0a),
+    存量旧码逐行结果与改前相同,新码则能正确折到它的 `source_key`。
+    取行时多带一列 `store`:登记簿主键是 (store, sku),没有店铺压根查不到。
     """
     out: dict = {}
     try:
         with conn.cursor() as cur:
             cur.execute(SRC_ITEMS_ANY)
-            for sku, text in cur.fetchall():
-                if not text:
-                    continue
-                a = extract_asin(sku)
-                if a and a not in out:
-                    out[a] = text
+            rows = [(st, sk, txt) for st, sk, txt in cur.fetchall() if txt]
     except Exception as e:                                      # noqa: BLE001
         logger.warning("按 asin 扫 items 失败(本级跳过):%s", e)
         conn.rollback()
+        return out
+    # 反查分批:一次全表的 (store, sku) 对可能上十万,`resolve_many` 一批一条
+    # SQL,别把它当成能吞任意长度的入参
+    for i in range(0, len(rows), _RESOLVE_CHUNK):
+        batch = rows[i:i + _RESOLVE_CHUNK]
+        try:
+            mapping = sku_asin.resolve_many(conn, [(st, sk) for st, sk, _ in batch])
+        except Exception as e:                                  # noqa: BLE001
+            logger.warning("按 asin 折 items 反查失败(本批跳过):%s", e)
+            conn.rollback()
+            continue
+        for st, sk, text in batch:
+            a = mapping.get((st, sk))
+            if a and a not in out:
+                out[a] = text
     return out
 
 

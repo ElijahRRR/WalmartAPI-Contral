@@ -280,11 +280,18 @@ def run(params: dict) -> str:
     lines: list[str] = []
     if execute:
         _settle(lines)
+    # 标题整路停闸(所有者 2026-09-05,唯一出处 mi.TITLE_SYNC):执行件也不领
+    # 存量 title 建议 —— 只停生成侧的话,库里已有的 suggested 行下一轮照样被领走
+    # 提交,停闸就只停了一半。留在 suggested 不撤:恢复后它们还在。
+    actions = tuple(a for a in dispositions.MAINT_ACTIONS
+                    if a != "title" or mi.TITLE_SYNC)
     with db.pg_conn() as conn:
-        rows = dispositions.claim(conn, dispositions.MAINT_ACTIONS)
+        rows = dispositions.claim(conn, actions)
         # 压制必须见人:claim 少返回几行是静默的,不报的话摘要写着"没有待执行
         # 的维护建议",人会以为扫描件没算出东西来
-        n_sup = dispositions.count_suppressed(conn, dispositions.MAINT_ACTIONS)
+        n_sup = dispositions.count_suppressed(conn, actions)
+        n_title_held = (0 if mi.TITLE_SYNC
+                        else dispositions.count_open_action(conn, "title"))
         # 缺席避让(店级重试标准③补全,2026-08-26 对抗校验):扫描件避让了
         # 缺席店、withdraw 还护住了它们的存量 suggested(cap 顺延/上轮提交
         # 异常留下的)—— 执行件不避让的话,同一轮链里这批按**隔夜现值**算的
@@ -314,6 +321,11 @@ def run(params: dict) -> str:
         intents = [i for i in intents if i["kind"] == only]
 
     mode = "" if execute else "🧪 [DRY-RUN] "
+    if not mi.TITLE_SYNC:
+        # 停闸必须天天见人(静默关闭 = 没人记得它关着)
+        lines.append(f"  ⛔ 标题维护已整路停闸(所有者 2026-09-05):本轮不领 title 建议,"
+                     f"库里 {n_title_held} 条 title 建议留在 suggested 不动;"
+                     f"改价/改库存照常。恢复条件见 services/maintenance_intents.TITLE_SYNC")
     if not intents:
         return "\n".join(lines + [
             f"{mode}没有待执行的维护建议 —— 先跑 "

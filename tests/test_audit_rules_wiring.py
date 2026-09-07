@@ -266,6 +266,26 @@ def test_pick_where_online_scopes_to_listed_rows():
     assert "catalog.walmart_items" in w and "missing_since IS NULL" in w
     assert "published_status" not in w
     assert "online" in product_audit._MODES
+    # 身份第二条腿:经登记簿反查(0a-16)
+    assert "catalog.listing_sources" in w and "ls.source_key = p.asin" in w
+
+
+def test_online_candidates_also_match_through_the_registry():
+    """在架候选两条腿 OR,**故意不写成 coalesce** —— 理由是索引。
+
+    这是对 products 每一行做的相关子查询:写成
+    coalesce(ls.source_key, w.sku) = p.asin 就用不上 walmart_items_sku_idx,
+    几十万行候选退化成逐行全表扫(2026-08-14 视图挂死同一类事故)。
+    第一条腿逐字保留今天的语义(存量全覆盖),第二条腿走
+    listing_sources_key_idx、只覆盖新码 —— 存量下 source_key = sku,
+    是第一条腿的子集,切换后才开始起作用。
+    """
+    w, _ = product_audit._pick_where({"mode": "online"})
+    assert "coalesce(" not in w                 # 两条腿 OR,不是 coalesce
+    assert w.count("EXISTS (") == 2
+    assert "w.sku = p.asin" in w                 # 第一条腿:走 sku 索引
+    assert "ls.source_type = 'amz'" in w         # 第二条腿:限 amz 出身
+    assert "w.missing_since IS NULL" in w or "missing_since IS NULL" in w
 
 
 def test_online_mode_is_pinned_to_l0(monkeypatch):
@@ -2040,6 +2060,98 @@ def test_mode_stale_refuses_l0_only(monkeypatch):
         product_audit.run({"mode": "stale", "stages": "L0"})
 
 
+# ── 实证 PT 的身份键(0a-19)────────────────────────────────────────────
+
+class _PtCur:
+    """输入:{SQL 片段: 行} → 输出:按 SQL 片段派发的假游标(其余一律空)。"""
+
+    def __init__(self, routes):
+        self._routes = routes
+        self._rows: list = []
+        self.description = ()
+
+    def execute(self, sql, args=None):
+        self._rows = []
+        self.description = ()
+        for frag, (cols, rows) in self._routes.items():
+            if frag in sql:
+                self._rows = rows
+                self.description = tuple((c,) for c in cols)
+                return
+
+    def fetchall(self):
+        return self._rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+class _PtConn:
+    def __init__(self, routes):
+        self._routes = routes
+
+    def cursor(self):
+        return _PtCur(self._routes)
+
+
+def _pt_ctx(monkeypatch, items):
+    """输入:walmart_items 的 (source_key, sku, product_type) 行 → 输出:装配好的 ctx。
+
+    ⚠ 2026-09-03 C 批瘦身把 `audit_l2.load_nice_mapping` 与
+    `refdata/audit/pt_nice_class.yaml` 整条删了(R5 退役),所以这里不再打它的桩;
+    政策表这条路由留空 ⇒ `check_rule_policies` 按"没有表可对"跳过(见它的头注)。
+    """
+    monkeypatch.setattr(audit_rules.category_blacklist, "load",
+                        lambda conn: SimpleNamespace())
+    routes = {
+        "FROM audit.walmart_pt_meta": (
+            ["walmart_product_type", "walmart_category", "walmart_ptg",
+             "access_state", "zh_can_do", "requirements", "notes"],
+            [("Socks", "Fashion", None, None, None, None, None),
+             ("Hats", "Fashion", None, None, None, None, None)]),
+        "FROM catalog.walmart_items w": (["source_key", "sku", "product_type"],
+                                         items),
+    }
+    return audit_rules.load_context(_PtConn(routes))
+
+
+def test_confirmed_pt_keys_prefer_the_registry_then_the_pattern(monkeypatch):
+    """实证 PT 的键 = pick_asin(登记簿 amz 键 → 模式提取 → 原文)。
+
+    三条腿都要在:
+      · 裸 ASIN 行 —— 键就是它自己(存量绝大多数);
+      · 三段式 SKU —— 取中段 ASIN(2026-08-11 评审 I-1 修的正是这个,所以
+        这一跳**不能**换成纯 SQL 的 coalesce:那会把键换成三段式原文);
+      · 不透明码 + 登记簿 source_key —— 键取登记簿(切码后唯一认得出的一条腿)。
+    """
+    ctx = _pt_ctx(monkeypatch, [
+        (None, "B0AAAA0001", "Socks"),              # 裸 ASIN
+        (None, "XKJ-B0BBBB0002-39.98", "Hats"),     # 三段式
+        ("B0CCCC0003", "AZZZZ234567", "Socks"),     # 不透明码 + 登记簿键
+    ])
+    assert ctx.walmart_confirmed["B0AAAA0001"] == "Socks"
+    assert ctx.walmart_confirmed["B0BBBB0002"] == "Hats"
+    assert ctx.walmart_confirmed["B0CCCC0003"] == "Socks"
+    assert "AZZZZ234567" not in ctx.walmart_confirmed
+
+
+def test_confirmed_pt_still_drops_cross_store_disagreements(monkeypatch):
+    """同一 ASIN 两家店报了两个 PT ⇒ **不采信**(收口不许动这条判据)。
+
+    归并键换成身份键之后,跨店归并只会更准 —— 分歧本身照旧一票否决。
+    """
+    ctx = _pt_ctx(monkeypatch, [
+        ("B0CCCC0003", "AZZZZ234567", "Socks"),     # A 店:不透明码
+        (None, "B0CCCC0003", "Hats"),               # B 店:裸 ASIN,同一个品
+        (None, "B0AAAA0001", "Socks"),              # 无分歧的对照组
+    ])
+    assert "B0CCCC0003" not in ctx.walmart_confirmed
+    assert ctx.walmart_confirmed["B0AAAA0001"] == "Socks"
+
+
 # ── 首条串行预热(2026-09-02 B2,规格 §3.9)────────────────────────────────
 
 class _FakeEx:
@@ -2163,7 +2275,10 @@ def test_stale_filters_by_recent_sales_with_the_one_sanctioned_predicate():
     # 与唯一口径同源:三个要件在 alloc_survey 那条 SQL 里长一个样
     sales = alloc_survey._SQL_SALES
     assert "order_date >=" in sales and "make_interval(days =>" in sales
-    assert "coalesce(sale_status, '') <> 'Cancelled'" in sales
+    # ⚠ 列名带不带表别名不算口径差异:alloc_survey 那条 SQL 因为要 LEFT JOIN
+    # catalog.sku_aliases(SKU 改造),列一律写成 `o.xxx`;这里比的是**判据**
+    # ——窗口打 order_date、只排 Cancelled、按 asin 匹配
+    assert "sale_status, '') <> 'Cancelled'" in sales
     # 版本闸(天然分页)一个字都没丢
     assert "p.audit_status = 'approved'" in w
     assert "p.audit_version IS DISTINCT FROM %(stale_ver)s" in w

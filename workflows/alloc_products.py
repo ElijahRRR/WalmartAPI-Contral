@@ -57,9 +57,15 @@ _SQL_RISK = pool_svc._SQL_RISK
 #   在线店 = 此刻货**实际**挂在谁那儿(walmart_items 观测)。
 # 两者不一致本身就是信息:占用在 A、货在 B = B 该下架;有货无占用 = 规划外店
 # (谭总系不占任何品牌与产品)或回填时被闸挡下的行。合成一列会把这些全抹掉。
+# 身份键经登记簿 amz 行(唯一写法见 conventions §九);存量下 source_key = sku,
+# 「在线店」一列逐行不变。裸提取在切码后会让这一列恒空 ⇒「占用在 A、货在 B」
+# 这类信息全被抹掉。
 _SQL_ONLINE_SKU = """
-SELECT store, sku FROM catalog.walmart_items
-WHERE missing_since IS NULL AND published_status = 'PUBLISHED'
+SELECT w.store, w.sku, ls.source_key
+FROM catalog.walmart_items w
+LEFT JOIN catalog.listing_sources ls
+  ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
+WHERE w.missing_since IS NULL AND w.published_status = 'PUBLISHED'
 """
 
 
@@ -97,8 +103,8 @@ def run(params: dict) -> str:
         with conn.cursor() as cur:
             cur.execute(_SQL_ONLINE_SKU)
             online: dict = {}
-            for store, sku in cur.fetchall():
-                a = sku_asin.extract_asin(sku)
+            for store, sku, k in cur.fetchall():
+                a = sku_asin.pick_asin(k, sku)
                 if a:
                     online.setdefault(a, set()).add(store)
     scored, gated_raw = pool_svc.score_all(data)

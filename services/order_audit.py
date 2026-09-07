@@ -36,6 +36,7 @@ from difflib import SequenceMatcher
 # 就是选错档 / 定价偏低,而全程不报错。
 from services.pricing import landed_price
 from services.scrape_batches import ERROR_TYPES, RETRY_LATER, RETRYABLE, TERMINAL
+from services import sku_asin
 
 # ⚠ **订单链的"终局"比产品库的宽一档**(2026-08-14 拆 RETRY_LATER 时定):
 # 判据是**决策窗口**,不是错误类型的物理性质。
@@ -69,7 +70,20 @@ PHISHING_MARK = "钓鱼"
 # 订单行的 SKU 里混着旧系统留下的自定义编码,采集侧建任务时就把它们丢掉,
 # 推了也是白推——这类行必须给出**与"待采集"不同的结论**,否则会永远挂着等
 # 一个不会到来的快照。
+# ⚠ 它判的是**解出来的 asin** 像不像 ASIN,不是判 sku 的形态 —— 切码后 sku
+# 永远不像 ASIN。
 ASIN_RE = re.compile(r"^B[0-9A-Z]{9}$")
+
+
+def line_asin(line: dict) -> str:
+    """输入:订单行(orders.order_lines 列名)→ 输出:该行的源头 ASIN(大写;取不出返空串)。
+
+    订单链一律以 `orders.order_lines.asin` 为准 —— 登记簿那一跳发生在**写入侧**
+    (order_lines.upsert_order_lines / order_asin_normalize),判定侧不查库、不认
+    SKU 形态。`asin` 为 NULL 的存量行才回落形态提取,那是兜底不是主路。
+    """
+    return (str(line.get("asin") or "").strip().upper()
+            or sku_asin.extract_asin(line.get("sku") or "") or "")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -355,10 +369,11 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
     if not zip5:
         return AuditResult(MANUAL, "收件邮编缺失或不足 5 位,无法按邮编采集,"
                                    "需人工核对地址", detail)
-    asin = str(line.get("sku") or "").strip().upper()
+    asin = line_asin(line)
     if not ASIN_RE.fullmatch(asin):
-        return AuditResult(MANUAL, f"SKU「{asin or '空'}」不是 ASIN 形态,"
-                                   f"采集器不受理,需人工核对", detail)
+        return AuditResult(MANUAL, f"SKU「{line.get('sku') or '空'}」解不出 ASIN"
+                                   f"(登记簿无记录且形态不符),采集器不受理,"
+                                   f"需人工核对", detail)
 
     # ③ 采集完整性:没采到 / 采到但缺关键字段 → 待人工,绝不当通过
     if not snap:

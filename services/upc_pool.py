@@ -14,6 +14,13 @@ SELECT … FOR UPDATE SKIP LOCKED,数据库层面杜绝双领):
   **Unknown(结局不确定)永不回收**——沃尔玛可能已收单,回收再分配
   = 同 UPC 双上架(旧系统生死规则)。
   conflict(全站已存在该 UPC)/ bad_prefix 永久弃用。
+  burned_delete / burned_lock(2026-09-02,SKU 改造批次 0a 登记,批次 2 接线):
+  **主动烧号** —— 码与 UPC 同寿命,弃码时把该 (店, ASIN) 名下的号一起烧掉
+  (delete=DELETE 经观测核验;lock=SKU_LOCKED 自愈退役)。与 conflict 的分工:
+  **conflict 只表示「全站已存在该 UPC」(撞库)**,主动烧号不复用这个语义,否则
+  池表投影与 pool_stats 里永远分不清「这号是撞库废的」还是「我们主动烧的」。
+  三个值的**唯一写入函数是 `burn(conn, pairs, status)`**,唯一调用方是
+  services/sku_codec.abandon(弃码点三个原因各配一个状态);别处不许再写状态值。
 """
 
 import logging
@@ -22,9 +29,23 @@ logger = logging.getLogger("services.upc_pool")
 
 _SAFE_PREFIX = "016789"     # 首位白名单(旧系统实证:2/3/4/5 开头被沃尔玛拒)
 
+# 弃码烧号的三个状态值(0a 登记两个,批次 2 接线并补 conflict 一项)。
+# burned_* 不复用 conflict:那个值的语义是「撞库」,两件事混在一个值里就再也分不开;
+# 反过来撞库弃码烧的号仍写 conflict,因为它本来就是撞库。
+# ⚠ 2026-09-02 批次 2 删掉了 `mark_conflict(conn, upc, asin)`:它是按**单个 UPC**
+# 写 conflict 的第二条写入路径,唯一调用方(listing_sheet 的撞库处置)本批已改走
+# sku_codec.abandon → burn;留着就是「同一个能力两条实现路径」,而误用它的后果正是
+# 本批要消灭的死循环(烧了号没弃码 ⇒ 同码换号重发 ⇒ 0101211)。
+BURN_DELETE = "burned_delete"   # DELETE 经观测核验后弃码,同时烧号
+BURN_LOCK = "burned_lock"       # SKU_LOCKED 自愈退役后弃码,同时烧号
+#: 撞库(全站已存在该 UPC)。这个值**语义在先**:0101119 说的就是"号被占了",
+#: 所以 upc_conflict 弃码烧的号继续用它,而不是再造第四个字样。
+CONFLICT = "conflict"
+
 # PG 状态值 → 表格「状态」列文案
 STATUS_CN = {"": "", "claimed": "已领", "used": "已用",
-             "conflict": "冲突", "bad_prefix": "非法前缀"}
+             CONFLICT: "冲突", "bad_prefix": "非法前缀",
+             BURN_DELETE: "删除烧号", BURN_LOCK: "锁死烧号"}
 
 
 def normalize(upc) -> str:
@@ -135,7 +156,8 @@ def claim(conn, wants: list[dict]) -> list[str | None]:
     legacy_survey:1667 同款死亡路径),而且每次重试白烧一个新号。
     多个旧号时取**最早领的**(最可能是沃尔玛端建 SKU 时绑的那个)。
     自愈链要"领新号"的场景不受影响:RETIRE 成功清列时旧号已被
-    burn_for_retire 标 conflict,复用查询摸不到它。
+    `burn(..., BURN_LOCK)` 烧掉(由 sku_codec.abandon 调),复用查询只看
+    claimed/used,摸不到它。
 
     新领仍是单事务 FOR UPDATE SKIP LOCKED:并发领号互不阻塞且绝不双领。
     调用方必须在同一事务或紧随其后提交 feed;领了不用要走 release 三类路径。
@@ -185,25 +207,39 @@ def claim(conn, wants: list[dict]) -> list[str | None]:
     return out
 
 
-def burn_for_retire(conn, pairs: list[tuple[str, str]]) -> int:
-    """输入:[(store, asin)] → 输出:标 conflict 的行数(RETIRE 成功后旧号永久弃用)。
+def burn(conn, pairs: list[tuple[str, str]], status: str) -> int:
+    """输入:连接 + [(store, asin)] + 烧号状态 → 输出:烧掉的行数(永久弃用)。
 
-    自愈链清列重上要的是**新号**(SKU 已绑死旧号,不退役换号必败;退役后
-    旧号也不能再给任何人用)。标成 conflict 之后,claim 的同 (店,ASIN)
-    复用查询摸不到它,下一轮 list_new 自然领新号——两条语义各归其位。
+    **烧号只有这一条实现路径**(批次 2 决策 D:旧 `burn_for_retire` 已删,不留
+    薄封装 —— 两个名字就是两条路径,总有人调到写死 conflict 的那个)。唯一
+    调用方是 `services/sku_codec.abandon`,状态由那里的弃码原因分派表给:
+      弃码原因 delete_verified → BURN_DELETE   (DELETE 经观测核验)
+      弃码原因 sku_locked      → BURN_LOCK     (SKU_LOCKED 自愈退役)
+      弃码原因 upc_conflict    → CONFLICT      (撞库:号确实被别人占了)
+
+    烧掉之后 `claim` 的同 (店,ASIN) 复用查询(status IN ('claimed','used'))
+    摸不到它,下一轮 list_new 自然领新号 —— "清列重上领新号"靠的就是这一步,
+    不烧就会被原号复用回来。
+
+    非法状态直接抛(与 `release` 的三类原因同款 fail loud):随手传一个新字样
+    进来,池表投影与 pool_stats 里就多出一支没人认识的状态,而且不报错。
     """
+    if status not in (BURN_DELETE, BURN_LOCK, CONFLICT):
+        raise ValueError(
+            f"非法烧号状态 {status!r}:只有 {BURN_DELETE} / {BURN_LOCK} / "
+            f"{CONFLICT}(取值登记在本模块顶部,新增先在那里登记)")
     if not pairs:
         return 0
     with conn.cursor() as cur:
         cur.execute(
-            "UPDATE catalog.upc_pool SET status = 'conflict' "
+            "UPDATE catalog.upc_pool SET status = %s "
             "FROM unnest(%s::text[], %s::text[]) AS t(s, a) "
             "WHERE store = t.s AND asin = t.a "
             "  AND status IN ('claimed', 'used')",
-            ([p[0] for p in pairs], [p[1] for p in pairs]))
+            (status, [p[0] for p in pairs], [p[1] for p in pairs]))
         n = cur.rowcount
     if n:
-        logger.info("RETIRE 退役烧号 %d 个(标 conflict,重上必领新号)", n)
+        logger.info("弃码烧号 %d 个(状态=%s,重上必领新号)", n, status)
     return n
 
 
@@ -217,6 +253,36 @@ def mark_used(conn, pairs: list[tuple[str, str]]) -> int:
             "used_at = now() WHERE upc = %s",
             [(sku, upc) for upc, sku in pairs])
     return len(pairs)
+
+
+def retag_sku(conn, triples: list[tuple[str, str, str]]) -> int:
+    """输入:连接 + [(店, ASIN, 新 SKU)] → 输出:改标行数(改码后号还是那个号,
+    只是它现在挂在新 SKU 名下)。
+
+    `sku` 列的语义是「这个号现在被哪个沃尔玛 SKU 占着」(schema.sql 的列注)。
+    改码后不改它,列里存的就是一个**已经不存在于沃尔玛的串**;而
+    listing_sheet._mark_upc_conflicts 与 UPC 池表投影都按它反查 —— 反查不到就是
+    撞库标不上、运营在表上看到的归属是错的,**而且不报错**。
+
+    **不复用 mark_used**(那是"新消耗"):mark_used 会把 status 推成 'used' 并刷
+    used_at;改码不是一次新消耗,时间戳不该被改写。本函数只动 sku 一列,
+    asin(领号复用键)/ status / used_at 一律不动。
+    状态条件 `status IN ('claimed','used')` 与 burn 逐字一致 —— 两个改池表的出口
+    口径不一致本身就是漂移源。
+    """
+    if not triples:
+        return 0
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE catalog.upc_pool SET sku = t.new_sku "
+            "FROM unnest(%s::text[], %s::text[], %s::text[]) AS t(s, a, new_sku) "
+            "WHERE store = t.s AND asin = t.a "
+            "  AND status IN ('claimed', 'used')",
+            ([t[0] for t in triples], [t[1] for t in triples],
+             [t[2] for t in triples]))
+        n = cur.rowcount
+    logger.info("UPC 改标 %d 个(改码:号不动,只换挂在它名下的 SKU)", n)
+    return n
 
 
 def release(conn, upcs: list[str], reason: str) -> int:
@@ -237,13 +303,6 @@ def release(conn, upcs: list[str], reason: str) -> int:
         n = cur.rowcount
     logger.info("UPC 回收 %d 个(原因=%s)", n, reason)
     return n
-
-
-def mark_conflict(conn, upc: str, asin: str | None = None) -> None:
-    """输入:连接 + UPC(+尝试的 asin)→ 输出:无。全站已存在,永久弃用。"""
-    with conn.cursor() as cur:
-        cur.execute("UPDATE catalog.upc_pool SET status = 'conflict', "
-                    "asin = COALESCE(%s, asin) WHERE upc = %s", (asin, upc))
 
 
 def pool_stats(conn) -> dict[str, int]:

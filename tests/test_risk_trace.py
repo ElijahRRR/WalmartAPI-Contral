@@ -140,6 +140,24 @@ def test_items_leg_has_all_three_still_listed_conditions():
     assert "coalesce(upper(lifecycle_status), 'ACTIVE') = 'ACTIVE'" in rt._ITEMS_SQL
 
 
+def test_items_leg_also_matches_through_the_registry():
+    """①号证据源按登记簿 amz 键与裸 sku 取**并集**(0a-17)。
+
+    只按裸 sku 匹配的话,切码后同一 ASIN 的新码行整条追不出来 —— 而这条链的
+    口号就是「宁可多追一家,不能漏一家」。
+    ⚠ 两条腿必须是 UNION 而不是一条 OR:OR 写法两个索引都用不上
+    (walmart_items_sku_idx / listing_sources_key_idx),几百万行全表扫,
+    与 ③号源踩过的是同一个坑。UNION(不是 UNION ALL)去重,防同一行两边都命中。
+    """
+    q = rt._ITEMS_SQL
+    assert "ls.source_type = 'amz'" in q
+    assert "ls.source_key = ANY(%(asins)s::text[])" in q
+    assert "sku = ANY(%(asins)s::text[])" in q
+    assert "\n    UNION\n" in q and "UNION ALL" not in q
+    # 聚合仍逐店做,数组仍是真 SKU(展示给人的是 SKU,不是身份键)
+    assert "array_agg(DISTINCT sku)" in q and "GROUP BY store" in q
+
+
 def test_brand_leg_skipped_when_no_brand_key():
     """没有品牌键时走的是不含品牌腿的那条 SQL(显式路由,不靠 `= NULL` 空转)。"""
     conn = _Conn({_T_CLAIMS: []})
@@ -263,11 +281,13 @@ def _seed(conn):
             "(store, sku, missing_since, lifecycle_status, last_seen_at) VALUES "
             "('A085', %s, NULL, NULL, now()),"          # 在架
             "('B012', %s, now(), NULL, now()),"         # 历史:已缺席
-            "('R900', %s, NULL, 'RETIRED', now())",     # 退市:missing_since 也是 NULL
+            "('R900', %s, NULL, 'RETIRED', now()),"     # 退市:missing_since 也是 NULL
+            "('N001', 'ARISKTRACE01', NULL, NULL, now())",   # 新码行:SKU ≠ ASIN
             (_A1, _A2, _A1))
         cur.execute(
             "INSERT INTO catalog.listing_sources (store, sku, source_type, source_key)"
-            " VALUES ('A085', %s, 'amz', %s)", (_A1, _A1))
+            " VALUES ('A085', %s, 'amz', %s), ('N001', 'ARISKTRACE01', 'amz', %s)",
+            (_A1, _A1, _A1))
         cur.execute(
             "INSERT INTO catalog.claims (kind, claim_key, store, status, source,"
             " released_at) VALUES ('brand', %s, '谭总9', 'released', 'test', now())",
@@ -321,14 +341,17 @@ def test_pg_traces_all_four_evidence_sources(pg):
     bkey, asins, hits = rt.stores_of_brand(pg, _BRAND)
     assert bkey == _BKEY and asins == [_A1, _A2]
     # 展示序 = stores.sort_key:字母 → 数字 → 中文
-    assert list(hits) == ["A085", "B012", "R900", "81刘何秀", "谭总9"]
+    assert list(hits) == ["A085", "B012", "N001", "R900", "81刘何秀", "谭总9"]
     assert hits["A085"]["evidence"] == [rt.EV_ITEM, rt.EV_SOURCE]
     assert hits["B012"]["evidence"] == [rt.EV_ITEM]
     assert hits["81刘何秀"]["evidence"] == [rt.EV_EVENT]
     assert hits["谭总9"]["evidence"] == [rt.EV_CLAIM_BRAND]      # 只有 released 行
-    # still_listed 只有 A085:B012 已缺席、R900 退市(missing_since 也是 NULL)、
-    # 另两家压根没有在架表的行
-    assert [s for s, v in hits.items() if v["still_listed"]] == ["A085"]
+    # ★ 新码行(SKU=ARISKTRACE01 ≠ ASIN)也被**①号源**追到:裸 sku 那条腿看不见
+    # 它,经登记簿那条腿看得见 —— 这就是 0a-17 那次并集改造要保住的东西
+    assert rt.EV_ITEM in hits["N001"]["evidence"]
+    assert "ARISKTRACE01" in hits["N001"]["asins"]        # 展示的是真 SKU
+    # still_listed:A085 与 N001(B012 已缺席、R900 退市、另两家没有在架表的行)
+    assert [s for s, v in hits.items() if v["still_listed"]] == ["A085", "N001"]
     assert hits["R900"]["listed_in_items"] is False
 
 

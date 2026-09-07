@@ -181,12 +181,28 @@ GROUP BY 1 ORDER BY 2 DESC, 1
 # 判法照抄仓内既有先例(maintenance_intents._SQL_MATCH_INV、
 # product_events 把 RETIRED 记 'gone'):**coalesce 到 ACTIVE 是 fail-open**
 # ——这一列没采到不算退市,判不准就判活。
+# ⚠ WHERE 两行**故意不加 w. 限定**:listing_sources 没有同名列,不歧义;而
+# tests/test_alloc_audit.py 与 tests/test_store_perf.py 的两条反向守门钉的是
+# 这两行的逐字文本(「退市行不算活货位」这条结论不许被顺手统一掉)。
+# 身份键那一列(ls.source_key)在 SQL 里 LEFT JOIN 拿,不在 Python 里回头
+# 反查:全表级取数拿十万对去 unnest 是另一回事(分工写在
+# services/sku_asin 的模块 docstring 里)。存量 amz 行 source_key = sku,
+# 未登记行与非 amz 行都回落裸 sku,enrich 的结果逐行不变。
+# ⚠ **本条 SQL 在 SKU 改造批次 2 一个字都没改**(所有者决策 C 拍死):
+# workflows/alloc_push._SQL_ONLINE 自 2026-09-02 起改按「码是否弃用」判、
+# 去掉了 lifecycle 条件,本函数**不跟**。两条答的不是一个问题:alloc_push 答
+# "该不该给运营派新活"(那里的危险是复活退市档案),本函数答"占用/冲突里
+# 这家店有没有活货位"(退市行不是活货位,把它算成活货位会让占用组与冲突组
+# 凭空多出一批)。两处都不触发破坏动作,判据分开是安全的,合并才会打破
+# 2026-08-15 的定稿 —— 不要顺手统一。
 _SQL_ONLINE = """
-SELECT store, sku, product_type, published_status
-FROM catalog.walmart_items
+SELECT w.store, w.sku, w.product_type, w.published_status, ls.source_key
+FROM catalog.walmart_items w
+LEFT JOIN catalog.listing_sources ls
+  ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
 WHERE missing_since IS NULL
   AND coalesce(upper(lifecycle_status), 'ACTIVE') = 'ACTIVE'
-ORDER BY store, sku
+ORDER BY w.store, w.sku
 """
 
 # 一次拿齐品牌/PT/渠道:渠道那段是 amz_source._SQL 的 LATERAL 口径
@@ -233,15 +249,27 @@ FROM ops.store_kpi_daily ORDER BY store, data_date DESC
 # 2. ⚠ **历史行里的退款单算进了销量**:源表的「统计状态」列没有被导入,
 #    退款/无效行与有效销售一起进来了。对"留销量大的店"这类相对比较影响
 #    很小(各店同样口径),但绝对额会偏高;真要精确得让导入侧补这一列。
+# 3. **改码后销量沿改码链继承一跳**(SKU 改造批次 3,O12,决策 H):
+#    定案之后 catalog.walmart_items.sku 是新码,而 orders.order_lines 的历史行
+#    仍是旧码 —— 不映射的话迁过码的品销量/GMV **恒 0**,而且不报错:店铺产出、
+#    resolve_conflicts 按销量选冲突赢家、alloc_audit 明细三处一起对这些品失真。
+#    别名走 catalog.sku_aliases(代际继承的唯一出处,与 problem_scan 四段判据
+#    同源),视图在改码前是空集 ⇒ LEFT JOIN 全落 NULL、coalesce 取回 o.sku,
+#    结果集逐行不变。
+#    ⚠ **返回键的形状不变**((store, sku)):改成按 order_lines.asin 聚合口径更
+#    根本(services/product_pool.py 已是那个写法),但要连带改三个消费点的键
+#    形状 —— 那是行为变化,另立批次(决策 H 的备选)。
 _SQL_SALES = """
-SELECT store, sku,
-       count(*)                                   AS orders,
-       coalesce(sum(product_amount), 0)::numeric  AS gmv
-FROM orders.order_lines
-WHERE order_date >= %(as_of)s::timestamptz - make_interval(days => %(days)s)
-  AND order_date <  %(as_of)s::timestamptz
-  AND coalesce(sale_status, '') <> 'Cancelled'
-GROUP BY store, sku
+SELECT o.store AS store, coalesce(a.sku, o.sku) AS sku,
+       count(*)                                     AS orders,
+       coalesce(sum(o.product_amount), 0)::numeric  AS gmv
+FROM orders.order_lines o
+LEFT JOIN catalog.sku_aliases a
+       ON a.store = o.store AND a.alias_sku = o.sku
+WHERE o.order_date >= %(as_of)s::timestamptz - make_interval(days => %(days)s)
+  AND o.order_date <  %(as_of)s::timestamptz
+  AND coalesce(o.sale_status, '') <> 'Cancelled'
+GROUP BY 1, 2
 """
 
 # 订单侧店名 vs 凭证表:对不上的店,其销量进不了"店×类目"维度
@@ -277,18 +305,21 @@ def sales_window(as_of: str = "", days: int = 365) -> dict:
 # ── 纯函数(逻辑都在这里,好测)────────────────────────────────────────────
 
 def enrich(items, meta, pt2cat):
-    """输入:在线行 [(store, sku, product_type, published_status)] +
+    """输入:在线行 [(store, sku, product_type, published_status, source_key)] +
     {asin: 元数据} + {PT: 大类} → 输出:(富化行 list, 统计 Counter)。
 
     每行补:asin(提不出为 None)、品牌占用键、大类、大类来源、渠道、是否已发布。
     大类主路取在线 PT(沃尔玛认过的),兜底取产品审核 PT——两条来源分开计数,
     因为兜底那部分可能是 LLM 推断的(pt_source),开新类目时不能当实证用。
+
+    ⚠ **补位到 5 列的写法不能删**:调用方喂 4 元组(无 source_key)时补成
+    None ⇒ pick_asin 回落模式提取 = 收口之前的行为,一个字不差。
     """
     rows, st = [], Counter()
     for it in items:
-        store, sku, pt, published = (list(it) + [None] * 4)[:4]
+        store, sku, pt, published, src_key = (list(it) + [None] * 5)[:5]
         st["online"] += 1
-        asin = sku_asin.extract_asin(sku)
+        asin = sku_asin.pick_asin(src_key, sku)
         if asin is None:
             st["no_asin"] += 1
             st[f"form_{sku_asin.classify(sku)}"] += 1
@@ -793,8 +824,9 @@ def load_rows(conn, *, win=None, need=(), with_channel: bool = True) -> Loaded:
             cur.execute(_SQL_ORDER_STORES, win)
             order_stores = cur.fetchall()
 
-        asins = sorted({a for a in (sku_asin.extract_asin(it[1])
-                                    for it in items) if a})
+        asins = sorted({a for a in (
+            sku_asin.pick_asin(it[4] if len(it) > 4 else None, it[1])
+            for it in items) if a})
         meta = _fetch_meta(cur, asins, with_channel)
 
     rows, st = enrich(items, meta, pt2cat)

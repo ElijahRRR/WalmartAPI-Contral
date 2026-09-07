@@ -1,5 +1,7 @@
 """listing L2d 回归:mapper 实证约束逐条验证(每条都有旧错误码背书)。"""
 
+import pytest
+
 from services import mp_mapper as m
 
 
@@ -296,3 +298,204 @@ def test_split_llm_output_two_part_and_legacy_flat():
     assert v == {"color": "Red"} and o == {"netContent": {}}
     v2, o2 = m.split_llm_output({"color": "Red"})      # 旧缓存平铺形态
     assert v2 == {"color": "Red"} and o2 == {}
+
+
+# ── SkuUpdate:系统专属开关字段(SKU 改造批次 3 地基,M1/M2/M3)───────────────
+
+def test_sku_update_is_a_system_field_and_never_reaches_the_llm():
+    """SkuUpdate 在 ORDERABLE_SYSTEM_FIELDS 里 ⇒ 既不进 LLM 提示词,也不许 LLM 填。
+
+    它一旦被 LLM 塞进普通上架载荷,后果不是报错,而是**沃尔玛把一次普通上架当成
+    改码请求** —— 本仓能想到的最贵的静默失效。
+    """
+    assert "SkuUpdate" in m.ORDERABLE_SYSTEM_FIELDS
+    ospec = {"required": [], "properties": {
+        "SkuUpdate": {"type": "string"}, "sku": {"type": "string"},
+        "netContent": {"type": "object"}}}
+    msgs = m.build_llm_messages("Cups", {"properties": {}}, {"title": "x"},
+                                ospec=ospec)
+    assert all("SkuUpdate" not in msg["content"] for msg in msgs)
+
+
+def test_llm_supplied_sku_update_is_stripped_from_orderable():
+    """LLM 填的 SkuUpdate 一律被剔掉。
+
+    2026-09-06 起这是它**唯一**的职责:改码走 MP_ITEM_MATCH 的原地换码,本仓
+    没有任何路径写 SkuUpdate,所以"LLM 塞进来的"就是唯一可能的来源。
+    """
+    o = m.build_orderable("B0X", "012345678905", 10, 3, "P1",
+                          llm_fields={"SkuUpdate": "Yes"})
+    assert "SkuUpdate" not in o
+
+
+def test_build_orderable_can_no_longer_be_turned_into_a_sku_update():
+    """改码不再有第二条路(2026-09-06,§六 双轨禁止)。
+
+    `sku_update=` 形参与 `build_sku_update_item` 一起删了:通道定案 MP_ITEM_MATCH
+    (同 GTIN + 新 SKU + REPLACE 原地换码),载荷里根本没有 SkuUpdate。留着那个
+    形参更坏 —— `mp_conform.strip_unknown` 的放行分支也删了,传了会被裁掉,
+    一次改码退化成一次普通上架(同店双挂),回执还全绿。
+    """
+    import inspect
+    import json
+    assert "sku_update" not in inspect.signature(m.build_orderable).parameters
+    assert not hasattr(m, "build_sku_update_item")
+    with pytest.raises(TypeError):
+        m.build_orderable("B0X", "012345678905", 10, 3, "P1", sku_update=True)
+    assert "SkuUpdate" not in json.dumps(
+        m.build_orderable("B0X", "012345678905", 10, 3, "P1"))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  发货重量:单位从数据里读,不猜(2026-09-06 生产事故 + 所有者定稿)
+#
+#  事故:第二级投放的两个品把 300.0 与 860.0 当"磅"发进了 REPLACE 载荷 ——
+#  老实现只抓字符串里第一个数字、**完全不看单位**,而采集侧给的是 "300 grams"。
+#  所有者定稿原话:「请勿猜测单位,一切以官方事实为主……如果解析不出重量或者重量
+#  大于 11 磅,则把重量都写为 1 磅。」
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _w(v):
+    """一个 slow.weight.package 的值 → (磅, 归因)。"""
+    return m.shipping_weight_ex({"attrs": {"weight": {"package": v}}})
+
+
+@pytest.mark.parametrize("raw, lbs", [
+    ("3.5 pounds", 3.5), ("3.5 Pounds", 3.5), ("  3.5   pound ", 3.5),
+    ("2 lb", 2.0), ("2lbs", 2.0), ("1.2 Lbs.", 1.2),
+    ("12.8 ounces", 0.8), ("8 oz", 0.5), ("1 Ounce", 0.06),
+    ("860 grams", 1.9), ("453.59237 g", 1.0), ("100 Gram", 0.22),
+    ("1.2 Kilograms", 2.65), ("1 kg", 2.2), ("0.5 KG", 1.1),
+])
+def test_every_unit_token_is_converted_by_the_official_constants(raw, lbs):
+    """认得的四族单位记号(大小写/空白/句点不敏感)按官方换算折成磅。
+
+    换算常量只在 mp_mapper 顶部出生一次:1 lb = 16 oz = 453.59237 g
+    (1959 国际码磅协定的精确定义值),1 kg = 1000/453.59237 = 2.20462 lb。
+    """
+    assert _w(raw) == (lbs, "parsed")
+
+
+def test_the_conversion_constants_are_the_official_ones():
+    assert m.OUNCES_PER_POUND == 16.0 and m.GRAMS_PER_POUND == 453.59237
+    assert round(m.POUNDS_PER_KILOGRAM, 5) == 2.20462
+    assert m.MAX_SHIPPING_WEIGHT_LBS == 11.0
+    assert m.DEFAULT_SHIPPING_WEIGHT == 1.0
+
+
+def test_a_bare_number_has_no_unit_so_it_is_not_parsed():
+    """**这条就是事故本身**:裸数字不假设是磅 —— 老实现拿 300 当 300 磅发了出去。
+
+    没有单位记号 ⇒ 解析不出 ⇒ 写 1 磅(所有者定稿),归因 `no_unit`,
+    调用方据此分桶报数(list_new 摘要 / sku_migrate 预览)。
+    """
+    assert _w(300) == (m.DEFAULT_SHIPPING_WEIGHT, "no_unit")
+    assert _w("300") == (m.DEFAULT_SHIPPING_WEIGHT, "no_unit")
+    assert _w(0.82) == (m.DEFAULT_SHIPPING_WEIGHT, "no_unit")
+
+
+def test_the_two_production_rows_that_blew_up_now_land_on_the_fallback():
+    """2026-09-06 实测那两个品:"300 grams" / "860 grams" 折算后不到 2 磅,
+    老实现却当 300.0 / 860.0 磅发了出去。新解析器给真值,不再是那两个数。"""
+    assert _w("300 grams") == (0.66, "parsed")
+    assert _w("860 grams") == (1.9, "parsed")
+
+
+def test_an_unknown_unit_token_is_never_guessed():
+    """表外记号(stone / 中文"克" / 拼错)一律 unknown_unit ⇒ 1 磅,不猜。"""
+    assert _w("5 stones") == (m.DEFAULT_SHIPPING_WEIGHT, "unknown_unit")
+    assert _w("5 克") == (m.DEFAULT_SHIPPING_WEIGHT, "unknown_unit")
+    assert _w({"value": 5, "unit": "tonnes"}) == (
+        m.DEFAULT_SHIPPING_WEIGHT, "unknown_unit")
+
+
+def test_over_the_owner_cap_writes_one_pound():
+    """> 11 磅判为**不可信**(所有者定稿),写 1 磅;恰好 11 磅仍是真值。"""
+    assert _w("12 pounds") == (m.DEFAULT_SHIPPING_WEIGHT, "over_cap")
+    assert _w("176.1 oz") == (m.DEFAULT_SHIPPING_WEIGHT, "over_cap")
+    assert _w("6 kg") == (m.DEFAULT_SHIPPING_WEIGHT, "over_cap")   # 13.2 磅
+    assert _w("11 lbs") == (11.0, "parsed")                        # 边界含 11
+    assert _w("176 oz") == (11.0, "parsed")
+
+
+def test_nonpositive_and_missing_weights_fall_back_with_their_own_reason():
+    assert _w("0 oz") == (m.DEFAULT_SHIPPING_WEIGHT, "nonpositive")
+    assert _w("-1 lb") == (m.DEFAULT_SHIPPING_WEIGHT, "nonpositive")
+    assert _w("N/A") == (m.DEFAULT_SHIPPING_WEIGHT, "no_weight")
+    assert _w("") == (m.DEFAULT_SHIPPING_WEIGHT, "no_weight")
+    assert _w(None) == (m.DEFAULT_SHIPPING_WEIGHT, "no_weight")
+    assert m.shipping_weight_ex(None) == (m.DEFAULT_SHIPPING_WEIGHT, "no_weight")
+    assert m.shipping_weight_ex({"attrs": {}}) == (
+        m.DEFAULT_SHIPPING_WEIGHT, "no_weight")
+    assert m.shipping_weight_ex({"attrs": {"weight": "3.5 pounds"}}) == (
+        m.DEFAULT_SHIPPING_WEIGHT, "no_weight")      # 不是 {package,item} 形态
+
+
+def test_dict_shaped_weight_takes_value_plus_unit():
+    """{value, unit} 形态:两半都从数据里读;value 键的别名与旧实现同源。"""
+    assert _w({"value": 3.5, "unit": "pounds"}) == (3.5, "parsed")
+    assert _w({"value": "12.8", "units": "Ounces"}) == (0.8, "parsed")
+    assert _w({"measure": 1.2, "unit": "kg"}) == (2.65, "parsed")
+    assert _w({"amount": 860, "unitOfMeasure": "grams"}) == (1.9, "parsed")
+    # value 里自带单位、dict 没给 unit ⇒ 从串里读
+    assert _w({"value": "3.5 lbs"}) == (3.5, "parsed")
+    # 有数字没单位 ⇒ 与裸数字同一档(不猜)
+    assert _w({"value": 3.5}) == (m.DEFAULT_SHIPPING_WEIGHT, "no_unit")
+    assert _w({}) == (m.DEFAULT_SHIPPING_WEIGHT, "no_weight")
+
+
+def test_package_wins_over_item_and_item_is_the_fallback_key():
+    """既有顺序保留:包装重优先、本体重次之;包装重读不出才看本体重。"""
+    both = {"attrs": {"weight": {"package": "3.5 pounds", "item": "2 lb"}}}
+    assert m.shipping_weight_ex(both) == (3.5, "parsed")
+    fell = {"attrs": {"weight": {"package": "N/A", "item": "2 lb"}}}
+    assert m.shipping_weight_ex(fell) == (2.0, "parsed")
+    # 两个都读不出 ⇒ 报**包装重**那一档的归因(先看到的那个)
+    none = {"attrs": {"weight": {"package": "N/A", "item": "3.5"}}}
+    assert m.shipping_weight_ex(none) == (m.DEFAULT_SHIPPING_WEIGHT, "no_weight")
+    # 包装重超上限**就地判定**,不退到本体重(退过去等于拿另一个数替它猜)
+    cap = {"attrs": {"weight": {"package": "20 lbs", "item": "2 lb"}}}
+    assert m.shipping_weight_ex(cap) == (m.DEFAULT_SHIPPING_WEIGHT, "over_cap")
+
+
+def test_shipping_weight_is_a_thin_wrapper_over_the_one_parser():
+    """`shipping_weight` 只取第一个返回值(一条实现路径,不另写解析)。"""
+    for raw in ("3.5 pounds", "300", "12 pounds", "N/A", {"value": 1, "unit": "kg"}):
+        assert m.shipping_weight(
+            {"attrs": {"weight": {"package": raw}}}) == _w(raw)[0]
+    assert set(m.WEIGHT_REASONS) == {"parsed", "no_weight", "no_unit",
+                                     "unknown_unit", "over_cap", "nonpositive"}
+
+
+def test_orderable_ships_the_parsed_pounds_and_falls_back_otherwise():
+    """载荷侧:`ShippingWeight` 是**磅**(沃尔玛后台那一栏是 Shipping Weight (lbs))。"""
+    o = m.build_orderable("B0X", "0123", 10, 1, "P1", pt="Cups",
+                          product={"attrs": {"weight": {"package": "860 grams"}}})
+    assert o["ShippingWeight"] == 1.9          # 不再是 860.0(事故行为)
+    o2 = m.build_orderable("B0X", "0123", 10, 1, "P1", pt="Cups",
+                           product={"attrs": {"weight": {"package": "12 pounds"}}})
+    assert o2["ShippingWeight"] == m.DEFAULT_SHIPPING_WEIGHT
+
+
+# ── 2026-09-06 全库单位直方图(所有者 SQL)对照:长尾里有定义的两个记号 + 双词/夹杂形态 ──
+def test_histogram_long_tail_units_with_a_definition_are_converted():
+    """milligrams(197 行)与 "hundredths pound"(94 行,亚马逊百分之一磅)有官方定义,
+    进表;foot_ounces / tons / gravity 之类没有重量定义的记号仍判 unknown_unit。"""
+    from services import mp_mapper as m
+    lbs, why = m._parse_weight_value("197 milligrams")
+    assert why == "parsed" and abs(lbs - 197 / 1000 / m.GRAMS_PER_POUND) < 1e-9
+    assert m._parse_weight_value("0.5 hundredths pound") == (0.005, "parsed")
+    assert m._parse_weight_value("1 foot_ounces") == (None, "unknown_unit")
+    assert m._parse_weight_value("3 tons") == (None, "unknown_unit")
+
+
+def test_unit_word_is_read_even_when_followed_by_punctuation_or_a_second_measure():
+    """直方图里的 "ounces(181.44 g)" / "kg/6.8lbs" / "600g / 1.3lb" 这类:取数字后紧跟的
+    字母词当单位;非字母记号("克")仍是 unknown_unit,而不是 no_unit。"""
+    from services import mp_mapper as m
+    assert m._parse_weight_value("6.4 ounces(181.44 g)") == (0.4, "parsed")
+    lbs, why = m._parse_weight_value("3.1 kg/6.8lbs")
+    assert why == "parsed" and abs(lbs - 3.1 * m.POUNDS_PER_KILOGRAM) < 1e-9
+    assert m._parse_weight_value("item weight: 600g / 1.3lb")[1] == "parsed"
+    assert m._parse_weight_value("5 克") == (None, "unknown_unit")
+    assert m._parse_weight_value("300") == (None, "no_unit")

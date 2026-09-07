@@ -30,8 +30,8 @@
     pending ──(新码在架 ∧ 旧码缺席 ∧ 观测新鲜)──────────────▶ confirmed
       │                                                        (旧行弃码 sku_update,
       │                                                         不烧 UPC;UPC 改标、
-      │                                                         处置迁键、库存回写、
-      │                                                         节点库存清行)
+      │                                                         处置迁键、节点库存清行;
+      │                                                         **不回写库存**)
       ├──(回执 failed ∨ 观测反证且超 OBSERVE_HOURS)─────────▶ rolled_back
       │                                                        (旧行复活,新码弃掉)
       ├──(超 STALE_HOURS 仍判不出)──────────────────────────▶ stalled(点名人工,不自动定案)
@@ -65,8 +65,8 @@
      既定规则见 docs/plan.md 工作流 6「新鲜度优先,单店整量当轮连发」)。
      桶与**跟卖链 match_listing 共享** —— 跟卖真跑那天别并跑。
   ⑥ **dry-run 下 _settle 与 _migrate 都零写**:不 mint、不定案、不提交、
-     不改处置、不删节点库存、不回写库存 —— 一行库、一条 feed 都不写
-     (飞书本工作流**只读不写**:库存回写要读「维护仓库」判受管仓,见头注
+     不改处置、不删节点库存 —— 一行库、一条 feed 都不写
+     (飞书本工作流**只读不写**:载荷取 FC 要读「维护仓库」判受管仓,见头注
       「身份映射写在哪」—— 上架表一格都不碰)。
   ⑦ **REPLACE 不带的字段会被写空,所以库存必须随载荷一起发**(2026-09-07 通道
      升 v5 之后的定稿;起因是 2026-09-06 第一级投放实证,见 docs/sku_plan.md §9.12):
@@ -77,12 +77,16 @@
        · **载荷自己带库存**(`_item_of`):qty = 候选行的 `avail_qty`(旧码行最后
          一次观测),FC 走 `store_limits.listing_fc`(上架链同一个入口);没观测到
          库存的行**不猜**,受管仓校验失败的店**不带**且不回落 Partner ID;
-       · 定案时的 `_restore_inventory` **保留作兜底**:带过库存之后它应当恒判
-         「新码现值已等于旧码」而一条都不写(所有者定稿「库存直接使用在数据库中
-         读取到的库存就可以了,不需要记库存」——两处读的是同一列同一口径);
+       · **定案不再回写库存**(所有者 2026-09-07 定稿,原话「按我们现在修改 sku
+         的流程,已经不需要再提交一次改库存了」):同一份数据**不走第二条写路径**
+         (§六 双轨)。原先定案时的 `_restore_inventory` 读的正是改码 feed 已经
+         发过的那一列(旧码行 `avail_qty`),再 PUT 一遍既烧库存接口配额,又可能
+         把提交之后**已经卖掉**的那几件原样写回去(A131 第一批定案就写了一遍:
+         新码行的 avail_qty 还没被下一轮库存拉取更新,所以它判成"不相等");
+       · **未观测到库存的行不带**,由沃尔玛按 REPLACE 语义处理,维护链下一轮
+         按 amz 库存重算 —— 本工作流不为库存补第二条腿;
        · **没带库存的那几条,提交到定案之间仍是停售的** —— 之后要尽快跑
-         `catalog_sync -p store=X`,再 `sku_migrate -p store=X -p settle_only=1`;
-       · 回写失败只点名,**不自动重试、不换方法**(写操作永不自动兜底)。
+         `catalog_sync -p store=X`,再 `sku_migrate -p store=X -p settle_only=1`。
   ⑧ **上架上限闸**(2026-09-07 A131吕灿荣 整店被拒实证,见 docs/sku_plan.md §9.12):
      沃尔玛按「**店内现有 item 数 + 本 feed 条数**」对每店的 item setup limit 做
      **整 feed 拒收** —— MP_ITEM_MATCH 的改码在它眼里**先算新增**。A131 整店 2740 条
@@ -139,7 +143,7 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 
-from api import feeds, inventory as inv_api
+from api import feeds
 from registry import db, resources
 from services import amz_source, dispositions, feed_track, \
     listing_sources, match_feed, mp_mapper, notify_fmt as nf, order_lines, \
@@ -353,9 +357,8 @@ LEFT JOIN catalog.products p
 #: 重量**不是**判据,是每条候选都要按新口径重算的一个值(见 `_weight_of`)。
 #: `avail_qty` 是**旧码行最后观测到的库存**(2026-09-07 随通道升 v5 带出):v5 的
 #: Item 有可选 `inventory[]`,改码 feed 从此**自己把库存带过去**(见 `_item_of`),
-#: 不再指望定案时的 `_restore_inventory` 补写。它**不是判据**(没观测到就不带库存,
-#: 不剔候选);与 `_SQL_INV_QTY` 读的是同一列同一口径,只是时点一个在发之前、
-#: 一个在定案之后。
+#: 这是本工作流写库存的**唯一一条路**(所有者 2026-09-07 定稿:定案不再回写库存,
+#: 同一份数据不走第二条写路径)。它**不是判据**(没观测到就不带库存,不剔候选)。
 _SQL_CANDIDATES = (
     "SELECT w.store, w.sku AS old_sku, ls.source_type, ls.source_key,\n"
     "       coalesce(w.gtin, w.upc) AS product_id,\n"
@@ -423,8 +426,8 @@ ORDER BY id
 #: 节奏闸的两个数:`open` 按**店**数(该店账没清就不发下一批),`confirmed` 按
 #: **全船队**数 —— 1 → 10 这两级验的是"通道能不能原地换码"这件店无关的事
 #: (2026-09-06 A085朱丽霖 已实证),所有者 2026-09-07 定稿:后面的店不必每家
-#: 重走 1 → 10。店相关的风险另有闸:凭证/在营(闸①)、受管仓节点判不出不回写
-#: (_restore_inventory fail-closed)。
+#: 重走 1 → 10。店相关的风险另有闸:凭证/在营(闸①)、受管仓节点判不出则载荷
+#: **不带库存**(`_fc_of` fail-closed,绝不回落 Partner ID)。
 _SQL_STAGE = """
 SELECT (SELECT count(*) FROM listing.sku_migrations
          WHERE status = 'confirmed')                            AS confirmed,
@@ -481,27 +484,6 @@ UPDATE listing.sku_migrations
 _SQL_LEDGER_STALLED = """
 UPDATE listing.sku_migrations
    SET status = 'stalled', error = %(error)s
- WHERE id = %(id)s
-"""
-
-#: 定案回写库存的取数(**一轮一条 SQL**,新旧码一起问)。
-#: qty 取**旧码行**的 `avail_qty`:旧码在沃尔玛侧消失之后 catalog_sync 只给它盖
-#: `missing_since`,`avail_qty` 保留**最后一次观测值**(2026-09-06 那一例正是 30)。
-#: 所有者定稿:「库存直接使用在数据库中读取到的库存就可以了,**不需要记库存**」
-#: —— 不在提交前另抓一次现值另存一份:多一份状态就多一处会漂的地方,而观测本来就有。
-#: 新码行的 `avail_qty` 一起取,只为「已经等于 qty 就不写」这条空转判据:
-#: 将来通道若自己把库存带过去(v5 / 沃尔玛改行为),这一段自然什么都不做。
-_SQL_INV_QTY = """
-SELECT sku, avail_qty FROM catalog.walmart_items
-WHERE store = %(store)s AND sku = ANY(%(skus)s::text[])
-"""
-
-#: 回写成功的留档(事后核对「这条改码补回去多少件」)。detail 是 jsonb,用 `||`
-#: **合并**不整块覆盖 —— 提交时写进去的 product_id/price/weight 是复盘凭据,
-#: 不能被这一笔冲掉。
-_SQL_LEDGER_INV = """
-UPDATE listing.sku_migrations
-   SET detail = coalesce(detail, '{}'::jsonb) || %(patch)s::jsonb
  WHERE id = %(id)s
 """
 
@@ -680,8 +662,8 @@ def _confirm(store_name: str, row: dict) -> list[str]:
     一个事务里把 confirmed 的全部后果做完:
     身份定案 → UPC 改标 → 处置迁键 → 节点库存清行 → 过程账落 confirmed。
     **上架表不在这张清单里**:改码不回写上架表 SKU 列(2026-09-06 所有者定稿,
-    见模块头注「身份映射写在哪」)。库存回写是事务**之后**的外部 IO(_settle 里做),
-    它失败不让已经定案的身份回滚。
+    见模块头注「身份映射写在哪」)。**库存也不在这张清单里**:它随改码 feed 一起
+    写完了,定案不再回写(所有者 2026-09-07 定稿,见安全约束⑦)。
     """
     warns: list[str] = []
     old, new = row["old_sku"], row["new_sku"]
@@ -722,141 +704,24 @@ def _roll_back(store_name: str, row: dict, why: str) -> None:
                    {"status": _ROLLED_BACK, "error": why[:900], "id": row["id"]})
 
 
-def _restore_inventory(conn, store_name: str, rows: list[dict], execute: bool,
-                       *, store_of) -> tuple[dict, list[str]]:
-    """输入:只读连接 + 店 + 本轮 confirmed 的行 + 是否真写(+ 店铺凭证取处)
-    → 输出:(计数, 摘要行)。
-
-    **兜底,不是主路**(2026-09-07 通道升 v5 之后改口):库存现在**随改码 feed
-    一起写**(`_item_of` 的 `inventory[]`,安全约束⑦),所以本段在正常情况下
-    应当恒判「新码现值已等于旧码」而**一条都不写**。留着它是因为三种情况载荷
-    带不了库存:提交时还没观测到 avail_qty、该店受管仓校验失败(载荷不带、
-    不回落 Partner ID)、以及 v5 之前发出去、还压在 pending 上的存量行。
-    起因仍是 2026-09-06 第一级投放实证:MP_ITEM_MATCH v4.2 的载荷里没有库存
-    字段,REPLACE 把「没带」当 0 写 —— 旧码最后观测 30 件,换码成功后新码 0 件,
-    而这中间我们**没有发过任何库存 feed 或处置**。
-
-    qty 的唯一来源是**旧码行的 `catalog.walmart_items.avail_qty`**(`_SQL_INV_QTY`
-    头注)。三种情况**不写**:
-      · qty 为 NULL(从未观测到库存)或 0 —— 没有可回写的数,写 0 是空动作;
-      · 新码行的 avail_qty 已等于 qty —— 通道自己把库存带过去了,本段空转;
-      · 受管仓判不出(「维护仓库」填错 / 飞书读不到)—— **fail-closed 整轮不写**:
-        回落 legacy 单仓 = 把货写到旧节点,正是 `store_limits.resolve_node`
-        拼命避免的那件事。
-
-    节点走**维护链的同一个入口** `store_limits.resolve_node(store, maint_nodes())`:
-    受管仓的店带节点走 `PUT /v3/inventories/{sku}`,未配置的店 None 走 legacy
-    —— 不在这里写第二份取节点的逻辑(§六 双轨禁止)。`maint_nodes()` 读飞书,
-    **一轮只读一次**(本函数一轮只调一次)。
-
-    写失败(返回 False / 抛异常)**只点名告警,不自动重试、不换方法**
-    (CLAUDE.md 安全红线:换方法重试 = 重复提交制造机)。漏掉的那件由维护链
-    下一轮按 amz 库存重算补上,急的话人工 `api.inventory.put_inventory` 补。
-    **不为往轮补写**:本函数只看本轮 confirmed 的行 —— 攒一张"欠回写"的表就是
-    第二条实现路径,而维护链本来就是库存的正式出口。
-    """
-    counts = {"restored": 0, "skipped": 0, "failed": 0, "todo": 0}
-    if not rows:
-        return counts, []
-    skus = [s for r in rows for s in (r["old_sku"], r["new_sku"])]
-    with conn.cursor() as cur:
-        cur.execute(_SQL_INV_QTY, {"store": store_name, "skus": skus})
-        qty_map = {r["sku"]: r["avail_qty"] for r in _rows(cur)}
-
-    todo: list[tuple[dict, int]] = []
-    for r in rows:
-        old_q, new_q = qty_map.get(r["old_sku"]), qty_map.get(r["new_sku"])
-        if old_q is None or int(old_q) <= 0:
-            counts["skipped"] += 1
-            continue
-        if new_q is not None and int(new_q) == int(old_q):
-            counts["skipped"] += 1
-            continue
-        todo.append((r, int(old_q)))
-    lines: list[str] = []
-    if counts["skipped"]:
-        lines.append(f"  库存无需回写 {counts['skipped']} 条(旧码最后观测 avail_qty "
-                     f"为 0 或从未观测到,或新码现值已等于它)")
-    if not todo:
-        return counts, lines
-    counts["todo"] = len(todo)
-    pairs = ", ".join(f"{r['old_sku']}→{r['new_sku']} {q} 件" for r, q in todo)
-    if not execute:
-        lines.append(f"  [DRY-RUN] 将回写库存 {len(todo)} 条"
-                     f"(qty 来自旧码最后观测):{pairs} —— 本次一件都没写")
-        return counts, lines
-
-    store = store_of()
-    if store is None:
-        counts["failed"] += len(todo)
-        lines.append(f"  ⚠ 库存回写 {len(todo)} 条**没做**:{store_name} 不在可调用"
-                     f"列表里(未启用/没配代理/没凭证)—— 这些新码线上库存是 0"
-                     f"(该品停售);维护链下一轮会按 amz 库存重算补上,"
-                     f"急的话人工补:{pairs}")
-        return counts, lines
-    try:
-        node = store_limits.resolve_node(store, store_limits.maint_nodes())
-    except Exception as e:            # noqa: BLE001 —— 判不出受管仓就整轮不写
-        counts["failed"] += len(todo)
-        logger.warning("受管仓判不出,本轮 %d 条库存回写全部跳过:%s", len(todo), e)
-        lines.append(f"  ⚠ 库存回写 {len(todo)} 条**没做**:受管仓判不出"
-                     f"({e.__class__.__name__}: {e})—— **不回落 legacy 单仓**"
-                     f"(那是把货写到旧节点,见 services/store_limits.resolve_node);"
-                     f"这些新码线上库存是 0,维护链下一轮会按 amz 库存重算补上:{pairs}")
-        return counts, lines
-
-    ok_pairs: list[str] = []
-    fails: list[str] = []
-    for r, q in todo:
-        tag = f"{r['old_sku']}→{r['new_sku']}"
-        try:
-            ok, why = inv_api.put_inventory(store, r["new_sku"], q, ship_node=node)
-        except Exception as e:        # noqa: BLE001 —— 逐条隔离:一条炸了不拖垮其余
-            ok, why = False, f"{e.__class__.__name__}: {e}"
-        if ok:
-            with db.pg_conn() as tx:
-                tx.execute(_SQL_LEDGER_INV,
-                           {"patch": json.dumps({"inventory_restored": q}),
-                            "id": r["id"]})
-            counts["restored"] += 1
-            ok_pairs.append(f"{tag} {q} 件")
-            logger.info("改码定案回写库存 %s %s = %s 件(节点 %s)",
-                        store_name, tag, q, node or "legacy 单仓")
-        else:
-            counts["failed"] += 1
-            fails.append(f"{tag} {q} 件({why})")
-            logger.warning("改码定案回写库存失败 %s %s = %s 件:%s"
-                           "(**不自动重试、不换方法**)", store_name, tag, q, why)
-    if ok_pairs:
-        lines.append(f"  库存回写 {counts['restored']} 条"
-                     f"(节点 {node or 'legacy 单仓(未配「维护仓库」)'};"
-                     f"qty = 旧码最后观测的 avail_qty):" + ", ".join(ok_pairs))
-    if fails:
-        lines.append(f"  ⚠ 库存回写失败 {len(fails)} 条,**不自动重试、不换方法**"
-                     f"(换方法重试 = 重复提交制造机):" + ", ".join(fails[:5])
-                     + " —— 这些新码线上库存仍是 0(该品停售);维护链下一轮会按 "
-                       "amz 库存重算补上,急的话人工 put_inventory 补")
-    return counts, lines
-
-
-def _settle(conn, store_name: str, execute: bool, *, store_of,
+def _settle(conn, store_name: str, execute: bool, *,
             observe_hours: float = OBSERVE_HOURS,
             stale_hours: float = STALE_HOURS) -> tuple[dict, list[str]]:
-    """输入:只读连接 + 店 + 是否真写 + 店铺凭证取处 → 输出:(判决计数, 摘要行)。
+    """输入:只读连接 + 店 + 是否真写 → 输出:(判决计数, 摘要行)。
 
     每次调用**最先**跑这一段(-p settle_only=1 时只跑它)。判据见 _verdict;
-    execute=False 时六处写全部跳过(定案 / UPC 改标 / 处置迁键 / 节点库存 /
-    过程账 / **库存回写**),只算判决并报"将定案多少条、将回写库存多少条"。
+    execute=False 时五处写全部跳过(定案 / UPC 改标 / 处置迁键 / 节点库存 /
+    过程账),只算判决并报"将定案多少条"。
     **上架表一格都不写**(2026-09-06 所有者定稿,见模块头注「身份映射写在哪」)。
 
-    `store_of` 是本轮**店铺凭证的取处**(懒加载,一轮最多读一次):库存回写
-    要拿凭证与代理去调沃尔玛,而这一段跑在闸不过、settle_only 的路径上也照跑。
+    **本段不调任何沃尔玛写接口**,所以也不需要店铺凭证:库存随改码 feed 一起
+    写完了,**定案不再回写库存**(所有者 2026-09-07 定稿,安全约束⑦)。
 
     ⚠ 写不走入参的 `conn`:那是本轮的**只读**连接,而定案必须是自己的短事务
     (每条各自成败,一条撞车不拖垮整轮)。
     """
     counts = {_CONFIRMED: 0, _ROLLED_BACK: 0, _STALLED: 0, _PENDING: 0,
-              "double": 0, "inventory": 0, "inventory_failed": 0}
+              "double": 0}
     lines: list[str] = []
     warns: list[str] = []
     now = datetime.now(timezone.utc)
@@ -896,7 +761,6 @@ def _settle(conn, store_name: str, execute: bool, *, store_of,
         feed_st = {}
     n_feed_rejected = 0
 
-    confirmed_rows: list[dict] = []
     for row in pend:
         row["_observe_hours"], row["_stale_hours"] = observe_hours, stale_hours
         receipt = receipts.get(row.get("feed_id") or "", {}).get(row["new_sku"])
@@ -914,17 +778,12 @@ def _settle(conn, store_name: str, execute: bool, *, store_of,
             continue
         if not execute:
             lines.append(f"  [DRY-RUN] 将定案 {tag} = {verdict}({why})")
-            # 空跑也把"将 confirmed"的行收进来:库存回写的"将做多少"就从这张表
-            # 算(真跑与空跑同一条路径,报出来的数才是真跑会做的数)
-            if verdict == _CONFIRMED:
-                confirmed_rows.append(row)
             continue
         # 逐条隔离:一条定案炸了(撞唯一索引 / 连接抖动)不拖垮整轮 —— 否则
         # 一条卡住的行会让**其余全部**改码永远定不了案。异常不吞:点名 + 记日志
         try:
             if verdict == _CONFIRMED:
                 warns += _confirm(store_name, row)
-                confirmed_rows.append(row)
                 logger.info("改码定案 confirmed %s %s:%s", store_name, tag, why)
             elif verdict == _ROLLED_BACK:
                 _roll_back(store_name, row, why)
@@ -945,31 +804,17 @@ def _settle(conn, store_name: str, execute: bool, *, store_of,
                          f"{e.__class__.__name__}: {e} —— 该行事务已回滚,状态没变,"
                          f"下一轮会重新判;连续失败请人工看日志")
 
-    # 库存回写:**confirmed 之后**(安全约束⑦:REPLACE 把库存清成 0,定案回写是
-    # 流程的一部分,不是可选的善后)。整段失败不让这一轮报失败、更不让已经定案的
-    # 身份回滚 —— 沃尔玛是外部 IO,点名即可,**不自动重试**
-    try:
-        inv_counts, inv_lines = _restore_inventory(
-            conn, store_name, confirmed_rows, execute, store_of=store_of)
-    except Exception as e:                     # noqa: BLE001 —— 见上
-        logger.exception("定案库存回写整段失败(**不自动重试**)")
-        inv_counts = {"restored": 0, "failed": len(confirmed_rows)}
-        inv_lines = [f"  ⚠ 库存回写整段失败({e.__class__.__name__}: {e}):"
-                     f"{len(confirmed_rows)} 条新码线上库存可能仍是 0(该品停售),"
-                     f"维护链下一轮会按 amz 库存重算补上"]
-    counts["inventory"] = inv_counts.get("restored", 0)
-    counts["inventory_failed"] = inv_counts.get("failed", 0)
-    counts["inventory_todo"] = inv_counts.get("todo", 0)
-    lines += inv_lines
-
-    # ⚠ 这里**没有**上架表回写(2026-09-06 所有者定稿删掉了 `_sync_sheet`):
+    # ⚠ 这里**没有**库存回写(所有者 2026-09-07 定稿):库存随改码 feed 一起写
+    # (v5 的 `Item.inventory`,见 `_item_of`),定案再 PUT 一遍就是同一份数据的
+    # 第二条写路径(§六 双轨)—— 还烧库存接口配额、可能把提交后已售出的数量写
+    # 回去。载荷没带上库存的那几条由维护链下一轮按 amz 库存重算,**不在这里补**。
+    # ⚠ 这里**也没有**上架表回写(2026-09-06 所有者定稿删掉了 `_sync_sheet`):
     # 身份映射在登记簿 + 在线产品总表「来源码」列,上架表 SKU 列只由上架链写。
     # 见模块头注「身份映射写在哪」——**不要把它加回来**(上架表会被清理,拿它
     # 当第二处身份映射就是双轨,§六)。
     lines.append(f"  定案:confirmed {counts[_CONFIRMED]}、"
                  f"rolled_back {counts[_ROLLED_BACK]}、stalled {counts[_STALLED]},"
-                 f"仍 pending {counts[_PENDING]},本轮回写库存 "
-                 f"{counts['inventory']} 条")
+                 f"仍 pending {counts[_PENDING]}")
     if n_feed_rejected:
         lines.append(f"  整 feed 被拒的回执 {n_feed_rejected} 条按 failed 定案"
                      f"(台账 missing + feed_log failed = 沃尔玛一条都没收,不等观测反证)")
@@ -1279,11 +1124,11 @@ def _fc_of(store: dict, rows: list[dict]) -> tuple[str | None, str]:
       · 受管仓**校验失败**(「维护仓库」填错 / 发货节点列表读不到 ⇒ 该店落在
         `managed_nodes()` 的第二个返回值里)⇒ **本轮不带库存**并在摘要点名,
         **绝不回落 Partner ID**:回落等于把货写到旧节点,正是
-        `store_limits.resolve_node` 拼命避免的那件事(与 `_restore_inventory`
-        的 fail-closed 同一条口径);
+        `store_limits.resolve_node` 拼命避免的那件事;
       · 读表/校验整段抛异常 ⇒ 同样不带库存并点名。**改码本身照发** —— 不带
-        库存就是退回 v4.2 时代的行为,由定案时的 `_restore_inventory` 兜底,
-        而为了库存把改码整轮停掉是拿大的换小的。
+        库存就是退回 v4.2 时代的行为,**定案不再回写兜底**(所有者 2026-09-07
+        定稿),由维护链下一轮按 amz 库存重算;为了库存把改码整轮停掉是拿大的
+        换小的。
     """
     if not any(r.get("avail_qty") is not None for r in rows):
         return None, ""
@@ -1293,12 +1138,12 @@ def _fc_of(store: dict, rows: list[dict]) -> tuple[str | None, str]:
     except Exception as e:                  # noqa: BLE001 —— 判不出就不带库存
         logger.warning("受管仓判不出,本轮载荷不带库存:%s", e)
         return None, (f"  ⚠ 本轮载荷**不带库存**:受管仓判不出"
-                      f"({e.__class__.__name__}: {e})—— 改码照发,库存留给定案时的"
-                      f"回写兜底(该品在提交到定案之间线上库存是 0)")
+                      f"({e.__class__.__name__}: {e})—— 改码照发,**定案不回写**,"
+                      f"库存交给维护链下一轮按 amz 库存重算(在那之前该品停售)")
     if name in skipped:
         return None, (f"  ⚠ {name} 受管仓校验失败({skipped[name]})—— 本轮载荷"
                       f"**不带库存**、**不回落 Partner ID**(回落 = 把货写到旧节点);"
-                      f"改码照发,库存留给定案时的回写兜底")
+                      f"改码照发,**定案不回写**,库存交给维护链下一轮按 amz 库存重算")
     return store_limits.listing_fc(store, ok), ""
 
 
@@ -1325,7 +1170,8 @@ def _item_of(row: dict, sku: str, fc: str | None = None) -> dict:
         `inventory[{quantity, fulfillmentCenterID}]`,而 REPLACE 会把**载荷没带
         的字段当空值写** —— 第一级投放正是这样把旧码最后观测的 30 件写成 0
         (docs/sku_plan.md §9.12)。qty 取候选行的 `avail_qty`(旧码行最后一次
-        观测,与定案回写 `_restore_inventory` 同一列同一口径),**非空且 ≥0 才带**:
+        观测;这是本工作流写库存的**唯一一条路** —— 定案**不再**回写,
+        所有者 2026-09-07 定稿),**非空且 ≥0 才带**:
         从没观测到库存的行不猜一个数(猜错 = 一次改码顺手改了库存)。
         `fc` 为 None(该店受管仓校验失败 / 本轮判不出)时同样**不带**。
     信封由 api/feeds.build_payload 包成 `{"Item": …}`(铁律 2:api 层只包信封)。
@@ -1383,7 +1229,8 @@ def _preview(rows: list[dict], fc: str | None = None) -> list[str]:
     lines.append(f"    库存:{n_inv}/{len(rows)} 条随载荷带库存"
                  + (f"(FC {fc})" if fc else "(**本轮一条都不带**:未观测到库存,"
                                             "或本店受管仓判不出)")
-                 + " —— REPLACE 不带就写空,定案回写只是兜底")
+                 + " —— REPLACE 不带就写空;**定案不回写**,没带上的由"
+                   "维护链下一轮按 amz 库存重算")
     sample = _item_of(rows[0], sku_codec.DRYRUN_PLACEHOLDER, fc)
     lines.append(f"    载荷样例({FEED_TYPE};sku 位置真跑时是抽出来的 12 位码,"
                  f"这里是占位码):{sample}")
@@ -1431,7 +1278,8 @@ def _migrate(store: dict, rows: list[dict], execute: bool) -> tuple[dict, list[s
     n_inv = sum(1 for r in rows if r.get("avail_qty") is not None) if fc else 0
     lines.append(f"  载荷带库存 {n_inv}/{len(rows)} 条"
                  + (f"(FC {fc};qty = 旧码最后观测的 avail_qty)" if fc else "")
-                 + (";其余未观测到库存 ⇒ REPLACE 会把它们写空,等定案回写兜底"
+                 + (";其余未观测到库存 ⇒ REPLACE 会把它们写空,**定案不回写**,"
+                    "等维护链下一轮按 amz 库存重算"
                     if n_inv < len(rows) else ""))
     # ① 先落库并 commit(防重状态先落库再调接口)
     with db.pg_conn() as conn:
@@ -1534,9 +1382,9 @@ def run(params: dict) -> str:
     lines: list[str] = []
     warns: list[str] = []
 
-    # 本轮**店铺凭证的唯一取处**(懒加载,最多读一次):定案的库存回写要它、
-    # 提交也要它。两处各读一次 = 两次凭证表往返,而且可能读到不一样的东西;
-    # 一个都不用时(纯定案且无 confirmed)一次都不读。
+    # 本轮**店铺凭证的唯一取处**(懒加载,最多读一次):只有提交(_migrate)
+    # 要它 —— 定案那一侧不再取凭证(所有者 2026-09-07 定稿:定案不回写库存)。
+    # 纯定案 / `-p settle_only=1` 的一轮**一次都不读**。
     _store_box: list = []
 
     def _store_of():
@@ -1555,7 +1403,7 @@ def run(params: dict) -> str:
         # 跑过新的一轮(fresh),两条都由**观测数据**说了算,水位陈旧只会让它们
         # 一直停在 pending。
         settle_counts, settle_lines = _settle(
-            conn, store_name, execute, store_of=_store_of,
+            conn, store_name, execute,
             observe_hours=observe_h, stale_hours=stale_h)
         lines += settle_lines
         # 顺序即语义:`-p settle_only=1` 与"闸未过"都把上限压到 0,而**只定案的那
@@ -1586,7 +1434,7 @@ def run(params: dict) -> str:
 
     mig_counts: dict = {}
     if ok and not settle_only:
-        store = _store_of() if cands else None     # 与定案回写同一个取处
+        store = _store_of() if cands else None     # 本轮唯一取凭证的地方
         if cands and store is None:
             warns.append(f"  ⚠ {store_name} 不在可调用列表里(未启用/没配代理/没凭证),"
                          f"本轮 {len(cands)} 个候选一个都没发")
@@ -1609,17 +1457,15 @@ def run(params: dict) -> str:
     n_double = settle_counts.get("double", 0)
     n_unsent = settle_counts.get("unsent", 0)
     n_failed = settle_counts.get("failed", 0)
-    n_inv = settle_counts.get("inventory", 0)
-    n_inv_bad = settle_counts.get("inventory_failed", 0)
     n_sub = mig_counts.get("submitted", 0)
     n_unk = mig_counts.get("unknown", 0)
     n_skip = len(cands) - n_sub - n_unk - mig_counts.get("rolled_back", 0) \
         if execute else len(cands)
 
-    # 「库存回写 N」拼在定案段里:改码把库存清成 0(安全约束⑦),回写做没做成
-    # 是这一轮定案**有没有把商品放回可售**的唯一指标,首行看不见就只进了日志
+    # ⚠ 首行**不再有**「库存回写 N」(所有者 2026-09-07 定稿:定案不回写库存)。
+    # 带没带库存这件事在提交那一段的「载荷带库存 N/M」里报,那才是唯一的写路径。
     gist = (f"定案 confirmed {n_conf} / rolled_back {n_roll} / stalled {n_stall}"
-            f"(仍 pending {n_pend}),库存回写 {n_inv},"
+            f"(仍 pending {n_pend}),"
             f"本轮提交 {n_sub},跳过 {max(n_skip, 0)}")
     if n_named:
         # 首行必须说清"点了几个、中了几个、为什么只中这么几个":cli 的链通知只取
@@ -1649,17 +1495,15 @@ def run(params: dict) -> str:
         gist += f";⚠ 落库未提交 {n_unsent}"
     if n_failed:
         gist += f";⚠ 定案失败 {n_failed}"
-    if n_inv_bad:
-        # 回写没做成 = 那几个新码此刻线上库存是 0(停售),必须见人
-        gist += f";⚠ 库存回写失败 {n_inv_bad}(该品线上库存 0)"
     # dry-run 前缀**拼在首行行首**:用 insert(0) 会让告警顶到抬头行之前,
     # 一条空跑摘要就以真跑的面目进了飞书(cli 只取首行)
     first = ("" if execute else "🧪 [DRY-RUN] ") + nf.head(
         "sku_migrate", gist, store_name)
     return nf.summary(first, sections=[("本轮明细", lines + warns)],
-                      tail=(f"下一步(**尽快**:提交到定案之间这些品线上库存是 0、"
-                            f"处于停售,见安全约束⑦):catalog_sync -p store={store_name} "
-                            f"跑一轮观测,再 sku_migrate -p store={store_name} "
-                            f"-p settle_only=1 定案(载荷已带库存的那几条,定案会核对到"
-                            f"「已相等」不再写;没带上的按旧码最后观测回写兜底)"
+                      tail=(f"下一步(**尽快**:载荷没带上库存的那几条,提交到"
+                            f"定案之间线上库存是空的、处于停售,见安全约束⑦):"
+                            f"catalog_sync -p store={store_name} 跑一轮观测,再 "
+                            f"sku_migrate -p store={store_name} -p settle_only=1 "
+                            f"定案(**定案不回写库存**:库存已随改码 feed 发出,"
+                            f"没带上的由维护链下一轮按 amz 库存重算)"
                             if n_sub else ""))

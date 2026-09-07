@@ -8,8 +8,8 @@
   · 节奏闸 1 → 10 → 按 limit,`-p limit=` 只能收紧;
   · 跟卖不入候选、不透明码不入候选;
   · 提交 failed 当场回滚,unknown **保持 pending 不回滚**(决策 F);
-  · **定案要把库存写回新码**(REPLACE 会把库存清成 0,安全约束⑦):qty 取旧码行
-    最后观测的 avail_qty,节点走维护链同一个入口,写失败只告警**不自动重试**。
+  · **库存只随改码 feed 写一次**(v5 的 `Item.inventory`,安全约束⑦),
+    **定案不回写库存**(所有者 2026-09-07 定稿:同一份数据不走第二条写路径)。
 
 守门(白名单/单一出处)一律在 tests/test_sku_guard.py,本文件只放行为测试。
 """
@@ -724,13 +724,12 @@ def test_observe_and_stale_hours_are_overridable_per_run():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  W3 · 定案的后果(六处写)
+#  W3 · 定案的后果(五处写)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _settle_wired(monkeypatch, obs_rows, receipts=None, calls=None, inv=()):
+def _settle_wired(monkeypatch, obs_rows, receipts=None, calls=None):
     calls = calls if calls is not None else []
-    read = _Conn([("SELECT sku, avail_qty", (["sku", "avail_qty"], list(inv))),
-                  ("FROM listing.sku_migrations m", (
+    read = _Conn([("FROM listing.sku_migrations m", (
                       ["id", "old_sku", "new_sku", "source_type", "source_key",
                        "feed_id", "submitted_at", "new_present", "old_gone",
                        "fresh"], obs_rows))])
@@ -807,187 +806,71 @@ def test_double_listing_warns_and_settles_nothing(monkeypatch):
 
 
 def test_settle_in_dry_run_writes_nothing(monkeypatch):
-    """_settle 是全包写得最重的一段,dry-run 下六处写**全部**跳过。"""
-    read, calls, _tx = _settle_wired(monkeypatch, [_OBS_COLS_CONFIRM],
-                                     inv=[("B0OLD00001", 30)])
+    """_settle 是全包写得最重的一段,dry-run 下五处写**全部**跳过。"""
+    read, calls, _tx = _settle_wired(monkeypatch, [_OBS_COLS_CONFIRM])
     counts, lines = _settle_at(sm, read, False)
     assert counts["confirmed"] == 1                      # 判决照算
     assert not [c for c in calls if isinstance(c, tuple)]  # 写一次都没有
     assert "open:tx" not in calls                        # 连写事务都没开
     assert any("将定案" in ln for ln in lines)
-    assert any("将回写库存" in ln and "一件都没写" in ln for ln in lines)
 
 
 _STORE_DICT = {"name": "T1", "client_id": "C1", "client_secret": "S1",
                "proxy": None}
 
 
-def _settle_at(mod, read_conn, execute, store_of=None):
+def _settle_at(mod, read_conn, execute):
     """按当轮语义调 _settle(读连接与写事务分开,见 _settle 头注)。
 
-    `store_of` 是库存回写要用的店铺凭证取处(懒加载),缺省给一个可调用的店。
+    **不传店铺凭证**:定案不回写库存(所有者 2026-09-07 定稿),这一段不调
+    任何沃尔玛写接口。
     """
-    return mod._settle(read_conn, "T1", execute,
-                       store_of=store_of or (lambda: _STORE_DICT))
+    return mod._settle(read_conn, "T1", execute)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  W3b · 定案回写库存(安全约束⑦:REPLACE 会把库存清成 0)
+#  W3b · 守门:定案**不回写库存**(所有者 2026-09-07 定稿)
 #
-#  2026-09-06 第一级投放实证:A085朱丽霖 B0000C8W8W → AVW476VD6W3H 原地换码成功
-#  (wpid 不变、价格不变、旧码 404),而**我们没发过任何库存 feed 或处置**,新码
-#  线上库存却是 0(旧码最后观测 30)。⇒ 是 REPLACE 把"载荷没带的库存"当 0 写了。
-#  钉的都是"错了不报错"的那几件:回写用的是**旧码行最后观测的 avail_qty**、
-#  节点走维护链同一个入口、写失败**不自动重试不换方法**、dry-run 一件都不写。
+#  所有者原话:「按我们现在修改 sku 的流程,已经不需要再提交一次改库存了。」
+#  MP_ITEM_MATCH 升 v5 之后改码 feed **自带 inventory**(qty = 旧码最后观测的
+#  avail_qty,FC 走 listing_fc),定案时再 PUT /v3/inventory 写一遍就是**同一份
+#  数据的第二条写路径**(§六 双轨):A131 第一批定案时 `_restore_inventory` 真逐条
+#  写了一遍 —— 新码行在库里的 avail_qty 还没被下一轮库存拉取更新,所以它判"不
+#  相等",既烧库存接口配额,又可能把提交之后**已经卖掉**的数量原样写回去。
+#  加回来的表现不会报错:库存悄悄多了第二条写路径,而摘要读起来像"补救成功"。
+#  ⚠ 载荷带库存那一路是**主路**,用例在下面的 W3c 段(`_item_of` / `_migrate`)。
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _inv_wired(monkeypatch, *, node=None, ok=True, why="", boom=None, store="T1"):
-    """把库存回写的三个外部依赖打成桩 → 返回 (put_inventory 调用序, 读表次数)。
+def test_settling_never_calls_the_inventory_api():
+    """源码守门:**可执行行**里不许再出现 `put_inventory` / `_restore_inventory` /
+    `inventory_restored`,也不许再把 `api.inventory` import 进来。
 
-    `resolve_node` 的桩与真实现同形:配了就返回节点,没配返回 None。
+    只看可执行行(`#` 注释与模块 docstring 剔除):头注与注释里要能把"为什么删了、
+    别加回来"讲清楚,那是文档不是第二条写路径。
     """
-    puts: list = []
-    reads: list = []
-
-    def _nodes():
-        reads.append(1)
-        return {store: node} if node else {}
-
-    monkeypatch.setattr(sm.store_limits, "maint_nodes", _nodes)
-    monkeypatch.setattr(sm.store_limits, "resolve_node",
-                        lambda store, nodes: nodes.get(store["name"]))
-
-    def _put(store, sku, qty, ship_node=None):
-        puts.append((store["name"], sku, qty, ship_node))
-        if boom is not None:
-            raise boom
-        return ok, why
-
-    monkeypatch.setattr(sm.inv_api, "put_inventory", _put)
-    return puts, reads
+    src = (_ROOT / "workflows" / "sku_migrate.py").read_text(encoding="utf-8")
+    body = src.replace(ast.get_docstring(ast.parse(src)) or "", "", 1)
+    hits = [ln for ln in body.splitlines()
+            if not ln.lstrip().startswith("#")
+            and any(t in ln for t in ("put_inventory", "_restore_inventory",
+                                      "inventory_restored", "_SQL_INV_QTY",
+                                      "_SQL_LEDGER_INV"))]
+    assert not hits, f"改码定案又回写库存了(所有者 2026-09-07 定稿:不回写):{hits}"
+    assert not hasattr(sm, "_restore_inventory")
+    assert not hasattr(sm, "_SQL_INV_QTY")
+    assert not hasattr(sm, "_SQL_LEDGER_INV")
+    imported = set()
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.ImportFrom) and (node.module or "") == "api":
+            imported |= {a.name for a in node.names}
+    assert "inventory" not in imported, f"api.inventory 不再是改码链的依赖:{imported}"
 
 
-def test_confirmed_writes_the_old_codes_last_stock_back_to_the_new_code(monkeypatch):
-    """qty 取 **(店, 旧码) 的 avail_qty**(旧码消失后那一行保留最后一次观测值),
-    带受管仓节点写到新码上,并把 `inventory_restored` 留档进 detail。"""
-    read, calls, tx = _settle_wired(monkeypatch, [_OBS_COLS_CONFIRM],
-                                    inv=[("B0OLD00001", 30)])
-    puts, reads = _inv_wired(monkeypatch, node="N1")
-    counts, lines = _settle_at(sm, read, True)
-    assert puts == [("T1", "AAAAAAAAAAAA", 30, "N1")]
-    assert counts["inventory"] == 1 and counts["inventory_failed"] == 0
-    assert len(reads) == 1                    # maint_nodes 读飞书:一轮只读一次
-    assert any("库存回写 1 条" in ln and "B0OLD00001→AAAAAAAAAAAA 30 件" in ln
-               for ln in lines), lines
-    patch = [a for sql, a in tx.sqls if "detail = coalesce(detail" in sql]
-    assert patch and '"inventory_restored": 30' in patch[0]["patch"]
-
-
-def test_a_store_without_a_maintenance_node_stays_on_the_legacy_path(monkeypatch):
-    """未配「维护仓库」的店 ship_node=None ⇒ legacy 单仓 PUT(与维护链同口径)。"""
-    read, _calls, _tx = _settle_wired(monkeypatch, [_OBS_COLS_CONFIRM],
-                                      inv=[("B0OLD00001", 7)])
-    puts, _reads = _inv_wired(monkeypatch, node=None)
-    counts, _lines = _settle_at(sm, read, True)
-    assert puts == [("T1", "AAAAAAAAAAAA", 7, None)]
-    assert counts["inventory"] == 1
-
-
-def test_no_observed_stock_writes_nothing(monkeypatch):
-    """旧码行 avail_qty 为 0 或从未观测到 ⇒ 不写(写 0 是空动作),只报数。"""
-    rows = [_OBS_COLS_CONFIRM,
-            (2, "B0OLD00002", "BBBBBBBBBBBB", "amz", "B0OLD00002", "F1",
-             NOW - timedelta(hours=2), True, True, True)]
-    read, _calls, _tx = _settle_wired(monkeypatch, rows,
-                                      inv=[("B0OLD00001", 0)])  # 2 号行查无库存
-    puts, reads = _inv_wired(monkeypatch, node="N1")
-    counts, lines = _settle_at(sm, read, True)
-    assert puts == [] and reads == []          # 一次接口、一次飞书都没有
-    assert counts["inventory"] == 0 and counts["inventory_failed"] == 0
-    assert any("库存无需回写 2 条" in ln for ln in lines), lines
-
-
-def test_a_new_code_that_already_carries_the_stock_is_not_written_again(monkeypatch):
-    """新码现值已等于旧码最后观测 ⇒ 空转(将来通道自己保住库存时这段自然不动)。"""
-    read, _calls, _tx = _settle_wired(
-        monkeypatch, [_OBS_COLS_CONFIRM],
-        inv=[("B0OLD00001", 30), ("AAAAAAAAAAAA", 30)])
-    puts, _reads = _inv_wired(monkeypatch, node="N1")
-    counts, lines = _settle_at(sm, read, True)
-    assert puts == [] and counts["inventory"] == 0
-    assert any("库存无需回写 1 条" in ln for ln in lines), lines
-
-
-def test_a_failed_inventory_write_is_named_and_never_retried(monkeypatch):
-    """写失败**只告警**:不重试、不换方法(换方法重试 = 重复提交制造机)。"""
-    read, _calls, _tx = _settle_wired(monkeypatch, [_OBS_COLS_CONFIRM],
-                                      inv=[("B0OLD00001", 30)])
-    puts, _reads = _inv_wired(monkeypatch, node="N1", ok=False, why="HTTP 500")
-    counts, lines = _settle_at(sm, read, True)
-    assert len(puts) == 1                       # 只试了一次,没有第二次、没换端点
-    assert counts["confirmed"] == 1             # 身份照样定案(回写不是定案的前提)
-    assert counts["inventory"] == 0 and counts["inventory_failed"] == 1
-    bad = [ln for ln in lines if "库存回写失败" in ln]
-    assert bad and "不自动重试、不换方法" in bad[0] and "维护链下一轮" in bad[0], lines
-
-
-def test_an_inventory_write_that_throws_does_not_stop_the_others(monkeypatch):
-    """一条抛异常(代理断线/凭证失效)不许拖垮其余 —— 逐条隔离,点名。"""
-    read, _calls, _tx = _settle_wired(monkeypatch, [_OBS_COLS_CONFIRM],
-                                      inv=[("B0OLD00001", 30)])
-    puts, _reads = _inv_wired(monkeypatch, node="N1",
-                              boom=RuntimeError("代理断线"))
-    counts, lines = _settle_at(sm, read, True)
-    assert len(puts) == 1 and counts["inventory_failed"] == 1
-    assert any("库存回写失败" in ln and "代理断线" in ln for ln in lines), lines
-
-
-def test_an_unknown_managed_node_skips_the_write_instead_of_falling_back(monkeypatch):
-    """「维护仓库」填错 / 节点列表读不到 ⇒ **整轮不写**,不回落 legacy 单仓
-    (回落 = 把货写到旧节点,正是 store_limits.resolve_node 拼命避免的那件事)。"""
-    read, _calls, _tx = _settle_wired(monkeypatch, [_OBS_COLS_CONFIRM],
-                                      inv=[("B0OLD00001", 30)])
-    puts, _reads = _inv_wired(monkeypatch, node="N1")
-
-    def _boom(store, nodes):
-        raise sm.store_limits.NodeConfigError("N1 不在该店发货节点列表里")
-
-    monkeypatch.setattr(sm.store_limits, "resolve_node", _boom)
-    counts, lines = _settle_at(sm, read, True)
-    assert puts == [] and counts["inventory_failed"] == 1
-    assert any("受管仓判不出" in ln and "不回落 legacy 单仓" in ln
-               for ln in lines), lines
-
-
-def test_a_store_we_cannot_call_is_named_not_silently_skipped(monkeypatch):
-    """店铺不在可调用列表里(没凭证/没代理)⇒ 点名:那几个新码此刻库存是 0。"""
-    read, _calls, _tx = _settle_wired(monkeypatch, [_OBS_COLS_CONFIRM],
-                                      inv=[("B0OLD00001", 30)])
-    puts, _reads = _inv_wired(monkeypatch, node="N1")
-    counts, lines = _settle_at(sm, read, True, store_of=lambda: None)
-    assert puts == [] and counts["inventory_failed"] == 1
-    assert any("不在可调用" in ln and "库存回写" in ln for ln in lines), lines
-
-
-def test_dry_run_settle_reports_the_restore_and_touches_nothing(monkeypatch):
-    """`--dry-run -p settle_only=1` 只报"将回写库存 N 条",不调接口、不读飞书。"""
-    read, calls, _tx = _settle_wired(monkeypatch, [_OBS_COLS_CONFIRM],
-                                     inv=[("B0OLD00001", 30)])
-    puts, reads = _inv_wired(monkeypatch, node="N1")
-    counts, lines = _settle_at(sm, read, False)
-    assert puts == [] and reads == []
-    assert counts["inventory"] == 0 and counts["inventory_todo"] == 1
-    assert not [c for c in calls if isinstance(c, tuple)]     # 仍然零写
-    assert any("将回写库存 1 条" in ln and "qty 来自旧码最后观测" in ln
-               for ln in lines), lines
-
-
-def test_the_first_line_carries_the_restore_count_and_its_failures(monkeypatch):
-    """cli 的链通知只取首行:回写做没做成 = 这一轮有没有把商品放回可售。"""
+def test_the_first_line_no_longer_carries_an_inventory_restore(monkeypatch):
+    """cli 的链通知只取首行:定案段里**不再有**「库存回写 N」那一格,也不再有
+    「⚠ 库存回写失败」;整轮定案一次受管仓表、一次沃尔玛写接口都不碰。"""
     _wire(monkeypatch)
     _read_conn(monkeypatch, [
-        ("SELECT sku, avail_qty", (["sku", "avail_qty"],
-                                   [("B0OLD00001", 30)])),
         ("FROM listing.sku_migrations m", (
             ["id", "old_sku", "new_sku", "source_type", "source_key", "feed_id",
              "submitted_at", "new_present", "old_gone", "fresh"],
@@ -1005,12 +888,13 @@ def test_the_first_line_carries_the_restore_count_and_its_failures(monkeypatch):
     monkeypatch.setattr(sm.walmart_catalog, "drop_node_rows", lambda *a, **k: 1)
     monkeypatch.setattr(sm.dispositions, "executing_actions_on",
                         lambda *a, **k: [])
-    puts, _reads = _inv_wired(monkeypatch, node="N1", ok=False, why="HTTP 500")
-    first = sm.run({"store": "T1", "execute": True,
-                    "settle_only": "1"}).splitlines()[0]
-    assert len(puts) == 1
-    assert "库存回写 0" in first
-    assert "⚠ 库存回写失败 1" in first and "线上库存 0" in first
+    monkeypatch.setattr(sm.store_limits, "maint_nodes",
+                        lambda: pytest.fail("定案不回写库存,不该读受管仓表"))
+    out = sm.run({"store": "T1", "execute": True, "settle_only": "1"})
+    first = out.splitlines()[0]
+    assert "定案 confirmed 1" in first
+    assert "库存回写" not in out                # 首行与明细里都不再有这句
+    assert "定案:confirmed 1" in out
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1088,7 +972,8 @@ def test_payload_uses_the_new_code_and_the_observed_product_id(monkeypatch):
 # ── 库存随改码 feed 一起发(2026-09-07 通道升 v5;安全约束⑦)────────────────
 #  v4.2 时代载荷里没有库存字段,REPLACE 把「没带」当 0 写 —— 第一级投放把旧码
 #  最后观测的 30 件写成了 0(§9.12)。v5 的 Item 有可选 inventory[],于是库存
-#  跟着载荷走,定案回写只剩兜底。下面四条钉的是"错了不报错"的那几件:
+#  跟着载荷走,**这是本工作流写库存的唯一一条路**(定案不再回写,所有者
+#  2026-09-07 定稿)。下面四条钉的是"错了不报错"的那几件:
 #  qty 从哪一列来、FC 从哪个入口来、判不出时**不猜**、以及不该读飞书时不读。
 
 def _nodes(monkeypatch, ok=None, skipped=None):
@@ -1680,15 +1565,13 @@ def test_pg_confirm_moves_identity_upc_dispositions_and_node_rows(pg, monkeypatc
         cur.execute("UPDATE listing.sku_migrations SET submitted_at = "
                     "now() - interval '2 hours' WHERE store=%s", (_STORE,))
     monkeypatch.setattr(sm.feed_track, "item_results", lambda fid: {})
-    # 库存回写(安全约束⑦):旧码行保留着最后一次观测的 avail_qty,定案时写回新码
-    with pg.cursor() as cur:
-        cur.execute("UPDATE catalog.walmart_items SET avail_qty = 30 "
-                    "WHERE store=%s AND sku=%s", (_STORE, _OLD))
-    puts, _reads = _inv_wired(monkeypatch, node="N1", store=_STORE)
-    counts, _lines = sm._settle(
-        pg, _STORE, True, store_of=lambda: dict(_STORE_DICT, name=_STORE))
+    # ⚠ 定案**不回写库存**(所有者 2026-09-07 定稿):库存随改码 feed 一起写,
+    # 这一段一次沃尔玛写接口都不调 —— 连店铺凭证都不取。
+    monkeypatch.setattr(sm.store_limits, "maint_nodes",
+                        lambda: pytest.fail("定案不回写库存,不该读受管仓表"))
+    counts, _lines = sm._settle(pg, _STORE, True)
     assert counts["confirmed"] == 1 and "sheet" not in counts
-    assert puts == [(_STORE, new_sku, 30, "N1")] and counts["inventory"] == 1
+    assert "inventory" not in counts and "inventory_failed" not in counts
     with pg.cursor() as cur:
         cur.execute("SELECT abandoned_at IS NOT NULL, abandoned_reason "
                     "FROM catalog.listing_sources WHERE store=%s AND sku=%s",
@@ -1708,10 +1591,12 @@ def test_pg_confirm_moves_identity_upc_dispositions_and_node_rows(pg, monkeypatc
         cur.execute("SELECT status, settled_at IS NOT NULL, sheet_synced_at "
                     "IS NULL FROM listing.sku_migrations WHERE store=%s", (_STORE,))
         assert cur.fetchone() == ("confirmed", True, True)
-        # 回写量留档进 detail(jsonb `||` 合并:提交时写的凭据不许被冲掉)
+        # detail 里**没有** inventory_restored(定案不回写库存);提交时写的
+        # 凭据(product_id/price/weight)原样还在
         cur.execute("SELECT detail ->> 'inventory_restored', detail ->> 'price' "
                     "FROM listing.sku_migrations WHERE store=%s", (_STORE,))
-        assert cur.fetchone()[0] == "30"
+        restored, price = cur.fetchone()
+        assert restored is None and price is not None
         # 新码的出生事件进了病历,旧码记的是 sku_replaced(不是 item_missing)
         cur.execute("SELECT sku, event FROM catalog.product_events "
                     "WHERE store=%s ORDER BY sku", (_STORE,))
@@ -1774,7 +1659,7 @@ def test_pg_stage_cap_and_observe_read_the_real_ledger(pg, monkeypatch):
     cap, note = sm._stage_cap(pg, _STORE, 100)
     assert cap == 0 and "只定案不提交" in note              # 有 pending:先清账
     monkeypatch.setattr(sm.feed_track, "item_results", lambda fid: {})
-    counts, _ = sm._settle(pg, _STORE, True, store_of=lambda: _STORE_DICT)
+    counts, _ = sm._settle(pg, _STORE, True)
     assert counts["pending"] == 1                          # 观测还没跑,不定案
 
 
@@ -1833,8 +1718,7 @@ def test_rows_that_never_left_the_building_are_named_never_auto_settled(monkeypa
                       [(5, "B0OLD00005", "EEEEEEEEEEEE", NOW)]))])
     tx = _Conn(tag="tx")
     monkeypatch.setattr(sm.db, "pg_conn", lambda *a, **k: tx)
-    counts, lines = sm._settle(read, "T1", True,
-                               store_of=lambda: _STORE_DICT)
+    counts, lines = sm._settle(read, "T1", True)
     assert counts["unsent"] == 1
     assert counts["confirmed"] == counts["rolled_back"] == 0
     assert not tx.sqls                       # 一条写都没有

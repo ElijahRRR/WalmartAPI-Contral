@@ -1308,7 +1308,12 @@ ship_node=None)` → `(True, '')`,库存已补回。
 **旧码行**的 `avail_qty`(旧码消失后 catalog_sync 只给它盖 `missing_since`,
 这一列保留最后一次观测值;上例正是 30)。
 
-**修法**(`workflows/sku_migrate._restore_inventory`,一条实现路径):
+> ⛔ **以下这张「定案时回写库存」的修法表已于 2026-09-07 整段作废**,`_restore_inventory`
+> 连同 `_SQL_INV_QTY` / `_SQL_LEDGER_INV` / `api.inventory` 依赖已从工作流删除 ——
+> 见本节末「定案不再回写库存(2026-09-07 所有者定稿)」。表留在这里只为记录当时
+> 为什么这么做、以及它是怎么被 v5 的载荷带库存取代的,**不是现行做法**。
+
+**修法**(`workflows/sku_migrate._restore_inventory`,一条实现路径;**已作废**):
 
 | 项 | 定稿 |
 |---|---|
@@ -1335,8 +1340,8 @@ ship_node=None)` → `(True, '')`,库存已补回。
 **库存这次全部跟随**(新旧逐一相等:12/19/27/30/11/999/9/0),`_restore_inventory`
 判「新码现值已等于旧码」一条都没写 —— 行为正确。价格 8 个逐一不变。
 结论修正:第一级的库存归零更像是沃尔玛把库存挂到新码上有几分钟延迟、被 8 分钟后的
-catalog_sync 采到了过渡态,**不是 REPLACE 必然清零**;回写逻辑作为兜底保留(只在观测到
-差异时写)。3 个旧码名下滞留 executing 的 inventory 处置按设计不迁,由 expire_executing
+catalog_sync 采到了过渡态,**不是 REPLACE 必然清零**;回写逻辑当时作为兜底保留(只在
+观测到差异时写)——⛔ **这条"兜底保留"已于 2026-09-07 作废**,见本节末所有者定稿。3 个旧码名下滞留 executing 的 inventory 处置按设计不迁,由 expire_executing
 收尾。上架表无对应行 9 条(旧系统上架的存量品),计数不告警;首行「未同步 N 行」的
 终态口径待所有者定。
 
@@ -1391,7 +1396,8 @@ ounce/oz、gram/g、kilogram/kg、milligram/mg、hundredths pound),数字后紧�
 **节奏闸改按全船队计(2026-09-07,所有者定稿)**:所有者问「难道后面每个店都需要先跑
 10 个才能做剩下的吗?」—— 不需要。1 → 10 两级验的是「通道能否原地换码」,店无关,
 A085朱丽霖 已实证;`_stage_cap` 的 confirmed 改数全船队,pending/stalled 仍按店数
-(该店账没清就不发下一批)。店相关风险另有闸:闸①凭证/在营、受管仓节点判不出不回写库存。
+(该店账没清就不发下一批)。店相关风险另有闸:闸①凭证/在营、受管仓节点判不出则
+**载荷不带库存**(`_fc_of` fail-closed,绝不回落 Partner ID)。
 ~~每轮仍有配额留量硬顶 1000 条(2 个 feed × 500)~~ **当天作废**,见下一条;整店按轮走,
 每轮之间 catalog_sync + settle_only + feed_poll。
 
@@ -1479,13 +1485,12 @@ v4.2 兼容路径就是双轨,而两条路径的副作用完全不同)。
                                      "fulfillmentCenterID": "<listing_fc>"}]}}]}
 ```
 
-**库存口径改口(安全约束⑦)**:**v5 起库存随改码 feed 一起写,定案回写只是兜底**。
-qty 仍是 `catalog.walmart_items` **旧码行**的 `avail_qty`(与 `_restore_inventory` 同一列
-同一口径,只是时点一个在发之前、一个在定案之后),所以带过库存之后 `_restore_inventory`
-应当恒判「新码现值已等于旧码」而一条都不写 —— 它留着只为三种带不了库存的情况:
-提交时还没观测到 avail_qty、该店受管仓校验失败、以及 v5 之前发出去还压在 pending 上的
-存量行。**没带库存的那几条,提交到定案之间仍是停售的**,运维口径不变(尽快
-`catalog_sync` + `settle_only=1`)。
+**库存口径改口(安全约束⑦)**:**v5 起库存随改码 feed 一起写**。qty 是
+`catalog.walmart_items` **旧码行**的 `avail_qty`。当时定的是「定案回写降为兜底」,
+⛔ **一天后(2026-09-07)所有者把兜底也去掉了** —— 见本节末「定案不再回写库存」:
+库存现在**只有改码 feed 这一条写路径**。**没带库存的那几条,提交到定案之间仍是停售的**,
+运维口径不变(尽快 `catalog_sync` + `settle_only=1`),补库存的活交给维护链下一轮按
+amz 库存重算。
 
 **版本串为什么用 0607 而不是所有者上传成功的那个**:所有者 2026-09-06 用 Seller Center
 模板成功上传过,模板头写的是 `5.0.20260703-18_22_27`;但**可下载的 API 规范原件是 0607
@@ -1561,3 +1566,37 @@ ensure that the total number of items in your catalog is below your designated l
 **A131 的善后**(所有者动作):那 2740 条台账行现在会被下一轮 `feed_poll` /
 `sku_migrate -p store=A131吕灿荣 -p settle_only=1` 判成 `rolled_back`(旧码复活、
 新码弃掉,旧码在沃尔玛侧从没变过);要继续改这家店,先把死档清到上限以下。
+
+#### 定案不再回写库存(2026-09-07 所有者定稿)
+
+**所有者原话**:「按我们现在修改 sku 的流程,已经不需要再提交一次改库存了。」
+
+**背景**:MP_ITEM_MATCH 升 v5 之后,改码 feed 自带 `Item.inventory`
+(quantity = 旧码最后观测的 `avail_qty`,fulfillmentCenterID 走
+`store_limits.listing_fc`)。同一天 A131 第一批定案时,留作兜底的 `_restore_inventory`
+仍**逐条 PUT `/v3/inventory` 写了一遍** —— 因为新码行在库里的 `avail_qty` 还没被下一轮
+库存拉取更新,那条「新码现值已等于旧码就不写」的空转判据判成了"不相等"。于是:
+
+- 这是**同一份数据的第二条写路径**(conventions §六 双轨禁止);
+- 白烧库存接口配额(一条改码 = 一次额外 PUT);
+- 更糟的是**可能把提交之后已经卖掉的数量原样写回去** —— 回写用的是改码之前的观测值。
+
+**定案**:**定案不再回写库存**。库存只随改码 feed 写一次;**未观测到库存的行不带**,
+由沃尔玛按 REPLACE 语义处理,维护链下一轮按 amz 库存重算 —— 本工作流不为库存补第二条腿。
+
+**落地**(`workflows/sku_migrate`,2026-09-07):
+
+| # | 删掉 | 备注 |
+|---|---|---|
+| ① | `_restore_inventory` 整个函数 | 连同它的 fail-closed 受管仓判定;`_fc_of`(载荷侧)的 fail-closed **保留**,那是主路 |
+| ② | `_SQL_INV_QTY` / `_SQL_LEDGER_INV` | 定案不再读旧码 avail_qty、不再写 `detail` 补丁 |
+| ③ | `from api import inventory as inv_api` | 库存接口不再是改码链的依赖 |
+| ④ | `_settle` 的 `store_of` 入参与 `inventory` / `inventory_failed` / `inventory_todo` 三个计数、摘要那一行 | 定案段不调任何沃尔玛写接口,**连店铺凭证都不取**(`run()` 的 `_store_of` 只剩提交那一侧用) |
+| ⑤ | 首行的「库存回写 N」与「⚠ 库存回写失败 N」 | 带没带库存改由提交段的「载荷带库存 N/M」报 |
+
+**不动的两处**:`listing.sku_migrations.detail` 里历史行的 `inventory_restored` 键
+**原样保留**(事实记录,不回填不改写),**库表 schema 无变更**。
+
+**守门**:`tests/test_sku_migrate.test_settling_never_calls_the_inventory_api`
+—— 可执行行里不许再出现 `put_inventory` / `_restore_inventory` / `inventory_restored`,
+也不许再 import `api.inventory`。

@@ -466,34 +466,6 @@ def _row_hash(fields: dict, hash_field: str) -> str:
 
 
 
-def update_by_key(table: Bitable, key_field: str,
-                  desired: dict[str, dict]) -> tuple[int, list[str]]:
-    """输入:表 + 键字段名 + {键: fields dict} → 输出:(更新行数, 表中不存在的键)。
-
-    **只更新,不新建、不删除**。用于"给别人已建好的行补几列"的场景
-    (order_audit 往销售订单表写审核列):建行是 order_center_push 的职责,
-    这里若也建行会造出只有审核列、没有订单本体的半截行。
-    键不在表里不是错误——调用方通常在下一轮(等对方建完行)自然补上,
-    返回缺键清单供调用方计数与告警。
-
-    只覆盖 fields 里给出的列(省略的列保留飞书旧值),人工列绝不会被碰。
-    """
-    existing: dict[str, str] = {}
-    for rec in list_records(table, field_names=[key_field]):
-        k = _plain_text(rec["fields"].get(key_field)).strip()
-        if k and k not in existing:
-            existing[k] = rec["record_id"]
-    updates = [{"record_id": existing[k], "fields": f}
-               for k, f in desired.items() if k in existing]
-    missing = sorted(k for k in desired if k not in existing)
-    if updates:
-        batch_update(table, updates)
-    logger.info("表「%s」定向更新:%d 行%s", table.name, len(updates),
-                f",{len(missing)} 个键不在表中(待建行方补齐)" if missing else "")
-    return len(updates), missing
-
-
-
 def _call_multipart(path: str, *, data: dict, files: dict, timeout=120) -> dict:
     """输入:open-apis 路径 + 表单字段 + 文件 → 输出:envelope 的 data(dict)。
 

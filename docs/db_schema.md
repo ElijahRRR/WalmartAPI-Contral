@@ -570,6 +570,9 @@ order_line_id = 'ol_' + sha256(po_id + '\x1f' + sku)[:24]
   官方统计窗口)。
 - **审核结论落在 order_lines 自身**(2026-08-09 定稿,不另建表):
   `audit_status`(✓ 通过 / 建议拒绝 / 待人工)+ `audit_detail` jsonb + `audited_at`。
+  **结论与明细都没变的行不写**(2026-09-07):`audited_at`/`updated_at` 只在两列
+  之一真变时刷新,所以 `audited_at` 是「结论最后一次变化」不是「最后一次被判」
+  (待人工行每小时重判;无条件刷 updated_at 会让销售投影每小时重推这些行)。
   安全前提已核:`order_sync` 的 upsert 只覆盖它自己给出的列,拉单永远冲不掉
   审核结论;反之 order_audit 的 UPDATE 也只碰这三列。
   `audit_detail` 结构(order_audit 写,飞书审核列由它投影):
@@ -680,7 +683,9 @@ CREATE TABLE ops.feed_items (       -- feed 的 SKU 级台账(所有 feed 操作
 -- MP_ITEM_MATCH / price / inventory),载荷构造唯一出处 api/feeds.py。
 
 CREATE TABLE ops.feishu_sync_state (   -- 飞书投影同步状态(order_center_push)
-    table_id    text NOT NULL,      -- 飞书 table_id
+    table_id    text NOT NULL,      -- 飞书 table_id;审核列指纹用派生键 <table_id>#audit
+                                    -- (2026-09-07:同一张销售表两套载荷各存各的指纹,
+                                    --  record_id 映射只有销售表那一份)
     row_key     text NOT NULL,      -- 行去重键(order_line_id / 唯一键 / perf_key)
     record_id   text NOT NULL,      -- 飞书行内部编号(更新按它定位)
     pushed_hash text,               -- 上次写入飞书时的载荷指纹

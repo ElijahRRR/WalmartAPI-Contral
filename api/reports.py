@@ -7,6 +7,7 @@ On-request Reports(一端点一函数;轮询/等待/落台账是业务节奏,归
   get_download_url(store, request_id)                     GET  /v3/reports/downloadReport(20/hour)
   download_report(url, proxy)                             预签名地址 → 字节(经店铺固定代理)
   parse_report_csv / extract_item_id / report_row_sku     解析(zip 内 CSV 或裸 CSV)
+  report_blob_info(blob)                                  探针体检:zip 成员 / 换行数 / 解析行数 / 首行最长字段
 
 为什么用报表拿 itemId:GET /v3/items 与 catalog/search 的响应都没有数字 itemId
 (后者 schema 声明但线上不返回,2026-08-05 实证);全站搜索按 gtin/upc 召回率极差
@@ -85,14 +86,19 @@ def _quota_log(what: str, store: dict, status, headers: dict) -> None:
 
 
 def create_report_request(store: dict, report_type: str, report_version: str,
-                          body: dict | None = None) -> dict:
-    """输入:店铺 + reportType + reportVersion(+ 可选 body:rowFilters/excludeColumns)
+                          body: dict | None = None, *, data_start: str | None = None,
+                          data_end: str | None = None) -> dict:
+    """输入:店铺 + reportType + reportVersion(+ 可选 body:rowFilters/excludeColumns;
+    + 可选数据范围 dataStartTime/dataEndTime,ISO 8601 `YYYY-MM-DDTHH:mm:ssZ`)
     → 输出:响应 dict(含 requestId / requestStatus / requestSubmissionDate)。
 
     官方 POST /v3/reports/reportRequests。reportType/reportVersion **必须走 query**
-    (放 body 会 400,2026-08-05 实证);body 只装过滤器,不传过滤器 = 整个目录,
-    但 **body 必须是 JSON 对象**:不带 body 沃尔玛回 415 "Supported formats
-    [Content-Type:application/json]"(2026-09-07 生产实证)—— 所以缺省发 `{}`。
+    (放 body 会 400,2026-08-05 实证);body 装过滤器与数据范围(官方 Get All 响应里
+    的 payload 回显字段就是 rowFilters / excludeColumns / dataStartTime / dataEndTime,
+    ITEM_PERFORMANCE 指南的示例也把日期放 body),但 **body 必须是 JSON 对象**:不带
+    body 沃尔玛回 415 "Supported formats [Content-Type:application/json]"(2026-09-07
+    生产实证)—— 所以缺省发 `{}`。⚠ ITEM 报表不带日期**只回 1 行**(2026-09-07 22:05
+    C021 探针,在架 1490 行;后台不设时间同样只显示很少),日期由业务层决定传多长。
     ⚠ **max_retries=0**:POST 创建不是幂等的,5xx 后自动重试会重复建报表、
     重复吃每小时一次的创建额度(写操作永不自动兜底)。
     令牌走 **rate_try_acquire**(有就占、没有立刻抛 ReportQuotaError),不睡:
@@ -100,13 +106,18 @@ def create_report_request(store: dict, report_type: str, report_version: str,
     把令牌还回去(沃尔玛那侧什么都没发生),429 / 5xx / 网络未达不还。
     """
     cid = store["client_id"]
+    payload = dict(body or {})
+    if data_start:
+        payload["dataStartTime"] = data_start
+    if data_end:
+        payload["dataEndTime"] = data_end
     if not _client.rate_try_acquire("reports.create", cid):
         raise ReportQuotaError(f"{store['name']} {report_type} 报表本小时已创建过一次"
                                f"(本地限速桶),本轮不再创建")
     status, hdr, data = _client.safe_post_ex(
         f"{_client.base_url()}/v3/reports/reportRequests",
         _token(store), cid, store["proxy"],
-        json_body=body if body is not None else {},
+        json_body=payload,
         params={"reportType": report_type, "reportVersion": report_version},
         max_retries=0)
     _quota_log("reportRequests 创建", store, status, hdr)
@@ -218,14 +229,43 @@ def download_report(url: str, proxy: str | None) -> bytes:
     return _client.download_bytes(url, proxy)
 
 
+def _report_csv_member(blob: bytes) -> tuple[str | None, bytes, list[tuple[str, int]]]:
+    """输入:下载的报表字节 → 输出:(选中的 zip 成员名或 None, CSV 字节, zip 全部成员 [(名, 解压大小)])。
+
+    zip 包取第一个 .csv 成员(没有 .csv 就取第一个成员);裸 CSV 原样返回。
+    """
+    if blob[:2] != b"PK":
+        return None, blob, []
+    with zipfile.ZipFile(io.BytesIO(blob)) as zf:
+        members = [(i.filename, i.file_size) for i in zf.infolist()]
+        names = [n for n, _ in members if n.lower().endswith(".csv")] or [n for n, _ in members]
+        return names[0], zf.read(names[0]), members
+
+
+def _decode_report(raw: bytes) -> str:
+    return raw.decode("utf-8-sig", errors="replace")
+
+
 def parse_report_csv(blob: bytes) -> list[dict]:
     """输入:下载的报表字节(zip 内含 CSV,或裸 CSV)→ 输出:行 dict 列表(表头为键)。"""
-    if blob[:2] == b"PK":       # zip 包
-        with zipfile.ZipFile(io.BytesIO(blob)) as zf:
-            names = [n for n in zf.namelist() if n.lower().endswith(".csv")] or zf.namelist()
-            blob = zf.read(names[0])
-    text = blob.decode("utf-8-sig", errors="replace")
-    return list(csv.DictReader(io.StringIO(text)))
+    _, raw, _ = _report_csv_member(blob)
+    return list(csv.DictReader(io.StringIO(_decode_report(raw))))
+
+
+def report_blob_info(blob: bytes) -> dict:
+    """输入:下载的报表字节 → 输出:体检 dict(bytes / members / member / csv_bytes / lines / rows / longest_field)。
+
+    探针用,回答「报表只有 N 行」到底是沃尔玛只给了 N 行,还是解析出了问题:
+    zip 里有几个成员、取的哪个;CSV 有多少个换行、解析出多少行 —— 换行数远大于
+    行数 + 1,多半是某个字段引号没闭合把后面整个文件吞进了一个字段(首行最长字段
+    会大得离谱);成员不止一个则可能是分片。与 parse_report_csv 同一条取成员/解码路径。
+    """
+    member, raw, members = _report_csv_member(blob)
+    text = _decode_report(raw)
+    rows = list(csv.DictReader(io.StringIO(text)))
+    longest = max((len(str(v or "")) for r in rows[:1] for v in r.values()), default=0)
+    return {"bytes": len(blob), "members": members, "member": member, "csv_bytes": len(raw),
+            "lines": text.count("\n"), "rows": len(rows), "longest_field": longest}
 
 
 def item_id_from_column(row: dict) -> str | None:

@@ -8,6 +8,9 @@
 
 import contextlib
 import inspect
+import io
+import pathlib
+import zipfile
 
 import pytest
 
@@ -157,8 +160,9 @@ def _wire(monkeypatch, *, open_row=None, rows=None, current=None,
     monkeypatch.setattr(ir, "expire_stale", lambda conn, store, report_type=ir.REPORT_TYPE: 0)
     monkeypatch.setattr(ir, "open_request", lambda conn, store, report_type=ir.REPORT_TYPE: open_row)
 
-    def record_pending(conn, store, rt, ver, workflow):
+    def record_pending(conn, store, rt, ver, workflow, note=""):
         log["pending"] += 1
+        log["pending_note"] = note
         return 7
     monkeypatch.setattr(ir, "record_pending", record_pending)
     monkeypatch.setattr(ir, "mark_submitted", lambda conn, rid, req: log["submitted"].append((rid, req)))
@@ -167,8 +171,9 @@ def _wire(monkeypatch, *, open_row=None, rows=None, current=None,
     monkeypatch.setattr(ir, "mark_applied", lambda conn, rid, c, note="": log["applied"].append((rid, dict(c), note)))
     monkeypatch.setattr(ir, "mark_error", lambda conn, rid, note: log["error"].append((rid, note)))
 
-    def create_fn(store, rt, ver, body=None):
+    def create_fn(store, rt, ver, body=None, **kw):
         log["create"] += 1
+        log["create_kw"] = kw
         if isinstance(create, Exception):
             raise create
         return {"requestId": "REQ-NEW", "requestStatus": "RECEIVED"}
@@ -262,6 +267,10 @@ def test_probe_downloads_but_never_writes(monkeypatch):
     assert log["written"] == {} and log["applied"] == []
     assert r["sample"][0] == ("A", "11", "11") and r["publish"] and "header" in r
     assert log["downloaded"] == [(7, 3)]                 # 台账停在 ready + 已下载
+    # 原件留存(conftest 已把 reports_dir 指到临时目录)+ 体检 dict
+    assert r["blob"]["bytes"] == 4 and r["blob"]["member"] is None
+    assert pathlib.Path(r["blob"]["dump"]).read_bytes() == b"blob"
+    assert any("原件 4 字节" in ln for ln in wf._probe_lines(r))
 
 
 def test_create_failure_marks_ledger_and_raises_for_serial_retry(monkeypatch):
@@ -559,3 +568,85 @@ def test_reports_calls_log_walmart_quota_headers(monkeypatch, caplog):
     with caplog.at_level("INFO", logger="api.reports"):
         list(reports.iter_report_requests(STORE, "ITEM"))
     assert any("令牌 5" in r.getMessage() and "下枚 t" in r.getMessage() for r in caplog.records)
+
+
+# ── 2026-09-07 探针第四轮:55 列对上、在架 1490 行却只解析出 1 行 ────────────────────
+
+def _zip_csv(text: str, name: str = "ItemReport.csv") -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(name, text)
+    return buf.getvalue()
+
+
+def test_report_blob_info_distinguishes_short_file_from_swallowed_rows():
+    """体检要能分清「沃尔玛只给了 1 行」和「引号没闭合把后面全吞进一个字段」。"""
+    good = _zip_csv("SKU,Item ID,Item Page URL\nA,1,u\nB,2,u\nC,3,u\n")
+    info = reports.report_blob_info(good)
+    assert (info["rows"], info["lines"], info["member"]) == (3, 4, "ItemReport.csv")
+    assert info["members"] == [("ItemReport.csv", info["csv_bytes"])]
+    assert reports.parse_report_csv(good)[2]["SKU"] == "C"
+
+    swallowed = _zip_csv("SKU,Item ID,Name\nA,1,\"oops\nB,2,x\nC,3,y\n")
+    info = reports.report_blob_info(swallowed)
+    assert info["rows"] == 1 and info["lines"] == 4          # 换行 4 个却只 1 行
+    assert info["longest_field"] > len("oops")                # 吞进去的都在这个字段里
+    lines = wf._probe_lines({"store": "S", "request_id": "R", "header": ["SKU"], "note": "",
+                             "publish": {}, "lifecycle": {}, "sample": [], "counters": {},
+                             "blob": {**info, "dump": "/tmp/x.zip"}})
+    assert any("引号没闭合" in ln for ln in lines)
+
+    raw = b"SKU,Item ID\nA,1\n"                                 # 裸 CSV 也走同一条路
+    assert reports.report_blob_info(raw)["members"] == [] and reports.parse_report_csv(raw)[0]["SKU"] == "A"
+
+
+# ── 2026-09-07 22:05 后决定:不带日期只回 1 行 ⇒ 请求体带近一年数据范围;renew 作废在途行 ──
+
+def test_data_window_is_official_format_and_capped_at_730_days():
+    from datetime import datetime, timezone
+    now = datetime(2026, 9, 7, 14, 5, 7, 123456, tzinfo=timezone.utc)
+    assert ir.data_window(365, now) == ("2025-09-07T14:05:07Z", "2026-09-07T14:05:07Z")
+    assert ir.data_window(9999, now)[0] == "2024-09-07T14:05:07Z"     # 夹到 730
+    assert ir.DATA_RANGE_DAYS == 365
+
+
+def test_create_puts_data_window_in_json_body(monkeypatch):
+    """dataStartTime/dataEndTime 是 body 字段(官方 payload 回显 + ITEM_PERFORMANCE 指南示例),不进 query。"""
+    seen = {}
+    monkeypatch.setattr(_client, "rate_try_acquire", lambda b, c: True)
+    monkeypatch.setattr(_client, "get_token", lambda *a: "tok")
+
+    def post(url, token, cid, proxy, json_body=None, params=None, timeout=30, max_retries=0):
+        seen.update(json_body=json_body, params=params)
+        return 200, {}, {"requestId": "R-1", "requestStatus": "RECEIVED"}
+    monkeypatch.setattr(_client, "safe_post_ex", post)
+    reports.create_report_request(STORE, "ITEM", "v6", data_start="2025-09-07T00:00:00Z",
+                                  data_end="2026-09-07T00:00:00Z")
+    assert seen["json_body"] == {"dataStartTime": "2025-09-07T00:00:00Z",
+                                 "dataEndTime": "2026-09-07T00:00:00Z"}
+    assert seen["params"] == {"reportType": "ITEM", "reportVersion": "v6"}
+    reports.create_report_request(STORE, "ITEM", "v6")
+    assert seen["json_body"] == {}                        # 不给日期仍是 {},不是 None
+
+
+def test_one_store_creates_with_window_and_records_it_in_ledger(monkeypatch):
+    log = _wire(monkeypatch, rows=_ROWS, current={"A": None})
+    r = wf._one_store(STORE, 60, 300, probe=False, data_days=365)
+    kw = log["create_kw"]
+    assert set(kw) == {"data_start", "data_end"} and kw["data_end"].endswith("Z")
+    assert log["pending_note"] == f"dataStartTime={kw['data_start']} dataEndTime={kw['data_end']}"
+    assert r["window"] == (kw["data_start"], kw["data_end"])
+
+
+def test_renew_supersedes_in_flight_row_and_creates_again(monkeypatch):
+    """改了请求形状:在途行(哪怕 ready)记 error 作废,重新 POST;不带 renew 照旧接着用。"""
+    open_row = {"id": 3, "request_id": "REQ-OLD", "status": "ready",
+                "submitted_at": None, "created_at": None}
+    log = _wire(monkeypatch, open_row=open_row, rows=_ROWS, current={"A": None})
+    r = wf._one_store(STORE, 60, 300, probe=True, renew=True)
+    assert log["error"] == [(3, "superseded: renew=1,原 requestId=REQ-OLD")]
+    assert log["create"] == 1 and log["pending"] == 1 and r["request_id"] == "REQ-NEW"
+    assert any("数据范围" in ln for ln in wf._probe_lines(r))
+    log = _wire(monkeypatch, open_row=open_row, rows=_ROWS, current={"A": None})
+    wf._one_store(STORE, 60, 300, probe=True)
+    assert log["create"] == 0 and log["error"] == []

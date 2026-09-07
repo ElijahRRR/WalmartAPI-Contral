@@ -47,7 +47,7 @@
 | 31 | GET /v3/orders/{purchaseOrderId} | orders | 单单详情:**下单时间的真相来源**(新单首见查;没被详情核对过的存量行每轮查直到定稿;定稿后不再查。2026-09-02 新增,旧系统未用;探针 4 实证 550 单详情全对) | safe_get_ex | order_sync |
 | 32 | PUT /v3/inventories/{sku} | inventory | **按发货节点**改库存(shipNode 在 body、**部分成功语义**) | safe_put_ex | maintenance(受管仓的店,多仓批次 2) |
 | 33 | GET /v3/settings/shipping/shipnodes | settings | 该店发货节点列表(校验「维护仓库」填的 FC ID) | safe_get_ex | maintenance/listing(多仓批次 1) |
-| 34 | POST /v3/reports/reportRequests | reports | On-request 报表创建(ITEM 报表=数字 itemId 唯一批量来源,2026-08-05 实证;reportType/reportVersion 走 query,不传 body=整个目录;**每店每类型每小时一次**,POST 不自动重试) | safe_post_ex(max_retries=0) | item_id_sync |
+| 34 | POST /v3/reports/reportRequests | reports | On-request 报表创建(ITEM 报表=数字 itemId 唯一批量来源,2026-08-05 实证;reportType/reportVersion 走 query;body 带 dataStartTime/dataEndTime 近 365 天 —— **不带日期只回 1 行**,2026-09-07 22:05 实证;**每店每类型每小时一次**,POST 不自动重试) | safe_post_ex(max_retries=0) | item_id_sync |
 | 35 | GET /v3/reports/reportRequests | reports | 报表请求列表(**轮询走这条**;官方表 200/min 但生产实见小时级桶,与单查共用 18/hour;nextCursor 是完整 query 串**直接拼 URL**;requestStatus / src 过滤;只能查 30 天) | safe_get_ex(逐页生成器,找到即停) | item_id_sync |
 | 36 | GET /v3/reports/reportRequests/{requestId} | reports | 单个请求状态(20/hour,与列表共用 reports.query 桶,只作列表找不到时的兜底) | safe_get_ex | item_id_sync |
 | 37 | GET /v3/reports/downloadReport | reports | 预签名下载地址 + 时效(20/hour) | safe_get_ex + download_bytes | item_id_sync |
@@ -125,7 +125,7 @@ marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁�
 | GET /v3/orders/{purchaseOrderId} | 5000/min(tsv:119「An order」) | 新登记(2026-09-02) | 3000/min,与列表分桶(orders.get);探针 4:并发 8、550 次/69s 无 429 |
 | GET /v3/returns | 50/min | 一致(旧 sleep1.3s≈46/min) | 46/min(沿用) |
 | GET /v3/report/payment/statement | 15/min | 一致 | 12/min |
-| POST /v3/reports/reportRequests(创建) | **US 页未列**;MX 站/1P 页「每种报表每小时一次」;生成典型 15–45 分钟,保留 30 天;**body 必须是 JSON 对象**(不带 body 回 415,2026-09-07 实证,缺省发 `{}`) | 08-05 测试期 429 实证(当时误记为"配额极低",真相是下面那行的轮询桶配错) | **1/hour/店** 持久桶(reports.create),令牌走 `rate_try_acquire` 不睡等;POST 不自动重试;429 / 本地桶已满 = 本轮放弃该店;请求形状被拒的 4xx 还令牌 |
+| POST /v3/reports/reportRequests(创建) | **US 页未列**;MX 站/1P 页「每种报表每小时一次」;生成典型 15–45 分钟,保留 30 天;**body 必须是 JSON 对象**(不带 body 回 415,2026-09-07 实证,缺省发 `{}`);**ITEM 不带 dataStartTime/dataEndTime 只回 1 行**(22:05 C021 实证,在架 1490 行;后台不设时间同现象)—— body 带近 365 天(所有者定,官方上限 730),按哪个日期列筛官方没写,靠覆盖率检验 | 08-05 测试期 429 实证(当时误记为"配额极低",真相是下面那行的轮询桶配错) | **1/hour/店** 持久桶(reports.create),令牌走 `rate_try_acquire` 不睡等;POST 不自动重试;429 / 本地桶已满 = 本轮放弃该店;请求形状被拒的 4xx 还令牌 |
 | GET /v3/reports/reportRequests(列表) | 官方表 200/min;**生产实见不是**(2026-09-07 21:48 C021:连打 4 次第 4 次 429,X-Next-Replenishment-Time 在 142 秒后 —— 官方 Rate limiting 页说桶按固定速率连续补令牌,200/min 的桶下枚 0.3 秒就到,142 秒只能是小时级桶,与同路径前缀的单查 20/hour 一致);缺省 10 条一页,**nextCursor 是完整 query 串**(`reportType=ITEM&page=2&limit=10`,官方参考页「use nextCursor value instead of query params」)| 新登记(2026-09-07);同日按实证改配 | **与单查共用 `reports.query` 18/hour 持久桶**;**轮询用它**,按 requestId 匹配、找到即停(生成器,通常一枚令牌);cursor **直接拼 URL**(当 `nextCursor=` 参数传会被忽略、原样回第一页,实见同 cursor 连回三次),同 cursor 重复立即停;每次响应的 x-current-token-count / x-next-replenishment-time 进日志,真实桶大小以它为准 |
 | GET /v3/reports/reportRequests/{id}(单查) | **20/hour** | 旧代码与 downloadReport 共用 55/min 桶、20 秒轮询一次 ⇒ 必 429 | 与列表共用 `reports.query` 18/hour 持久桶,只作兜底 |
 | GET /v3/reports/downloadReport | **20/hour**;响应 downloadURL + downloadURLExpirationTime(时效长度未公布) | 同上 | 18/hour 持久桶(reports.download) |

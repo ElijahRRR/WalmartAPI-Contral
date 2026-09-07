@@ -276,7 +276,12 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
 - `AMZ_IN_STOCK_QTY`:仅在 `stock_count` 采不到时用;**终值=10**(所有者拍板 2026-08-12)
 - [x] 变体分组:2026-08-15 落地(`variant_group.plan()` 增量归组、组大小上限
   `MAX_FAMILY=20` 超了退单品口径;`variant_remap` 补维度重映射、`variant_title`
-  做标题差异化;同轮同族多主变体按 ASIN 字母序降级定序)
+  做标题差异化;同轮同族多主变体按 ASIN 字母序降级定序)。
+  **2026-09-07 组号改不透明码**(所有者定稿三条,`docs/sku_plan.md` §9.13):
+  `variantGroupId` 不再是 `vg_<父 ASIN>`,改由登记表 `catalog.variant_groups`
+  按 (店, 家族键) 发号(唯一出口 `sku_codec.mint_group_code`,发号点在
+  `_prep_rows` 的抽码事务里,与 SKU mint 同处一室);存量组不回改;
+  `variant_group.family_key` 只当查表键、永不发出去
 
 ### L2 上架主链 list_new(最大;内部再分批,依赖 L0)
 

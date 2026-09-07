@@ -26,12 +26,14 @@
 """
 
 import ast
+import inspect
 import re
 import socket
 from pathlib import Path
 
 import pytest
 
+from registry import resources
 from services import sku_codec
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -211,6 +213,15 @@ _LISTING_SOURCES_INSERT_OK: dict[str, tuple[str, str]] = {
         "permanent", "register:存量 backfill 与跟卖 B 列人工号的首次登记"),
     "services/sku_codec.py": (
         "permanent", "mint:抽码与登记同一函数同一事务"),
+}
+
+#: ⑦ 允许 INSERT 变体组登记簿的文件(**只有一个出口**,2026-09-07)。
+#: 组号与 SKU 是两种身份,但同一套编码规则、同一个之家 —— 第二个 INSERT 出口
+#: = 第二条发号路径,它照样写得进去,只是不过 mint_group_code 的查表与查重,
+#: 于是同一族在两轮里拿到两个号(同族被劈成两组,沃尔玛侧不报错)。
+_VARIANT_GROUPS_INSERT_OK: dict[str, tuple[str, str]] = {
+    "services/sku_codec.py": (
+        "permanent", "mint_group_code:抽号与登记同一函数同一事务"),
 }
 
 
@@ -1191,6 +1202,117 @@ def test_legacy_shapes_resolve_identically():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  ⑪ 变体组号(2026-09-07 所有者定稿三条,docs/sku_plan.md §9.13)
+#
+#  改造前变体品的 variantGroupId 是 `vg_<父 ASIN>`:SKU 那条线的 ASIN 摘干净了,
+#  组号这条线还在往外递(docs/sku_wiring_audit.md G-7)。现在组号是不透明码,
+#  按 (店, 家族键) 登记在 catalog.variant_groups;家族键只进库、永不外发。
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_the_variant_group_table_has_exactly_one_insert_site():
+    """变体组登记簿的 INSERT **只有 sku_codec.mint_group_code 一个出口**。
+
+    第二个出口 = 第二条发号路径,而且不报错:它照样写得进去,只是不过
+    mint_group_code 的查表(① 已登记就复用)与存量沿用(② existing 原样登记),
+    于是同一族在两轮里拿到两个号 —— 兄弟被劈进两个变体组,沃尔玛侧不会拦。
+    """
+    offenders = _offenders(re.compile(r"INSERT\s+INTO\s+catalog\.variant_groups"),
+                           _VARIANT_GROUPS_INSERT_OK)
+    assert not offenders, _fmt(
+        offenders, "变体组登记簿的 INSERT 只有 services/sku_codec.mint_group_code:")
+    # 行永不 DELETE:删一行 = 下一个兄弟重新发号 = 同一族被劈成两组
+    assert not _offenders(re.compile(r"DELETE\s+FROM\s+catalog\.variant_groups"),
+                          {}), "变体组登记簿的行永不 DELETE"
+
+
+def _vg_prefix_hits(path: Path) -> list[str]:
+    """输入:.py 路径 → 输出:代码里 `vg_` 前缀字面量的证据(注释/docstring 不计)。
+
+    判据用 AST 扫**字符串常量**(与 `_second_generator_hits` 同款手法):注释与
+    docstring 里写"改造前是 vg_<父 ASIN>、为什么改掉"正是要留的文档,文本 grep
+    会把它们全判成违规。词界用 `(?<![A-Za-z0-9_])` 卡住 —— `avg_online` 这类
+    正常标识符里也含 `vg_`,不卡就是一片假阳。
+    """
+    pat = re.compile(r"(?<![A-Za-z0-9_])vg_")
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    # 模块 / 类 / 函数**三种 docstring 全部掐掉**:本条守的是"代码里还在拼
+    # vg_ 吗",而每个 docstring 里都该写清这段历史(掐得不干净就只能删断言)
+    docs: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                             ast.AsyncFunctionDef)):
+            first = (node.body or [None])[0]
+            if (isinstance(first, ast.Expr)
+                    and isinstance(first.value, ast.Constant)
+                    and isinstance(first.value.value, str)):
+                docs.add(id(first.value))
+    return [node.value[:40] for node in ast.walk(tree)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+            and id(node) not in docs and pat.search(node.value)]
+
+
+def test_no_vg_prefix_literal_survives_in_code():
+    """`vg_` 前缀从代码里**绝迹**:它是"把 ASIN 从后门递出去"的那个形态。
+
+    组号今天由 `sku_codec.mint_group_code` 发,存量 `vg_…` 只从
+    `walmart_items.variant_group_id` **读**回来原样登记(所有者定稿第 2 条:
+    存量组不回改)—— 任何地方再拼一次 `vg_` + 什么,就是那条被拆掉的派生路
+    复活了,而且发出去照样能用,没有任何报错。
+    """
+    offenders = [f"{rel}:{sorted(set(hits))}" for rel, path in _prod_files()
+                 if (hits := _vg_prefix_hits(path))]
+    assert not offenders, _fmt(
+        offenders, "代码里不许再拼 `vg_` 组号(注释/docstring 里讲历史可以):")
+    from services import variant_group as vg
+    assert not hasattr(vg, "_GROUP_PREFIX")
+    assert not hasattr(vg, "group_id"), "改名不留兼容壳(一个能力一条实现路径)"
+
+
+def test_the_variant_group_letter_is_not_a_source_letter():
+    """组号首字母**不许与来源字母重合**,且必须在字母表里。
+
+    重合了两种后果都静默:一眼分不出手上这串是 SKU 还是组号(排障时两种身份
+    混着查);`source_of` 也会把一个组号回答成某种货源。首字母不在
+    `_ALPHABET` 里则更糟 —— 抽出来的号 `is_opaque` 恒 False,形态上就不是我们
+    自己认得的码。
+    """
+    letter = resources.VARIANT_GROUP_LETTER
+    assert letter not in set(resources.SKU_SOURCE_LETTERS.values()), letter
+    assert letter in sku_codec._ALPHABET and letter.isalpha()
+    # 组号不是 SKU:source_of 对它只回答 None(不给它加分支)
+    code = letter + "X7QM2X9RT4W"
+    assert sku_codec.is_opaque(code) and sku_codec.source_of(code) is None
+    # 空跑占位串形态上就不是真码(与 SKU 占位同纪律)
+    assert not sku_codec.is_opaque(sku_codec.DRYRUN_GROUP_PLACEHOLDER)
+    assert len(sku_codec.DRYRUN_GROUP_PLACEHOLDER) == sku_codec._LEN
+
+
+def test_the_variant_group_table_carries_no_opaque_regex():
+    """新表**故意不带** 12 位字符集条件:存量沿用的 `vg_…` 不是 12 位码,
+    加了条件它们一条都进不来(而那正是"存量组不回改"要登记的东西)。
+
+    另一半理由在 `test_no_second_opaque_regex_in_the_repo`:那个正则在
+    schema.sql 里只准出现两次(listing_sources 的两条部分唯一索引)。
+    """
+    ddl = _SCHEMA[_SCHEMA.index("CREATE TABLE IF NOT EXISTS catalog.variant_groups"):]
+    ddl = ddl[:ddl.index("variant_groups_code_uidx") + 200]
+    assert not _OPAQUE_REGEX_RE.search(ddl), ddl
+    assert len(_OPAQUE_REGEX_RE.findall(_SCHEMA)) == 2      # 仍然恰好两处
+    # 唯一索引是 (store, group_code) 而**不是全局**:存量 vg_ 号可能跨店重复
+    assert "ON catalog.variant_groups (store, group_code)" in _SCHEMA
+
+
+def test_mint_group_code_has_no_dry_run_switch():
+    """写库函数不设「这次不写」模式(与 mint 同纪律):两条路径迟早各自演化,
+    而 dry-run 那条没人跑。空跑由调用方不调它 + 回显"组号待发"表达。"""
+    params = inspect.signature(sku_codec.mint_group_code).parameters
+    assert "dry_run" not in params and "execute" not in params
+    assert list(params) == ["conn", "store", "family_key", "workflow", "existing"]
+    src = inspect.getsource(sku_codec.mint_group_code)
+    assert "conn.commit" not in src            # commit 归调用方(先落库再调接口)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  白名单不许烂掉
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1202,6 +1324,7 @@ _ALL_WHITELISTS = {
     "_LISTING_SOURCES_UPDATE_OK": _LISTING_SOURCES_UPDATE_OK,
     "_RECLASSIFY_CALLERS_OK": _RECLASSIFY_CALLERS_OK,
     "_LISTING_SOURCES_INSERT_OK": _LISTING_SOURCES_INSERT_OK,
+    "_VARIANT_GROUPS_INSERT_OK": _VARIANT_GROUPS_INSERT_OK,
     "_ABANDON_CALLERS_OK": _ABANDON_CALLERS_OK,
 }
 
@@ -1364,6 +1487,131 @@ def test_two_new_codes_cannot_claim_the_same_old_sku(pg):
                     "abandoned_reason = %s WHERE store = 'GUARD_R' AND sku = %s",
                     (sku_codec.ABANDON_SKU_UPDATE_FAILED, "AG4ARDNEW223"))
     _claim("AG4ARDNEW224", "B0KEYRB")
+
+
+# ── 变体组登记簿(2026-09-07):发号语义在真库上跑一遍 ────────────────────────
+
+def _ensure_variant_groups(conn) -> None:
+    """输入:连接 → 输出:无(在**本事务里**按 schema.sql 原文建表,随夹具回滚)。
+
+    DDL 直接从 `refdata/schema.sql` 切出来,不在测试里抄第二份 —— 抄一份就有了
+    第二个建表口径,而两份一漂,用例绿着而生产建出来的表不是这个形状。
+    (PG 的 DDL 是事务性的:夹具最后 rollback,沙箱库里不留残渣。)
+    """
+    head = _SCHEMA.index("CREATE TABLE IF NOT EXISTS catalog.variant_groups")
+    tail = _SCHEMA.index("variant_groups_code_uidx", head)
+    tail = _SCHEMA.index(";", tail) + 1
+    with conn.cursor() as cur:
+        cur.execute(_SCHEMA[head:tail])
+
+
+@needs_pg
+def test_pg_the_same_family_always_gets_the_same_group_code(pg):
+    """同一个 (店, 家族键) 发两次号 = 同一个号:这就是"分批上架的兄弟并进同一
+    个组"的全部机制(组号不透明之后,不能再靠各自派生同一个串)。"""
+    _ensure_variant_groups(pg)
+    a = sku_codec.mint_group_code(pg, "GUARD_V", "B0FAMILY001",
+                                  workflow="test_sku_guard")
+    b = sku_codec.mint_group_code(pg, "GUARD_V", "B0FAMILY001",
+                                  workflow="test_sku_guard")
+    assert a == b
+    assert a[0] == resources.VARIANT_GROUP_LETTER and sku_codec.is_opaque(a)
+    assert "B0FAMILY001" not in a               # 家族键**永不**出现在组号里
+    with pg.cursor() as cur:
+        cur.execute("SELECT count(*) FROM catalog.variant_groups "
+                    "WHERE store = 'GUARD_V' AND family_key = 'B0FAMILY001'")
+        assert cur.fetchone()[0] == 1           # 只登记了一行
+
+
+@needs_pg
+def test_pg_an_existing_legacy_group_is_registered_as_is(pg):
+    """存量组**不回改**(所有者定稿第 2 条):在架成员现有的 `vg_…` 原样登记。
+
+    登记之后,这一族的延续不再依赖那个成员是否还在架 —— 它哪天被删/缺席,
+    下一个兄弟照样从表里拿到同一个号(不带 existing 也一样)。
+    """
+    _ensure_variant_groups(pg)
+    got = sku_codec.mint_group_code(pg, "GUARD_V", "B0FAMILY002",
+                                    workflow="test_sku_guard",
+                                    existing="vg_B0FAMILY002")
+    assert got == "vg_B0FAMILY002"              # 原样,不抽新号
+    again = sku_codec.mint_group_code(pg, "GUARD_V", "B0FAMILY002",
+                                      workflow="test_sku_guard")
+    assert again == "vg_B0FAMILY002"            # 在架成员没了也延续得下去
+    # existing 只在"表里还没有这一族"时说话:表是权威
+    third = sku_codec.mint_group_code(pg, "GUARD_V", "B0FAMILY002",
+                                      workflow="test_sku_guard",
+                                      existing="vg_SOMETHINGELSE")
+    assert third == "vg_B0FAMILY002"
+
+
+@needs_pg
+def test_pg_two_stores_with_the_same_family_get_their_own_codes(pg):
+    """同一个家族分到两家店时**各发各的号**:两家店共用一个组号串,正是"两家店
+    有关联"的信号,而关联就是封号线(与跨店永不复用 SKU 同一条纪律)。
+
+    唯一索引因此是 (store, group_code) 而不是全局 —— 存量 `vg_<ASIN>` 号本来就
+    可能跨店重复,全局唯一在登记存量的那一刻就插不进去。
+    """
+    _ensure_variant_groups(pg)
+    a = sku_codec.mint_group_code(pg, "GUARD_V1", "B0FAMILY003",
+                                  workflow="test_sku_guard")
+    b = sku_codec.mint_group_code(pg, "GUARD_V2", "B0FAMILY003",
+                                  workflow="test_sku_guard")
+    assert a != b
+    # 跨店同号是允许的(存量形态):唯一索引只管一家店内不重
+    legacy = sku_codec.mint_group_code(pg, "GUARD_V1", "B0FAMILY004",
+                                       workflow="test_sku_guard",
+                                       existing="vg_SHARED")
+    same = sku_codec.mint_group_code(pg, "GUARD_V2", "B0FAMILY004",
+                                     workflow="test_sku_guard",
+                                     existing="vg_SHARED")
+    assert legacy == same == "vg_SHARED"
+
+
+@needs_pg
+def test_pg_a_random_code_collision_redraws(pg, monkeypatch, caplog):
+    """撞号(同店该号已属于另一族)⇒ **重抽**,不是静默复用别人的号。
+
+    两族共用一个号 = 沃尔玛侧两族并成一组,而且不报错。这里把随机源钉死成
+    "第一次必撞、第二次让开",走的正是 ON CONFLICT DO NOTHING 拿不到行那条路。
+    """
+    import logging
+    _ensure_variant_groups(pg)
+    taken = sku_codec.mint_group_code(pg, "GUARD_V", "B0FAMILY005",
+                                      workflow="test_sku_guard")
+    draws = iter(list(taken[1:]) + list("X7QM2X9RT4W"))
+    monkeypatch.setattr(sku_codec.secrets, "choice", lambda _abc: next(draws))
+    before = sku_codec._group_redraws
+    with caplog.at_level(logging.INFO, logger="services.sku_codec"):
+        got = sku_codec.mint_group_code(pg, "GUARD_V", "B0FAMILY006",
+                                        workflow="test_sku_guard")
+    assert got != taken and sku_codec.is_opaque(got)
+    assert sku_codec._group_redraws == before + 1
+    assert any("重抽" in m for m in caplog.messages)
+
+
+@needs_pg
+def test_pg_a_legacy_code_already_taken_by_another_family_is_still_reused(pg,
+                                                                         caplog):
+    """② 那一支的兜底:`existing` 在本店已登给**另一个家族键**(同一族的家族键
+    随 parent_asin 补全而变过一次,是实见形态)⇒ 登不进去,但**照样返回它**。
+
+    它就是这批兄弟在沃尔玛侧真实所在的组,换个号发出去反而把一族劈成两组。
+    真兜底三要件:同函数内、触发记 warning + 计数、条件明确(不是 catch-all)。
+    """
+    import logging
+    _ensure_variant_groups(pg)
+    sku_codec.mint_group_code(pg, "GUARD_V", "B0OLDKEY001",
+                              workflow="test_sku_guard", existing="vg_MOVED")
+    before = sku_codec._group_code_shared
+    with caplog.at_level(logging.WARNING, logger="services.sku_codec"):
+        got = sku_codec.mint_group_code(pg, "GUARD_V", "B0NEWKEY001",
+                                        workflow="test_sku_guard",
+                                        existing="vg_MOVED")
+    assert got == "vg_MOVED"
+    assert sku_codec._group_code_shared == before + 1
+    assert any("已登给别的家族键" in m for m in caplog.messages)
 
 
 @needs_pg

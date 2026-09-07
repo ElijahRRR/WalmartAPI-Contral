@@ -335,6 +335,38 @@ CREATE OR REPLACE VIEW catalog.sku_aliases AS
   FROM catalog.listing_sources
   WHERE replaces IS NOT NULL AND abandoned_at IS NULL;
 
+-- ── 变体组登记簿(2026-09-07 所有者定稿三条,docs/sku_plan.md §9.13)───────────
+-- 为什么要有这张表:变体组 ID 从 `vg_<父 ASIN>` 改成不透明组号之后,「同族分批
+-- 上架的兄弟怎么进同一个组」不再能靠各自派生同一个串 —— **必须查表**。
+-- (不用「ASIN 取哈希」当组号:ASIN 空间公开可枚举,哈希等于没藏。)
+-- family_key 是 services/variant_group.family_key 的产出(父 ASIN,或父落在家族内时
+-- 取 min(家族)),**只进库当查表键,永不发给沃尔玛**;发出去的只有 group_code。
+-- 三条纪律:
+--   ① 本表的 INSERT **只有 services/sku_codec.mint_group_code 一个出口**
+--      (守门 tests/test_sku_guard.py),组号与 SKU 同一套编码规则、同一个之家;
+--   ② 行**永不 DELETE**:组号发出去就挂在沃尔玛侧那一族上,删行 = 下一个兄弟
+--      重新发号 = 同一族被劈成两组,而且不报错;
+--   ③ 存量家族**不回改**:已在架成员现有的 `vg_…` 由 mint_group_code 原样登记进
+--      group_code 列(所有者定稿第 2 条),登记之后这一族的延续不再依赖那个成员
+--      是否还在架。
+-- 唯一索引是 **(store, group_code) 而不是全局**:存量 `vg_<ASIN>` 号在两家店可能
+-- 重复(同一个 ASIN 被两家店上过),全局唯一在存量登记那一刻就会建不起来/插不进;
+-- 而"一个组号在一家店只能属于一族"才是我们真正要防的(两族共号 = 沃尔玛侧两族并成
+-- 一组)。⚠ **本表故意不加 12 位字符集条件**:存量沿用的 `vg_…` 根本不是 12 位码,
+-- 加了条件它们一条都进不来;而那个正则在本文件里只准出现两次(listing_sources 的
+-- 两条部分唯一索引),守门 test_no_second_opaque_regex_in_the_repo 逐字钉住。
+CREATE TABLE IF NOT EXISTS catalog.variant_groups (
+    store       text NOT NULL,
+    family_key  text NOT NULL,   -- 家族键:variant_group.family_key 的产出,只进不出
+    group_code  text NOT NULL,   -- 发给沃尔玛的 variantGroupId:新家族 = G+11 位
+                                 -- 不透明码;存量家族 = 沿用在架成员的 vg_… 原样登记
+    workflow    text,            -- 发号来源工作流(今天只有 list_new)
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (store, family_key)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS variant_groups_code_uidx
+    ON catalog.variant_groups (store, group_code);
+
 -- ── UPC 池(L2a,2026-08-07 所有者定稿:PG 权威,飞书表=注入口+投影)────
 -- 领号并发安全靠单事务 FOR UPDATE SKIP LOCKED(旧系统文件锁/本地声明簿/
 -- server 集中分配三层补丁全部消灭)。状态机照搬旧实证语义:

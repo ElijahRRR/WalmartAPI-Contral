@@ -356,3 +356,19 @@ workflows/。
 `params["dry_run"]`** 并把 `execute` 透传给五个反哺器;五个反哺器一律带
 `execute: bool = True` 关键字(守门 `test_every_reflector_takes_an_execute_flag`),
 `execute=False` 时一行飞书、一行 PG 都不写。
+
+**⑩′ 变体组号的口径**(2026-09-07 所有者定稿三条,sku_plan §9.13):
+
+- **唯一出生地** `services/sku_codec.mint_group_code`(组号与 SKU 是两种身份、两张表,
+  但同一套编码规则、同一个之家);首字母 `registry.VARIANT_GROUP_LETTER='G'`,
+  **不是来源字母**,取值不许与 `SKU_SOURCE_LETTERS` 重合。
+- `catalog.variant_groups` 的 **INSERT 只有那一个出口**,行**永不 DELETE**
+  (删一行 = 下一个兄弟重新发号 = 同一族被劈成两组);键是 (店, 家族键)。
+- **家族键永不外发**:`services/variant_group.family_key` 出的是裸的父 ASIN
+  (或 min(家族)),它只是查表键;`vg_` 前缀连同派生路一起删掉,代码里不许再拼
+  (守门 `test_no_vg_prefix_literal_survives_in_code`)。**也不许拿 ASIN 取哈希**
+  —— ASIN 公开可枚举,哈希离线可反查。
+- **存量 `vg_` 号原样登记、不回改**:同族新成员沿用在架成员的现有组号
+  (`_FAMILY_LISTED_SQL` 查回来 → `mint_group_code(existing=…)` 登记)。
+- 发号点在 `list_new._prep_rows` 的**抽码事务里**(三条硬理由与 SKU mint 逐条相同);
+  空跑不调它,回显"组号待发(家族键 …)"、载荷用 `DRYRUN_GROUP_PLACEHOLDER`。

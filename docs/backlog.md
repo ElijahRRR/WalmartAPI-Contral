@@ -195,7 +195,15 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 - ✅ ~~只读健康视图 cli.py health~~(所有者拍板 2026-08-13:**不要**)
 - ✅ LLM 校验失败 payload 落盘诊断(2026-08-12:必填缺失行落 `<DATA_ROOT>/logs/llm_raw_*.json`,含 missing/notes/两段载荷)
 - ✅ 三条实证抢救(2026-08-12 全部落位):日期字段硬闸进 mp_conform(第 5 轮,格式感知比 endDate 单点更广);PROHIBITED 三违禁码进回执分类(O=PROHIBITED 永不重试,heal 同步处理);"UPC 领过永久不再用"口径留档(历史迁移已关闭;该口径在 upc_audit 与未来注入校验中使用)
-- 🟡 变体分组(**决策层与载荷层已落地** 2026-08-15,余 list_new 生产验收):`services/variant_group.py` + `mp_conform.ensure_variant_bag(plan=...)` + `list_new._variant_plan`。⚠ **先决条件当初写错了**:不是「采集契约顶层暴露三字段」——数据一直在 `catalog.snapshots.raw`(生产实证 358,743 条有 variant_attributes、262,933 条有 variation_asins),之前判断卡在采集侧是**只翻了 products.slow**。`slow.variant.theme` 确实曾恒空,但那是采集侧导出的 bug(按 ':' 切、实际格式是 '='),已由采集侧 dad8f60 修复;即便修好也**只给维度名不给取值**,分变体要的取值仍只能从 raw 取。跨店重定向与 LLM remap 按原计划砍掉(20 个维度手写映射表);`full_set >= 10` 伪组闸**不抄**——采集侧 twister 版已用真实家族键取代会混进广告 ASIN 的旧正则
+- 🟡 变体分组(**决策层与载荷层已落地** 2026-08-15;**2026-09-07 组号改不透明码**,
+  余 list_new 生产验收(变体家族)):变体组 ID 不再是 `vg_<父 ASIN>` —— 那等于把
+  亚马逊 ASIN 从后门递给沃尔玛(sku_wiring_audit G-7 目标级漏洞)。所有者定稿三条:
+  新登记表 `catalog.variant_groups`((店, 家族键) → 不透明组号,唯一发号出口
+  `services/sku_codec.mint_group_code`,发号点在 `list_new._prep_rows` 的抽码事务里)、
+  **存量组不回改**(在架成员的 `vg_…` 原样登记沿用)、**不许拿 ASIN 取哈希**当组号。
+  `variant_group.group_id` 改名 `family_key` 并去前缀,家族键只当查表键、永不外发。
+  验收步骤见 `docs/sku_plan.md` §9.13(db_init 两遍 → dry-run 看"组号待发(家族键 …)"
+  → 真跑一小批 → 同族第二批必须进同一个组)。原文:`services/variant_group.py` + `mp_conform.ensure_variant_bag(plan=...)` + `list_new._variant_plan`。⚠ **先决条件当初写错了**:不是「采集契约顶层暴露三字段」——数据一直在 `catalog.snapshots.raw`(生产实证 358,743 条有 variant_attributes、262,933 条有 variation_asins),之前判断卡在采集侧是**只翻了 products.slow**。`slow.variant.theme` 确实曾恒空,但那是采集侧导出的 bug(按 ':' 切、实际格式是 '='),已由采集侧 dad8f60 修复;即便修好也**只给维度名不给取值**,分变体要的取值仍只能从 raw 取。跨店重定向与 LLM remap 按原计划砍掉(20 个维度手写映射表);`full_set >= 10` 伪组闸**不抄**——采集侧 twister 版已用真实家族键取代会混进广告 ASIN 的旧正则
 
   ✅ **多维已补齐**(2026-08-17;此前是**漏的**不是砍的)。所有者问「单属性多属性
   都会自动用对应方法吧」时暴露:首版 `pick_walmart_dim` 只取第一个映得上的维度,

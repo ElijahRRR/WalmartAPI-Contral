@@ -125,7 +125,11 @@ CREATE TABLE catalog.walmart_items (
                                              -- 搜索召回 3/131);缺席复现重置 NULL 触发重查
     upc text, gtin text,                     -- upc/gtin 必须 text:前导零教训
     product_name text, shelf text, product_type text,
-    variant_group_id text,                   -- 变体组 ID(同组共享;listing 工作流复用)
+    variant_group_id text,                   -- 变体组 ID(同组共享;listing 工作流复用)。
+                                             -- **新家族的值是 catalog.variant_groups.group_code**
+                                             -- (2026-09-07 起不透明组号);存量行仍是
+                                             -- `vg_<父ASIN>`,不回改 —— 同族新成员并入时
+                                             -- 由 list_new 读这一列、原样登记进那张表
     variant_group_info jsonb,                -- 变体组详情(isPrimary/分组维度,原样存)
     price numeric, currency text,
     avail_qty integer,                       -- GET /v3/inventories 合并(**全节点合计**)
@@ -286,6 +290,41 @@ CREATE VIEW catalog.sku_aliases AS
 --   若也出现在视图里,LEFT JOIN 会把同一笔历史算两次,且不报错);
 --   ③ 它是视图不是表 —— 改码前恒为空集,所有消费方的 UNION ALL / LEFT JOIN 在
 --   改码前都是"加一个空集",结果集逐行不变(批次 3 零行为变化的地基)。
+```
+
+```sql
+-- 变体组登记簿(2026-09-07 所有者定稿三条,docs/sku_plan.md §9.13)
+-- 为什么有这张表:变体组 ID 从 `vg_<父 ASIN>` 改成不透明组号之后,「同族分批上架
+-- 的兄弟怎么进同一个组」不再能靠各自派生同一个串 —— **必须查表**。
+-- (不用「ASIN 取哈希」当组号:ASIN 空间公开可枚举,哈希等于没藏。)
+CREATE TABLE catalog.variant_groups (
+    store       text NOT NULL,
+    family_key  text NOT NULL,   -- 家族键 = services/variant_group.family_key 的产出
+                                 -- (父 ASIN,或父落在家族内时取 min(家族))。
+                                 -- **只进库当查表键,永不发给沃尔玛**
+    group_code  text NOT NULL,   -- 发给沃尔玛的 variantGroupId:新家族 = G + 11 位
+                                 -- 不透明码(首字母 registry.VARIANT_GROUP_LETTER);
+                                 -- 存量家族 = 沿用在架成员的 vg_… 原样登记
+    workflow    text,            -- 发号来源工作流(今天只有 list_new)
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (store, family_key)
+);
+-- variant_groups_code_uidx UNIQUE (store, group_code)
+--   一个组号在**一家店**内只能属于一族(两族共号 = 沃尔玛侧两族并成一组)。
+--   ⚠ 为什么不是全局唯一:存量 `vg_<ASIN>` 号可能跨店重复(同一个 ASIN 被两家店
+--   上过),全局唯一在登记存量的那一刻就插不进去。跨店同号只对**存量**成立;
+--   新家族各店各抽各的号(与「跨店永不复用 SKU」同一条纪律)。
+-- 纪律三条:
+--   ① 本表的 INSERT **只有 services/sku_codec.mint_group_code 一个出口**
+--      (守门 tests/test_sku_guard.py::test_the_variant_group_table_has_exactly_one_insert_site);
+--      发号点在 workflows/list_new._prep_rows 的抽码事务里,与 SKU mint 同处一室
+--      (不进 _one_store:串行补试重发号 = 载荷漂 = 在途防重不命中 = 双上架)。
+--   ② 行**永不 DELETE**:删一行 = 下一个兄弟重新发号 = 同一族被劈成两组。
+--   ③ **存量组不回改**:已在架成员的 `vg_…` 原样登记进 group_code;登记之后这一族
+--      的延续不再依赖那个成员是否还在架。
+-- ⚠ 本表**故意不加 12 位字符集条件**:存量沿用的 `vg_…` 根本不是 12 位码,加了
+--   条件它们一条都进不来;而那个正则在 schema.sql 里只准出现两次(listing_sources
+--   的两条部分唯一索引),守门 test_no_second_opaque_regex_in_the_repo 钉住。
 ```
 
 ```sql

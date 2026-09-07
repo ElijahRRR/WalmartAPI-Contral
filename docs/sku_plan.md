@@ -815,9 +815,10 @@ feedType 与两个桶都已收录,只补注释与测试)。
       是否要程序回显来源码。
 - [ ] **维护记录表是否加「来源码」展示列**(§3.5 建议 2,**未做,仍在待办**):
       与上一条同源 —— 运营在表上只看得到一串随机码时,"这是哪个品"要能一眼看出来。
-- [ ] **`variant_group.group_id` 仍把 ASIN 递给沃尔玛**(批次 3 评审转出的目标级
-      漏洞):改码把 SKU 里的 ASIN 摘掉了,变体组 ID 这条线还在往外递。属编码规则层,
-      不属批次 3;要单独定口径(换成不透明组号 = 变体组的身份也要过登记簿)。
+- [x] **`variant_group.group_id` 仍把 ASIN 递给沃尔玛**(批次 3 评审转出的目标级
+      漏洞):改码把 SKU 里的 ASIN 摘掉了,变体组 ID 这条线还在往外递。
+      **2026-09-07 所有者定稿三条并实现,见 §9.13** —— 组号改不透明码、身份过新登记表
+      `catalog.variant_groups`、存量组不回改。余生产验收(变体家族)。
 
 ### 8.1 批次 3 待验收清单(所有者动作;代码已就绪,**生产投放尚未开始**)
 
@@ -1600,3 +1601,97 @@ ensure that the total number of items in your catalog is below your designated l
 **守门**:`tests/test_sku_migrate.test_settling_never_calls_the_inventory_api`
 —— 可执行行里不许再出现 `put_inventory` / `_restore_inventory` / `inventory_restored`,
 也不许再 import `api.inventory`。
+
+### 9.13 变体组号改不透明码(2026-09-07,所有者定稿三条)
+
+**背景**:SKU 已经是 12 位不透明码,但变体品发给沃尔玛的 `variantGroupId` 仍是
+`vg_<父 ASIN>`(`services/variant_group.group_id` 派生 → `mp_conform._apply_variant_plan`
+写进载荷)—— 等于**把亚马逊 ASIN 从后门递给沃尔玛**,货源隐匿在变体这条线上一直没
+生效(§8 待决项、`docs/sku_wiring_audit.md` G-7 目标级漏洞)。
+
+**所有者定稿三条**(原文口径):
+
+1. 新增登记表 `catalog.variant_groups`,键为(店铺, 家族键),值为一个不透明组号;
+   list_new 上架时先查表,没有就发号落库,再写进载荷。兄弟分批上架仍能并入同组,
+   ASIN 不再外递。
+2. 存量已在架的组**不回改**,继续用它们现在的 `vg_ASIN`;同族新成员并入时沿用在架
+   成员的现有组 ID(这条规则 `_FAMILY_LISTED_SQL` 本来就有)。
+3. **不许用 ASIN 取哈希当组号**(ASIN 空间公开可枚举,哈希等于没藏);也不许任何
+   确定性从 ASIN 派生的串发出去。
+
+**为什么不用哈希**:组号的威胁模型不是"看不看得懂",是"**能不能反查**"。ASIN 是公开
+可枚举的十位串,任何哈希都能离线打一张全表彩虹表,把组号反解回 ASIN —— 那和明文
+只差一步脚本。同理也不用"ASIN + 盐":盐一旦泄漏(或被同一批数据侧写出来)全部回退,
+而我们并没有轮换盐的机制。随机号没有这个面:它与 ASIN 之间**只有我们库里那一行**。
+
+**登记表设计**(`refdata/schema.sql`,`docs/db_schema.md` 同步):
+
+```sql
+CREATE TABLE IF NOT EXISTS catalog.variant_groups (
+    store       text NOT NULL,
+    family_key  text NOT NULL,   -- 家族键:variant_group.family_key 的产出,只进不出
+    group_code  text NOT NULL,   -- 发给沃尔玛的 variantGroupId
+    workflow    text,
+    created_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (store, family_key)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS variant_groups_code_uidx
+    ON catalog.variant_groups (store, group_code);
+```
+
+- 唯一索引是 **(store, group_code) 而不是全局**:存量 `vg_<ASIN>` 号可能跨店重复
+  (同一个 ASIN 被两家店上过),全局唯一在登记存量那一刻就插不进去;而"一个组号在
+  一家店只能属于一族"才是真正要防的(两族共号 = 沃尔玛侧两族并成一组)。
+- **不加 12 位字符集条件**:存量沿用的 `vg_…` 不是 12 位码,加了它们一条都进不来;
+  而那个正则在 schema.sql 里只准出现两次(守门 `test_no_second_opaque_regex_in_the_repo`)。
+- 行**永不 DELETE**(删一行 = 下一个兄弟重新发号 = 同一族被劈成两组);
+  INSERT 只有 `sku_codec.mint_group_code` 一个出口(守门一条白名单)。
+
+**落地**(七处):
+
+| # | 位置 | 改动 |
+|---|---|---|
+| ① | `registry/resources.VARIANT_GROUP_LETTER` | 新增,值 `"G"`;**不是来源字母**,取值不许与 `SKU_SOURCE_LETTERS` 重合(守门钉住) |
+| ② | `services/sku_codec.mint_group_code` | 组号的**唯一出生地**:① 查表 → ② `existing` 原样登记(存量不回改)→ ③ 抽 `G`+11 位随机段。与 mint 同纪律:无 `dry_run` 形参、抽号与登记同一事务、commit 归调用方。占位串 `DRYRUN_GROUP_PLACEHOLDER` 给空跑用 |
+| ③ | `services/variant_group` | `group_id` → **`family_key`**(去掉 `vg_` 前缀,派生规则一字未改);`plan()` 多出 `family_key`,`group_id` 只可能是在架同族的现有号或空串,**不再派生** |
+| ④ | `workflows/list_new._prep_rows` | **发号点**:紧跟 SKU mint 循环、同一个 `with db.pg_conn()`,按 (店, 家族键) 去重每族一次,写回该族所有行;发号后仍为空则 `raise`(不许静默退单品) |
+| ⑤ | `workflows/list_new` 三个分组函数 | `_drop_degenerate_dims` / `_remap_unmapped_dims` / `_dedupe_primary` 的分组键 `(store, group_id)` → `(store, family_key)`(发号在它们之后,组号此刻恒空) |
+| ⑥ | `workflows/list_new` dry-run | 逐行回显 `组号待发(家族键 …)`;`_spec_precheck` 用 `DRYRUN_GROUP_PLACEHOLDER` 填**副本**的 group_id。**空跑绝不写库**(守门:dry-run 底座把 `mint_group_code` 桩成抛断言) |
+| ⑦ | `services/mp_conform._apply_variant_plan` | `plan["group_id"]` 为空**一律不发**(整套走单品口径 + note「变体组号缺失」),防上游漏发号时发出空组 ID |
+
+**发号点为什么必须在 `_prep_rows`**(与 SKU mint 逐条相同的三条硬理由):① 不进
+`_one_store` —— 店级失败的串行补试重跑的就是它,重发号 ⇒ 载荷不再一字不差 ⇒
+`api/feeds.payload_key` 在途防重不命中 ⇒ **双上架且不报错**;② 单事务顺序做一遍,不放
+进 128 路 autocommit worker(并发抢同一个 `(store, family_key)` 主键只会制造唯一冲突
+重试);③ 排在任何外部调用之前(防重状态先落库再调接口,进程半路死掉重跑拿回同一
+个号)。
+
+**一处有意的兜底**(真兜底三要件,写在 `mint_group_code` 里):`existing` 非空但那个号
+在本店**已登给另一个家族键**时(同一族的家族键随 parent_asin 补全变过一次,是实见
+形态),登记不进去,**仍返回 `existing`** —— 它就是这批兄弟在沃尔玛侧真实所在的组,
+换个号发出去反而把一族劈成两组。触发记 warning + 计数,不静默。
+
+**验收步骤**(所有者动作):
+
+```bash
+python cli.py db_init                     # 跑两遍:第二遍必须零变化(幂等)
+python cli.py list_new --dry-run          # 逐行回显看「组号待发(家族键 B0…)」;
+                                          # 同族两行的家族键必须相同,且输出里没有 vg_
+python cli.py list_new -p limit=2         # 真跑一小批(含一个变体家族)
+```
+
+```sql
+-- 发出去的号与登记表对得上,且组号里不含 ASIN
+SELECT * FROM catalog.variant_groups ORDER BY created_at DESC LIMIT 20;
+SELECT w.store, w.sku, w.variant_group_id, g.family_key
+  FROM catalog.walmart_items w
+  JOIN catalog.variant_groups g
+    ON g.store = w.store AND g.group_code = w.variant_group_id
+ WHERE w.variant_group_id <> '' ORDER BY w.last_seen_at DESC LIMIT 20;
+```
+
+- **同族第二批上架进同一个组**:先上家族里的 1 个,回执成功、catalog_sync 观测到
+  `variant_group_id` 之后,再上同族第 2 个 —— 两条的 `variantGroupId` 必须**一模一样**,
+  且 `catalog.variant_groups` 里这一族**只有一行**。
+- **存量家族不回改**:挑一个已在架的 `vg_…` 家族补上一个新成员,新成员发出去的仍是
+  那个 `vg_…`,登记表里这一族的 `group_code` 也是它(不是新抽的 G 号)。

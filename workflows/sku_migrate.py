@@ -886,10 +886,24 @@ def _settle(conn, store_name: str, execute: bool, *, store_of,
                 logger.warning("回执台账读取失败 feed=%s: %s", fid, e)
                 receipts[fid] = {}
 
+    # 整 feed 被拒(feed 级 ERROR、itemsReceived=0,如 2026-09-07 A131 撞上架上限)时,
+    # 2026-09-07 之前轮询过的台账行落的是 missing 而不是 failed —— 那批行不该等 24h
+    # 观测反证才回滚:feed_log 已经 failed 就是确凿的「没发出去」。
+    try:
+        feed_st = feed_track.feed_statuses([r.get("feed_id") for r in pend])
+    except Exception as e:                    # noqa: BLE001 —— 读不到就按原判据走
+        logger.warning("feed_log 状态读取失败: %s", e)
+        feed_st = {}
+    n_feed_rejected = 0
+
     confirmed_rows: list[dict] = []
     for row in pend:
         row["_observe_hours"], row["_stale_hours"] = observe_hours, stale_hours
         receipt = receipts.get(row.get("feed_id") or "", {}).get(row["new_sku"])
+        if (receipt and receipt[0] == "missing"
+                and feed_st.get(row.get("feed_id") or "") == "failed"):
+            receipt = ("failed", receipt[1] or "FEED_REJECTED")
+            n_feed_rejected += 1
         verdict, why = _verdict(row, receipt, now)
         counts[verdict] = counts.get(verdict, 0) + 1
         tag = f"{row['old_sku']}→{row['new_sku']}"
@@ -956,6 +970,9 @@ def _settle(conn, store_name: str, execute: bool, *, store_of,
                  f"rolled_back {counts[_ROLLED_BACK]}、stalled {counts[_STALLED]},"
                  f"仍 pending {counts[_PENDING]},本轮回写库存 "
                  f"{counts['inventory']} 条")
+    if n_feed_rejected:
+        lines.append(f"  整 feed 被拒的回执 {n_feed_rejected} 条按 failed 定案"
+                     f"(台账 missing + feed_log failed = 沃尔玛一条都没收,不等观测反证)")
     return counts, lines + warns
 
 

@@ -738,6 +738,8 @@ def _settle_wired(monkeypatch, obs_rows, receipts=None, calls=None, inv=()):
     monkeypatch.setattr(sm.db, "pg_conn", lambda *a, **k: tx)
     monkeypatch.setattr(sm.feed_track, "item_results",
                         lambda fid: dict(receipts or {}))
+    monkeypatch.setattr(sm.feed_track, "feed_statuses",
+                        lambda fids: dict(getattr(_settle_wired, "feed_st", {})))
     monkeypatch.setattr(sm.sku_codec, "settle_replacement",
                         lambda c, s, o, n, v, r="": calls.append(
                             ("settle", s, o, n, v)))
@@ -2083,3 +2085,36 @@ def test_listing_sheet_heal_only_reads_list_new_receipts():
     sql = listing_sheet._SQL_HEAL_RECEIPT
     assert "f.feed_type = 'MP_ITEM'" in sql
     assert "f.workflow = 'list_new'" in sql
+
+
+def test_a_missing_receipt_on_a_rejected_feed_rolls_back_at_once(monkeypatch):
+    """2026-09-07 A131:整 feed 被拒(feed 级 ERROR、itemsReceived=0),当时的轮询把台账
+    落成 missing 而不是 failed ⇒ 旧判据要等 24h 观测反证。feed_log 已 failed 就是确凿的
+    「一条都没发出去」,按 failed 当场回滚。"""
+    row = (1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001",
+           "F1", datetime.now(timezone.utc) - timedelta(hours=1), False, False, True)
+    _settle_wired.feed_st = {"F1": "failed"}
+    try:
+        read, calls, _tx = _settle_wired(monkeypatch, [row],
+                                         receipts={"AAAAAAAAAAAA": ("missing", "")})
+        counts, lines = _settle_at(sm, read, True)
+    finally:
+        _settle_wired.feed_st = {}
+    assert counts["rolled_back"] == 1 and counts.get("pending", 0) == 0
+    assert any("整 feed 被拒的回执 1 条按 failed 定案" in ln for ln in lines)
+    assert any(c[0] == "settle" and c[4] == "rolled_back" for c in calls)
+
+
+def test_a_missing_receipt_on_a_processed_feed_still_waits(monkeypatch):
+    """feed 正常 PROCESSED 但明细里查无这个 SKU:仍是 missing,不许当 failed 回滚。
+    (_settle 用真时钟判观测期,所以夹具的 submitted_at 也按真时钟给:1 小时前。)"""
+    row = (1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001",
+           "F1", datetime.now(timezone.utc) - timedelta(hours=1), False, False, True)
+    _settle_wired.feed_st = {"F1": "done"}
+    try:
+        read, calls, _tx = _settle_wired(monkeypatch, [row],
+                                         receipts={"AAAAAAAAAAAA": ("missing", "")})
+        counts, lines = _settle_at(sm, read, True)
+    finally:
+        _settle_wired.feed_st = {}
+    assert counts.get("rolled_back", 0) == 0 and counts["pending"] == 1

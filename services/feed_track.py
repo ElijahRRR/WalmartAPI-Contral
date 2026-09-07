@@ -372,6 +372,22 @@ def poll_all(stores_by_name: dict) -> str:
     return "\n".join([line] + detail_lines)
 
 
+def feed_statuses(feed_ids) -> dict[str, str]:
+    """输入:feed_id 列表 → 输出:{feed_id: ops.feed_log.status}(pending/submitted/done/failed)。
+
+    给回执消费方分辨「整 feed 被拒」用:feed 级 ERROR 且沃尔玛不给逐条明细时,台账
+    行历史上落的是 missing(2026-09-07 之前的轮询;之后落 failed),消费方看到 missing +
+    feed_log failed 就该按 failed 处理,而不是等 24h 观测反证。
+    """
+    ids = [f for f in dict.fromkeys(feed_ids) if f]
+    if not ids:
+        return {}
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT feed_id, status FROM ops.feed_log WHERE feed_id = ANY(%s)",
+                    (ids,))
+        return {fid: st for fid, st in cur.fetchall()}
+
+
 def item_results(feed_id: str, workflow: str | None = None
                  ) -> dict[str, tuple[str, str]]:
     """输入:feed_id(+ 可选提交来源工作流)→ 输出:{sku: (status, error_code)}

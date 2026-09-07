@@ -297,9 +297,11 @@ def test_backfill_preview_does_not_write(wired, monkeypatch):
     # B0DDD 已在表里 ⇒ 真跑只新增 2 条
     assert "真跑只会新增 2 条" in out and "回填只加不减" in out
     assert "apply=1" in out
-    # ⚠ 摘要必须点明「产品级判定 ≠ 行级记录」,以及 blacklist_route 判据没跟上
+    # ⚠ 摘要必须点明「产品级判定 ≠ 行级记录」;路由 2026-09-04 起同一份判据,
+    #   那句「判据没跟上」是过时警告,2026-09-07 删(留着会让人以为路由有问题)
     assert "产品级判定" in out and "行级记录" in out
-    assert "blacklist_route" in out and "判据没跟上" in out
+    assert "blacklist_route" in out and "同一份判据" in out
+    assert "判据没跟上" not in out
     assert wrote == []
 
 
@@ -538,3 +540,13 @@ def test_reason_存全文_不许再截200():
     # 展示侧那道闸还在(它才是该管长度的地方)
     from api import feishu
     assert feishu._SHEET_CELL_MAX_CHARS >= 20000
+
+
+def test_回填预览不再说路由判据没跟上():
+    """那句「⚠ blacklist_route 删行用的是行级码 —— 判据没跟上」写于 2026-09-04
+    上午,当天下午路由就加了产品级判定(三路计划),之后这句一直没删,
+    2026-09-06 所有者看到还以为路由有问题。过时的警告比没有警告更误导。"""
+    import inspect
+    src = inspect.getsource(wf)
+    assert "判据没跟上" not in src
+    assert "产品级判定救一遍" in src           # 换成说清两边同一份判据

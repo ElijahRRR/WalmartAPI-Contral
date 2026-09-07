@@ -265,8 +265,10 @@ def test_站不住要按会不会被放行分两栏():
     src = inspect.getsource(wf._blacklist_pass)
     assert "会被放行的" in src and "按裁决仍留" in src
     assert "下次 blacklist_route 会删" in src
-    # 判据取自引擎,不在这儿重新写一份
-    assert "error_taxonomy.is_permanent(c, None)" in src
+    # 判据取自引擎,不在这儿重新写一份;分栏合计走 _split_suspect(按码相加,
+    # 2026-09-06 那个字典推导互相覆盖的 bug 就是在这儿)
+    assert "_split_suspect(suspect)" in src
+    assert "error_taxonomy.is_permanent(code, None)" in inspect.getsource(wf._split_suspect)
     # GATED 正是那个两边都在的码 —— 它必须落到"仍留"那一栏
     assert "GATED" in et.NOT_A_PRODUCT_BAN and "GATED" in et.PERMANENT_CODES
 
@@ -436,3 +438,17 @@ def test_还原门槛量原始长度_不是rstrip之后的():
     # 真的没够到 200 的,照旧一律不还原
     short = "x" * (es.SAMPLE_LEN - 1)
     assert es.restore(short, [("d", short + "TAIL")]) == (short, "self")
+
+
+def test_站不住的合计要按新码相加_不是互相覆盖():
+    """⚠ 2026-09-06 实遇:字典推导 `{c: n for (_o, c), n in …}` 同码不同旧类别
+    互相覆盖 —— 302 条 `LEGACY→PT_WRONG` 被 8 条 `FLAGGED→PT_WRONG` 盖掉,
+    摘要报「会被放行 37 条」,`blacklist_route` 实算 347。报错的数比不报还坏。"""
+    from collections import Counter
+    suspect = Counter({("LEGACY", "PT_WRONG"): 302, ("FLAGGED", "PT_WRONG"): 8,
+                       ("LEGACY", "EXPIRED"): 28, ("POLICY", "GATED"): 3})
+    doomed, kept = wf._split_suspect(suspect)
+    assert doomed["PT_WRONG"] == 310                # 相加,不是 8
+    assert doomed["EXPIRED"] == 28
+    assert kept == {"GATED": 3}                     # GATED 永久 → 仍留那一栏
+    assert "PT_WRONG" not in kept and "GATED" not in doomed

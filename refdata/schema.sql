@@ -563,7 +563,12 @@ CREATE VIEW catalog.audit_listing_conflicts AS
              p.asin, p.audit_status, p.audit_reason, p.audited_at, p.audit_version
       FROM catalog.walmart_items w
       JOIN catalog.products p ON p.asin = w.sku AND p.marketplace = 'US'
-      WHERE w.missing_since IS NULL            -- 在架 = 最近一轮全量扫描还见得到
+      WHERE w.missing_since IS NULL            -- 目录里还见得到(最近一轮全量扫描)
+        AND w.published_status = 'PUBLISHED'   -- 且真的在卖。2026-09-07 所有者定:
+                                               --   已被沃尔玛下架的不算「仍在架」——
+                                               --   那是问题扫描链的事(一律删除),审核链
+                                               --   再建议一次只会拼出「审核:… | 问题:…」
+                                               --   两条互相矛盾的理由(实见 B0FHPSYT8N)
         AND p.audit_status = 'rejected'
   )
   SELECT lr.store, lr.sku, lr.asin,

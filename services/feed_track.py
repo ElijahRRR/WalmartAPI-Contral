@@ -190,7 +190,7 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
             and product_events.feed_kind(meta[sku][1]) == "list"
             and (code or "").strip() in resources.WALMART_ERR_PROHIBITED]
         if prohibited:
-            n_bl = blacklist.record_asins(conn, prohibited)
+            n_bl = blacklist.record_asins(conn, prohibited, src="feed")
             logger.warning("上架回执命中政策违禁 %d 个,新入 ASIN 黑名单 %d 个"
                            "(POLICY=违反禁售政策,上架前拦截自此生效):%s",
                            len(prohibited), n_bl,

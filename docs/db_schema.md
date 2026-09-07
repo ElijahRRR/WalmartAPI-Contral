@@ -730,6 +730,12 @@ ASIN,经 `asin_blacklist_import` 一次性导入(2026-08-13 黑名单中心统�
   **截 200 字符的样本**,判据串可能被切掉 ⇒ 这部分判出来的码是下限)→
   `none`(四处都没有 ⇒ `taxonomy_code` 留 **NULL**,不猜)。
 - `taxonomy_version` 是增量谓词,同 `audit_runs.audit_version` 的套路。
+- **日常进口也盖章**(2026-09-07):`blacklist.record_asins`(problem_scan 下架
+  报错 / feed_track 上架回执违禁)写行时随手填 `taxonomy_code/term/version` 与
+  `taxonomy_src`(`scan` / `feed`)。这里的码是当轮**全文**判的,与回填同等可信;
+  不盖章的话 `blacklist_route` 每天把前一天新进的行报成「N 条还没回填」
+  (2026-09-06 实见 348 条)。`taxonomy_policy` 留 NULL(政策名 join 要读政策表,
+  日常进口不付这个代价;路由与上架闸都不读它)。
 - ⚠ **`blacklist_push -p rebuild_asin=1` 只重灌有产品事件背书的行**(2026-09-04
   所有者定:「那 10,335 行没有产品事件背书的历史导入**需要保留**」)。重建的
   数据源只有 `product_events` 时间线,时间线里没有的行删了**再也回不来** ——
@@ -850,6 +856,14 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA catalog, listing, orders, ops, audit
 | `rejected_after_listing` | **时序**:最近一次判拒晚于最近一次上架 | 上架时那道闸没拦住(或当时还没审)= **审核链漏拦线索** |
 
 ⚠ 两件事,别当成一件:前者问"该不该下架",后者问"我们的闸为什么没拦住"。
+
+⚠ **「在架」= 目录里还见得到 且 `published_status = 'PUBLISHED'`**(2026-09-07
+所有者定「改」)。首版只判 `missing_since IS NULL`,于是一个被沃尔玛下架、但
+目录里还在的品也算"仍在架",审核链与问题扫描链同轮各建议一次删除,处置行拼出
+「审核:审核判拒仍在架:… | 问题:This item is unpublished because the End Date
+has passed…」两条互相矛盾的理由(实见 B0FHPSYT8N)。收窄后已下架的归问题链
+(一律删除),审核链只管「审核判拒、但还在卖」的。覆盖面不变。
+⚠ 改的是 `DROP VIEW … CREATE VIEW`,拉代码后要 `python cli.py db_init` 才生效。
 
 **为什么不能只看 product_risk**:审核事件的 `store` 是 NULL(审核不分店铺),
 所以它们进得了全局 `product_risk`,却进不了 `product_risk_store`

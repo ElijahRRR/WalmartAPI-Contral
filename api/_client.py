@@ -340,6 +340,87 @@ def rate_acquire(bucket: str, client_id: str) -> float:
     return _acquire_mem(bucket, client_id, limit, window)
 
 
+def rate_try_acquire(bucket: str, client_id: str) -> bool:
+    """输入:bucket 名 + 店铺 client_id → 输出:此刻有令牌就占一枚返回 True,没有立刻返回 False(**不睡**)。
+
+    给「每小时一次」这类持久桶的调用方用:rate_acquire 的语义是"睡到有令牌为止",
+    对创建报表这种一小时一枚的桶,补试进来会睡上整整一小时(2026-09-07 生产实见
+    「等待 3595.1s」)。拿不到令牌应当是本轮的一个结局(放弃、明天再来),不是等待。
+    """
+    if bucket not in _RATE_BUCKETS:
+        raise KeyError(f"限速桶未登记: {bucket}(先在 api/_client._RATE_BUCKETS 按蓝图定稿登记)")
+    limit, window = _RATE_BUCKETS[bucket]
+    if _is_persistent(bucket):
+        return _try_pg(bucket, client_id, limit, window)
+    return _try_mem(bucket, client_id, limit, window)
+
+
+def rate_release(bucket: str, client_id: str) -> None:
+    """输入:bucket 名 + 店铺 client_id → 输出:无;把**最近一枚**令牌还回去。
+
+    只给「请求根本没被受理」的确定性 4xx 用(如 415 媒体类型不对、400 形状不对):
+    沃尔玛那侧没有发生任何事,本地却记了一枚一小时才回来的令牌,人修好代码得
+    干等一小时。⚠ 429 与 5xx **不许还**:429 说明沃尔玛那侧已经计了数,5xx 不知道
+    有没有处理 —— 还了就是本地比沃尔玛宽,下一枚必然再 429。
+    """
+    if bucket not in _RATE_BUCKETS:
+        raise KeyError(f"限速桶未登记: {bucket}")
+    if _is_persistent(bucket):
+        _release_pg(bucket, client_id)
+    else:
+        _release_mem(bucket, client_id)
+
+
+def _try_mem(bucket: str, client_id: str, limit: int, window: float) -> bool:
+    from collections import deque
+
+    with _rate_lock:
+        q = _rate_state.setdefault((client_id, bucket), deque())
+        now = time.monotonic()
+        while q and now - q[0] >= window:
+            q.popleft()
+        if len(q) < limit:
+            q.append(now)
+            return True
+        return False
+
+
+def _release_mem(bucket: str, client_id: str) -> None:
+    with _rate_lock:
+        q = _rate_state.get((client_id, bucket))
+        if q:
+            q.pop()
+
+
+def _try_pg(bucket: str, client_id: str, limit: int, window: float) -> bool:
+    """稀缺桶的"有就占、没有就走":与 _acquire_pg 同一张事件表、同一把 advisory 锁,只是不睡。"""
+    from registry import db
+
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"{client_id}|{bucket}",))
+        cur.execute(_PG_COUNT_SQL, (client_id, bucket, window))
+        n, _oldest, _db_now = cur.fetchone()
+        if n >= limit:
+            return False
+        cur.execute("INSERT INTO ops.rate_events (client_id, bucket) VALUES (%s, %s)",
+                    (client_id, bucket))
+        return True
+
+
+def _release_pg(bucket: str, client_id: str) -> None:
+    from registry import db
+
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"{client_id}|{bucket}",))
+        cur.execute(
+            "DELETE FROM ops.rate_events WHERE ctid = ("
+            "SELECT ctid FROM ops.rate_events WHERE client_id = %s AND bucket = %s "
+            "ORDER BY called_at DESC LIMIT 1)",
+            (client_id, bucket))
+
+
 def _acquire_mem(bucket: str, client_id: str, limit: int, window: float) -> float:
     from collections import deque
 

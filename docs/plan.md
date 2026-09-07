@@ -106,6 +106,10 @@ ITEM 报表批量给(GET /v3/items 与 catalog/search 都不返回,2026-08-05 �
   首行点名「疑似不全」,当轮照填已匹配的;表头守门以所有者贴的 55 列后台导出为原件
   (`refdata/specs/item_report_header.txt`),SKU / Item ID / Item Page URL 缺一即拦。
 - 飞书「在线产品总表」的 itemId 列仍由 catalog_sync 投影(06:40 日报链那次就带上)。
+- **首次生产探针(C021,当天 19:55)两条修正**:① 不带 body 沃尔玛回 415(要求
+  Content-Type: application/json),创建缺省发 `{}`;② 创建失败进串行补试后在一小时
+  一枚的创建桶里睡了 3595 秒 —— 创建改走 `rate_try_acquire`(有就占、没有立刻当
+  quota 结局),请求形状被拒的 4xx 把令牌还回去,5xx / 网络未达才交补试。
 
 ### 2026-09-02 SKU 身份改造立项 + 批次 0a 落地
 

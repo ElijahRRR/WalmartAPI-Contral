@@ -1,7 +1,7 @@
 """沃尔玛 Reports 域接口。
 
 On-request Reports(一端点一函数;轮询/等待/落台账是业务节奏,归 services/item_reports):
-  create_report_request(store, type, version, body=None)  POST /v3/reports/reportRequests(1/hour/类型)
+  create_report_request(store, type, version, body=None)  POST /v3/reports/reportRequests(1/hour/类型;body 缺省 {})
   list_report_requests(store, type, status=, since=)      GET  /v3/reports/reportRequests(200/min,轮询走它)
   get_report_request(store, request_id)                   GET  /v3/reports/reportRequests/{id}(20/hour,兜底)
   get_download_url(store, request_id)                     GET  /v3/reports/downloadReport(20/hour)
@@ -40,11 +40,22 @@ REPORT_STATUS_TERMINAL = ("READY", "ERROR")
 
 
 class ReportQuotaError(RuntimeError):
-    """创建报表被 429 拒绝:该店该类型报表这一小时的额度已用完。
+    """创建报表的额度这一小时已用完(沃尔玛 429,或本地桶已记过一枚)。
 
-    调用方语义:**本轮放弃该店、明天再来**,不补试 —— 创建桶是每小时一次的
-    持久桶,补试只会在 rate_acquire 里睡到下一个小时。
+    调用方语义:**本轮放弃该店、明天再来**,不补试 —— 创建是每小时一次,
+    等待不是选项(2026-09-07 生产实见:补试在桶里睡 3595 秒)。
     """
+
+
+class ReportRequestError(RuntimeError):
+    """报表接口回了非 2xx(401/403 之外)。`status` 是 HTTP 状态码,网络未达为 None。
+
+    调用方按它分诊:4xx(非 429)是请求形状问题,重试无用;5xx / None 可补试。
+    """
+
+    def __init__(self, msg: str, status):
+        super().__init__(msg)
+        self.status = status
 
 
 def _token(store: dict) -> str:
@@ -52,10 +63,10 @@ def _token(store: dict) -> str:
 
 
 def _fail(status, store: dict, what: str, data) -> None:
-    """非 2xx 的统一出口:401/403 归凭证死(与 items._guard_store_dead 同口径),其余 RuntimeError。"""
+    """非 2xx 的统一出口:401/403 归凭证死(与 items._guard_store_dead 同口径),其余 ReportRequestError。"""
     if status in (401, 403):
         raise _client.StoreDeadError(store["name"], status)
-    raise RuntimeError(f"{what} 返回 {status}(店铺 {store['name']}): {data}")
+    raise ReportRequestError(f"{what} 返回 {status}(店铺 {store['name']}): {data}", status)
 
 
 def create_report_request(store: dict, report_type: str, report_version: str,
@@ -64,20 +75,30 @@ def create_report_request(store: dict, report_type: str, report_version: str,
     → 输出:响应 dict(含 requestId / requestStatus / requestSubmissionDate)。
 
     官方 POST /v3/reports/reportRequests。reportType/reportVersion **必须走 query**
-    (放 body 会 400,2026-08-05 实证);body 只装过滤器,不传 = 整个目录。
+    (放 body 会 400,2026-08-05 实证);body 只装过滤器,不传过滤器 = 整个目录,
+    但 **body 必须是 JSON 对象**:不带 body 沃尔玛回 415 "Supported formats
+    [Content-Type:application/json]"(2026-09-07 生产实证)—— 所以缺省发 `{}`。
     ⚠ **max_retries=0**:POST 创建不是幂等的,5xx 后自动重试会重复建报表、
-    重复吃每小时一次的创建额度(写操作永不自动兜底)。429 抛 ReportQuotaError。
+    重复吃每小时一次的创建额度(写操作永不自动兜底)。
+    令牌走 **rate_try_acquire**(有就占、没有立刻抛 ReportQuotaError),不睡:
+    创建桶一小时一枚,睡等 = 补试在桶里躺一小时。请求形状被拒的 4xx(非 429)
+    把令牌还回去(沃尔玛那侧什么都没发生),429 / 5xx / 网络未达不还。
     """
-    _client.rate_acquire("reports.create", store["client_id"])
+    cid = store["client_id"]
+    if not _client.rate_try_acquire("reports.create", cid):
+        raise ReportQuotaError(f"{store['name']} {report_type} 报表本小时已创建过一次"
+                               f"(本地限速桶),本轮不再创建")
     status, _, data = _client.safe_post_ex(
         f"{_client.base_url()}/v3/reports/reportRequests",
-        _token(store), store["client_id"], store["proxy"],
-        json_body=body or None,
+        _token(store), cid, store["proxy"],
+        json_body=body if body is not None else {},
         params={"reportType": report_type, "reportVersion": report_version},
         max_retries=0)
     if status == 429:
         raise ReportQuotaError(f"{store['name']} {report_type} 报表创建被限流(429):"
                                f"该类型每小时只能创建一次")
+    if status is not None and 400 <= status < 500 and status not in (401, 403):
+        _client.rate_release("reports.create", cid)      # 请求没被受理,令牌还回去
     if status != 200 or not data:
         _fail(status, store, "reportRequests 创建", data)
     if not data.get("requestId"):

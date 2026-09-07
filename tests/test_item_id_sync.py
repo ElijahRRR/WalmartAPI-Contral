@@ -374,3 +374,86 @@ def test_scheduled_daily_at_0500_on_gpt_runner():
 
 def test_workflow_flags():
     assert wf.DANGEROUS is False and wf.SUPPORTS_STORE is True
+
+
+# ── 2026-09-07 首次生产探针暴露的两条(415 无 body;补试在创建桶里睡一小时)──────
+
+def test_create_sends_empty_json_object_and_query_params(monkeypatch):
+    """不带 body 沃尔玛回 415(要求 Content-Type: application/json):缺省发 `{}`。"""
+    seen = {}
+    monkeypatch.setattr(_client, "rate_try_acquire", lambda b, c: True)
+    monkeypatch.setattr(_client, "get_token", lambda *a: "tok")
+
+    def post(url, token, cid, proxy, json_body=None, params=None, timeout=30, max_retries=0):
+        seen.update(json_body=json_body, params=params, max_retries=max_retries)
+        return 200, {}, {"requestId": "R-1", "requestStatus": "RECEIVED"}
+    monkeypatch.setattr(_client, "safe_post_ex", post)
+    data = reports.create_report_request(STORE, "ITEM", "v6")
+    assert data["requestId"] == "R-1"
+    assert seen["json_body"] == {} and seen["max_retries"] == 0
+    assert seen["params"] == {"reportType": "ITEM", "reportVersion": "v6"}
+
+
+def test_create_does_not_sleep_on_a_full_bucket(monkeypatch):
+    """创建桶一小时一枚:没令牌立刻 ReportQuotaError,**不**进 rate_acquire 睡等。"""
+    monkeypatch.setattr(_client, "rate_try_acquire", lambda b, c: False)
+
+    def boom(*a, **k):
+        raise AssertionError("桶满时不该发 POST")
+    monkeypatch.setattr(_client, "safe_post_ex", boom)
+    with pytest.raises(reports.ReportQuotaError):
+        reports.create_report_request(STORE, "ITEM", "v6")
+
+
+@pytest.mark.parametrize("status,released,exc", [
+    (415, True, reports.ReportRequestError),    # 请求形状被拒:令牌还回去
+    (400, True, reports.ReportRequestError),
+    (429, False, reports.ReportQuotaError),     # 沃尔玛计了数:不还
+    (503, False, reports.ReportRequestError),   # 不知道有没有处理:不还
+    (None, False, reports.ReportRequestError),  # 网络未达:不还
+])
+def test_create_releases_token_only_for_deterministic_4xx(monkeypatch, status, released, exc):
+    calls = {"release": 0}
+    monkeypatch.setattr(_client, "rate_try_acquire", lambda b, c: True)
+    monkeypatch.setattr(_client, "rate_release", lambda b, c: calls.__setitem__("release", calls["release"] + 1))
+    monkeypatch.setattr(_client, "get_token", lambda *a: "tok")
+    monkeypatch.setattr(_client, "safe_post_ex", lambda *a, **k: (status, {}, None))
+    with pytest.raises(exc) as ei:
+        reports.create_report_request(STORE, "ITEM", "v6")
+    assert calls["release"] == (1 if released else 0)
+    if exc is reports.ReportRequestError:
+        assert ei.value.status == status
+
+
+def test_create_401_is_store_dead(monkeypatch):
+    monkeypatch.setattr(_client, "rate_try_acquire", lambda b, c: True)
+    monkeypatch.setattr(_client, "get_token", lambda *a: "tok")
+    monkeypatch.setattr(_client, "safe_post_ex", lambda *a, **k: (401, {}, None))
+    with pytest.raises(_client.StoreDeadError):
+        reports.create_report_request(STORE, "ITEM", "v6")
+
+
+def test_try_acquire_and_release_in_memory_bucket():
+    """有就占、没有立刻 False(不睡);release 把最近一枚还回去。"""
+    _client._rate_state.pop(("cidT", "reports.create"), None)
+    assert _client.rate_try_acquire("reports.create", "cidT") is True
+    assert _client.rate_try_acquire("reports.create", "cidT") is False   # 1/hour,第二枚没有
+    _client.rate_release("reports.create", "cidT")
+    assert _client.rate_try_acquire("reports.create", "cidT") is True
+    with pytest.raises(KeyError):
+        _client.rate_try_acquire("reports.NOT_REGISTERED", "cidT")
+
+
+def test_one_store_deterministic_4xx_is_a_round_outcome(monkeypatch):
+    """415/400 这类确定性拒绝:记台账、报 error、**不抛**(抛了就是补试再被拒一次)。"""
+    log = _wire(monkeypatch, create=reports.ReportRequestError("415 媒体类型", 415))
+    r = wf._one_store(STORE, 60, 120, probe=False)
+    assert r["outcome"] == "error" and "415" in r["note"]
+    assert log["error"][0][1].startswith("create: 415")
+
+
+def test_one_store_5xx_still_goes_to_serial_retry(monkeypatch):
+    log = _wire(monkeypatch, create=reports.ReportRequestError("503", 503))
+    with pytest.raises(reports.ReportRequestError):
+        wf._one_store(STORE, 60, 120, probe=False)
+    assert log["error"][0][1].startswith("create: 503")

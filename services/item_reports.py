@@ -6,6 +6,7 @@
   map_item_ids(rows)                报表行 → ({sku: item_id}, 计数):Item ID 列与 URL 尾段互校
   plan_updates(current, mapping)    在架现值 × 报表映射 → ({sku: 要写的 item_id}, 计数)
   coverage_note(counters)           计数 → 「疑似不全」提示或空串
+  date_span(rows, column)           报表行 + 日期列名 → 最早/最晚/按年计数(探针判断数据范围按哪列筛)
   wait_ready(store, request_id, …)  轮询到 READY / ERROR / TIMEOUT(先睡后查,列表生成器找到即停)
   台账 ops.report_requests:open_request / expire_stale / record_pending / mark_*
 
@@ -72,6 +73,53 @@ def data_window(days: int = DATA_RANGE_DAYS, now: datetime | None = None) -> tup
     start = end - timedelta(days=days)
     fmt = "%Y-%m-%dT%H:%M:%S.000Z"
     return start.strftime(fmt), end.strftime(fmt)
+
+
+# ── 日期列分布(探针)────────────────────────────────────────────────────────
+
+DATE_COLUMNS = ("Item Creation Date", "Item Last Updated")
+_DATE_FORMATS = ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S",
+                 "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y")
+
+
+def _parse_date(raw: str) -> datetime | None:
+    s = str(raw or "").strip()
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def date_span(rows: list[dict], column: str) -> dict:
+    """输入:报表行 + 日期列名(模糊匹配)→ 输出:{min, max, parsed, unparsed, by_year, sample}。
+
+    探针用:dataStartTime/dataEndTime 按哪个日期列筛官方没写 —— 哪一列的最早值贴着
+    dataStartTime,就是按哪列筛;by_year 顺便给出老品分布,决定要不要把范围放到 730 天
+    或分段多拿。列名找不到给 parsed=0、sample=None。
+    """
+    key = next((k for k in (rows[0].keys() if rows else []) if _norm(k) == _norm(column)), None)
+    out = {"min": None, "max": None, "parsed": 0, "unparsed": 0, "by_year": {}, "sample": None}
+    if key is None:
+        return out
+    lo = hi = None
+    for r in rows:
+        raw = r.get(key)
+        if out["sample"] is None and raw:
+            out["sample"] = str(raw)
+        dt = _parse_date(raw)
+        if dt is None:
+            out["unparsed"] += 1
+            continue
+        out["parsed"] += 1
+        out["by_year"][dt.year] = out["by_year"].get(dt.year, 0) + 1
+        lo = dt if lo is None or dt < lo else lo
+        hi = dt if hi is None or dt > hi else hi
+    if lo is not None:
+        out["min"], out["max"] = lo.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d")
+        out["by_year"] = dict(sorted(out["by_year"].items()))
+    return out
 
 
 # ── 表头守门 ────────────────────────────────────────────────────────────────

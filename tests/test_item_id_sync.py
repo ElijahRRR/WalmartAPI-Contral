@@ -649,3 +649,28 @@ def test_renew_supersedes_in_flight_row_and_creates_again(monkeypatch):
     log = _wire(monkeypatch, open_row=open_row, rows=_ROWS, current={"A": None})
     wf._one_store(STORE, 60, 300, probe=True)
     assert log["create"] == 0 and log["error"] == []
+
+
+# ── 2026-09-07 探针第六轮(A109):近一年范围拿到 3359 行、覆盖 49% ⇒ 要看范围按哪列筛 ──
+
+def test_date_span_parses_mixed_formats_and_buckets_by_year():
+    rows = [_row(**{"Item Creation Date": "2024-03-05T10:00:00.000Z", "Item Last Updated": "09/01/2026"}),
+            _row(**{"Item Creation Date": "2025-12-31", "Item Last Updated": "2026-09-07T01:02:03Z"}),
+            _row(**{"Item Creation Date": "n/a", "Item Last Updated": ""})]
+    d = ir.date_span(rows, "Item Creation Date")
+    assert (d["min"], d["max"], d["parsed"], d["unparsed"]) == ("2024-03-05", "2025-12-31", 2, 1)
+    assert d["by_year"] == {2024: 1, 2025: 1} and d["sample"] == "2024-03-05T10:00:00.000Z"
+    d = ir.date_span(rows, "item last updated")               # 列名模糊匹配
+    assert (d["min"], d["max"]) == ("2026-09-01", "2026-09-07")
+    assert ir.date_span(rows, "No Such Column")["parsed"] == 0
+    assert ir.date_span([], "Item Creation Date")["sample"] is None
+
+
+def test_probe_prints_date_spans(monkeypatch):
+    rows = [dict(r, **{"Item Creation Date": "2025-11-01", "Item Last Updated": "2026-09-01"}) for r in _ROWS]
+    _wire(monkeypatch, rows=rows, current={"A": None})
+    r = wf._one_store(STORE, 60, 300, probe=True)
+    assert r["dates"]["Item Creation Date"]["min"] == "2025-11-01"
+    lines = wf._probe_lines(r)
+    assert any(ln.startswith("  Item Creation Date:最早 2025-11-01") for ln in lines)
+    assert any(ln.startswith("  Item Last Updated:最早 2026-09-01") for ln in lines)

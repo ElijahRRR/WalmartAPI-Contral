@@ -205,6 +205,7 @@ def _one_store(store: dict, wait_min: int, poll_secs: int, probe: bool,
         res["sample"] = [(reports.report_row_sku(r), reports.item_id_from_column(r),
                           reports.item_id_from_url(r)) for r in rows[:_PROBE_SAMPLE]]
         res["publish"] = dict(Counter(str(r.get("Publish Status") or "") for r in rows))
+        res["dates"] = {c: ir.date_span(rows, c) for c in ir.DATE_COLUMNS}
         res["lifecycle"] = dict(Counter(str(r.get("Lifecycle Status") or "") for r in rows))
     return res
 
@@ -233,6 +234,10 @@ def _probe_lines(r: dict) -> list[str]:
            + ("(与 specs 原件一致)" if not r.get("note") else f";{r['note']}")]
     if r.get("window"):
         out.append(f"  本轮新建,数据范围 {r['window'][0]} ~ {r['window'][1]}")
+    for col, d in (r.get("dates") or {}).items():
+        # 哪一列的最早值贴着 dataStartTime,数据范围就是按哪列筛的
+        out.append(f"  {col}:最早 {d['min']} 最晚 {d['max']},按年 {d['by_year']}"
+                   + (f",无法解析 {d['unparsed']} 行(样本 {d['sample']!r})" if d["unparsed"] else ""))
     out.append(f"  Publish Status 分布:{r['publish']}")
     out.append(f"  Lifecycle Status 分布:{r['lifecycle']}")
     out.append(f"  样本(SKU, Item ID 列, URL 尾段):{r['sample']}")

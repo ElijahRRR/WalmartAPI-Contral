@@ -113,6 +113,17 @@ ITEM 报表批量给(GET /v3/items 与 catalog/search 都不返回,2026-08-05 �
 - **探针第二轮(21:16)**:创建通了(200,拿到 requestId);列表接口按官方参考页格式
   `YYYY-MM-DDTHH:mm:ssZ` 带 requestSubmissionStartDate 回 400 —— 轮询改为不带日期
   参数(每店 30 天内只有几十条,按 requestId 匹配);GET 的 400 正文从此进日志。
+- **探针第三轮(21:46)**:列表接口通了,但翻页写错 —— nextCursor 是完整 query 串
+  (`reportType=ITEM&page=2&limit=10`),官方参考页「use nextCursor value instead of
+  query params」即直接拼 URL;当成 `nextCursor=` 参数传被服务端忽略、原样回第一页,
+  同一 cursor 连回三次、第四次 429(orders/returns 早有「同 cursor 重复立即停」的闸,
+  reports 漏抄)。那次 429 的 X-Next-Replenishment-Time 在 142 秒后:官方 Rate limiting
+  页说桶按固定速率连续补令牌,200/min 的桶下枚 0.3 秒就到,142 秒只能是小时级桶 ——
+  **官方表的 200/min 与生产不符**。改法:列表改生成器、找到即停、cursor 拼 URL、同
+  cursor 重复即停;列表与单查共用 `reports.query` 18/hour 持久桶(`reports.list` /
+  `reports.status` 撤销);轮询间隔 2 → 5 分钟(60 分钟 12 次 + 兜底单查 ≤2 次 < 18);
+  报表族每次响应的 x-current-token-count / x-next-replenishment-time 进日志,真实桶
+  大小以它为准、拿到实证再改登记。
 
 ### 2026-09-02 SKU 身份改造立项 + 批次 0a 落地
 

@@ -26,11 +26,11 @@ def test_persistent_partition_snapshot():
     posts = {b for b in _client._RATE_BUCKETS if b.startswith("feeds.post.")}
     assert posts and posts <= persistent
     assert "prices.put" in persistent            # 80/hour
-    # On-request Reports 三个小时级桶跨进程共享(创建 1/hour、状态与下载 20/hour);
-    # 列表接口 200/min 留在进程内(2026-09-07 按官方 Rate limiting 页登记)
-    for b in ("reports.create", "reports.status", "reports.download"):
+    # On-request Reports 三个小时级桶跨进程共享(创建 1/hour;列表+单查共用、下载各 20/hour;
+    # 列表官方表 200/min 但生产实见小时级桶,2026-09-07 改与单查共用 reports.query)
+    for b in ("reports.create", "reports.query", "reports.download"):
         assert b in persistent, b
-    assert "reports.list" not in persistent
+    assert "reports.list" not in _client._RATE_BUCKETS
     assert "items.walmart_search_spec" in persistent   # 1000/day 日额度
     ins = {b for b in _client._RATE_BUCKETS if b.startswith("insights.")}
     assert ins and ins <= persistent             # 1/min

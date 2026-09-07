@@ -18,7 +18,8 @@
     「疑似不全」,当轮照填已匹配的行,明天再拿一份。
   · **数据范围带近 DATA_RANGE_DAYS 天**(所有者 2026-09-07 22:xx 决定):不带日期的
     ITEM 报表只回 1 行(C021 探针,在架 1490 行;后台不设时间同样只显示很少),
-    官方参数 dataStartTime/dataEndTime 放 body,上限 730 天。范围按哪个日期列筛
+    官方参数 dataStartTime/dataEndTime 放 body(格式要带毫秒,见 data_window),上限
+    730 天。范围按哪个日期列筛
     官方没写 —— 覆盖率就是检验:老品掉出窗口会体现为「疑似不全」,那时把天数放到 730。
 
 轮询节奏(官方 On-request Reports 页:生成典型 15–45 分钟;单查 20/hour;列表官方表
@@ -58,14 +59,18 @@ ORPHAN_PENDING_MIN = 15        # pending 无 requestId 超过它 = POST 前后�
 # ── 数据范围 ────────────────────────────────────────────────────────────────
 
 def data_window(days: int = DATA_RANGE_DAYS, now: datetime | None = None) -> tuple[str, str]:
-    """输入:天数(+ 可注入的当前时刻)→ 输出:(dataStartTime, dataEndTime),官方格式 `YYYY-MM-DDTHH:mm:ssZ`(UTC)。
+    """输入:天数(+ 可注入的当前时刻)→ 输出:(dataStartTime, dataEndTime),`YYYY-MM-DDTHH:mm:ss.000Z`(UTC)。
 
     结束 = 现在,开始 = 现在 - days;days 夹在 1..730(官方上限两年)。
+    ⚠ 格式带毫秒:官方参考页写 `YYYY-MM-DDTHH:mm:ssZ`,照它传沃尔玛回 400
+    「Date parse exception - Text '2025-09-07T14:52:02Z' could not be parsed at index 19」
+    (2026-09-07 22:52 C021 实证,第 19 位就是 Z 的位置,解析器要 `.SSS`);
+    ITEM_PERFORMANCE 指南的 cURL 示例用的正是 `2024-08-10T20:11:24.000Z`。
     """
     days = max(1, min(int(days), 730))
     end = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).replace(microsecond=0)
     start = end - timedelta(days=days)
-    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    fmt = "%Y-%m-%dT%H:%M:%S.000Z"
     return start.strftime(fmt), end.strftime(fmt)
 
 

@@ -307,6 +307,27 @@ def test_inflight_sql_caps_submitted_at_48h():
     assert "'failed'" not in sql
 
 
+def test_日常进口也盖新码章():
+    """⚠ 2026-09-07:`record_asins` 写行时随手盖 `taxonomy_*` 章。不盖的话
+    `blacklist_route` 每天把前一天新进的行报成「N 条还没回填」(实见 348 条),
+    `error_reclass` 增量也会白重判一遍。这里的码是当轮全文判的,与回填同等可信。
+    """
+    import inspect
+    from registry import resources
+    from services import feed_track
+    conn = _Conn()
+    bl.record_asins(conn, [_it("B0A", "FLAGGED")])
+    row = conn.asin_rows["B0A"]
+    assert row[7] == "FLAGGED"                                # taxonomy_code = category
+    assert row[9] == resources.ERROR_TAXONOMY_VERSION          # 盖当前版本章
+    assert row[10] == "scan"                                   # 缺省进口 = problem_scan
+    # 上架回执那条进口要自报身份
+    assert 'record_asins(conn, prohibited, src="feed")' in inspect.getsource(feed_track)
+    # SQL 列名与参数个数对齐(错位会把版本号写进 src_sku 之类,静默)
+    cols = bl._ASIN_SQL.split("(", 1)[1].split(")", 1)[0].replace("\n", " ").split(",")
+    assert len(cols) == bl._ASIN_SQL.count("%s") == 11
+
+
 # ── 回填/重建那条腿(2026-09-02 补:_LATEST_CTE 此前漏在收口清单外)───────────
 
 def test_latest_cte_takes_the_key_from_the_registry_first():

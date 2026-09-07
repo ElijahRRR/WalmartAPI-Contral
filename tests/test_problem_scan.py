@@ -963,3 +963,19 @@ def test_归类事件存全文_不许再截200():
     src = inspect.getsource(problem_scan)
     assert '(it["reasons"] or "")[:200]' not in src
     assert '"reason": it["reasons"] or None' in src
+
+
+def test_审核冲突视图的仍在架必须是真在卖():
+    """⚠ 2026-09-06 实见 B0FHPSYT8N:审核链说「审核判拒仍在架」、问题链说
+    「已因 End Date 过期下架」,两条理由拼在同一行互相矛盾。病根是视图里
+    「在架」只判 `missing_since IS NULL`(目录里还见得到),不判 published。
+    所有者 2026-09-07:「改」—— 已下架的归问题扫描链(一律删除),审核链不重复建议。
+    覆盖面不变:问题链本来就删全部未 published 的行。"""
+    import pathlib as _p
+    sql = _p.Path(__file__).resolve().parents[1] / "refdata" / "schema.sql"
+    body = sql.read_text(encoding="utf-8")
+    view = body.split("CREATE VIEW catalog.audit_listing_conflicts AS", 1)[1]
+    head = view.split("SELECT lr.store", 1)[0]          # 只看 CTE 那段
+    assert "w.missing_since IS NULL" in head
+    assert "w.published_status = 'PUBLISHED'" in head
+    assert "p.audit_status = 'rejected'" in head

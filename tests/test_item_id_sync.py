@@ -609,7 +609,8 @@ def test_data_window_is_official_format_and_capped_at_730_days():
     now = datetime(2026, 9, 7, 14, 5, 7, 123456, tzinfo=timezone.utc)
     # 带毫秒:不带毫秒沃尔玛回 400「could not be parsed at index 19」(22:52 实证)
     assert ir.data_window(365, now) == ("2025-09-07T14:05:07.000Z", "2026-09-07T14:05:07.000Z")
-    assert ir.data_window(9999, now)[0] == "2024-09-07T14:05:07.000Z"     # 夹到 730
+    assert ir.data_window(9999, now)[0] == "2024-09-08T14:05:07.000Z"     # 夹到 729(730 整被拒,2026-09-08 实证)
+    assert ir.data_window(730, now) == ir.data_window(729, now) and ir.MAX_RANGE_DAYS == 729
     assert ir.DATA_RANGE_DAYS == 365
 
 

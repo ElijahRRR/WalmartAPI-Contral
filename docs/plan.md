@@ -160,6 +160,10 @@ ITEM 报表批量给(GET /v3/items 与 catalog/search 都不返回,2026-08-05 �
   ACTIVE/UNPUBLISHED 25 + ACTIVE/IN_PROGRESS 3。报表里 RETIRED 只有 3 行、SYSTEM_PROBLEM
   0 行 ⇒ 报表基本不带这两类;真正待解释的是 235 行 ACTIVE/PUBLISHED。待定:缺口与
   覆盖率的分母是否只算 ACTIVE(且 PUBLISHED),以及 730 天范围能否收回那 235 行。
+  **2026-09-08 10:29 试 730 天被拒**:400 "Max lookback date range for DataStartTime
+  '2024-09-08T02:29:37.000Z' cannot be more than 2 years from now - 2024-09-08 02:29:41.7" ——
+  沃尔玛按它收到请求那一刻算两年,我们的起点在请求前 4 秒算出来就出界;被拒的 400 又
+  吃了一枚创建令牌。代码夹到 `MAX_RANGE_DAYS = 729`。
 
 ### 2026-09-02 SKU 身份改造立项 + 批次 0a 落地
 

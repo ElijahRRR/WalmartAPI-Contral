@@ -7,7 +7,7 @@
   python cli.py item_id_sync -p store=A085朱丽霖         # 单店
   python cli.py item_id_sync -p store=X -p probe=1     # 探针:拿报表,打印表头/行数/状态分布/样本 + 原件留存与体检,**不写 item_id**
   python cli.py item_id_sync -p wait_min=60 -p poll_secs=300   # 等待上限(分钟)/ 轮询间隔(秒),缺省即此
-  python cli.py item_id_sync -p store=X -p data_days=730       # 报表数据范围天数(缺省 365,官方上限 730)
+  python cli.py item_id_sync -p store=X -p data_days=729       # 报表数据范围天数(缺省 365;官方上限两年,代码夹到 729)
   python cli.py item_id_sync -p store=X -p renew=1             # 台账在途行作废,重新创建(改了请求形状时用)
 
 为什么单独一条工作流(所有者定稿 2026-09-07):数字 itemId 只有 On-request ITEM

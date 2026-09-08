@@ -141,6 +141,29 @@ ITEM 报表批量给(GET /v3/items 与 catalog/search 都不返回,2026-08-05 �
   的限速头:**400 之后 x-current-token-count=0** —— 被拒的请求沃尔玛照样计数、桶容量
   就是 1,#117「请求形状被拒的 4xx 还令牌」的前提不成立,撤销(`rate_release` 三件套
   连同唯一调用者一起删);任何结局都不还,本地比沃尔玛宽只会换来下一枚 429。
+- **探针第六轮(22:58,A109黄威威)—— 链路全通**:创建 200(限速头令牌 0 ⇒ 桶容量 1)
+  → 5 分钟一问、五次轮询(列表限速头每次令牌 19 ⇒ 20/hour 桶坐实,requestId 在列表
+  第 1 条)→ 25 分钟 READY → 下载 zip 871KB(单 CSV 2.97MB,3360 换行 / 3359 行,首行
+  最长字段 128 字符,解析健康)→ 55 列一致,PUBLISHED 3355 / UNPUBLISHED 4,ACTIVE
+  3356 / RETIRED 3。**近一年范围拿到 3359 行,覆盖在架 3359/6864 = 49%**:范围确实在
+  筛,但筛的是哪个日期列官方没写。探针加打印 Item Creation Date / Item Last Updated
+  的最早/最晚/按年分布(`date_span`):哪列的最早值贴着 dataStartTime 就是按哪列筛;
+  按年分布决定放到 730 天够不够、还是要分段多拿(每段一小时一份)。
+  **所有者不认可「老品掉出窗口」的猜想**:更可能是 catalog_sync 名单里的僵尸 / RETIRED
+  存档(08-28 起 GET /v3/items 把删除后的存档也列出来);拿报表 SKU × catalog_sync 名单
+  直接对账才知道。探针加对账明细(`reconcile_breakdown` + `in_catalog_profile`):
+  在架不在报表的行按库里 lifecycle/published 与首次入库年分组 + 样本,报表有但名单没有
+  的行按报表状态分组 + 样本 —— 这就是「全量靠对账不靠参数」的对账本身。
+  **对账结果(A109,所有者本地跑)**:在架 6864 / 报表 3359 / 报表 ⊂ 在架(报表不在
+  在架 0);缺口 3505 = RETIRED/UNPUBLISHED 1532 + RETIRED/SYSTEM_PROBLEM 1109(合计
+  2641,**75%,所有者判断成立**)+ ACTIVE/SYSTEM_PROBLEM 601 + ACTIVE/PUBLISHED 235 +
+  ACTIVE/UNPUBLISHED 25 + ACTIVE/IN_PROGRESS 3。报表里 RETIRED 只有 3 行、SYSTEM_PROBLEM
+  0 行 ⇒ 报表基本不带这两类;真正待解释的是 235 行 ACTIVE/PUBLISHED。待定:缺口与
+  覆盖率的分母是否只算 ACTIVE(且 PUBLISHED),以及 730 天范围能否收回那 235 行。
+  **2026-09-08 10:29 试 730 天被拒**:400 "Max lookback date range for DataStartTime
+  '2024-09-08T02:29:37.000Z' cannot be more than 2 years from now - 2024-09-08 02:29:41.7" ——
+  沃尔玛按它收到请求那一刻算两年,我们的起点在请求前 4 秒算出来就出界;被拒的 400 又
+  吃了一枚创建令牌。代码夹到 `MAX_RANGE_DAYS = 729`。
 
 ### 2026-09-02 SKU 身份改造立项 + 批次 0a 落地
 

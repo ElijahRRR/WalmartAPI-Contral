@@ -7,7 +7,7 @@
   python cli.py item_id_sync -p store=A085朱丽霖         # 单店
   python cli.py item_id_sync -p store=X -p probe=1     # 探针:拿报表,打印表头/行数/状态分布/样本 + 原件留存与体检,**不写 item_id**
   python cli.py item_id_sync -p wait_min=60 -p poll_secs=300   # 等待上限(分钟)/ 轮询间隔(秒),缺省即此
-  python cli.py item_id_sync -p store=X -p data_days=730       # 报表数据范围天数(缺省 365,官方上限 730)
+  python cli.py item_id_sync -p store=X -p data_days=729       # 报表数据范围天数(缺省 365;官方上限两年,代码夹到 729)
   python cli.py item_id_sync -p store=X -p renew=1             # 台账在途行作废,重新创建(改了请求形状时用)
 
 为什么单独一条工作流(所有者定稿 2026-09-07):数字 itemId 只有 On-request ITEM
@@ -43,7 +43,7 @@
 **不复用**后台(Seller Center)/ Scheduler 生成的报表(所有者定稿 2026-09-07):只认自己
 POST 的 requestId。全量靠对账不靠参数:请求体不传行过滤器,「拿全没有」用报表 SKU 集合 ×
 catalog_sync 扫回来的在架集合来证明;数据范围按哪个日期列筛官方没写,老品掉出窗口会
-体现为「疑似不全」,那时把 data_days 放到官方上限 730。
+体现为「疑似不全」,那时把 data_days 放到 729(官方两年上限留一天余量)。
 
 失败处理走店级重试标准(conventions §四):跨店并发 → 凭证失效跳店 → 其余失败店跑完
 别人后串行补试一次(补试进来先查台账,已建的报表接着等,不会二次创建)→ 仍失败按
@@ -192,6 +192,7 @@ def _one_store(store: dict, wait_min: int, poll_secs: int, probe: bool,
         if probe:
             # 探针不写 item_id;台账停在 ready,紧接着的真跑直接下载不重建
             outcome = "probe"
+            recon = ir.reconcile_breakdown(walmart_catalog.in_catalog_profile(conn, name), rows)
         else:
             walmart_catalog.set_item_ids(conn, name, updates)
             ir.mark_applied(conn, row_id, counters, note=drift)
@@ -205,6 +206,8 @@ def _one_store(store: dict, wait_min: int, poll_secs: int, probe: bool,
         res["sample"] = [(reports.report_row_sku(r), reports.item_id_from_column(r),
                           reports.item_id_from_url(r)) for r in rows[:_PROBE_SAMPLE]]
         res["publish"] = dict(Counter(str(r.get("Publish Status") or "") for r in rows))
+        res["dates"] = {c: ir.date_span(rows, c) for c in ir.DATE_COLUMNS}
+        res["recon"] = recon
         res["lifecycle"] = dict(Counter(str(r.get("Lifecycle Status") or "") for r in rows))
     return res
 
@@ -233,9 +236,21 @@ def _probe_lines(r: dict) -> list[str]:
            + ("(与 specs 原件一致)" if not r.get("note") else f";{r['note']}")]
     if r.get("window"):
         out.append(f"  本轮新建,数据范围 {r['window'][0]} ~ {r['window'][1]}")
+    for col, d in (r.get("dates") or {}).items():
+        # 哪一列的最早值贴着 dataStartTime,数据范围就是按哪列筛的
+        out.append(f"  {col}:最早 {d['min']} 最晚 {d['max']},按年 {d['by_year']}"
+                   + (f",无法解析 {d['unparsed']} 行(样本 {d['sample']!r})" if d["unparsed"] else ""))
     out.append(f"  Publish Status 分布:{r['publish']}")
     out.append(f"  Lifecycle Status 分布:{r['lifecycle']}")
     out.append(f"  样本(SKU, Item ID 列, URL 尾段):{r['sample']}")
+    rc = r.get("recon")
+    if rc:
+        # 对账:覆盖率缺口是什么,拿两边名单分组看,不猜(所有者 2026-09-07)
+        out.append(f"  对账·报表覆盖的在架行 {rc['matched']} 行:按库里 lifecycle/published {rc['matched_by_status']}")
+        out.append(f"  对账·在架不在报表 {rc['unmatched']} 行:按库里 lifecycle/published {rc['unmatched_by_status']};"
+                   f"样本 {rc['unmatched_sample']}")
+        out.append(f"  对账·报表有但在架名单没有 {rc['extra']} 行:按报表 Lifecycle/Publish {rc['extra_by_status']};"
+                   f"样本 {rc['extra_sample']}")
     b = r.get("blob") or {}
     if b:
         out.append(f"  原件 {b['bytes']} 字节,zip 成员 {b['members'] or '无(裸 CSV)'},取 {b['member']};"

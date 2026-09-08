@@ -6,6 +6,8 @@
   map_item_ids(rows)                报表行 → ({sku: item_id}, 计数):Item ID 列与 URL 尾段互校
   plan_updates(current, mapping)    在架现值 × 报表映射 → ({sku: 要写的 item_id}, 计数)
   coverage_note(counters)           计数 → 「疑似不全」提示或空串
+  date_span(rows, column)           报表行 + 日期列名 → 最早/最晚/按年计数(探针判断数据范围按哪列筛)
+  reconcile_breakdown(catalog, rows) 在架行画像 + 报表行 → 两边差集按状态/入库年分组(探针对账,不猜)
   wait_ready(store, request_id, …)  轮询到 READY / ERROR / TIMEOUT(先睡后查,列表生成器找到即停)
   台账 ops.report_requests:open_request / expire_stale / record_pending / mark_*
 
@@ -18,9 +20,9 @@
     「疑似不全」,当轮照填已匹配的行,明天再拿一份。
   · **数据范围带近 DATA_RANGE_DAYS 天**(所有者 2026-09-07 22:xx 决定):不带日期的
     ITEM 报表只回 1 行(C021 探针,在架 1490 行;后台不设时间同样只显示很少),
-    官方参数 dataStartTime/dataEndTime 放 body(格式要带毫秒,见 data_window),上限
-    730 天。范围按哪个日期列筛
-    官方没写 —— 覆盖率就是检验:老品掉出窗口会体现为「疑似不全」,那时把天数放到 730。
+    官方参数 dataStartTime/dataEndTime 放 body(格式要带毫秒,见 data_window),上限两年(代码夹到
+    729 天)。范围按哪个日期列筛
+    官方没写 —— 覆盖率就是检验:老品掉出窗口会体现为「疑似不全」,那时把天数放到 729(官方两年上限留一天余量)。
 
 轮询节奏(官方 On-request Reports 页:生成典型 15–45 分钟;单查 20/hour;列表官方表
 写 200/min 但生产实见是小时级桶 —— 2026-09-07 连打 4 次即 429、下枚令牌 142 秒后,
@@ -31,6 +33,7 @@
 
 import logging
 import time
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 from api import reports
@@ -46,7 +49,9 @@ DEFAULT_WAIT_MIN = 60          # 官方典型 15–45 分钟;超过就把 reques
 DEFAULT_POLL_SECS = 300        # 列表与单查共用 18/hour 桶:五分钟一问,60 分钟 12 次 + 兜底 ≤2 次 < 18
 STATUS_FALLBACK_EVERY = 5      # 列表找不到 requestId 时,每第 N 次轮询才用一次 20/hour 单查
 
-DATA_RANGE_DAYS = 365          # 报表数据范围:近一年(所有者定;官方上限 730 天;-p data_days= 可覆盖)
+DATA_RANGE_DAYS = 365          # 报表数据范围:近一年(所有者定;-p data_days= 可覆盖,夹到 MAX_RANGE_DAYS)
+MAX_RANGE_DAYS = 729           # 官方上限「两年」按沃尔玛自己的 now 判:起点在请求前几秒算出来、
+                               # 正好 730 天就被拒(2026-09-08 实证,400 还吃创建令牌),留一天余量
 
 COVERAGE_WARN_RATIO = 0.95     # 报表匹配到的在架行 / 在架行 低于它 ⇒ 首行点名「疑似不全」
 COVERAGE_MIN_ROWS = 20         # 在架行太少时比例没意义,不报
@@ -61,17 +66,110 @@ ORPHAN_PENDING_MIN = 15        # pending 无 requestId 超过它 = POST 前后�
 def data_window(days: int = DATA_RANGE_DAYS, now: datetime | None = None) -> tuple[str, str]:
     """输入:天数(+ 可注入的当前时刻)→ 输出:(dataStartTime, dataEndTime),`YYYY-MM-DDTHH:mm:ss.000Z`(UTC)。
 
-    结束 = 现在,开始 = 现在 - days;days 夹在 1..730(官方上限两年)。
+    结束 = 现在,开始 = 现在 - days;days 夹在 1..MAX_RANGE_DAYS(官方上限两年,留一天余量:
+    2026-09-08 实证传满 730 天被拒 "Max lookback date range for DataStartTime … cannot be more
+    than 2 years from now",沃尔玛按它收到请求那一刻算,我们的起点早了 4 秒就出界,400 还吃创建令牌)。
     ⚠ 格式带毫秒:官方参考页写 `YYYY-MM-DDTHH:mm:ssZ`,照它传沃尔玛回 400
     「Date parse exception - Text '2025-09-07T14:52:02Z' could not be parsed at index 19」
     (2026-09-07 22:52 C021 实证,第 19 位就是 Z 的位置,解析器要 `.SSS`);
     ITEM_PERFORMANCE 指南的 cURL 示例用的正是 `2024-08-10T20:11:24.000Z`。
     """
-    days = max(1, min(int(days), 730))
+    days = max(1, min(int(days), MAX_RANGE_DAYS))
     end = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).replace(microsecond=0)
     start = end - timedelta(days=days)
     fmt = "%Y-%m-%dT%H:%M:%S.000Z"
     return start.strftime(fmt), end.strftime(fmt)
+
+
+# ── 日期列分布(探针)────────────────────────────────────────────────────────
+
+DATE_COLUMNS = ("Item Creation Date", "Item Last Updated")
+_DATE_FORMATS = ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S",
+                 "%Y-%m-%d %H:%M:%S", "%Y-%m-%d", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y")
+
+
+def _parse_date(raw: str) -> datetime | None:
+    s = str(raw or "").strip()
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def date_span(rows: list[dict], column: str) -> dict:
+    """输入:报表行 + 日期列名(模糊匹配)→ 输出:{min, max, parsed, unparsed, by_year, sample}。
+
+    探针用:dataStartTime/dataEndTime 按哪个日期列筛官方没写 —— 哪一列的最早值贴着
+    dataStartTime,就是按哪列筛;by_year 顺便给出老品分布,决定要不要把范围放到 729 天
+    或分段多拿。列名找不到给 parsed=0、sample=None。
+    """
+    key = next((k for k in (rows[0].keys() if rows else []) if _norm(k) == _norm(column)), None)
+    out = {"min": None, "max": None, "parsed": 0, "unparsed": 0, "by_year": {}, "sample": None}
+    if key is None:
+        return out
+    lo = hi = None
+    for r in rows:
+        raw = r.get(key)
+        if out["sample"] is None and raw:
+            out["sample"] = str(raw)
+        dt = _parse_date(raw)
+        if dt is None:
+            out["unparsed"] += 1
+            continue
+        out["parsed"] += 1
+        out["by_year"][dt.year] = out["by_year"].get(dt.year, 0) + 1
+        lo = dt if lo is None or dt < lo else lo
+        hi = dt if hi is None or dt > hi else hi
+    if lo is not None:
+        out["min"], out["max"] = lo.strftime("%Y-%m-%d"), hi.strftime("%Y-%m-%d")
+        out["by_year"] = dict(sorted(out["by_year"].items()))
+    return out
+
+
+# ── 对账明细(探针)──────────────────────────────────────────────────────────
+
+_RECON_SAMPLE = 8
+
+
+def reconcile_breakdown(catalog_rows: list[dict], report_rows: list[dict]) -> dict:
+    """输入:在架行画像(walmart_catalog.in_catalog_profile)+ 报表行 → 输出:对账明细 dict。
+
+    matched_by_status {"lifecycle/published": n}:报表覆盖到的在架行是什么;
+    unmatched_by_status 同款分组 + unmatched_sample [sku…]:在架却不在报表里的行是什么;
+    extra_by_status {"报表 Lifecycle/Publish": n}、extra_sample:报表有、在架名单没有的行。
+    (不按 created_at 分年:那是本库首次入库时间不是沃尔玛上架时间,全是 2026 没信息量。)
+    所有者 2026-09-07:覆盖率缺口是老品掉出数据范围、还是 catalog_sync 名单里的僵尸 /
+    RETIRED 存档(08-28 起 GET /v3/items 会把删除后的存档也列出来),拿两边名单对一下
+    就知道,不猜 —— 这一步就是「全量靠对账不靠参数」的对账本身。
+    """
+    report_by_sku: dict[str, dict] = {}
+    for r in report_rows:
+        sku = reports.report_row_sku(r)
+        if sku:
+            report_by_sku.setdefault(sku, r)
+    catalog_skus = {r["sku"] for r in catalog_rows}
+    matched = [r for r in catalog_rows if r["sku"] in report_by_sku]
+    unmatched = [r for r in catalog_rows if r["sku"] not in report_by_sku]
+    extra = [r for sku, r in report_by_sku.items() if sku not in catalog_skus]
+
+    def by_status(rows):
+        return dict(Counter(f"{r.get('lifecycle_status') or '?'}/{r.get('published_status') or '?'}"
+                            for r in rows).most_common())
+
+    return {
+        "matched": len(matched),
+        "matched_by_status": by_status(matched),
+        "unmatched": len(unmatched),
+        "unmatched_by_status": by_status(unmatched),
+        "unmatched_sample": [r["sku"] for r in unmatched[:_RECON_SAMPLE]],
+        "extra": len(extra),
+        "extra_by_status": dict(Counter(
+            f"{r.get('Lifecycle Status') or '?'}/{r.get('Publish Status') or '?'}" for r in extra
+        ).most_common()),
+        "extra_sample": [reports.report_row_sku(r) for r in extra[:_RECON_SAMPLE]],
+    }
 
 
 # ── 表头守门 ────────────────────────────────────────────────────────────────

@@ -22,7 +22,7 @@
     ITEM 报表只回 1 行(C021 探针,在架 1490 行;后台不设时间同样只显示很少),
     官方参数 dataStartTime/dataEndTime 放 body(格式要带毫秒,见 data_window),上限
     730 天。范围按哪个日期列筛
-    官方没写 —— 覆盖率就是检验:老品掉出窗口会体现为「疑似不全」,那时把天数放到 730。
+    官方没写 —— 覆盖率就是检验:老品掉出窗口会体现为「疑似不全」,那时把天数放到 729(官方两年上限留一天余量)。
 
 轮询节奏(官方 On-request Reports 页:生成典型 15–45 分钟;单查 20/hour;列表官方表
 写 200/min 但生产实见是小时级桶 —— 2026-09-07 连打 4 次即 429、下枚令牌 142 秒后,
@@ -102,7 +102,7 @@ def date_span(rows: list[dict], column: str) -> dict:
     """输入:报表行 + 日期列名(模糊匹配)→ 输出:{min, max, parsed, unparsed, by_year, sample}。
 
     探针用:dataStartTime/dataEndTime 按哪个日期列筛官方没写 —— 哪一列的最早值贴着
-    dataStartTime,就是按哪列筛;by_year 顺便给出老品分布,决定要不要把范围放到 730 天
+    dataStartTime,就是按哪列筛;by_year 顺便给出老品分布,决定要不要把范围放到 729 天
     或分段多拿。列名找不到给 parsed=0、sample=None。
     """
     key = next((k for k in (rows[0].keys() if rows else []) if _norm(k) == _norm(column)), None)

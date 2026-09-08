@@ -32,9 +32,14 @@
      (SKU / Item ID / Item Page URL 缺一即拦,其余列增减只报不拦)。
   ④ 「Item ID」列与 URL 尾段互校 → 与本店在架行比对 → 写库:NULL 填、已有值且不同
      **按报表改**(所有者定稿「冲突以报表为准」)、报表里没有的在架行计未匹配。
-  ⑤ 覆盖率 < 95%(在架行 ≥ 20)在首行点名「疑似不全」:当轮照填已匹配的,明天再拿一份。
+  ⑤ 覆盖率 < 95%(在售行 ≥ 20)在首行点名「疑似不全」:当轮照填已匹配的,明天再拿一份。
+     **分母只算在售行**(在架且 ACTIVE / PUBLISHED,所有者定稿 2026-09-08):报表不给
+     RETIRED / SYSTEM_PROBLEM,库里还有列表接口翻回来的幽灵(A109:235 行"在售"里 232
+     行单查 404),对真正在售的品报表覆盖 3355/3358。
+  ⑥ 报表行整店落 catalog.item_report_rows(真跑才写):catalog_sync 扫店后用它兜底 ——
+     报表里 PUBLISHED 而扫描没见到的 SKU 单查补入,在线品不许因分页 / 切片漏掉。
 
-候选店:缺省 = 能调 API 的店里、在架行有 item_id 为空的店;`all=1` 全店;`store=X` 单店。
+候选店:缺省 = 能调 API 的店里、在售行有 item_id 为空的店;`all=1` 全店;`store=X` 单店。
 新上架的品要等沃尔玛 published 才有 itemId,所以「上架后补齐」不挂在 list_new 尾巴上,
 靠每天一轮自然覆盖;缺席后复现的行由 catalog_sync 把 item_id 重置为 NULL,同样自然回来。
 飞书「在线产品总表」的 itemId 列不在这里写:catalog_sync 每轮把 PG 投影回飞书,05:00 填好、
@@ -187,7 +192,8 @@ def _one_store(store: dict, wait_min: int, poll_secs: int, probe: bool,
     with db.pg_conn() as conn:
         ir.mark_downloaded(conn, row_id, len(rows))
         current = walmart_catalog.item_id_map(conn, name)
-        updates, pcount = ir.plan_updates(current, mapping)
+        # 覆盖率分母 = 在售行(所有者定稿 2026-09-08);写入仍按全部在架行
+        updates, pcount = ir.plan_updates(current, mapping, live=walmart_catalog.live_skus(conn, name))
         counters = {**mcount, **pcount}
         if probe:
             # 探针不写 item_id;台账停在 ready,紧接着的真跑直接下载不重建
@@ -195,6 +201,9 @@ def _one_store(store: dict, wait_min: int, poll_secs: int, probe: bool,
             recon = ir.reconcile_breakdown(walmart_catalog.in_catalog_profile(conn, name), rows)
         else:
             walmart_catalog.set_item_ids(conn, name, updates)
+            # 报表行整店落库:catalog_sync 的报表兜底(在线品不许因分页漏掉)读它
+            walmart_catalog.replace_report_rows(conn, name, request_id,
+                                                ir.report_rows(rows, mapping), submitted_at)
             ir.mark_applied(conn, row_id, counters, note=drift)
             outcome = "applied"
     res = _result(name, outcome, counters=counters, note=drift,

@@ -154,6 +154,12 @@ ITEM 报表批量给(GET /v3/items 与 catalog/search 都不返回,2026-08-05 �
   直接对账才知道。探针加对账明细(`reconcile_breakdown` + `in_catalog_profile`):
   在架不在报表的行按库里 lifecycle/published 与首次入库年分组 + 样本,报表有但名单没有
   的行按报表状态分组 + 样本 —— 这就是「全量靠对账不靠参数」的对账本身。
+  **对账结果(A109,所有者本地跑)**:在架 6864 / 报表 3359 / 报表 ⊂ 在架(报表不在
+  在架 0);缺口 3505 = RETIRED/UNPUBLISHED 1532 + RETIRED/SYSTEM_PROBLEM 1109(合计
+  2641,**75%,所有者判断成立**)+ ACTIVE/SYSTEM_PROBLEM 601 + ACTIVE/PUBLISHED 235 +
+  ACTIVE/UNPUBLISHED 25 + ACTIVE/IN_PROGRESS 3。报表里 RETIRED 只有 3 行、SYSTEM_PROBLEM
+  0 行 ⇒ 报表基本不带这两类;真正待解释的是 235 行 ACTIVE/PUBLISHED。待定:缺口与
+  覆盖率的分母是否只算 ACTIVE(且 PUBLISHED),以及 730 天范围能否收回那 235 行。
 
 ### 2026-09-02 SKU 身份改造立项 + 批次 0a 落地
 

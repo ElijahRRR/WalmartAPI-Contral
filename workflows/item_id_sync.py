@@ -246,8 +246,9 @@ def _probe_lines(r: dict) -> list[str]:
     rc = r.get("recon")
     if rc:
         # 对账:覆盖率缺口是什么,拿两边名单分组看,不猜(所有者 2026-09-07)
+        out.append(f"  对账·报表覆盖的在架行 {rc['matched']} 行:按库里 lifecycle/published {rc['matched_by_status']}")
         out.append(f"  对账·在架不在报表 {rc['unmatched']} 行:按库里 lifecycle/published {rc['unmatched_by_status']};"
-                   f"按首次入库年 {rc['unmatched_by_year']};样本 {rc['unmatched_sample']}")
+                   f"样本 {rc['unmatched_sample']}")
         out.append(f"  对账·报表有但在架名单没有 {rc['extra']} 行:按报表 Lifecycle/Publish {rc['extra_by_status']};"
                    f"样本 {rc['extra_sample']}")
     b = r.get("blob") or {}

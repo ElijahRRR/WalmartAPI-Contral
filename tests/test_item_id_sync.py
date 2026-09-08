@@ -695,9 +695,10 @@ def test_reconcile_breakdown_groups_both_sides():
               _row(SKU="Z", **{"Lifecycle Status": "ACTIVE", "Publish Status": "UNPUBLISHED"}),   # 重复 SKU 只算一次
               _row(**{"Item ID": "9"})]                                                          # 无 SKU 忽略
     rc = ir.reconcile_breakdown(catalog, report)
+    assert rc["matched"] == 1 and rc["matched_by_status"] == {"ACTIVE/PUBLISHED": 1}
     assert rc["unmatched"] == 3 and rc["unmatched_sample"] == ["B", "C", "D"]
     assert rc["unmatched_by_status"] == {"RETIRED/UNPUBLISHED": 2, "?/PUBLISHED": 1}
-    assert rc["unmatched_by_year"] == {2023: 1, 2026: 1, "?": 1}
+    assert "unmatched_by_year" not in rc                     # 入库年不是上架年,不打
     assert rc["extra"] == 1 and rc["extra_by_status"] == {"ACTIVE/UNPUBLISHED": 1} and rc["extra_sample"] == ["Z"]
 
 
@@ -707,5 +708,6 @@ def test_probe_prints_reconciliation(monkeypatch):
     assert r["recon"]["unmatched"] == 1 and r["recon"]["unmatched_sample"] == ["X"]
     assert r["recon"]["extra"] == 1 and r["recon"]["extra_sample"] == ["C"]
     lines = wf._probe_lines(r)
+    assert any("对账·报表覆盖的在架行 2 行" in ln and "ACTIVE/PUBLISHED" in ln for ln in lines)
     assert any("对账·在架不在报表 1 行" in ln and "ACTIVE/PUBLISHED" in ln for ln in lines)
     assert any("对账·报表有但在架名单没有 1 行" in ln for ln in lines)

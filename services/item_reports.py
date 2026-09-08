@@ -132,9 +132,10 @@ _RECON_SAMPLE = 8
 def reconcile_breakdown(catalog_rows: list[dict], report_rows: list[dict]) -> dict:
     """输入:在架行画像(walmart_catalog.in_catalog_profile)+ 报表行 → 输出:对账明细 dict。
 
-    unmatched_by_status {"lifecycle/published": n}、unmatched_by_year {首次入库年: n}、
-    unmatched_sample [sku…]:在架却不在报表里的行是什么;
+    matched_by_status {"lifecycle/published": n}:报表覆盖到的在架行是什么;
+    unmatched_by_status 同款分组 + unmatched_sample [sku…]:在架却不在报表里的行是什么;
     extra_by_status {"报表 Lifecycle/Publish": n}、extra_sample:报表有、在架名单没有的行。
+    (不按 created_at 分年:那是本库首次入库时间不是沃尔玛上架时间,全是 2026 没信息量。)
     所有者 2026-09-07:覆盖率缺口是老品掉出数据范围、还是 catalog_sync 名单里的僵尸 /
     RETIRED 存档(08-28 起 GET /v3/items 会把删除后的存档也列出来),拿两边名单对一下
     就知道,不猜 —— 这一步就是「全量靠对账不靠参数」的对账本身。
@@ -145,19 +146,19 @@ def reconcile_breakdown(catalog_rows: list[dict], report_rows: list[dict]) -> di
         if sku:
             report_by_sku.setdefault(sku, r)
     catalog_skus = {r["sku"] for r in catalog_rows}
+    matched = [r for r in catalog_rows if r["sku"] in report_by_sku]
     unmatched = [r for r in catalog_rows if r["sku"] not in report_by_sku]
     extra = [r for sku, r in report_by_sku.items() if sku not in catalog_skus]
 
-    def year(v):
-        return getattr(v, "year", None) or "?"
+    def by_status(rows):
+        return dict(Counter(f"{r.get('lifecycle_status') or '?'}/{r.get('published_status') or '?'}"
+                            for r in rows).most_common())
 
     return {
+        "matched": len(matched),
+        "matched_by_status": by_status(matched),
         "unmatched": len(unmatched),
-        "unmatched_by_status": dict(Counter(
-            f"{r.get('lifecycle_status') or '?'}/{r.get('published_status') or '?'}" for r in unmatched
-        ).most_common()),
-        "unmatched_by_year": dict(sorted(Counter(year(r.get("first_seen")) for r in unmatched).items(),
-                                         key=lambda kv: str(kv[0]))),
+        "unmatched_by_status": by_status(unmatched),
         "unmatched_sample": [r["sku"] for r in unmatched[:_RECON_SAMPLE]],
         "extra": len(extra),
         "extra_by_status": dict(Counter(

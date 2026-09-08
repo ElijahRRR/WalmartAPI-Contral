@@ -49,7 +49,9 @@ DEFAULT_WAIT_MIN = 60          # 官方典型 15–45 分钟;超过就把 reques
 DEFAULT_POLL_SECS = 300        # 列表与单查共用 18/hour 桶:五分钟一问,60 分钟 12 次 + 兜底 ≤2 次 < 18
 STATUS_FALLBACK_EVERY = 5      # 列表找不到 requestId 时,每第 N 次轮询才用一次 20/hour 单查
 
-DATA_RANGE_DAYS = 365          # 报表数据范围:近一年(所有者定;官方上限 730 天;-p data_days= 可覆盖)
+DATA_RANGE_DAYS = 365          # 报表数据范围:近一年(所有者定;-p data_days= 可覆盖,夹到 MAX_RANGE_DAYS)
+MAX_RANGE_DAYS = 729           # 官方上限「两年」按沃尔玛自己的 now 判:起点在请求前几秒算出来、
+                               # 正好 730 天就被拒(2026-09-08 实证,400 还吃创建令牌),留一天余量
 
 COVERAGE_WARN_RATIO = 0.95     # 报表匹配到的在架行 / 在架行 低于它 ⇒ 首行点名「疑似不全」
 COVERAGE_MIN_ROWS = 20         # 在架行太少时比例没意义,不报
@@ -64,13 +66,15 @@ ORPHAN_PENDING_MIN = 15        # pending 无 requestId 超过它 = POST 前后�
 def data_window(days: int = DATA_RANGE_DAYS, now: datetime | None = None) -> tuple[str, str]:
     """输入:天数(+ 可注入的当前时刻)→ 输出:(dataStartTime, dataEndTime),`YYYY-MM-DDTHH:mm:ss.000Z`(UTC)。
 
-    结束 = 现在,开始 = 现在 - days;days 夹在 1..730(官方上限两年)。
+    结束 = 现在,开始 = 现在 - days;days 夹在 1..MAX_RANGE_DAYS(官方上限两年,留一天余量:
+    2026-09-08 实证传满 730 天被拒 "Max lookback date range for DataStartTime … cannot be more
+    than 2 years from now",沃尔玛按它收到请求那一刻算,我们的起点早了 4 秒就出界,400 还吃创建令牌)。
     ⚠ 格式带毫秒:官方参考页写 `YYYY-MM-DDTHH:mm:ssZ`,照它传沃尔玛回 400
     「Date parse exception - Text '2025-09-07T14:52:02Z' could not be parsed at index 19」
     (2026-09-07 22:52 C021 实证,第 19 位就是 Z 的位置,解析器要 `.SSS`);
     ITEM_PERFORMANCE 指南的 cURL 示例用的正是 `2024-08-10T20:11:24.000Z`。
     """
-    days = max(1, min(int(days), 730))
+    days = max(1, min(int(days), MAX_RANGE_DAYS))
     end = (now or datetime.now(timezone.utc)).astimezone(timezone.utc).replace(microsecond=0)
     start = end - timedelta(days=days)
     fmt = "%Y-%m-%dT%H:%M:%S.000Z"

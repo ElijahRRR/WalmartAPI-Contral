@@ -32,11 +32,19 @@
       │                                                         不烧 UPC;UPC 改标、
       │                                                         处置迁键、节点库存清行;
       │                                                         **不回写库存**)
+      ├──(新码在架 ∧ 旧码也在架 ∧ **两码同 wpid** ∧ 旧码单查 404)▶ confirmed
+      │      判词 (a′)「影子双挂」(2026-09-08 所有者实证,docs/sku_plan.md §9.15):
+      │      2026-08-28 起沃尔玛的 GET /v3/items **列表**把已删档案照旧吐回
+      │      (僵尸列表,docs/backlog.md §十三),而**单条** GET 是 404 —— 同 wpid
+      │      说明这两个码是同一条 listing(原地换码已生效),两条证据缺一不可。
+      │      定案后果与上一条**逐字相同**(不新增写动作);double 行也走这一条。
       ├──(回执 failed ∨ 观测反证且超 OBSERVE_HOURS)─────────▶ rolled_back
       │                                                        (旧行复活,新码弃掉)
       ├──(超 STALE_HOURS 仍判不出)──────────────────────────▶ stalled(点名人工,不自动定案)
-      └──(新码在架 ∧ 旧码也在架)──▶ double(记台账;不拦节奏闸、不重复提交;
-                                            旧码缺席后自动转 confirmed;人工回头处置)
+      └──(新码在架 ∧ 旧码也在架 ∧ **不是**影子)──▶ double(记台账;不拦节奏闸、
+                                            不重复提交;旧码缺席后自动转 confirmed;
+                                            人工回头处置。**真双挂**才留在这里:
+                                            两码 wpid 不同,或旧码单查 200)
 
 **身份映射写在哪(2026-09-06 所有者定稿:改码不回写上架表)**:
 新码与它的来源码这份对应关系,权威在登记簿 `catalog.listing_sources`,人看的那份
@@ -71,6 +79,9 @@
      不改处置、不删节点库存 —— 一行库、一条 feed 都不写
      (飞书本工作流**只读不写**:载荷取 FC 要读「维护仓库」判受管仓,见头注
       「身份映射写在哪」—— 上架表一格都不碰)。
+     ⚠ **影子探测(GET /v3/items/{sku})dry-run 照做**(2026-09-08,§9.15):
+     它是**读**,空跑正是人眼确认"这批到底是影子还是真双挂"的那一步;
+     零写这条纪律管的是写,把只读的探测也停掉,dry-run 就答不出那个问题了。
   ⑦ **REPLACE 不带的字段会被写空,所以库存必须随载荷一起发**(2026-09-07 通道
      升 v5 之后的定稿;起因是 2026-09-06 第一级投放实证,见 docs/sku_plan.md §9.12):
      v4.2 的载荷里**没有**库存字段,沃尔玛把「没带」当 0 写 —— A085朱丽霖
@@ -146,7 +157,7 @@ import logging
 import re
 from datetime import datetime, timedelta, timezone
 
-from api import feeds
+from api import feeds, items as items_api
 from registry import db, resources
 from services import amz_source, dispositions, feed_track, \
     listing_sources, match_feed, mp_mapper, notify_fmt as nf, order_lines, \
@@ -244,6 +255,8 @@ _STALLED = "stalled"
 #: 现在它是一个**过程账状态**:不进节奏闸的 open、不许再开第二条台账,但**仍每轮
 #: 参与定案**(`_SQL_OBSERVE` 取 pending ∪ double)—— 所有者哪天把旧码删掉、
 #: catalog_sync 记了缺席,下一轮 `_verdict` 自然给 confirmed,走现有定案路径。
+#: ⚠ 2026-09-08 起还有第二条自动出路:**影子双挂**(两码同 wpid + 旧码单查 404)
+#: 由判词 (a′) 直接定案 confirmed(§9.15)—— 留在 double 里的是**真双挂**。
 #: ⚠ 身份层(`catalog.listing_sources`)**一个字不动**:旧行仍 replaced_by=新码
 #: 的在途态,新码仍是活码 —— 换的只是过程账的状态,不是身份的结论。
 _DOUBLE = "double"
@@ -310,10 +323,14 @@ _CONDS: tuple[tuple[str, str, str], ...] = (
     #   ② suggested 的 DELETE 马上会被 claim 成一条打在**旧码**上的 feed。
     # **维护组(title/price/inventory)不拦**(所有者 2026-09-04:13:00 三条链
     # 齐发是常态,拦它等于改码永远开不了工)。它们各有出路:
-    #   · suggested → 定案时 `dispositions.rekey_suggested` 把键从旧码搬到新码;
-    #   · executing → rekey **故意不碰**(搬键等于把判决对象换掉),于是滞留,
-    #     由 `expire_executing` 判成 ineffective 收尾 —— 自愈,不是事故。
-    #     但**不许静默**:`_confirm` 会把滞留的动作点名进摘要。
+    #   · suggested → 定案时 `dispositions.rekey_open` 把键从旧码搬到新码;
+    #   · executing → **也一并搬**(2026-09-08 改口,§9.15):改码是同一个 item 上
+    #     原地换码(同 wpid),新码的现值就是那条 feed 作用的对象,搬过去不是换
+    #     判决对象,而是把账挪到唯一还比得了的那一行,由 `settle_maintenance` 按
+    #     新码观测落定(A171罗尹鸿 691466 那条改价早已生效,却因为拿旧码那一行比
+    #     而要等 3 天 `expire_executing` 超期放行,每轮还被点名一遍)。
+    #     `expire_executing` 仍是最终兜底,**不动**;撞车(新码名下已有同动作未落定
+    #     行)的仍不迁,`_confirm` 点名人工。
     # 已落定的行(settled_at 非空)不算数:账已经清了。
     ("无未了结破坏建议",
      "该 (店, 旧码) 还有未落定的**破坏性**建议(delete/retire):executing 那条"
@@ -435,6 +452,7 @@ WHERE store = %(store)s AND status = 'pending'
 _SQL_OBSERVE = """
 SELECT m.id, m.old_sku, m.new_sku, m.source_type, m.source_key, m.feed_id,
        m.submitted_at, m.status,
+       nw.wpid AS new_wpid, ow.wpid AS old_wpid,
        (nw.sku IS NOT NULL AND nw.missing_since IS NULL)          AS new_present,
        (ow.sku IS NULL OR ow.missing_since IS NOT NULL)           AS old_gone,
        EXISTS (SELECT 1 FROM catalog.walmart_items s
@@ -677,26 +695,50 @@ def _verdict(row: dict, receipt: tuple[str, str] | None, now) -> tuple[str, str]
     """输入:一条 pending / double 台账 + 该新码的回执 + 当前时刻 → 输出:(判词, 人话理由)。
 
     判词 ∈ pending / confirmed / rolled_back / stalled / double。**纯函数**,
-    优先级固定(顺序即判据,改顺序就是改语义)。**六条规则与顺序 2026-09-07
-    一字未改**:double 从"留 pending 只告警"改成一个持久状态(§9.14),改的是
-    `_settle` 拿这个判词去做什么,不是判词本身怎么判 —— 也正因为规则没变,
-    已是 double 的行下一轮旧码一缺席就落到 (a),自动转 confirmed。
+    优先级固定(顺序即判据,改顺序就是改语义)。
 
-      (a) 新码在架 ∧ 旧码缺席                    ⇒ confirmed
-      (b) 新码在架 ∧ 旧码**也**在架              ⇒ double(记台账,不定案)
-      (c) 新码未现 ∧ 回执 failed                 ⇒ rolled_back(确认没成)
-      (d) 新码未现 ∧ 观测新鲜 ∧ 超 OBSERVE_HOURS ⇒ rolled_back(观测反证)
-      (e) 超 STALE_HOURS 仍判不出                ⇒ stalled(点名人工)
-      (f) 其余                                    ⇒ pending
+      (a)  新码在架 ∧ 旧码缺席                    ⇒ confirmed
+      (a′) 新码在架 ∧ 旧码在架 ∧ **两码同 wpid**
+           ∧ **旧码单查 404**(row["old_probe"]) ⇒ confirmed(列表接口的影子)
+      (b)  新码在架 ∧ 旧码**也**在架              ⇒ double(记台账,不定案)
+      (c)  新码未现 ∧ 回执 failed                 ⇒ rolled_back(确认没成)
+      (d)  新码未现 ∧ 观测新鲜 ∧ 超 OBSERVE_HOURS ⇒ rolled_back(观测反证)
+      (e)  超 STALE_HOURS 仍判不出                ⇒ stalled(点名人工)
+      (f)  其余                                    ⇒ pending
+
+    **(a′) 的证据是两条,缺一不可**(2026-09-08 所有者实证,docs/sku_plan.md §9.15):
+      · **wpid 相同** —— MP_ITEM_MATCH 是「同 GTIN + 新 SKU + REPLACE」在**同一个
+        item 上原地换码**(§9.12 实测),所以同 wpid = 这两个码是同一条 listing,
+        改码其实已经生效;wpid 不同 = 真的多了一条 listing(真双挂),仍判 double;
+      · **旧码单查 404** —— 2026-08-28 起 GET /v3/items **列表**把已删档案照旧吐回
+        (僵尸列表,docs/backlog.md §十三),而**单条** GET 是 404。
+    只有 wpid 相同(A131吕灿荣 43 条里 41 条)也不许定案:那只说明"曾经是同一条",
+    单查 404 才说明"旧码现在真的不在了";只有 404 也不许定案:那可能是别的原因
+    (旧 item 被删而新码是另建的一条),没有 wpid 这一条就没法说"改码生效了"。
+    ⚠ **不违反"定案只信观测"**:单查是**读**,它本身就是一次逐条观测,
+    比列表那一轮更新更准 —— 与"拿回执当判据"是两回事。
 
     **回执成功单独不定案**:「回执成功但后台没改」是本仓实证过的故障模式
     (delete_not_effective 同款),定案只信观测。
+
+    ⚠ 规则表 2026-09-08 之前是六条(a)~(f);double 从"留 pending 只告警"改成
+    持久状态(§9.14)时**一字未改**,加 (a′) 是它的第一次扩面 —— 也正因为 (a)
+    没动,已是 double 的行下一轮旧码一缺席仍旧自动转 confirmed。
     """
     observe_h = row.get("_observe_hours", OBSERVE_HOURS)
     stale_h = row.get("_stale_hours", STALE_HOURS)
     age = now - row["submitted_at"]
     if row["new_present"] and row["old_gone"]:
         return _CONFIRMED, "新码在架且旧码已缺席(观测确认)"
+    # (a′) 影子双挂:同 wpid + 旧码单查 404 —— 两条证据缺一不可(见 docstring)。
+    # `old_probe` 由 `_settle` 逐条探测挂上来(没探测过就是 None ⇒ 落到 (b) 判 double,
+    # fail-closed:探不出来就当它是真双挂,人工回头处置)。
+    if (row["new_present"] and not row["old_gone"]
+            and row.get("old_probe") == 404
+            and row.get("old_wpid")
+            and row.get("old_wpid") == row.get("new_wpid")):
+        return _CONFIRMED, (f"新码在架,旧码与新码同 wpid({row['old_wpid']})"
+                            "且单查 404 —— 列表接口的影子,改码已生效")
     if row["new_present"] and not row["old_gone"]:
         return _DOUBLE, ("新码与旧码**同时在架** —— 这不是改码而是多了一条 listing,"
                          "本工作流不自动处置,请人工核对沃尔玛后台")
@@ -712,6 +754,80 @@ def _verdict(row: dict, receipt: tuple[str, str] | None, now) -> tuple[str, str]
                           f"(新码未现且观测{'不新鲜' if not row['fresh'] else '新鲜但未到反证条件'})"
                           f" —— 超期 {stale_h}h,交人工,**不自动定案**")
     return _PENDING, "等观测(未到判据)"
+
+
+#: 影子探测的两句人话(摘要与日志共用一份措辞,别在两处各写一遍)。
+_SHADOW_WHY = ("列表接口把已删档案照旧吐回(僵尸列表,docs/backlog.md §十三);"
+               "单条 GET 才是真话")
+
+
+def _shadow_candidates(rows: list[dict]) -> list[dict]:
+    """输入:`_SQL_OBSERVE` 的观测行 → 输出:要**逐条单查旧码**的那些行。纯函数。
+
+    候选 = 新码在架 ∧ 旧码没缺席 ∧ **两码 wpid 相同且非空**(= 同一条 listing,
+    原地换码已生效)。wpid 不同的双挂**不探测**:那是真的多了一条 listing
+    (A131吕灿荣 43 条里那 2 条:`B08DR3TKQK` 两个 wpid 都 PUBLISHED、
+    `B09L3WXJ96` 旧码是 RETIRED 死档而新码是新建 item),留给人工。
+
+    ⚠ 面里**含已经是 double 的行**:`_SQL_OBSERVE` 本来就取 pending ∪ double
+    (§9.14),那 41 条按现状永远停在 double —— 它们正是本次自救的对象。
+    上限 = 该店 double/pending 里的同 wpid 双挂行数,不会失控(A131 是 41 条,
+    `items.get` 的桶是 900/min)。
+    """
+    return [r for r in rows
+            if r.get("new_present") and not r.get("old_gone")
+            and r.get("old_wpid") and r.get("old_wpid") == r.get("new_wpid")]
+
+
+def _probe_shadows(store_name: str, rows: list[dict]) -> list[str]:
+    """输入:店 + 影子候选行 → 输出:告警行;**副作用**:给行挂 `old_probe`(404/200)。
+
+    `api.items.get_item` 是**读**(GET /v3/items/{sku},补漏单查),走 api/_client
+    的每店固定出口代理与 `items.get` 速率桶(900/min)—— **严禁直连**(安全红线)。
+    api 层只回 None(404)/ dict(200),"是不是影子"这个业务判断在 `_verdict`
+    (铁律 2:api 层不写业务判断)。
+
+    **fail-closed,不猜**:凭证加载失败、单查抛异常 ⇒ 那些行**不挂 `old_probe`**,
+    于是 `_verdict` 照旧判 double(现状),并在摘要里点名一次「影子探测失败」。
+    反过来(探不出来就当 404)会拿一次网络抖动去弃码、改 UPC、迁处置键,而且
+    全程不报错 —— 那是不可逆的一侧。
+
+    **dry-run 照样探测**:它是只读的,而空跑正是人眼确认"这批到底是影子还是
+    真双挂"的那一步;写库那一侧由 `_settle` 的 execute 分支挡着。
+    """
+    if not rows:
+        return []
+    try:
+        matched = stores_svc.load_stores([store_name])
+        store = matched[0] if matched else None
+    except Exception as e:                    # noqa: BLE001 —— 判不出就不探测
+        logger.warning("影子探测取凭证失败 %s:%s", store_name, e)
+        return [f"  ⚠ 影子探测失败({e.__class__.__name__}),{len(rows)} 条按 "
+                f"double 处理:读店铺凭证没成 —— **不猜**(探不出来就当旧码已死,"
+                f"会拿一次抖动去弃码/改 UPC/迁处置键,而且不报错)"]
+    if store is None:
+        return [f"  ⚠ 影子探测失败(店铺不可调用),{len(rows)} 条按 double 处理:"
+                f"{store_name} 不在可调用列表里(未启用/没配代理/没凭证)"]
+    fails: dict[str, int] = {}
+    for r in rows:
+        try:
+            got = items_api.get_item(store, r["old_sku"])
+        except Exception as e:                # noqa: BLE001 —— 逐条隔离,不吞
+            logger.warning("影子探测 GET 失败 %s %s:%s",
+                           store_name, r["old_sku"], e)
+            fails[e.__class__.__name__] = fails.get(e.__class__.__name__, 0) + 1
+            continue
+        r["old_probe"] = 404 if got is None else 200
+    n_404 = sum(1 for r in rows if r.get("old_probe") == 404)
+    n_200 = sum(1 for r in rows if r.get("old_probe") == 200)
+    out = [f"  影子探测:同 wpid 的双挂 {len(rows)} 条,旧码单查 404 {n_404} 条"
+           f"(判 confirmed)、200 {n_200} 条(旧码真的还在,仍判 double)"
+           f" —— {_SHADOW_WHY}"]
+    if fails:
+        detail = "、".join(f"{k}×{v}" for k, v in sorted(fails.items()))
+        out.append(f"  ⚠ 影子探测失败({detail}),{sum(fails.values())} 条按 "
+                   f"double 处理(fail-closed:探不出来不猜,下一轮重探)")
+    return out
 
 
 def _confirm(store_name: str, row: dict) -> list[str]:
@@ -730,11 +846,10 @@ def _confirm(store_name: str, row: dict) -> list[str]:
                                      "观测确认(新码在架、旧码缺席)")
         if row["source_type"] == listing_sources.SOURCE_AMZ and row["source_key"]:
             upc_pool.retag_sku(tx, [(store_name, row["source_key"], new)])
-        # ⚠ 先读后改:rekey 之后旧码名下的 suggested 已经搬走,再读就读不到了。
-        # executing 行 rekey 故意不碰(搬键 = 换判决对象),它们滞留在旧码上,
-        # 由 expire_executing 判成 ineffective 收尾 —— 自愈,但**不许静默**。
+        # ⚠ 先读后改:rekey 之后旧码名下的行(suggested + 维护组的 executing)
+        # 已经搬走,再读就读不到了 —— 点名要的名单必须在迁键**之前**取。
         stranded = dispositions.executing_actions_on(tx, store_name, old)
-        _moved, taken = dispositions.rekey_suggested(
+        _moved, taken = dispositions.rekey_open(
             tx, store_name, old, new, asin=row["source_key"])
         walmart_catalog.drop_node_rows(tx, store_name, old)
         tx.execute(_SQL_LEDGER_SETTLE,
@@ -742,14 +857,27 @@ def _confirm(store_name: str, row: dict) -> list[str]:
     if taken:
         warns.append(f"  ⚠ {old}→{new}:新码名下已有未落定建议 {','.join(taken)},"
                      f"这些动作的旧码建议**不迁不删**,请人工处置")
-    if stranded:
-        bad = [a for a in stranded if a in dispositions.DESTRUCTIVE_ACTIONS]
+    # 维护组与破坏组的 executing **去向不同**(2026-09-08 改口,§9.15),分开报:
+    #   · 维护组(title/price/inventory)已随 `rekey_open` 迁到新码 —— 同一个 wpid,
+    #     新码的现值就是那条 feed 作用的对象,由维护链 `settle_maintenance` 按新码
+    #     观测落定(不加任何新的落定代码,`executed_at` 不改);
+    #   · 破坏组(delete/retire)**仍不迁**,告警原样保留。
+    moved_exec = [a for a in stranded
+                  if a in dispositions.MAINT_ACTIONS and a not in taken]
+    bad = [a for a in stranded if a in dispositions.DESTRUCTIVE_ACTIONS]
+    if moved_exec:
         warns.append(
-            f"  ⚠ {old}→{new}:旧码名下还有 executing 的 {','.join(stranded)},"
-            f"**不迁**(搬键等于换判决对象)—— 它们滞留在旧码上,由 "
-            f"expire_executing 判成 ineffective 收尾,不用管"
-            + (f";⛔ 其中 {','.join(bad)} 是**破坏组**,候选判据本该把这行剔掉"
-               f"(多半是中间窗口里新长出来的建议),**请人工核**" if bad else ""))
+            f"  {old}→{new}:旧码名下 executing 的 {','.join(moved_exec)} "
+            f"**已迁到新码**,由维护链按新码观测落定(同 wpid = 同一条 listing,"
+            f"新码的现值就是那条 feed 作用的对象;executed_at 不改,宽限期照旧"
+            f"从原提交时刻算)")
+    if bad:
+        warns.append(
+            f"  ⚠ {old}→{new}:旧码名下还有 executing 的**破坏组** "
+            f"{','.join(bad)},**不迁**(搬键等于换判决对象:它们等的是"
+            f"「这个 SKU 不见了」,而改码后旧码正好消失)—— 滞留在旧码上由 "
+            f"expire_executing 判成 ineffective 收尾;⛔ 候选判据本该把这行剔掉"
+            f"(多半是中间窗口里新长出来的建议),**请人工核**")
     return warns
 
 
@@ -779,14 +907,16 @@ def _settle(conn, store_name: str, execute: bool, *,
     所以本轮刚落的 double 立刻从节奏闸的 open 里消失 —— A131吕灿荣 那 2 条会在
     **同一轮**里先记成 double、闸随即放开、当轮就能提交后面那批。
 
-    **本段不调任何沃尔玛写接口**,所以也不需要店铺凭证:库存随改码 feed 一起
-    写完了,**定案不再回写库存**(所有者 2026-09-07 定稿,安全约束⑦)。
+    **本段不调任何沃尔玛写接口**:库存随改码 feed 一起写完了,**定案不再回写库存**
+    (所有者 2026-09-07 定稿,安全约束⑦)。店铺凭证**只有影子探测需要,按需加载**
+    (2026-09-08,§9.15):同 wpid 的双挂行要逐条 GET 一次旧码(读),一条这样的
+    候选都没有就**一次凭证都不读**、一次沃尔玛都不调。
 
     ⚠ 写不走入参的 `conn`:那是本轮的**只读**连接,而定案必须是自己的短事务
     (每条各自成败,一条撞车不拖垮整轮)。
     """
     counts = {_CONFIRMED: 0, _ROLLED_BACK: 0, _STALLED: 0, _PENDING: 0,
-              _DOUBLE: 0}
+              _DOUBLE: 0, "shadow": 0}
     lines: list[str] = []
     warns: list[str] = []
     now = datetime.now(timezone.utc)
@@ -826,6 +956,10 @@ def _settle(conn, store_name: str, execute: bool, *,
         feed_st = {}
     n_feed_rejected = 0
 
+    # 影子双挂逐条单查(§9.15):**只对同 wpid 的双挂行**探测,一条都没有就不碰凭证。
+    # 探测结果挂在行上(`old_probe`),判决仍由 `_verdict` 这个纯函数出。
+    lines += _probe_shadows(store_name, _shadow_candidates(pend))
+
     for row in pend:
         row["_observe_hours"], row["_stale_hours"] = observe_hours, stale_hours
         receipt = receipts.get(row.get("feed_id") or "", {}).get(row["new_sku"])
@@ -836,6 +970,12 @@ def _settle(conn, store_name: str, execute: bool, *,
         verdict, why = _verdict(row, receipt, now)
         counts[verdict] = counts.get(verdict, 0) + 1
         tag = f"{row['old_sku']}→{row['new_sku']}"
+        # 影子改码与「旧码真的缺席了」的 confirmed **分开计数**:首行两个数
+        # 各答各的问题(同店双挂 N = 还要人工回头处理几条)
+        shadow_hit = (verdict == _CONFIRMED and not row["old_gone"]
+                      and row.get("old_probe") == 404)
+        if shadow_hit:
+            counts["shadow"] += 1
         if verdict == _DOUBLE:
             # 双挂**不再留 pending**(2026-09-07 所有者定稿,docs/sku_plan.md §9.14)。
             # 落一个持久的 double:它不进节奏闸的 open(`_SQL_STAGE`)⇒ 后面那 500 条
@@ -874,6 +1014,11 @@ def _settle(conn, store_name: str, execute: bool, *,
         try:
             if verdict == _CONFIRMED:
                 warns += _confirm(store_name, row)
+                if shadow_hit:
+                    lines.append(
+                        f"  影子改码定案 {tag}:同 wpid {row['old_wpid']}、"
+                        f"旧码单查 404 ⇒ confirmed(弃旧码 / UPC 改标 / 处置迁键 / "
+                        f"节点库存清行全走现成路径,**不新增写动作**)")
                 logger.info("改码定案 confirmed %s %s:%s", store_name, tag, why)
             elif verdict == _ROLLED_BACK:
                 _roll_back(store_name, row, why)
@@ -888,6 +1033,8 @@ def _settle(conn, store_name: str, execute: bool, *,
                 warns.append(f"  ⚠ 超期未定案 {tag}:{why}")
         except Exception as e:                 # noqa: BLE001 —— 见上:隔离不是吞
             counts[verdict] -= 1
+            if shadow_hit:                     # 定案没成,首行就不许报"影子改码"
+                counts["shadow"] -= 1
             counts["failed"] = counts.get("failed", 0) + 1
             logger.exception("改码定案失败 %s %s(判词 %s)", store_name, tag, verdict)
             warns.append(f"  ⚠ 定案失败 {tag}(判词 {verdict}):"
@@ -902,9 +1049,10 @@ def _settle(conn, store_name: str, execute: bool, *,
     # 身份映射在登记簿 + 在线产品总表「来源码」列,上架表 SKU 列只由上架链写。
     # 见模块头注「身份映射写在哪」——**不要把它加回来**(上架表会被清理,拿它
     # 当第二处身份映射就是双轨,§六)。
-    lines.append(f"  定案:confirmed {counts[_CONFIRMED]}、"
-                 f"rolled_back {counts[_ROLLED_BACK]}、stalled {counts[_STALLED]},"
-                 f"仍 pending {counts[_PENDING]}")
+    lines.append(f"  定案:confirmed {counts[_CONFIRMED]}"
+                 + (f"(其中影子改码 {counts['shadow']})" if counts["shadow"] else "")
+                 + f"、rolled_back {counts[_ROLLED_BACK]}、"
+                   f"stalled {counts[_STALLED]},仍 pending {counts[_PENDING]}")
     if n_feed_rejected:
         lines.append(f"  整 feed 被拒的回执 {n_feed_rejected} 条按 failed 定案"
                      f"(台账 missing + feed_log failed = 沃尔玛一条都没收,不等观测反证)")
@@ -1559,6 +1707,7 @@ def run(params: dict) -> str:
     n_stall = settle_counts.get(_STALLED, 0)
     n_pend = settle_counts.get(_PENDING, 0)
     n_double = settle_counts.get(_DOUBLE, 0)
+    n_shadow = settle_counts.get("shadow", 0)
     n_unsent = settle_counts.get("unsent", 0)
     n_failed = settle_counts.get("failed", 0)
     n_sub = mig_counts.get("submitted", 0)
@@ -1586,6 +1735,11 @@ def run(params: dict) -> str:
         # 语义是「前提不成立、**什么都没做**」—— 闸不过时定案照跑,可能真定了案,
         # 报 refused 就把"清了账"说成"什么都没干"。闸的结论仍在首行里,人看得见。
         gist = "⛔ 前置闸未过,本轮只定案、不发新的;" + gist
+    # ⚠ 「影子改码 N」与「同店双挂 N」**分开报**(2026-09-08,§9.15):前者是本轮
+    # 自救掉的(同 wpid + 旧码单查 404,列表接口的影子),后者是**真双挂**、仍要
+    # 所有者回头人工处置 —— 合成一个数就等于把"已经解决"混进待办清单。
+    if n_shadow:
+        gist += f";影子改码 {n_shadow}"
     # 四类必须见人的告警**拼在首行**:cli 的链通知只取首行,落在下面就只进了日志
     if n_double:
         gist += f";⚠ 同店双挂 {n_double}"

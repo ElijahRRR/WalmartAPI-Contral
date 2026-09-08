@@ -383,27 +383,51 @@ def test_open_executing_count_only_counts_executing_rows_of_that_store():
     assert "UPDATE" not in sql.upper()               # 只读
 
 
-def test_rekey_suggested_moves_only_suggested_rows():
-    """迁的是**未落定的建议**(suggested),executing 行本函数不碰。
+def test_rekey_open_moves_suggested_and_maintenance_executing_rows():
+    """迁的面 = **全部 suggested + 维护组的 executing**(2026-09-08 扩面)。
 
-    executing 已经提交了 feed、正等观测判决,搬键等于把判决对象换掉;前置闸
-    (open_executing_count)保证这一刻该店没有 executing 行,所以这里只需要
-    不碰、不需要分支。asin 列跟着补(coalesce 只填不覆盖)—— 不透明码在 sku
-    列里提不出 ASIN,那一列是它与产品中心/黑名单对齐的唯一线索。
+    原口径「executing 一律不碰」的前提是"新码与旧码是两个不同的 item";
+    MP_ITEM_MATCH 的改码是**同一个 item 上原地换码**(同 wpid,sku_plan §9.12),
+    所以维护三类的 executing 搬过去不是换判决对象,而是把账挪到唯一还比得了的
+    那一行(A171罗尹鸿 691466:改价早就生效,拿旧码那一行比永远比不了)。
+    破坏组的 executing 仍旧不迁 —— 状态条件必须写成"suggested,或 executing 且
+    动作在维护组里",一句 `status <> 'settled'` 会把破坏组一起卷进来且不报错。
+    asin 列跟着补(coalesce 只填不覆盖);迁过的行 detail 留 rekeyed_from。
     """
     conn = _ScriptedConn(taken=(), moved=3)
-    moved, taken = ds.rekey_suggested(conn, "T1", "B0OLD00001", "AN3WC0DE2345",
-                                      asin="B0OLD00001")
+    moved, taken = ds.rekey_open(conn, "T1", "B0OLD00001", "AN3WC0DE2345",
+                                 asin="B0OLD00001")
     assert (moved, taken) == (3, [])
     upd_sql, upd_params = conn.log[1]
     assert "status = 'suggested'" in upd_sql
-    assert "executing" not in upd_sql                     # 只 suggested,不碰在途
+    assert "status = 'executing' AND action = ANY(%(maint)s::text[])" in upd_sql
+    assert upd_params["maint"] == list(ds.MAINT_ACTIONS)     # 名单不在这儿手打
     assert "asin = coalesce(asin, %(asin)s::text)" in upd_sql
     assert upd_params["asin"] == "B0OLD00001"
     assert upd_params["taken"] == []
+    # 迁过的行要留痕:回头查"这条 executing 当初打在哪个码上"必须有答案
+    assert "'rekeyed_from', %(old_sku)s::text" in upd_sql
+    assert "'rekeyed_at', now()" in upd_sql
+    # ⚠ executed_at 一个字不改:宽限期照旧从原提交时刻算
+    assert "executed_at" not in upd_sql
 
 
-def test_rekey_suggested_skips_and_reports_action_collisions(caplog):
+def test_rekey_open_never_moves_destructive_executing_rows():
+    """反向钉死:破坏组(delete/retire)的 executing **不许**被搬。
+
+    它们等的是 `product_events` 的 delete_verified(「这个 SKU 不见了」),而改码
+    之后旧码正好消失 —— 搬到新码上就是拿另一个身份去等一个已经被污染的判决。
+    这条与「维护组一并搬」是同一个 SQL 里的两半,写错一半不会报错。
+    """
+    sql = ds._REKEY_SQL
+    for a in ds.DESTRUCTIVE_ACTIONS:
+        assert f"'{a}'" not in sql, a                 # 名单里一个破坏动作都没有
+    assert "%(maint)s::text[]" in sql                 # executing 那一半只认维护组
+    assert "settled_at IS NULL" in sql                # 已落定的病历行一根手指不碰
+    assert "DELETE" not in sql.upper()                # 撞车的行不删
+
+
+def test_rekey_open_skips_and_reports_action_collisions(caplog):
     """新码名下已有同动作的未落定建议 ⇒ 那些动作**不迁、不删、不合并**,点名人工。
 
     dispositions_open_uidx 是 (store, sku, action) WHERE status IN
@@ -414,7 +438,7 @@ def test_rekey_suggested_skips_and_reports_action_collisions(caplog):
     import logging
     conn = _ScriptedConn(taken=("delete", "delete", "retire"), moved=1)
     with caplog.at_level(logging.WARNING, logger="services.dispositions"):
-        moved, taken = ds.rekey_suggested(conn, "T1", "B0OLD00001", "AN3WC0DE2345")
+        moved, taken = ds.rekey_open(conn, "T1", "B0OLD00001", "AN3WC0DE2345")
     assert (moved, taken) == (1, ["delete", "retire"])     # 去重且定序
     sel_sql, sel_params = conn.log[0]
     assert "status IN ('suggested', 'executing')" in sel_sql   # 在途也算占位
@@ -425,11 +449,57 @@ def test_rekey_suggested_skips_and_reports_action_collisions(caplog):
     assert any("人工" in m for m in caplog.messages)
 
 
-def test_rekey_suggested_never_touches_executing_rows():
-    """反向钉死:UPDATE 的 WHERE 里只能出现 suggested 这一个状态。"""
-    assert "status = 'suggested'" in ds._REKEY_SQL
-    assert ds._REKEY_SQL.count("status") == 1
-    assert "DELETE" not in ds._REKEY_SQL.upper()      # 撞车的行不删
+def test_only_one_rekey_function_exists():
+    """一个能力一条实现路径(§六):改名之后**不许**留着旧名当别名。
+
+    留一个 `rekey_suggested = rekey_open` 的别名不会报错,但半年后两个名字会各自
+    长出调用方,而"executing 到底搬不搬"这件事就有了两份口径。
+    """
+    assert not hasattr(ds, "rekey_suggested")
+    assert len([n for n in dir(ds) if n.startswith("rekey")]) == 1
+
+
+class _MaintSettleConn:
+    """settle_maintenance 的假连接:第一条 SQL 取待判行,后面是 UPDATE。"""
+
+    def __init__(self, rows):
+        self.rows, self.updates, self.sqls = list(rows), [], []
+
+    def cursor(self):
+        return self
+
+    def __enter__(self): return self
+
+    def __exit__(self, *a): return False
+
+    def execute(self, sql, args=None):
+        self.sqls.append(sql)
+        if "UPDATE ops.dispositions" in sql:
+            self.updates.append((args["status"], sorted(args["ids"])))
+        return self
+
+    def fetchall(self):
+        return list(self.rows)
+
+
+def test_a_rekeyed_executing_row_settles_on_the_new_codes_value():
+    """迁过去之后**不加任何新的落定代码**:`settle_maintenance` 的现有规则自然收尾。
+
+    A171罗尹鸿 691466(price,15.71→16.78,2026-09-07 14:00 executed):迁到新码
+    AJ5K52FK5SME 之后,`_MAINT_OPEN_SQL` JOIN 到的是**新码那一行**(观测 16.78,
+    `last_seen_at > executed_at + 2h`),按现值比 want ⇒ confirmed。
+    不迁的话它 JOIN 的是旧码 —— 那一行已经缺席,取不出来,一路挂到
+    `expire_executing` 3 天超期才放行,期间每次改码定案还要把它点名一遍。
+    """
+    conn = _MaintSettleConn([
+        (691466, "price", {"new": 16.78, "rekeyed_from": "B0OLDA171X"},
+         16.78, None, None, None),                      # 新码现值 = 提交的值
+    ])
+    assert ds.settle_maintenance(conn) == {"confirmed": 1, "ineffective": 0}
+    assert conn.updates == [("confirmed", [691466])]
+    # 落定判据仍是那两条,一个字没加:重新观测过 + 过了宽限期
+    assert "w.last_seen_at > d.executed_at" in ds._MAINT_OPEN_SQL
+    assert "%(grace)s::int" in ds._MAINT_OPEN_SQL
 
 
 # ── 沙箱 PG 集成:迁键真的绕开了那条部分唯一索引 ─────────────────────────────
@@ -488,7 +558,7 @@ def _state(conn):
 
 
 @needs_pg
-def test_rekey_suggested_survives_the_open_unique_index(pg):
+def test_rekey_open_survives_the_open_unique_index(pg):
     """撞车的动作**不迁**,不撞的照迁 —— 全程不抛 UniqueViolation。
 
     dispositions_open_uidx 是 (store, sku, action) WHERE status IN
@@ -498,8 +568,8 @@ def test_rekey_suggested_survives_the_open_unique_index(pg):
     _row(pg, _DOLD, "delete", "suggested")
     _row(pg, _DOLD, "retire", "suggested")
     _row(pg, _DNEW, "delete", "suggested")          # 新码名下已占了 delete
-    moved, taken = ds.rekey_suggested(pg, _DSTORE, _DOLD, _DNEW,
-                                      asin="B0DISPOLD01")
+    moved, taken = ds.rekey_open(pg, _DSTORE, _DOLD, _DNEW,
+                                 asin="B0DISPOLD01")
     assert (moved, taken) == (1, ["delete"])
     assert _state(pg) == [
         (_DNEW, "delete", "suggested", None),        # 新码原有的那条,原样不动
@@ -508,14 +578,22 @@ def test_rekey_suggested_survives_the_open_unique_index(pg):
 
 
 @needs_pg
-def test_rekey_suggested_never_touches_executing_or_settled_rows(pg):
-    """executing(正等观测判决)与已落定(病历)都不许被搬。"""
-    _row(pg, _DOLD, "delete", "executing")
-    _row(pg, _DOLD, "retire", "confirmed")
-    moved, taken = ds.rekey_suggested(pg, _DSTORE, _DOLD, _DNEW)
-    assert (moved, taken) == (0, [])
-    assert _state(pg) == [(_DOLD, "delete", "executing", None),
+def test_rekey_open_moves_maintenance_executing_but_not_destructive(pg):
+    """真库上分两组:维护组的 executing **搬**,破坏组的 executing 与已落定行**不搬**。"""
+    _row(pg, _DOLD, "delete", "executing")      # 破坏组在途:不搬
+    _row(pg, _DOLD, "retire", "confirmed")      # 已落定的病历:不搬
+    _row(pg, _DOLD, "price", "executing")       # 维护组在途:搬
+    moved, taken = ds.rekey_open(pg, _DSTORE, _DOLD, _DNEW, asin="B0DISPOLD01")
+    assert (moved, taken) == (1, [])
+    assert _state(pg) == [(_DNEW, "price", "executing", "B0DISPOLD01"),
+                          (_DOLD, "delete", "executing", None),
                           (_DOLD, "retire", "confirmed", None)]
+    with pg.cursor() as cur:
+        cur.execute("SELECT detail ->> 'rekeyed_from', detail ->> 'rekeyed_at' "
+                    "IS NOT NULL, executed_at FROM ops.dispositions "
+                    "WHERE store = %s AND sku = %s", (_DSTORE, _DNEW))
+        frm, stamped, _executed = cur.fetchone()
+        assert (frm, stamped) == (_DOLD, True)   # 留痕:当初打在哪个码上
 
 
 @needs_pg

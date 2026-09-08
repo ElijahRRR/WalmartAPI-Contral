@@ -578,6 +578,12 @@ CREATE TABLE listing.sku_migrations (   -- 改码过程台账(2026-09-02,SKU 改
 -- 身份层 catalog.listing_sources **一个字不动**(旧行仍 replaced_by=新码,新码仍是活码)。
 -- ⚠ 部分唯一索引 sku_migrations_open_uidx(WHERE status='pending')**不覆盖 double 行**,
 -- 这是有意的取舍:防第二条台账靠上面那条候选判据。展开见 docs/sku_plan.md §9.14。
+-- ⚠ **2026-09-08 起 double 还有第二条自动出路**(判词 (a′)「影子双挂」,§9.15):
+-- 两码 **wpid 相同**(= 同一条 listing 原地换码)且**旧码单查 404**(`api.items.get_item`)
+-- ⇒ 直接定案 confirmed,后果与"旧码真缺席"那条逐字相同。起因是列表接口把已删档案照旧
+-- 吐回(僵尸列表,docs/backlog.md §十三),A131吕灿荣 43 条 double 里 41 条属于此类。
+-- 两条证据缺一不可;探不出来(凭证/GET 失败)一律 fail-closed 仍判 double。留在 double
+-- 里的是**真双挂**(wpid 不同,或旧码单查 200),仍等人工。
 -- sheet_synced_at:**2026-09-06 起不再使用**(所有者定稿:改码不回写上架表 ——
 -- 「我们批量修改在线产品的 sku 无需回填上架表行,上架表我经常会清理,我们的 sku
 -- 和对应的来源码已经填写到在线产品表格中了。上架表中的 sku 列由上架的填写即可。」)。
@@ -1039,9 +1045,13 @@ ingestionError 一行,字段级报错聚合的燃料)、只读聚合视图 `ops.
 
 改码(批次 3)只准经两个积木碰这张表:`dispositions.open_executing_count`
 (前置闸:改码前该店必须无 `executing` 行 —— 它等的观测判决会随身份列一起换掉,
-从此永远等不到)与 `dispositions.rekey_suggested`(把 `suggested` 行从旧码搬到
-新码,`asin` 列 coalesce 补上;新码名下已有同动作未落定行的**不迁不删只点名**,
-`executing` 行一概不碰)。工作流里裸写 `UPDATE ops.dispositions SET sku = …`
+从此永远等不到)与 `dispositions.rekey_open`(把旧码名下**未落定**的行搬到新码,
+`asin` 列 coalesce 补上、`detail` 留 `rekeyed_from`/`rekeyed_at`;新码名下已有同动作
+未落定行的**不迁不删只点名**)。⚠ 迁的面 2026-09-08 扩了一次(原名
+`rekey_suggested`,docs/sku_plan.md §9.15):**全部 `suggested` + 维护组
+(title/price/inventory)的 `executing`** —— 改码是同一个 item 上原地换码(同 wpid),
+维护三类的判决对象就是新码那一行;**破坏组(delete/retire)的 `executing` 仍一概不碰**
+(它们等的是「这个 SKU 不见了」,改码后旧码正好消失)。`executed_at` **不刷新**。工作流里裸写 `UPDATE ops.dispositions SET sku = …`
 即违规:它绕过状态机、撞得上下面那条部分唯一索引、还漏掉 asin 列。
 
 未落定唯一性是 `(store, sku, action)` 的部分唯一索引 —— **动作在键里不能去掉**:

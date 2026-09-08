@@ -271,16 +271,64 @@ def test_the_real_guard_moved_to_a_per_candidate_condition():
     assert "删除成功" in why and "假确认" in why    # 最狠的那条后果要写在人话里
 
 
-def test_stranded_executing_maintenance_rows_are_named_not_silent():
-    """维护组的 executing 行改码后滞留在旧码上(rekey 故意不碰),由
-    expire_executing 判成 ineffective 收尾 —— 自愈,但**不许静默**:
-    滞留几条、哪些动作要进摘要。破坏组若出现在这里是异常,要额外喊。"""
+def test_executing_rows_are_named_and_the_two_groups_go_different_ways():
+    """两组的去向 2026-09-08 起**不一样**(§9.15),摘要要分开说:
+
+      · 维护组(title/price/inventory)的 executing **已随 rekey_open 迁到新码**,
+        由维护链按新码观测落定(同 wpid = 同一条 listing,新码的现值就是那条 feed
+        作用的对象);
+      · 破坏组(delete/retire)**仍不迁**,滞留旧码等 expire_executing 收尾,
+        而且它本不该出现在这里 —— 要额外喊「请人工核」。
+    """
     import inspect
     src = inspect.getsource(sm._confirm)
     assert "executing_actions_on" in src
-    # 先读后改:rekey 之后 suggested 已经搬走,再读就读不到了
-    assert src.index("executing_actions_on") < src.index("rekey_suggested")
+    # 先读后改:rekey 之后旧码名下的行已经搬走,再读就读不到了
+    assert src.index("executing_actions_on") < src.index("rekey_open")
+    assert "MAINT_ACTIONS" in src and "已迁到新码" in src
     assert "DESTRUCTIVE_ACTIONS" in src and "请人工核" in src
+
+
+def _confirm_wired(monkeypatch, *, stranded=(), taken=()):
+    """`_confirm` 的五处写全部打桩 → 只看它怎么点名。"""
+    monkeypatch.setattr(sm.db, "pg_conn", lambda *a, **k: _Conn(tag="tx"))
+    monkeypatch.setattr(sm.sku_codec, "settle_replacement", lambda *a, **k: None)
+    monkeypatch.setattr(sm.upc_pool, "retag_sku", lambda *a, **k: None)
+    monkeypatch.setattr(sm.walmart_catalog, "drop_node_rows", lambda *a, **k: 1)
+    monkeypatch.setattr(sm.dispositions, "executing_actions_on",
+                        lambda *a, **k: list(stranded))
+    monkeypatch.setattr(sm.dispositions, "rekey_open",
+                        lambda *a, **k: (1, list(taken)))
+    return {"id": 1, "old_sku": "B0OLD00001", "new_sku": "AAAAAAAAAAAA",
+            "source_type": "amz", "source_key": "B0OLD00001"}
+
+
+def test_a_migrated_maintenance_executing_row_is_reported_as_migrated(monkeypatch):
+    """维护组的 executing 迁走之后,摘要说的是「已迁到新码,由维护链按新码观测落定」
+    —— 不再是「不迁,由 expire_executing 判成 ineffective」(A171罗尹鸿 691466 那句)。"""
+    row = _confirm_wired(monkeypatch, stranded=["price"])
+    warns = sm._confirm("T1", row)
+    ln = next(ln for ln in warns if "price" in ln)
+    assert "已迁到新码" in ln and "维护链" in ln
+    assert "executed_at 不改" in ln          # 宽限期照旧从原提交时刻算
+    assert "expire_executing" not in ln
+
+
+def test_a_destructive_executing_row_is_still_never_migrated(monkeypatch):
+    """破坏组的告警**原样保留**:不迁、滞留旧码、请人工核。"""
+    row = _confirm_wired(monkeypatch, stranded=["delete"])
+    warns = sm._confirm("T1", row)
+    ln = next(ln for ln in warns if "delete" in ln)
+    assert "不迁" in ln and "expire_executing" in ln and "请人工核" in ln
+    assert "已迁到新码" not in ln
+
+
+def test_a_maintenance_row_that_collides_is_named_not_reported_as_migrated(monkeypatch):
+    """撞车(新码名下已有同动作未落定行)的**不算迁走**:只报「请人工处置」那一句。"""
+    row = _confirm_wired(monkeypatch, stranded=["price"], taken=["price"])
+    warns = sm._confirm("T1", row)
+    assert any("请人工处置" in ln for ln in warns)
+    assert not any("已迁到新码" in ln for ln in warns)
 
 
 def test_open_retire_cooldown_blocks_the_store(monkeypatch):
@@ -693,11 +741,13 @@ def test_the_workflow_never_reads_feishu_itself(monkeypatch):
 #  W3 · 三态判决(纯函数)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _obs(new_present=False, old_gone=False, fresh=True, hours=1):
+def _obs(new_present=False, old_gone=False, fresh=True, hours=1,
+         new_wpid=None, old_wpid=None, old_probe=None):
     return {"id": 1, "old_sku": "B0OLD00001", "new_sku": "AAAAAAAAAAAA",
             "source_type": "amz", "source_key": "B0OLD00001", "feed_id": "F1",
             "submitted_at": NOW - timedelta(hours=hours),
-            "new_present": new_present, "old_gone": old_gone, "fresh": fresh}
+            "new_present": new_present, "old_gone": old_gone, "fresh": fresh,
+            "new_wpid": new_wpid, "old_wpid": old_wpid, "old_probe": old_probe}
 
 
 def test_confirmed_needs_new_present_and_old_gone():
@@ -714,6 +764,41 @@ def test_receipt_success_alone_does_not_settle():
 def test_both_codes_live_is_a_double_listing_and_never_settles():
     v, why = sm._verdict(_obs(True, False, hours=100), ("success", ""), NOW)
     assert v == "double" and "同时在架" in why
+
+
+def test_a_shadow_double_settles_confirmed_on_two_pieces_of_evidence():
+    """判词 (a′):**同 wpid + 旧码单查 404** ⇒ confirmed(2026-09-08,§9.15)。
+
+    A131吕灿荣 43 条停在 double 的改码里 41 条新旧 wpid **相同** —— 同 wpid =
+    同一条 listing 原地换码,改码其实成功了;"旧码还在架"只是 2026-08-28 起
+    列表接口把已删档案照旧吐回(僵尸列表,backlog §十三),单条 GET 是 404。
+    按现状那 41 条永远停在 double:旧码永不弃码、UPC 永不改标、处置永不迁键。
+    """
+    v, why = sm._verdict(_obs(True, False, hours=100, new_wpid="W9",
+                              old_wpid="W9", old_probe=404), None, NOW)
+    assert v == "confirmed"
+    assert "同 wpid" in why and "404" in why and "影子" in why
+
+
+def test_a_same_wpid_double_whose_old_code_answers_200_stays_double():
+    """单查 200 = 旧码**真的还在**沃尔玛那儿 ⇒ 仍判 double,不许定案。"""
+    v, why = sm._verdict(_obs(True, False, hours=100, new_wpid="W9",
+                              old_wpid="W9", old_probe=200), None, NOW)
+    assert v == "double" and "同时在架" in why
+
+
+def test_a_404_without_the_same_wpid_stays_double():
+    """**两条证据缺一不可**:只有 404 而 wpid 不同 ⇒ 那是真的多了一条 listing
+    (A131 那 2 条:B08DR3TKQK 两个 wpid 都 PUBLISHED;B09L3WXJ96 旧码是 RETIRED
+    死档、新码是新建 item),仍判 double 交人工。"""
+    v, _ = sm._verdict(_obs(True, False, hours=100, new_wpid="WNEW",
+                            old_wpid="WOLD", old_probe=404), None, NOW)
+    assert v == "double"
+    # 反过来同理:只有同 wpid、没探测过(old_probe 为 None)也不许定案 —— 探不出来
+    # 就当它是真双挂(fail-closed),不猜
+    v2, _ = sm._verdict(_obs(True, False, hours=100, new_wpid="W9",
+                             old_wpid="W9"), None, NOW)
+    assert v2 == "double"
 
 
 def test_failed_receipt_rolls_back():
@@ -750,8 +835,11 @@ def test_observe_and_stale_hours_are_overridable_per_run():
 #: `_SQL_OBSERVE` 的列(顺序与 SQL 逐字对齐)。`status` 是 2026-09-07 加的:
 #: 观测面从 pending 扩成 **pending ∪ double**(§9.14),`_settle` 要靠它分辨
 #: "这轮刚判成双挂"与"上轮已经是 double"(后者一条 UPDATE 都不该发)。
+#: 两列 wpid 是 2026-09-08 加的(§9.15):判词 (a′)「影子双挂」的第一条证据就是
+#: **两码 wpid 相同**(同一条 listing 原地换码),第二条是旧码单查 404。
 _OBS_COLS = ["id", "old_sku", "new_sku", "source_type", "source_key", "feed_id",
-             "submitted_at", "status", "new_present", "old_gone", "fresh"]
+             "submitted_at", "status", "new_wpid", "old_wpid",
+             "new_present", "old_gone", "fresh"]
 
 
 def _settle_wired(monkeypatch, obs_rows, receipts=None, calls=None):
@@ -768,7 +856,7 @@ def _settle_wired(monkeypatch, obs_rows, receipts=None, calls=None):
                             ("settle", s, o, n, v)))
     monkeypatch.setattr(sm.upc_pool, "retag_sku",
                         lambda c, triples: calls.append(("retag", list(triples))))
-    monkeypatch.setattr(sm.dispositions, "rekey_suggested",
+    monkeypatch.setattr(sm.dispositions, "rekey_open",
                         lambda c, s, o, n, asin=None: (
                             calls.append(("rekey", o, n, asin)), (1, []))[1])
     monkeypatch.setattr(sm.walmart_catalog, "drop_node_rows",
@@ -776,8 +864,10 @@ def _settle_wired(monkeypatch, obs_rows, receipts=None, calls=None):
     return read, calls, tx
 
 
+#: 旧码真的缺席了的那种 confirmed(old_wpid 自然是 NULL:LEFT JOIN 取不到行)。
 _OBS_COLS_CONFIRM = (1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001",
-                     "F1", NOW - timedelta(hours=2), "pending", True, True, True)
+                     "F1", NOW - timedelta(hours=2), "pending", "W1", None,
+                     True, True, True)
 
 
 def test_confirmed_retags_upc_rekeys_dispositions_and_drops_node_rows(monkeypatch):
@@ -808,7 +898,7 @@ def test_confirmed_never_touches_the_listing_sheet(monkeypatch):
 
 def test_failed_receipt_settles_as_rolled_back_and_never_resubmits(monkeypatch):
     row = (1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001", "F1",
-           NOW - timedelta(hours=2), "pending", False, True, True)
+           NOW - timedelta(hours=2), "pending", None, None, False, True, True)
     read, calls, _tx = _settle_wired(
         monkeypatch, [row], receipts={"AAAAAAAAAAAA": ("failed", "ERR_9")})
     monkeypatch.setattr(sm.feeds, "submit_feed",
@@ -820,9 +910,12 @@ def test_failed_receipt_settles_as_rolled_back_and_never_resubmits(monkeypatch):
 
 
 #: 一条"新码在架、旧码也在架"的观测行(同店双挂)。`status` 是它当前的台账状态。
-def _double_row(status="pending", rid=1):
+def _double_row(status="pending", rid=1, new_wpid="WNEW", old_wpid="WOLD"):
+    """缺省是**真双挂**:两码 wpid 不同 ⇒ 影子探测不碰它(`_shadow_candidates`),
+    判词照旧走 (b)。同 wpid 的那种传 `new_wpid=old_wpid=…`(§9.15 的影子)。"""
     return (rid, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001", "F1",
-            NOW - timedelta(hours=2), status, True, False, True)
+            NOW - timedelta(hours=2), status, new_wpid, old_wpid,
+            True, False, True)
 
 
 def test_double_listing_warns_and_settles_nothing(monkeypatch):
@@ -886,11 +979,187 @@ def test_a_double_row_turns_into_confirmed_once_the_old_code_is_gone(monkeypatch
     **而且没有任何东西会报**。
     """
     row = (1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001", "F1",
-           NOW - timedelta(hours=2), "double", True, True, True)   # 旧码已缺席
+           NOW - timedelta(hours=2), "double", "W1", None,
+           True, True, True)   # 旧码已缺席
     read, calls, _tx = _settle_wired(monkeypatch, [row])
     counts, lines = _settle_at(sm, read, True)
     assert counts["confirmed"] == 1 and counts["double"] == 0
     assert ("settle", "T1", "B0OLD00001", "AAAAAAAAAAAA", "confirmed") in calls
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  W3a · 影子双挂逐条单查(2026-09-08 所有者实证,docs/sku_plan.md §9.15)
+#
+#  探测是**读**(GET /v3/items/{sku},走 api/items → api/_client 的每店固定出口
+#  代理与 items.get 桶),业务判断留在 `_verdict`(铁律 2:api 层不写业务判断)。
+#  fail-closed:探不出来**不猜**,那些行照旧判 double —— 反过来(当 404)会拿一次
+#  网络抖动去弃码、改 UPC、迁处置键,而且全程不报错。
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _probe_wired(monkeypatch, rows, *, probe=None, boom=None, creds=("T1",)):
+    """把 `_settle` 的读连接与探测两侧一起打桩 → (read, calls, tx, probe_log)。
+
+    probe: {旧码: None(404) | dict(200)};boom: {旧码: 异常} —— 逐条抛。
+    creds: None ⇒ load_stores 抛(凭证读不到);() ⇒ 返回空(店不可调用)。
+    """
+    read, calls, tx = _settle_wired(monkeypatch, rows)
+    log = {"stores": 0, "gets": []}
+
+    def _load(filter_names=None):
+        log["stores"] += 1
+        if creds is None:
+            raise RuntimeError("飞书抖了")
+        return [{"name": n, "client_id": "C1"} for n in creds]
+
+    def _get(store, sku):
+        log["gets"].append(sku)
+        if boom and sku in boom:
+            raise boom[sku]
+        return (probe or {}).get(sku)
+
+    monkeypatch.setattr(sm.stores_svc, "load_stores", _load)
+    monkeypatch.setattr(sm.items_api, "get_item", _get)
+    return read, calls, tx, log
+
+
+def test_only_same_wpid_doubles_are_probed_and_credentials_load_once(monkeypatch):
+    """**只对需要的行**单查:调用次数 = 同 wpid 的双挂行数,凭证只读一次。
+
+    多探一条就是白烧 items.get 配额(A085 那条教训:454 SKU 单查 = 8 分钟);
+    每行读一次凭证就是每行打一次飞书。真双挂(wpid 不同)与已缺席的行一条都不查。
+    """
+    rows = [_double_row(rid=1, new_wpid="W1", old_wpid="W1"),   # 影子:要查
+            _double_row(rid=2, new_wpid="WNEW", old_wpid="WOLD"),  # 真双挂:不查
+            _OBS_COLS_CONFIRM]                                   # 旧码已缺席:不查
+    rows[1] = tuple(["B0OLD00002" if i == 1 else v
+                     for i, v in enumerate(rows[1])])
+    read, calls, tx, log = _probe_wired(monkeypatch, rows,
+                                        probe={"B0OLD00001": None})
+    counts, lines = _settle_at(sm, read, True)
+    assert log["gets"] == ["B0OLD00001"]          # 只查了那一条
+    assert log["stores"] == 1                     # 凭证只读一次
+    assert counts["confirmed"] == 2 and counts["shadow"] == 1
+    assert counts["double"] == 1                  # 真双挂原样留着
+    assert any("影子改码定案" in ln for ln in lines)
+
+
+def test_no_shadow_candidate_means_no_credentials_and_no_walmart_call(monkeypatch):
+    """一条同 wpid 的双挂都没有 ⇒ **一次凭证都不读、一次沃尔玛都不调**。
+
+    (纯定案的一轮本来就不该碰凭证 —— 定案不回写库存,所有者 2026-09-07 定稿。)
+    """
+    read, calls, tx, log = _probe_wired(monkeypatch, [_OBS_COLS_CONFIRM])
+    monkeypatch.setattr(sm.stores_svc, "load_stores",
+                        lambda **k: pytest.fail("没有影子候选就不该读凭证"))
+    monkeypatch.setattr(sm.items_api, "get_item",
+                        lambda *a: pytest.fail("没有影子候选就不该调沃尔玛"))
+    counts, _lines = _settle_at(sm, read, True)
+    assert counts["confirmed"] == 1 and counts["shadow"] == 0
+
+
+def test_a_credential_failure_is_fail_closed_and_named(monkeypatch):
+    """凭证读不到 ⇒ **不探测**,那些行照旧判 double,并**点名一次**。
+
+    静默的表现是:所有者以为影子都自救了,而它们还停在 double —— 没有任何
+    东西会报。判不准就判活(conventions §五)。
+    """
+    read, calls, tx, log = _probe_wired(
+        monkeypatch, [_double_row(new_wpid="W1", old_wpid="W1")], creds=None)
+    counts, lines = _settle_at(sm, read, True)
+    assert counts["double"] == 1 and counts["shadow"] == 0
+    assert log["gets"] == []
+    ln = next(ln for ln in lines if "影子探测失败" in ln)
+    assert "RuntimeError" in ln and "1 条按 double 处理" in ln
+
+
+def test_a_store_that_cannot_be_called_is_fail_closed_and_named(monkeypatch):
+    """店不在可调用列表里(没配代理/没凭证)⇒ 同样不探测、点名。**严禁直连**。"""
+    read, calls, tx, log = _probe_wired(
+        monkeypatch, [_double_row(new_wpid="W1", old_wpid="W1")], creds=())
+    counts, lines = _settle_at(sm, read, True)
+    assert counts["double"] == 1 and log["gets"] == []
+    assert any("影子探测失败" in ln and "不在可调用列表" in ln for ln in lines)
+
+
+def test_a_get_that_blows_up_is_fail_closed_and_named(monkeypatch):
+    """单查抛异常(429/超时/代理波动)⇒ 那一条不挂探测结果 ⇒ 判 double,点名一次。
+
+    另一条查得到的**照常定案** —— 逐条隔离:一条抖动不该把整批影子拖回 double。
+    """
+    rows = [_double_row(rid=1, new_wpid="W1", old_wpid="W1"),
+            _double_row(rid=2, new_wpid="W2", old_wpid="W2")]
+    rows[1] = tuple(["B0OLD00002" if i == 1 else
+                     ("BBBBBBBBBBBB" if i == 2 else v)
+                     for i, v in enumerate(rows[1])])
+    read, calls, tx, log = _probe_wired(
+        monkeypatch, rows, probe={"B0OLD00001": None},
+        boom={"B0OLD00002": TimeoutError("代理波动")})
+    counts, lines = _settle_at(sm, read, True)
+    assert log["gets"] == ["B0OLD00001", "B0OLD00002"]
+    assert counts["shadow"] == 1 and counts["confirmed"] == 1
+    assert counts["double"] == 1
+    ln = next(ln for ln in lines if "影子探测失败" in ln)
+    assert "TimeoutError×1" in ln and "fail-closed" in ln
+
+
+def test_dry_run_probes_but_writes_nothing(monkeypatch):
+    """dry-run **照样探测**(只读),但一行库都不写 —— 空跑正是人眼确认
+    "这批到底是影子还是真双挂"的那一步。"""
+    read, calls, tx, log = _probe_wired(
+        monkeypatch, [_double_row(new_wpid="W1", old_wpid="W1")],
+        probe={"B0OLD00001": None})
+    counts, lines = _settle_at(sm, read, False)
+    assert log["gets"] == ["B0OLD00001"]              # 探了
+    assert counts["confirmed"] == 1 and counts["shadow"] == 1
+    assert not tx.sqls and "open:tx" not in calls     # 一行库都没写
+    assert not [c for c in calls if isinstance(c, tuple)]
+    ln = next(ln for ln in lines if "[DRY-RUN] 将定案" in ln)
+    assert "confirmed" in ln and "同 wpid" in ln and "404" in ln
+
+
+def test_a_row_already_double_turns_confirmed_through_the_shadow_probe(monkeypatch):
+    """**已经是 double 的行**(A131 那 41 条)经 (a′) 转 confirmed,走现成 `_confirm`。
+
+    `_SQL_OBSERVE` 的面本来就是 pending ∪ double(§9.14),所以这批不需要任何
+    额外的取数改动;定案后果与"旧码真缺席"那条**逐字相同**,不新增写动作。
+    """
+    read, calls, tx, log = _probe_wired(
+        monkeypatch, [_double_row(status="double", new_wpid="W1", old_wpid="W1")],
+        probe={"B0OLD00001": None})
+    counts, lines = _settle_at(sm, read, True)
+    assert counts["confirmed"] == 1 and counts["double"] == 0
+    kinds = [c[0] for c in calls if isinstance(c, tuple)]
+    assert kinds[:4] == ["settle", "retag", "rekey", "drop"]   # 现成的五处后果
+    assert ("settle", "T1", "B0OLD00001", "AAAAAAAAAAAA", "confirmed") in calls
+    assert not any("status = 'double'" in sql for sql, _ in tx.sqls)  # 不再写 double
+
+
+def test_the_first_line_counts_shadows_apart_from_real_doubles(monkeypatch):
+    """首行「影子改码 N」与「⚠ 同店双挂 N」**分开报**:前者已解决,后者是待办。"""
+    rows = [_double_row(rid=1, new_wpid="W1", old_wpid="W1"),
+            _double_row(rid=2, new_wpid="WNEW", old_wpid="WOLD")]
+    rows[1] = tuple(["B0OLD00002" if i == 1 else v
+                     for i, v in enumerate(rows[1])])
+    _wire(monkeypatch)
+    _read_conn(monkeypatch, [
+        ("FROM listing.sku_migrations m", (_OBS_COLS, rows)),
+        ("FROM listing.sku_migrations WHERE store", (["confirmed", "open"],
+                                                     [(50, 0)])),
+    ])
+    monkeypatch.setattr(sm.feed_track, "item_results", lambda fid: {})
+    monkeypatch.setattr(sm.stores_svc, "load_stores",
+                        lambda filter_names=None: [{"name": "T1"}])
+    monkeypatch.setattr(sm.items_api, "get_item", lambda store, sku: None)
+    monkeypatch.setattr(sm.sku_codec, "settle_replacement", lambda *a, **k: None)
+    monkeypatch.setattr(sm.upc_pool, "retag_sku", lambda *a, **k: None)
+    monkeypatch.setattr(sm.dispositions, "rekey_open", lambda *a, **k: (1, []))
+    monkeypatch.setattr(sm.dispositions, "executing_actions_on",
+                        lambda *a, **k: [])
+    monkeypatch.setattr(sm.walmart_catalog, "drop_node_rows", lambda *a, **k: 1)
+    first = sm.run({"store": "T1", "execute": True,
+                    "settle_only": "1"}).splitlines()[0]
+    assert "影子改码 1" in first
+    assert "⚠ 同店双挂 1" in first
 
 
 def test_the_observe_face_covers_double_rows_too():
@@ -991,7 +1260,7 @@ def test_the_first_line_no_longer_carries_an_inventory_restore(monkeypatch):
     monkeypatch.setattr(sm.sku_codec, "settle_replacement",
                         lambda *a, **k: None)
     monkeypatch.setattr(sm.upc_pool, "retag_sku", lambda *a, **k: None)
-    monkeypatch.setattr(sm.dispositions, "rekey_suggested",
+    monkeypatch.setattr(sm.dispositions, "rekey_open",
                         lambda *a, **k: (1, []))
     monkeypatch.setattr(sm.walmart_catalog, "drop_node_rows", lambda *a, **k: 1)
     monkeypatch.setattr(sm.dispositions, "executing_actions_on",
@@ -1312,10 +1581,11 @@ def test_first_line_carries_the_four_warnings(monkeypatch):
     read = _read_conn(monkeypatch, [
         ("FROM listing.sku_migrations m", (_OBS_COLS,
             [(1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001", "F1",
-              NOW - timedelta(hours=200), "pending", True, False, True),
+              NOW - timedelta(hours=200), "pending", "WNEW", "WOLD",
+              True, False, True),
              (2, "B0OLD00002", "BBBBBBBBBBBB", "amz", "B0OLD00002", "F1",
               datetime.now(timezone.utc) - timedelta(hours=200), "pending",
-              False, False, False)])),
+              None, None, False, False, False)])),
         ("FROM listing.sku_migrations WHERE store", (["confirmed", "open"],
                                                      [(0, 2)])),
     ])
@@ -1834,9 +2104,9 @@ def test_one_bad_row_does_not_stop_the_others(monkeypatch):
     正被缺席抑制着,没人会报。
     """
     rows = [(1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001", "F1",
-             NOW - timedelta(hours=2), "pending", True, True, True),
+             NOW - timedelta(hours=2), "pending", "W1", None, True, True, True),
             (2, "B0OLD00002", "BBBBBBBBBBBB", "amz", "B0OLD00002", "F1",
-             NOW - timedelta(hours=2), "pending", True, True, True)]
+             NOW - timedelta(hours=2), "pending", "W2", None, True, True, True)]
     read, calls, _tx = _settle_wired(monkeypatch, rows)
     boom = {"n": 0}
 
@@ -2137,7 +2407,7 @@ def test_a_missing_receipt_on_a_rejected_feed_rolls_back_at_once(monkeypatch):
     「一条都没发出去」,按 failed 当场回滚。"""
     row = (1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001", "F1",
            datetime.now(timezone.utc) - timedelta(hours=1), "pending",
-           False, False, True)
+           None, None, False, False, True)
     _settle_wired.feed_st = {"F1": "failed"}
     try:
         read, calls, _tx = _settle_wired(monkeypatch, [row],
@@ -2155,7 +2425,7 @@ def test_a_missing_receipt_on_a_processed_feed_still_waits(monkeypatch):
     (_settle 用真时钟判观测期,所以夹具的 submitted_at 也按真时钟给:1 小时前。)"""
     row = (1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001", "F1",
            datetime.now(timezone.utc) - timedelta(hours=1), "pending",
-           False, False, True)
+           None, None, False, False, True)
     _settle_wired.feed_st = {"F1": "done"}
     try:
         read, calls, _tx = _settle_wired(monkeypatch, [row],

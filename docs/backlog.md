@@ -386,6 +386,15 @@ ACTIVE),problem_scan 每天建议删/停,cleanup 每天发、每天失败;删除
 根治后由所有者回头处置(删旧码 → catalog_sync → `settle_only=1` 自动 confirmed)。
 详见 `docs/sku_plan.md` §9.14 —— 本条(§十三)的范围**不变**,仍是另议。
 
+⚠ **2026-09-08 追加**:改码链已按「**同 wpid + 旧码单查 404**」**逐条自救** ——
+A131吕灿荣 43 条 `double` 里 41 条新旧 wpid 相同(= 同一条 listing 原地换码,改码
+其实已经生效),`sku_migrate._settle` 现在对这些行逐条 `api.items.get_item`,404 就
+判 `confirmed`(判词 (a′),详见 `docs/sku_plan.md` §9.15)。这只解决**改码链自己**
+那一段账;**列表影子的根治仍归本条**:影子行的 `catalog.walmart_items` 仍是
+`missing_since IS NULL`(标了也会被下一轮 upsert 翻回 NULL,见 §9.15),于是它照旧
+留在维护面与问题面上、维护/删除 feed 对它照旧失败。本条建议的修法(对可疑行逐条
+单查、404 ⇒ 当观测缺席)与 §9.15 用的是**同一个端点**,可一并落地。
+
 建议修法(待所有者点头):对 executing 的破坏类处置、回执 failed 或 QARTH「No matching
 record」的 (店, SKU) 逐条单查(api/items.get_item),404 ⇒ 标 missing_since 当观测缺席,
 定案 / 弃码 / 释放 UPC 全走现有路径;单查配额有限,每轮限额几天清完;查到 200 的

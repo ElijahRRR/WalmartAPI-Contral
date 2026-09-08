@@ -249,11 +249,62 @@ def in_catalog_profile(conn, store_name: str) -> list[dict]:
 
 
 def stores_missing_item_id(conn) -> dict[str, int]:
-    """输入:连接 → 输出:{店铺: 在架且 item_id 为空的行数}(只列有缺口的店)。"""
+    """输入:连接 → 输出:{店铺: **在售**(ACTIVE 且 PUBLISHED)且 item_id 为空的行数}(只列有缺口的店)。
+
+    缺口只算在售行(所有者定稿 2026-09-08):ITEM 报表不给 RETIRED / SYSTEM_PROBLEM,
+    把它们算进缺口 = 每家店的缺口永远清不完、每天为一堆存档白建一份报表。
+    """
     with conn.cursor() as cur:
         cur.execute("SELECT store, count(*) FROM catalog.walmart_items "
-                    "WHERE item_id IS NULL AND missing_since IS NULL GROUP BY store")
+                    "WHERE item_id IS NULL AND missing_since IS NULL "
+                    "AND lifecycle_status = 'ACTIVE' AND published_status = 'PUBLISHED' "
+                    "GROUP BY store")
         return {r[0]: int(r[1]) for r in cur.fetchall()}
+
+
+def live_skus(conn, store_name: str) -> set[str]:
+    """输入:连接 + 店铺 → 输出:在售 SKU 集合(在架且 ACTIVE / PUBLISHED;item_id_sync 覆盖率的分母)。"""
+    with conn.cursor() as cur:
+        cur.execute("SELECT sku FROM catalog.walmart_items WHERE store = %s AND missing_since IS NULL "
+                    "AND lifecycle_status = 'ACTIVE' AND published_status = 'PUBLISHED'",
+                    (store_name,))
+        return {r[0] for r in cur.fetchall()}
+
+
+def replace_report_rows(conn, store_name: str, request_id: str, rows: list[dict],
+                        reported_at=None) -> int:
+    """输入:连接 + 店铺 + requestId + 报表行 [{sku, item_id, lifecycle_status, publish_status}]
+    (+ 报表提交时刻,缺省 now)→ 输出:写入行数。整店替换:一店只留最近一份报表。
+
+    catalog.item_report_rows 是 catalog_sync「报表兜底」的依据(report_live_skus),
+    只由 item_id_sync 真跑写入(探针不写)。
+    """
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM catalog.item_report_rows WHERE store = %s", (store_name,))
+        cur.executemany(
+            "INSERT INTO catalog.item_report_rows (store, sku, item_id, lifecycle_status, "
+            "publish_status, request_id, reported_at) "
+            "VALUES (%(store)s, %(sku)s, %(item_id)s, %(lifecycle_status)s, %(publish_status)s, "
+            "%(request_id)s, COALESCE(%(reported_at)s, now())) "
+            "ON CONFLICT (store, sku) DO NOTHING",
+            [{"store": store_name, "request_id": request_id, "reported_at": reported_at,
+              "sku": r["sku"], "item_id": r.get("item_id"),
+              "lifecycle_status": r.get("lifecycle_status"),
+              "publish_status": r.get("publish_status")} for r in rows])
+    return len(rows)
+
+
+def report_live_skus(conn, store_name: str, max_age_hours: int) -> set[str]:
+    """输入:连接 + 店铺 + 报表最大年龄(小时)→ 输出:最近一份 ITEM 报表里 PUBLISHED 的 SKU 集合。
+
+    catalog_sync 报表兜底用:太旧的报表不认(空集),免得拿几天前的名单去单查一堆 404。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT sku FROM catalog.item_report_rows WHERE store = %s "
+                    "AND publish_status = 'PUBLISHED' "
+                    "AND reported_at > now() - make_interval(hours => %s)",
+                    (store_name, int(max_age_hours)))
+        return {r[0] for r in cur.fetchall()}
 
 
 def set_item_ids(conn, store_name: str, mapping: dict[str, str]) -> int:
@@ -272,10 +323,3 @@ def set_item_ids(conn, store_name: str, mapping: dict[str, str]) -> int:
         affected = cur.rowcount
     # 返回数据库实际更新行数;与提交数不一致说明 (store, sku) 没对上,要暴露不要吞
     return affected if affected and affected >= 0 else len(mapping)
-
-
-def known_skus(conn, store_name: str) -> set[str]:
-    """输入:连接 + 店铺 → 输出:该店铺 PG 中已知的全部 SKU 集合(offset 截断补漏候选)。"""
-    with conn.cursor() as cur:
-        cur.execute("SELECT sku FROM catalog.walmart_items WHERE store = %s", (store_name,))
-        return {r[0] for r in cur.fetchall()}

@@ -4,8 +4,9 @@
   expected_header()                 无 → 实测表头列表(refdata/specs/item_report_header.txt)
   check_header(header)              报表表头 → (拦截原因, 漂移提示);三个关键列缺一即拦
   map_item_ids(rows)                报表行 → ({sku: item_id}, 计数):Item ID 列与 URL 尾段互校
-  plan_updates(current, mapping)    在架现值 × 报表映射 → ({sku: 要写的 item_id}, 计数)
-  coverage_note(counters)           计数 → 「疑似不全」提示或空串
+  plan_updates(current, mapping, live=) 在架现值 × 报表映射(+ 在售集合)→ ({sku: 要写的 item_id}, 计数)
+  coverage_note(counters)           计数 → 「疑似不全」提示或空串(分母 = 在售行)
+  report_rows(rows, mapping)        报表行 + 已互校的映射 → 落 catalog.item_report_rows 的行(报表兜底依据)
   date_span(rows, column)           报表行 + 日期列名 → 最早/最晚/按年计数(探针判断数据范围按哪列筛)
   reconcile_breakdown(catalog, rows) 在架行画像 + 报表行 → 两边差集按状态/入库年分组(探针对账,不猜)
   wait_ready(store, request_id, …)  轮询到 READY / ERROR / TIMEOUT(先睡后查,列表生成器找到即停)
@@ -18,6 +19,10 @@
   · **全量靠对账不靠参数**:请求体不传行过滤器,「拿全没有」用报表 SKU 集合 ×
     catalog_sync 扫回来的在架集合来证明(两边独立);覆盖率低于阈值在首行点名
     「疑似不全」,当轮照填已匹配的行,明天再拿一份。
+  · **缺口与覆盖率只算在售行**(所有者定稿 2026-09-08):分母 = 在架且 ACTIVE / PUBLISHED。
+    A109 实证:报表不给 RETIRED(2641 行)与 SYSTEM_PROBLEM(601 行),而库里 235 行
+    "ACTIVE/PUBLISHED" 有 232 行单查 404(列表接口把已删品当在售返回的幽灵);对真正
+    在售的品报表覆盖 3355/3358。写入仍照报表全写(在架行有就填),只是分母不再把存档算进去。
   · **数据范围带近 DATA_RANGE_DAYS 天**(所有者 2026-09-07 22:xx 决定):不带日期的
     ITEM 报表只回 1 行(C021 探针,在架 1490 行;后台不设时间同样只显示很少),
     官方参数 dataStartTime/dataEndTime 放 body(格式要带毫秒,见 data_window),上限两年(代码夹到
@@ -244,20 +249,26 @@ def map_item_ids(rows: list[dict]) -> tuple[dict[str, str], dict]:
     return mapping, n
 
 
-def plan_updates(current: dict[str, str | None],
-                 mapping: dict[str, str]) -> tuple[dict[str, str], dict]:
-    """输入:{在架 sku: 现 item_id 或 None} × {报表 sku: item_id} → 输出:(要写的 {sku: item_id}, 计数)。
+def plan_updates(current: dict[str, str | None], mapping: dict[str, str],
+                 live: set[str] | None = None) -> tuple[dict[str, str], dict]:
+    """输入:{在架 sku: 现 item_id 或 None} × {报表 sku: item_id}(+ 在售 sku 集合)
+    → 输出:(要写的 {sku: item_id}, 计数)。
 
     matched   报表 ∩ 在架
     filled    现值 NULL → 写
     overwritten 现值 ≠ 报表 → 写(报表为准,所有者定稿 2026-09-07)
     unchanged 现值 = 报表
-    unmatched 在架且 NULL、报表里没有(还没 published / 报表不全)
+    unmatched 在架且 NULL、报表里没有(还没 published / 存档 / 幽灵)
     extra     报表里有、在架里没有(已缺席/退役档,不写)
+    live / live_matched  在售行数 / 其中报表覆盖到的(覆盖率分母,所有者定稿 2026-09-08);
+              不传 live 就没有这两项,coverage_note 退回按全部在架行算
     """
     updates: dict[str, str] = {}
     n = {"catalog": len(current), "matched": 0, "filled": 0,
          "overwritten": 0, "unchanged": 0, "unmatched": 0, "extra": 0}
+    if live is not None:
+        n["live"] = len(live)
+        n["live_matched"] = sum(1 for s in live if s in mapping)
     for sku, iid in mapping.items():
         if sku not in current:
             n["extra"] += 1
@@ -277,15 +288,37 @@ def plan_updates(current: dict[str, str | None],
 
 
 def coverage_note(counters: dict) -> str:
-    """输入:plan_updates 的计数 → 输出:覆盖率不达标的提示(达标或样本太小给空串)。"""
-    cat, matched = counters.get("catalog", 0), counters.get("matched", 0)
+    """输入:plan_updates 的计数 → 输出:覆盖率不达标的提示(达标或样本太小给空串)。
+
+    分母优先用在售行(live / live_matched,所有者定稿 2026-09-08);没有才退回全部在架行。
+    """
+    if "live" in counters:
+        cat, matched, what = counters.get("live", 0), counters.get("live_matched", 0), "在售行"
+    else:
+        cat, matched, what = counters.get("catalog", 0), counters.get("matched", 0), "在架行"
     if cat < COVERAGE_MIN_ROWS:
         return ""
     ratio = matched / cat
     if ratio >= COVERAGE_WARN_RATIO:
         return ""
-    return (f"⚠ 疑似不全:报表只覆盖在架行 {matched}/{cat}({ratio:.0%}),"
+    return (f"⚠ 疑似不全:报表只覆盖{what} {matched}/{cat}({ratio:.0%}),"
             f"本轮只填已匹配的,明天再拿一份")
+
+
+def report_rows(rows: list[dict], mapping: dict[str, str]) -> list[dict]:
+    """输入:报表行 + map_item_ids 给出的 {sku: item_id} → 输出:落 catalog.item_report_rows 的行。
+
+    每个 SKU 一行(重复只取首次);item_id 取互校通过的映射值(两列不一致 / 无 ID 的给 None),
+    lifecycle_status / publish_status 原样带上 —— catalog_sync 报表兜底只认 PUBLISHED。
+    """
+    out: dict[str, dict] = {}
+    for r in rows:
+        sku = reports.report_row_sku(r)
+        if sku and sku not in out:
+            out[sku] = {"sku": sku, "item_id": mapping.get(sku),
+                        "lifecycle_status": str(r.get("Lifecycle Status") or "") or None,
+                        "publish_status": str(r.get("Publish Status") or "") or None}
+    return list(out.values())
 
 
 # ── 等报表就绪 ───────────────────────────────────────────────────────────────

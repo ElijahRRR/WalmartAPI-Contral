@@ -157,6 +157,21 @@ ALTER TABLE catalog.walmart_items ADD COLUMN IF NOT EXISTS variant_group_id text
 ALTER TABLE catalog.walmart_items ADD COLUMN IF NOT EXISTS variant_group_info jsonb;
 CREATE INDEX IF NOT EXISTS walmart_items_item_id_idx ON catalog.walmart_items (item_id);
 
+-- ── ITEM 报表行(2026-09-08 所有者定稿:报表兜底真正在线的品)──────────────────
+-- item_id_sync 真跑时整店替换(一店只留最近一份);catalog_sync 扫店后拿这里
+-- publish_status='PUBLISHED' 而本轮没扫到的 SKU 单查补入 —— 报表对在线品的覆盖
+-- A109 实证 3355/3358,GET /v3/items 列表反而会把已删品当在售返回(单查 404)。
+CREATE TABLE IF NOT EXISTS catalog.item_report_rows (
+    store            text NOT NULL,
+    sku              text NOT NULL,
+    item_id          text,                   -- 报表「Item ID」列(与 URL 尾段互校后的值)
+    lifecycle_status text,                   -- 报表 Lifecycle Status(ACTIVE / RETIRED …)
+    publish_status   text,                   -- 报表 Publish Status(PUBLISHED / UNPUBLISHED …)
+    request_id       text NOT NULL,          -- 来自哪份报表(ops.report_requests.request_id)
+    reported_at      timestamptz NOT NULL,   -- 报表提交时刻;兜底只认 48 小时内的
+    PRIMARY KEY (store, sku)
+);
+
 -- ── 产品事件账本(2026-08-06 所有者需求:产品全生命周期追踪)────────────────
 -- 一个 SKU(=ASIN,业务约定贯通)一生的病历:何时上架/何时下架及官方原因/
 -- 何时提交删除/删除是否真生效/报了什么错。只追加永不改。

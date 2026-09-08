@@ -16,7 +16,7 @@
 |---|---|---|---|---|---|
 | 1 | POST /v3/token | _client | 认证(全部前置) | 公共层 | 全部 |
 | 2 | GET /v3/items | items | 商品列表/按状态筛选 | safe_get_ex | 7 个模块 |
-| 3 | GET /v3/items/{sku} | items | 单品查询(补漏用) | safe_get_ex | auto_listing |
+| 3 | GET /v3/items/{sku} | items | 单品查询(catalog_sync 报表兜底 / 上架核对;「截断补漏」2026-09-08 撤销) | safe_get_ex | catalog_sync, auto_listing |
 | 4 | GET /v3/items/count | items | 按状态统计商品数 | safe_get | 店铺日报 |
 | 5 | GET /v3/items/walmart/search | items | 全站目录搜索(DEFAULT/SPEC 双格式) | safe_get_ex | 4 个模块 |
 | 6 | POST /v3/items/catalog/search | items | 本店目录精确查询 | safe_post_ex | 产品查询 |
@@ -96,7 +96,7 @@ marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁�
 | 6 maintenance | 10, 14, 15, 19, 20, 17, (32, 33) | 同步/feed 双路由是 services 层职责;配了「维护仓库」的店走 32 + MP_INVENTORY feed(多仓批次 2) |
 | 7 product_clear | 11, 12, 17 | 消费飞书「停用/删除表」:停用/下架→RETIRE_ITEM,删除或 C 列留空→DELETE_ITEM;防重走 ops.feed_log |
 | 8 problem_product_cleanup | 10, 11, 12, 17 | 反补(MP_MAINTENANCE)+删除+停用;定性决策拆在 problem_scan(零沃尔玛调用),删除是否生效靠 catalog_sync 的 2 观测,本工作流不调 2/25 |
-| 9 catalog_sync | 2(fast 两轮), 3(offset 超限补漏), 21, 22 | sync_online_products 的接口面;itemId 回填 2026-09-07 归 item_id_sync(#34–#37) |
+| 9 catalog_sync | 2(fast 动态切片), 3(ITEM 报表兜底单查), 21, 22 | sync_online_products 的接口面;itemId 回填 2026-09-07 归 item_id_sync(#34–#37) |
 | 10 list_new | 8, 30, 16, (33) | 主链只发 MP_ITEM(+ partnerprofile;反查/延后结算用 GET /v3/feeds);上架仓 FC ID 走 33 校验(未配置店仍用 30,多仓批次 3);跟卖的 9 与 5(SPEC) 在 match_listing;7 未用(spec 读本地 <DATA_ROOT>/specs),18 不可用(见 §5.3) |
 | 11 sku_migrate | 10(形态 A;形态 B 是 8);16 由 api/feeds 内部反查三态时用 | **存量改码**(SKU 改造批次 3,手动、永不进调度):载荷 `{Orderable:{sku 新码, productIdentifiers, SkuUpdate:'Yes'}}`,feedType 的唯一出生地是 `workflows/sku_migrate.FEED_TYPE`。**本工作流自己不调 17**:回执由 `feed_poll` 统一轮询落 `ops.feed_items`,改码只读那张台账(而且回执**不入病历、不反哺黑名单**);定案靠 2(catalog_sync)的观测,回执成功单独不定案。形态若改判为 B(MP_ITEM 全量),须先让 `mp_conform` 放行 SkuUpdate(否则被静默剔掉 ⇒ 每一行都双挂),且吃的是 list_new 的 MP_ITEM 桶 |
 | backup | 无沃尔玛调用 | — |
@@ -113,7 +113,7 @@ marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁�
 | 端点 | 官方现值(2026-08-05) | vs tsv/旧代码 | 定稿(写进 api 层令牌桶) |
 |---|---|---|---|
 | GET /v3/items | 300/min;带 query 参数 60/min;**limit 上限 1000(默认 20)**;offset ≤10000;cursor 全程不变、2 分钟过期→400 | 一致;limit=1000 生产实证被官方背书 | 带参 55/min(页间 1.1s 沿用) |
-| GET /v3/items/{id} | 900/min(带参 60/min) | 一致 | 800/min,补漏单查 ≤8 并发 |
+| GET /v3/items/{id} | 900/min(带参 60/min) | 一致 | 800/min,报表兜底单查 ≤8 并发(已知 SKU 补截断的用法 2026-09-08 撤销) |
 | GET /v3/items/count | 200/min(与 taxonomy 共享);status 枚举 PUBLISHED/UNPUBLISHED/SYSTEM_PROBLEM/IN_PROGRESS/ALL(**无 STAGE**) | 一致 | 180/min 共享桶 |
 | GET /v3/items/walmart/search | 200/min;**SPEC 格式另有 1000/day**(新发现);DEFAULT 最多返回 40 条(旧记 20 过时);只返回 published 商品;asin 参数仅 SPEC | tsv 原缺 1000/day,本次已补 | 180/min 桶 + SPEC 每日计数器 |
 | POST /v3/items/catalog/search | 200/min(与 associations 共享);⚠官方 schema 声明可选字段 itemId,**线上实测不返回**(2026-08-05 两店 195/195 含 PUBLISHED 全无;数字 itemId 唯一可靠来源=Item Search DEFAULT) | 一致 | 与 walmart/search 分桶,180/min |
@@ -166,7 +166,11 @@ docs/legacy_survey.md 的"共享桶"结论与 CLAUDE.md 相应表述据此**修�
    (是快照会话 ID 不是游标),真翻页靠 offset 递增;offset 硬上限 10000 为官方明文,
    "超限返 400"是旧代码实证(官方未写明错误码);
    cursor 约 2 分钟过期(400→重置 '*' 重试一次);limit 生产实证 1000。
-   超 10000 的部分用 GET /v3/items/{sku} 单查兜底。
+   超 10000 的部分**按 totalItems 动态切片**(所有者定稿 2026-09-08):首页 totalItems 就是
+   这个查询的总数,超上限就不再翻页,改按 lifecycleStatus(ACTIVE / RETIRED / ARCHIVED)逐个
+   扫,某个生命周期仍超再按 publishedStatus 扫;切到最细仍超才算截断。真正在线的品由
+   catalog_sync 的 **ITEM 报表兜底**(报表 PUBLISHED 而扫描未见 → 单查补入)。此前「用 PG
+   已知 SKU 单查补漏」撤销:已知的查不出未知的,一轮几千个 404 只烧时间。
    (sync_status_track.py:76-140 是唯一被生产验证的正确实现,已对拍 99,197 商品)
    **新系统生产实证(2026-08-05,两店对拍)**:① 某状态组合零商品时返回 **404 而非空列表**,
    必须按空轮处理;② **无参数调用返回全部状态的并集**(含 RETIRED,甚至含逐状态 5 轮
@@ -294,7 +298,7 @@ api/items.py
       # mode='full' = 逐状态 5 轮(api 层默认值,轮里仍含 STAGE),对拍/回退用。
       # ⚠ 2026-08-14 勘误:原写 5 轮组合器且列了 STAGE —— STAGE 状态已作废
       # (§3.1/§8.5 的枚举里都没有它),逐状态 5 轮也已按 §4.1 降级为对拍/回退用。
-  get_item(store, sku)           # 单查;只作补漏,禁止用于批量拿 PT(旧教训:454 SKU=8min)
+  get_item(store, sku)           # 单查;只作报表兜底 / 上架核对,禁止批量(旧教训:454 SKU=8min)
   count_items(store, status)     # GET /v3/items/count
   search_walmart(store, *, query=None, upc=None, gtin=None)         # DEFAULT 格式
   search_walmart_spec(store, *, upc=None, gtin=None, asin=None)     # SPEC 格式(跟卖路由)

@@ -223,8 +223,18 @@ _RATE_BUCKETS: dict[str, tuple[int, float]] = {
     "inventory.list": (180, 60.0),              # GET /v3/inventories(官方 200/min,单店 cursor 强制串行)
     "inventory.get": (180, 60.0),               # GET /v3/inventory?sku=(官方未单列,按 bulk 同档保守)
     "returns.list": (46, 60.0),                 # GET /v3/returns(官方 50/min,沿用旧 1.3s 节奏)
-    "reports.request": (2, 3600.0),             # POST reportRequests:配额极低(测试期 429 实证)
-    "reports.poll": (55, 60.0),                 # GET reportRequests/{id} 与 downloadReport
+    # On-request Reports 三桶(2026-09-07 按官方 Rate limiting 页登记、同日按生产实见改配;
+    # 此前 status/download 共用一个 55/min 的桶 —— 官方各 20/hour,20 秒轮询一次
+    # 必然 429,这就是 08-05「报表配额极低」实证的真相;创建报表的限额官方
+    # 美国站未列,墨西哥站/1P 页写「每种报表每小时一次」,08-05 测试期 429 实证)
+    "reports.create": (1, 3600.0),              # POST /v3/reports/reportRequests(每类型每小时一次)
+    # ⚠ 列表 GET /v3/reports/reportRequests 官方表写 200/min,生产不是(2026-09-07 21:48
+    # C021:连打 4 次第 4 次 429,X-Next-Replenishment-Time 在 142 秒后 —— 官方 Rate
+    # limiting 页说桶按固定速率连续补令牌,200/min 的桶下枚 0.3 秒就到,142 秒只能是
+    # 小时级桶,与同路径前缀的单查 20/hour 一致)。列表与单查共用一桶按 20/hour 留余量;
+    # 真实桶大小看 api/reports._quota_log 记的响应头,拿到实证再改这里
+    "reports.query": (18, 3600.0),              # GET /v3/reports/reportRequests(列表,轮询走它)+ /{id}(单查兜底)
+    "reports.download": (18, 3600.0),           # GET /v3/reports/downloadReport(官方 20/hour)
     "reports.payment_statement": (12, 60.0),    # GET /v3/report/payment/statement(官方 15/min)
     "reports.recon": (80, 60.0),                # reconreport 两端点共用(官方 reconFile 100/min)
     "orders.list": (3000, 60.0),                # GET /v3/orders(官方 5000/min)
@@ -265,7 +275,7 @@ def _is_persistent(bucket: str) -> bool:
     """输入:bucket 名 → 输出:是否"稀缺桶"(限速状态落 PG 跨进程共享)。
 
     判据(2026-08-12 定稿):窗口 ≥ 600s 或上限 ≤ 10。命中的是全部
-    feeds.post.*、prices.put、reports.request、insights 全家、SPEC 日额度
+    feeds.post.*、prices.put、reports.create/status/download、insights 全家、SPEC 日额度
     ——它们是小时/天级窗口或个位数配额,进程内计数在"多 workflow 并发 +
     进程退出即失忆"下形同虚设(cli 的 flock 只锁同名 workflow,不同
     workflow 是不同进程;DELETE_ITEM 就有三个提交来源)。高频大配额桶
@@ -332,6 +342,51 @@ def rate_acquire(bucket: str, client_id: str) -> float:
     if _is_persistent(bucket):
         return _acquire_pg(bucket, client_id, limit, window)
     return _acquire_mem(bucket, client_id, limit, window)
+
+
+def rate_try_acquire(bucket: str, client_id: str) -> bool:
+    """输入:bucket 名 + 店铺 client_id → 输出:此刻有令牌就占一枚返回 True,没有立刻返回 False(**不睡**)。
+
+    给「每小时一次」这类持久桶的调用方用:rate_acquire 的语义是"睡到有令牌为止",
+    对创建报表这种一小时一枚的桶,补试进来会睡上整整一小时(2026-09-07 生产实见
+    「等待 3595.1s」)。拿不到令牌应当是本轮的一个结局(放弃、明天再来),不是等待。
+    """
+    if bucket not in _RATE_BUCKETS:
+        raise KeyError(f"限速桶未登记: {bucket}(先在 api/_client._RATE_BUCKETS 按蓝图定稿登记)")
+    limit, window = _RATE_BUCKETS[bucket]
+    if _is_persistent(bucket):
+        return _try_pg(bucket, client_id, limit, window)
+    return _try_mem(bucket, client_id, limit, window)
+
+
+def _try_mem(bucket: str, client_id: str, limit: int, window: float) -> bool:
+    from collections import deque
+
+    with _rate_lock:
+        q = _rate_state.setdefault((client_id, bucket), deque())
+        now = time.monotonic()
+        while q and now - q[0] >= window:
+            q.popleft()
+        if len(q) < limit:
+            q.append(now)
+            return True
+        return False
+
+
+def _try_pg(bucket: str, client_id: str, limit: int, window: float) -> bool:
+    """稀缺桶的"有就占、没有就走":与 _acquire_pg 同一张事件表、同一把 advisory 锁,只是不睡。"""
+    from registry import db
+
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))",
+                    (f"{client_id}|{bucket}",))
+        cur.execute(_PG_COUNT_SQL, (client_id, bucket, window))
+        n, _oldest, _db_now = cur.fetchone()
+        if n >= limit:
+            return False
+        cur.execute("INSERT INTO ops.rate_events (client_id, bucket) VALUES (%s, %s)",
+                    (client_id, bucket))
+        return True
 
 
 def _acquire_mem(bucket: str, client_id: str, limit: int, window: float) -> float:
@@ -628,7 +683,9 @@ def _request_ex(method, url, token, client_id, proxy, *,
         if attempt < max_retries:
             if status == 429:
                 wait = _parse_retry_after(headers)
-                _log(f"⚠ {method} 429 限流 {url},{wait:.1f}s 后重试 (第 {attempt+1}/{max_retries} 次)")
+                _log(f"⚠ {method} 429 限流 {url},{wait:.1f}s 后重试 (第 {attempt+1}/{max_retries} 次;"
+                     f"令牌 {headers.get('x-current-token-count', '?')},"
+                     f"下枚 {headers.get('x-next-replenishment-time', '?')})")
                 time.sleep(wait)
                 attempt += 1
                 continue
@@ -654,7 +711,10 @@ def _request_ex(method, url, token, client_id, proxy, *,
             # 500 截取,不是 200(2026-08-19):Akamai 错误页的 Reference #
             # 在 HTML 后半段,200 字符正好截在它前面——持续 5xx 要开沃尔玛
             # 工单,工单要的就是这个号
-            body_snip = resp.text[:500] if method in ("POST", "PUT") else ""
+            # GET 的 400 也截正文(2026-09-07 实见:reportRequests 列表带日期参数回 400,
+            # 日志里只有一个状态码,沃尔玛嫌弃的是什么完全看不见);404 不截 ——
+            # 单查补漏一轮几千个 404 是常态,截了就是日志灌水
+            body_snip = resp.text[:500] if (method in ("POST", "PUT") or status == 400) else ""
             msg = f"✗ {method} {status} {url}"
             if body_snip:
                 msg += f": {body_snip}"

@@ -79,6 +79,92 @@ TRO 跨仓边界(暂放)。
 maintenance/list_new)→ 按域停旧切换。
 **✅ 2026-08-17 全部完成** —— 验收记录见 `docs/production_cutover.md` §九。
 
+### 2026-09-07 itemId 补齐:独立工作流 item_id_sync(所有者定稿)
+
+**需求**:`catalog.walmart_items.item_id` 一直是空的;数字 itemId 只有沃尔玛 On-request
+ITEM 报表批量给(GET /v3/items 与 catalog/search 都不返回,2026-08-05 实证)。第一次
+全店全量,之后上架了新品只需再拉报表补齐。
+
+**调研结论**(官方 developer.walmart.com,逐页核对,来源列在 skills 外的方案页):创建
+`POST /v3/reports/reportRequests?reportType=ITEM&reportVersion=v1…v6`,不传 body 即整个
+目录(日期范围参数只对 ITEM_PERFORMANCE 生效);状态 RECEIVED → INPROGRESS → READY | ERROR;
+生成典型 15–45 分钟,保留 30 天;限额 seller 级:Get All 200/min、单查 20/hour、下载
+20/hour;创建限额美国站未列,墨西哥站/1P 页「每种报表每小时一次」。仓里 08-05 那次
+「报表配额极低」的真相:轮询桶配成 55/min、20 秒轮询一次打 20/hour 的单查。
+
+**决定**:
+- 独立工作流 `item_id_sync`(DANGEROUS=False,SUPPORTS_STORE),每天 **05:00** gpt 调度,
+  缺省只为「在架行 item_id 为空」的店各拿一份报表;首轮手动 `-p all=1`;探针
+  `-p store=X -p probe=1`。catalog_sync 的 `-p item_ids=1` 接线摘掉(双轨禁止)。
+- **不复用**后台(Seller Center)/ Scheduler 生成的报表:台账 `ops.report_requests`
+  只记本仓自己 POST 的 requestId,先落 pending 再调接口,崩溃/超时接着等不重建。
+- **冲突以报表为准**:库里已有 item_id 与报表不同,按报表改并计数点名。
+- 轮询只用 200/min 的列表接口找自己的 requestId(先睡 2 分钟再查,上限 60 分钟);
+  桶按官方页登记 `reports.create` 1/hour、`reports.list` 180/min、`reports.status` 与
+  `reports.download` 18/hour。
+- 全量靠对账不靠参数:报表 SKU 集合 × catalog_sync 扫回的在架集合,覆盖率 < 95% 在
+  首行点名「疑似不全」,当轮照填已匹配的;表头守门以所有者贴的 55 列后台导出为原件
+  (`refdata/specs/item_report_header.txt`),SKU / Item ID / Item Page URL 缺一即拦。
+- 飞书「在线产品总表」的 itemId 列仍由 catalog_sync 投影(06:40 日报链那次就带上)。
+- **首次生产探针(C021,当天 19:55)两条修正**:① 不带 body 沃尔玛回 415(要求
+  Content-Type: application/json),创建缺省发 `{}`;② 创建失败进串行补试后在一小时
+  一枚的创建桶里睡了 3595 秒 —— 创建改走 `rate_try_acquire`(有就占、没有立刻当
+  quota 结局),请求形状被拒的 4xx 把令牌还回去,5xx / 网络未达才交补试。
+- **探针第二轮(21:16)**:创建通了(200,拿到 requestId);列表接口按官方参考页格式
+  `YYYY-MM-DDTHH:mm:ssZ` 带 requestSubmissionStartDate 回 400 —— 轮询改为不带日期
+  参数(每店 30 天内只有几十条,按 requestId 匹配);GET 的 400 正文从此进日志。
+- **探针第三轮(21:46)**:列表接口通了,但翻页写错 —— nextCursor 是完整 query 串
+  (`reportType=ITEM&page=2&limit=10`),官方参考页「use nextCursor value instead of
+  query params」即直接拼 URL;当成 `nextCursor=` 参数传被服务端忽略、原样回第一页,
+  同一 cursor 连回三次、第四次 429(orders/returns 早有「同 cursor 重复立即停」的闸,
+  reports 漏抄)。那次 429 的 X-Next-Replenishment-Time 在 142 秒后:官方 Rate limiting
+  页说桶按固定速率连续补令牌,200/min 的桶下枚 0.3 秒就到,142 秒只能是小时级桶 ——
+  **官方表的 200/min 与生产不符**。改法:列表改生成器、找到即停、cursor 拼 URL、同
+  cursor 重复即停;列表与单查共用 `reports.query` 18/hour 持久桶(`reports.list` /
+  `reports.status` 撤销);轮询间隔 2 → 5 分钟(60 分钟 12 次 + 兜底单查 ≤2 次 < 18);
+  报表族每次响应的 x-current-token-count / x-next-replenishment-time 进日志,真实桶
+  大小以它为准、拿到实证再改登记。
+- **探针第四轮(22:05)**:下载通了(downloadReport 限速头:令牌 19 ⇒ 20/hour 桶属实),
+  55 列与 specs 原件一致,但**只解析出 1 行**(在架 1490 行,覆盖率 0%)。分不清是
+  沃尔玛只给了 1 行还是解析吞了:探针改为把原件留存到
+  `<DATA_ROOT>/reports/item_report_<店>_<requestId>.zip`,并打印体检行(zip 成员 /
+  CSV 换行数 / 解析行数 / 首行最长字段),换行数远大于行数即引号没闭合把文件吞进了
+  一个字段。**所有者判断(22:2x)**:后台拿报表不设时间同样只显示很少,1 行大概率是真的
+  —— 官方参数 dataStartTime/dataEndTime(body 字段,ISO 8601,上限 730 天)**按近一年
+  带上**;`-p data_days=` 可覆盖;`-p renew=1` 把台账在途行作废重建(改了请求形状,
+  旧那份没用了);范围记进台账 note。范围按哪个日期列筛官方没写,老品掉出窗口会
+  体现为「疑似不全」,那时把天数放到 730。
+- **探针第五轮(22:52)**:renew 作废旧行、重新创建 —— 沃尔玛 400
+  `Date parse exception - Text '2025-09-07T14:52:02Z' could not be parsed at index 19`:
+  参考页写的 `YYYY-MM-DDTHH:mm:ssZ` 不被接受,第 19 位就是 Z,解析器要毫秒;
+  ITEM_PERFORMANCE 指南 cURL 示例正是 `…T20:11:24.000Z`,改为带 `.000Z`。同一条日志
+  的限速头:**400 之后 x-current-token-count=0** —— 被拒的请求沃尔玛照样计数、桶容量
+  就是 1,#117「请求形状被拒的 4xx 还令牌」的前提不成立,撤销(`rate_release` 三件套
+  连同唯一调用者一起删);任何结局都不还,本地比沃尔玛宽只会换来下一枚 429。
+- **探针第六轮(22:58,A109黄威威)—— 链路全通**:创建 200(限速头令牌 0 ⇒ 桶容量 1)
+  → 5 分钟一问、五次轮询(列表限速头每次令牌 19 ⇒ 20/hour 桶坐实,requestId 在列表
+  第 1 条)→ 25 分钟 READY → 下载 zip 871KB(单 CSV 2.97MB,3360 换行 / 3359 行,首行
+  最长字段 128 字符,解析健康)→ 55 列一致,PUBLISHED 3355 / UNPUBLISHED 4,ACTIVE
+  3356 / RETIRED 3。**近一年范围拿到 3359 行,覆盖在架 3359/6864 = 49%**:范围确实在
+  筛,但筛的是哪个日期列官方没写。探针加打印 Item Creation Date / Item Last Updated
+  的最早/最晚/按年分布(`date_span`):哪列的最早值贴着 dataStartTime 就是按哪列筛;
+  按年分布决定放到 730 天够不够、还是要分段多拿(每段一小时一份)。
+  **所有者不认可「老品掉出窗口」的猜想**:更可能是 catalog_sync 名单里的僵尸 / RETIRED
+  存档(08-28 起 GET /v3/items 把删除后的存档也列出来);拿报表 SKU × catalog_sync 名单
+  直接对账才知道。探针加对账明细(`reconcile_breakdown` + `in_catalog_profile`):
+  在架不在报表的行按库里 lifecycle/published 与首次入库年分组 + 样本,报表有但名单没有
+  的行按报表状态分组 + 样本 —— 这就是「全量靠对账不靠参数」的对账本身。
+  **对账结果(A109,所有者本地跑)**:在架 6864 / 报表 3359 / 报表 ⊂ 在架(报表不在
+  在架 0);缺口 3505 = RETIRED/UNPUBLISHED 1532 + RETIRED/SYSTEM_PROBLEM 1109(合计
+  2641,**75%,所有者判断成立**)+ ACTIVE/SYSTEM_PROBLEM 601 + ACTIVE/PUBLISHED 235 +
+  ACTIVE/UNPUBLISHED 25 + ACTIVE/IN_PROGRESS 3。报表里 RETIRED 只有 3 行、SYSTEM_PROBLEM
+  0 行 ⇒ 报表基本不带这两类;真正待解释的是 235 行 ACTIVE/PUBLISHED。待定:缺口与
+  覆盖率的分母是否只算 ACTIVE(且 PUBLISHED),以及 730 天范围能否收回那 235 行。
+  **2026-09-08 10:29 试 730 天被拒**:400 "Max lookback date range for DataStartTime
+  '2024-09-08T02:29:37.000Z' cannot be more than 2 years from now - 2024-09-08 02:29:41.7" ——
+  沃尔玛按它收到请求那一刻算两年,我们的起点在请求前 4 秒算出来就出界;被拒的 400 又
+  吃了一枚创建令牌。代码夹到 `MAX_RANGE_DAYS = 729`。
+
 ### 2026-09-02 SKU 身份改造立项 + 批次 0a 落地
 
 **立项**(所有者 2026-09-02):沃尔玛 SKU 从今天的「就是 ASIN / 三段式含 ASIN」

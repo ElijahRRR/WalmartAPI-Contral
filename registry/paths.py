@@ -202,3 +202,25 @@ def match_spec_file() -> Path:
     """
     repo_root = Path(__file__).resolve().parent.parent
     return repo_root / "refdata" / "specs" / "MP_ITEM_MATCH_5.0.20260607-22_38_54-api.json"
+
+
+def item_report_dump_file(store: str, request_id: str, suffix: str) -> Path:
+    """输入:店名 + requestId + 扩展名(.zip/.csv)→ 输出:探针留存的报表原件路径。
+
+    <DATA_ROOT>/reports/item_report_<店>_<requestId><suffix>:探针每次下载都原样留一份,
+    「报表只有 1 行」这类问题要拿原件才分得清是沃尔玛只给了 1 行还是解析吞了
+    (2026-09-07 C021 探针:55 列对上、在架 1490 行却只解析出 1 行)。
+    """
+    return reports_dir() / f"item_report_{store}_{request_id}{suffix}"
+
+
+def item_report_header_file() -> Path:
+    """输入:无 → 输出:沃尔玛 ITEM 报表(On-request Reports)实测表头原件的绝对路径。
+
+    所有者 2026-09-07 从 Seller Center 导出的 `ItemReport_10002762917_2026-08-31…csv`
+    首行,55 列,一列一行。消费方两个:services/item_reports(守门:SKU / Item ID /
+    Item Page URL 三列必须在;整表漂移只报不拦)与 tests/test_item_id_sync.py。
+    沃尔玛改版把文件换掉、这里不动(铁律 3:路径只从 registry 取)。
+    """
+    repo_root = Path(__file__).resolve().parent.parent
+    return repo_root / "refdata" / "specs" / "item_report_header.txt"

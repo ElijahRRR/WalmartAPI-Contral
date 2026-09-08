@@ -35,7 +35,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 
-from api import _client, feishu, inventory as inv_api, items, reports
+from api import _client, feishu, inventory as inv_api, items
 from registry import db, resources
 from services import notify_fmt as nf, product_events, sku_codec, \
     store_limits, store_retry, stores as stores_svc, walmart_catalog
@@ -48,8 +48,7 @@ logger = logging.getLogger("workflows.catalog_sync")
 _FILL_WORKERS = 8   # 补漏单查并发上限(items.get 桶 800/min,蓝图定稿 ≤8 并发)
 
 
-def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str,
-                    backfill_ids: bool) -> dict:
+def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str) -> dict:
     """输入:店铺 + 本轮时间 + 扫描模式 → 输出:该店统计 dict(拉取/入库/缺席/截断/补漏)。"""
     name = store["name"]
     stats: dict = {}
@@ -109,55 +108,13 @@ def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str,
         walmart_catalog.upsert_node_inventory(conn, name, inventory, run_at)
         missing = walmart_catalog.mark_missing(conn, name, run_at)
 
-    backfilled = _backfill_item_ids(store) if backfill_ids else 0
     # 多仓探测(批次 0):铺在 2 个及以上发货节点的 SKU 数。谭总12 自建中山仓
     # 之后它不再是 0 —— 摘要按"该店配没配「维护仓库」"分两种措辞(见 run())
     multi = sum(1 for nodes in inventory.values() if len(nodes) > 1)
     return {"store": name, "fetched": stats.get("total", 0), "written": written,
             "missing": missing, "truncated": bool(stats.get("truncated")),
             "filled": filled, "inv": len(inventory), "inv_failed": inv_failed,
-            "item_ids": backfilled, "multi_node": multi}
-
-
-def _backfill_item_ids(store: dict) -> int:
-    """输入:店铺 → 输出:本次回填的 item_id 数量。
-
-    来源 = On-request ITEM 报表(一店一份,覆盖全部商品):从 Item ID 列或
-    Item Page URL 提取数字 itemId。其余候选路径全部实证排除——GET /v3/items
-    与 catalog/search 响应无此字段,全站搜索按 gtin/upc 召回率 3/131。
-    itemId 平时不变,只有新品和"缺席后复现"(upsert 已重置 NULL)的行触发报表拉取;
-    报表失败只记警告,下轮重试,不影响店铺同步结果。
-    """
-    name = store["name"]
-    with db.pg_conn() as conn:
-        todo = walmart_catalog.skus_missing_item_id(conn, name)
-    if not todo:
-        return 0
-    try:
-        rows = reports.fetch_item_report(store)
-    except Exception as e:
-        logger.warning("店铺 %s ITEM 报表拉取失败,item_id 本轮不回填: %s", name, e)
-        return 0
-
-    found: dict[str, str] = {}
-    no_id = 0
-    for row in rows:
-        sku = reports.report_row_sku(row)
-        if not sku or sku not in todo:
-            continue
-        iid = reports.extract_item_id(row)
-        if iid:
-            found[sku] = iid
-        else:
-            no_id += 1
-    if no_id and not found:     # 一个都提不出来 = 列名/URL 格式假设错了,打样本诊断
-        logger.warning("店铺 %s 报表 %d 行均提取不到 itemId,首行字段:%s",
-                       name, len(rows), sorted(rows[0].keys()) if rows else [])
-    with db.pg_conn() as conn:
-        updated = walmart_catalog.set_item_ids(conn, name, found)
-    logger.info("店铺 %s item_id 报表回填:待补 %d / 报表行 %d / 提取成功 %d / 入库 %d",
-                name, len(todo), len(rows), len(found), updated)
-    return updated
+            "multi_node": multi}
 
 
 def run(params: dict) -> str:
@@ -171,9 +128,8 @@ def run(params: dict) -> str:
     mode = str(params.get("rounds", "fast"))
     if mode not in ("full", "fast"):
         return f"rounds 参数只接受 full/fast,收到:{mode}"
-    # item_id 报表回填默认关闭(2026-08-05 决策:报表请求配额极低,单店当日个位数,
-    # 测试期即打到 429;功能保留,-p item_ids=1 显式开启,后续迭代再转正)
-    backfill_ids = str(params.get("item_ids", "")) in ("1", "true", "yes")
+    # item_id 不在这里回填(2026-09-07 归 item_id_sync 独立工作流:报表要等
+    # 15–45 分钟、创建每小时一次,挂在每店同步里会把本步拖长一倍;双轨禁止)
     run_at = datetime.now(timezone.utc)
 
     # 标准①②(所有者定稿 2026-08-26):跨店并发 → 凭证死跳全店不补试 → 其余
@@ -183,18 +139,16 @@ def run(params: dict) -> str:
     # 这里的同一个 _sync_one_store(单一落地路径,不另写简化版)。
     results, dead, absent, gate_note = store_retry.fan_out(
         store_list,
-        lambda s: _sync_one_store(s, run_at, skip_inventory, mode, backfill_ids),
+        lambda s: _sync_one_store(s, run_at, skip_inventory, mode),
         workers, log_label="同步")
 
     total_written = sum(r["written"] for r in results)
     total_missing = sum(r["missing"] for r in results)
-    total_item_ids = sum(r.get("item_ids", 0) for r in results)
     truncated = [r["store"] for r in results if r["truncated"]]
     # ⚠ 首行 = 结论 + 最要紧的数,且链通知(product_chain)对成功步骤**只发
     # 首行**(cli first_line_of)—— 缺席店必须写在这一行,放后面等于只写日志
     lines = [f"catalog_sync:{len(results)}/{len(store_list)} 店完成,"
-             f"入库 {total_written} 行,本轮缺席标记 {total_missing} 行,"
-             f"回填 item_id {total_item_ids} 个"
+             f"入库 {total_written} 行,本轮缺席标记 {total_missing} 行"
              + nf.absent_tail(absent, gate_note,
                               tail="下游按水位避让,链尾重赛")]
     if gate_note:

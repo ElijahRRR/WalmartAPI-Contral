@@ -226,8 +226,42 @@ def skus_missing_item_id(conn, store_name: str) -> set[str]:
         return {r[0] for r in cur.fetchall()}
 
 
+def item_id_map(conn, store_name: str) -> dict[str, str | None]:
+    """输入:连接 + 店铺 → 输出:该店在架行 {sku: item_id 或 None}(item_id_sync 的比对基准)。"""
+    with conn.cursor() as cur:
+        cur.execute("SELECT sku, item_id FROM catalog.walmart_items "
+                    "WHERE store = %s AND missing_since IS NULL", (store_name,))
+        return {r[0]: r[1] for r in cur.fetchall()}
+
+
+def in_catalog_profile(conn, store_name: str) -> list[dict]:
+    """输入:连接 + 店铺 → 输出:该店在架行 [{sku, item_id, lifecycle_status, published_status, first_seen}]。
+
+    item_id_sync 探针对账用:报表没覆盖的在架行到底是什么(RETIRED / 未发布的僵尸,
+    还是老品),按库里的状态与首次入库时间分组就知道,不猜。在架判据与 item_id_map 同一条。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT sku, item_id, lifecycle_status, published_status, created_at "
+                    "FROM catalog.walmart_items WHERE store = %s AND missing_since IS NULL",
+                    (store_name,))
+        return [{"sku": r[0], "item_id": r[1], "lifecycle_status": r[2],
+                 "published_status": r[3], "first_seen": r[4]} for r in cur.fetchall()]
+
+
+def stores_missing_item_id(conn) -> dict[str, int]:
+    """输入:连接 → 输出:{店铺: 在架且 item_id 为空的行数}(只列有缺口的店)。"""
+    with conn.cursor() as cur:
+        cur.execute("SELECT store, count(*) FROM catalog.walmart_items "
+                    "WHERE item_id IS NULL AND missing_since IS NULL GROUP BY store")
+        return {r[0]: int(r[1]) for r in cur.fetchall()}
+
+
 def set_item_ids(conn, store_name: str, mapping: dict[str, str]) -> int:
-    """输入:连接 + 店铺 + {sku: item_id} → 输出:更新行数。"""
+    """输入:连接 + 店铺 + {sku: item_id} → 输出:更新行数。
+
+    **覆盖写**:库里已有值也按传入值改(所有者定稿 2026-09-07「冲突以报表为准」);
+    「只填空行 / 改了多少」的判断在 services/item_reports.plan_updates,这里只写。
+    """
     if not mapping:
         return 0
     with conn.cursor() as cur:

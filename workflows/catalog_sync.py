@@ -8,8 +8,12 @@
   python cli.py catalog_sync -p rounds=full     # 备用:旧式逐状态 5 轮显式扫
                                                 # (默认 fast 两轮已实证更快且更全,见 items.py)
 
-每店流程:GET /v3/items 5 轮全量扫店(去重)→ offset 截断时用 PG 已知 SKU 单查补漏
-→ GET /v3/inventories 合并可售数量 → upsert catalog.walmart_items → 标记本轮缺席行。
+每店流程:GET /v3/items 全量扫店(去重;首页 totalItems 超 offset 上限 10000 就按生命
+周期动态切片,仍超再按发布状态切 —— api/items.iter_all_items)→ **ITEM 报表兜底**:最近
+一份报表里 PUBLISHED 而本轮扫描没见到的 SKU 单查补入(真正在线的品不许因分页漏掉;
+404 = 报表已过时,只计数)→ GET /v3/inventories 合并可售数量 → upsert
+catalog.walmart_items → 标记本轮缺席行。「offset 截断后用 PG 已知 SKU 单查补漏」的老路
+2026-09-08 所有者撤销:已知的查不出未知的,一轮几千个 404 只烧时间。
 失败处理走店级重试标准(所有者定稿 2026-08-26,CLAUDE.md 工程规范):
 凭证失效(StoreDeadError)跳过全店不补试;其余失败店跑完别人后**串行补试
 一遍**,仍失败以「⚠ 缺席」点名进摘要首行、**不炸整轮**(零店完成仍失败);
@@ -45,32 +49,38 @@ SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重�
 
 logger = logging.getLogger("workflows.catalog_sync")
 
-_FILL_WORKERS = 8   # 补漏单查并发上限(items.get 桶 800/min,蓝图定稿 ≤8 并发)
+_BACKSTOP_WORKERS = 8      # 报表兜底单查并发上限(items.get 桶 800/min,蓝图定稿 ≤8 并发)
+REPORT_MAX_AGE_HOURS = 48  # 报表兜底只认这么新的 ITEM 报表(05:00 一轮,06:40 / 13:00 用)
 
 
 def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str) -> dict:
-    """输入:店铺 + 本轮时间 + 扫描模式 → 输出:该店统计 dict(拉取/入库/缺席/截断/补漏)。"""
+    """输入:店铺 + 本轮时间 + 扫描模式 → 输出:该店统计 dict(拉取/入库/缺席/切片/截断/报表兜底)。"""
     name = store["name"]
     stats: dict = {}
     summaries = [items.summarize_item(it)
                  for it in items.iter_all_items(store, stats, mode=mode)]
-    logger.info("店铺 %s 扫描(%s)各轮条数:%s,去重后 %d",
-                name, mode, stats.get("rounds"), stats.get("total", 0))
+    logger.info("店铺 %s 扫描(%s)各轮条数:%s,切片 %s,去重后 %d",
+                name, mode, stats.get("rounds"), stats.get("splits") or "无", stats.get("total", 0))
 
-    filled = 0
-    if stats.get("truncated"):
-        seen = {s["sku"] for s in summaries}
-        with db.pg_conn() as conn:
-            candidates = walmart_catalog.known_skus(conn, name) - seen
-        logger.warning("店铺 %s 扫描被 offset 截断,对 PG 已知 %d 个未见 SKU 单查补漏",
-                       name, len(candidates))
-        with ThreadPoolExecutor(max_workers=_FILL_WORKERS) as pool:
-            futures = [pool.submit(items.get_item, store, sku) for sku in sorted(candidates)]
+    # 报表兜底(所有者定稿 2026-09-08):最近一份 ITEM 报表里 PUBLISHED 而本轮扫描没见到
+    # 的 SKU 单查补入 —— 真正在线的品不许因分页/切片漏掉(报表对在线品的覆盖 A109 实证
+    # 3355/3358);404 = 报表生成后又删了,只计数不入库。切片扫得全时这里通常是零。
+    seen = {s["sku"] for s in summaries}
+    with db.pg_conn() as conn:
+        live = walmart_catalog.report_live_skus(conn, name, REPORT_MAX_AGE_HOURS)
+    candidates = sorted(live - seen)
+    backstop_filled = backstop_gone = 0
+    if candidates:
+        logger.info("店铺 %s 报表兜底:报表在线而扫描未见 %d 个 SKU,单查补入", name, len(candidates))
+        with ThreadPoolExecutor(max_workers=_BACKSTOP_WORKERS) as pool:
+            futures = [pool.submit(items.get_item, store, sku) for sku in candidates]
             for f in as_completed(futures):
                 item = f.result()
                 if item:
                     summaries.append(items.summarize_item(item))
-                    filled += 1
+                    backstop_filled += 1
+                else:
+                    backstop_gone += 1
 
     # {sku: {发货节点: 可售数量}} —— 合计与节点数都由 merge_rows 从这一份算
     inventory: dict[str, dict[str, int]] = {}
@@ -113,8 +123,10 @@ def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str) -> dic
     multi = sum(1 for nodes in inventory.values() if len(nodes) > 1)
     return {"store": name, "fetched": stats.get("total", 0), "written": written,
             "missing": missing, "truncated": bool(stats.get("truncated")),
-            "filled": filled, "inv": len(inventory), "inv_failed": inv_failed,
-            "multi_node": multi}
+            "splits": stats.get("splits") or {},
+            "backstop": len(candidates), "backstop_filled": backstop_filled,
+            "backstop_gone": backstop_gone,
+            "inv": len(inventory), "inv_failed": inv_failed, "multi_node": multi}
 
 
 def run(params: dict) -> str:
@@ -153,8 +165,20 @@ def run(params: dict) -> str:
                               tail="下游按水位避让,链尾重赛")]
     if gate_note:
         lines.append(gate_note)
+    split = {r["store"]: r["splits"] for r in results if r.get("splits")}
+    if split:
+        lines.append("按生命周期动态切片扫描(首页 totalItems 超 offset 上限):"
+                     + ",".join(f"{s}[" + ";".join(f"{k}={v}" for k, v in d.items()) + "]"
+                                for s, d in sorted(split.items())))
     if truncated:
-        lines.append(f"offset 截断已补漏:{','.join(truncated)}")
+        lines.append(f"⚠ 切到最细仍超 offset 上限,该组合超出部分没扫到(在线品由报表兜底):"
+                     f"{','.join(truncated)}")
+    bs = {r["store"]: (r.get("backstop_filled", 0), r.get("backstop_gone", 0))
+          for r in results if r.get("backstop")}
+    if bs:
+        lines.append("报表兜底(报表在线而扫描未见):"
+                     + ",".join(f"{s} 补入 {f}" + (f"/404 {g}" if g else "")
+                                for s, (f, g) in sorted(bs.items())))
     inv_failed = [r["store"] for r in results if r.get("inv_failed")]
     if inv_failed:
         lines.append(f"库存拉取失败(沿用旧值,目录已更新):{','.join(inv_failed)}")

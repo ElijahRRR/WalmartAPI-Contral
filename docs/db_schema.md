@@ -177,6 +177,24 @@ CREATE INDEX item_node_inventory_node_idx ON catalog.item_node_inventory (ship_n
 ```
 
 ```sql
+-- ITEM 报表行(2026-09-08 所有者定稿:报表兜底真正在线的品)
+-- item_id_sync 真跑时整店替换(一店只留最近一份,探针不写);catalog_sync 扫店后拿
+-- publish_status='PUBLISHED' 而本轮没扫到的 SKU 单查补入,在线品不许因分页 / 切片漏掉。
+-- 依据:报表对在线品的覆盖 A109 实证 3355/3358;而 GET /v3/items 列表会把已删品当
+-- 在售返回(库里 235 行"ACTIVE/PUBLISHED"单查 232 行 404)。
+CREATE TABLE catalog.item_report_rows (
+    store text NOT NULL, sku text NOT NULL,   -- PK (store, sku)
+    item_id          text,                    -- 报表「Item ID」列(与 URL 尾段互校后)
+    lifecycle_status text,                    -- 报表 Lifecycle Status
+    publish_status   text,                    -- 报表 Publish Status
+    request_id       text NOT NULL,           -- 来自哪份报表(ops.report_requests.request_id)
+    reported_at      timestamptz NOT NULL     -- 报表提交时刻;兜底只认 48 小时内的
+);
+-- 唯一写入口 services/walmart_catalog.replace_report_rows;唯一读者 report_live_skus。
+-- **加表后须 `python cli.py db_init`**。
+```
+
+```sql
 -- 产品来源登记簿(2026-08-07 所有者定稿):每个上架产品登记"出身"
 -- sku=asin 只对 amz 搬运品成立;跟卖/自建/1688 各有身份。谁上架谁登记,
 -- 自动化按出身路由(源数据缺失驱动的破坏动作必须限定 source_type;

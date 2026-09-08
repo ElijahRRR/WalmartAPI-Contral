@@ -80,6 +80,32 @@ def test_coverage_note_thresholds():
     assert ir.coverage_note({"catalog": 10, "matched": 1}) == ""      # 样本太小不报
 
 
+def test_coverage_denominator_is_live_rows_when_given():
+    """分母只算在售行(所有者定稿 2026-09-08):存档与幽灵不进分母,A109 49% → 99.9%。"""
+    current = {f"S{i}": None for i in range(100)}
+    mapping = {f"S{i}": str(i) for i in range(50)}                    # 报表只有 50
+    live = {f"S{i}": None for i in range(52)}.keys()                  # 在售 52
+    _, n = ir.plan_updates(current, mapping, live=set(live))
+    assert (n["catalog"], n["matched"], n["live"], n["live_matched"]) == (100, 50, 52, 50)
+    note = ir.coverage_note(n)
+    assert note == "" or "在售行" in note                              # 50/52 = 96% 达标
+    _, n = ir.plan_updates(current, {f"S{i}": str(i) for i in range(40)}, live=set(live))
+    assert "在售行 40/52" in ir.coverage_note(n)
+    _, n = ir.plan_updates(current, mapping)                           # 不传 live:退回在架行
+    assert "live" not in n and "在架行 50/100" in ir.coverage_note(n)
+
+
+def test_report_rows_shape_for_backstop_table():
+    rows = [_row(SKU="A", **{"Item ID": "11", "Item Page URL": "http://www.walmart.com/ip/a/11",
+                             "Lifecycle Status": "ACTIVE", "Publish Status": "PUBLISHED"}),
+            _row(SKU="A", **{"Item ID": "99"}),                        # 重复 SKU 只取首次
+            _row(SKU="B", **{"Lifecycle Status": "RETIRED", "Publish Status": "UNPUBLISHED"}),
+            _row(**{"Item ID": "5"})]                                  # 无 SKU 丢弃
+    out = ir.report_rows(rows, {"A": "11"})
+    assert out == [{"sku": "A", "item_id": "11", "lifecycle_status": "ACTIVE", "publish_status": "PUBLISHED"},
+                   {"sku": "B", "item_id": None, "lifecycle_status": "RETIRED", "publish_status": "UNPUBLISHED"}]
+
+
 def test_extract_item_id_prefers_column_then_url():
     row = _row(SKU="A", **{"Item ID": "123", "Item Page URL": "http://www.walmart.com/ip/x/456"})
     assert reports.item_id_from_column(row) == "123"
@@ -183,6 +209,9 @@ def _wire(monkeypatch, *, open_row=None, rows=None, current=None,
     monkeypatch.setattr(wf.reports, "download_report", lambda url, proxy: b"blob")
     monkeypatch.setattr(wf.reports, "parse_report_csv", lambda blob: list(rows or []))
     monkeypatch.setattr(wf.walmart_catalog, "item_id_map", lambda conn, s: dict(current or {}))
+    monkeypatch.setattr(wf.walmart_catalog, "live_skus", lambda conn, s: set(current or {}))
+    monkeypatch.setattr(wf.walmart_catalog, "replace_report_rows",
+                        lambda conn, s, rid, rows, at=None: log.__setitem__("report_rows", (rid, list(rows))) or len(rows))
     monkeypatch.setattr(wf.walmart_catalog, "in_catalog_profile",
                         lambda conn, s: [{"sku": k, "item_id": v, "lifecycle_status": "ACTIVE",
                                           "published_status": "PUBLISHED", "first_seen": None}
@@ -210,6 +239,9 @@ def test_one_store_creates_waits_downloads_and_applies(monkeypatch):
     c = r["counters"]
     # unmatched = 在架且 NULL、报表里没给出 ID 的:C(报表里无 ID)+ D(报表里没有)
     assert (c["filled"], c["overwritten"], c["unmatched"], c["no_id"]) == (1, 1, 2, 1)
+    assert (c["live"], c["live_matched"]) == (4, 2)                    # 分母走在售集合
+    rid, rows = log["report_rows"]                                     # 真跑落报表行(兜底依据)
+    assert rid == "REQ-NEW" and [x["sku"] for x in rows] == ["A", "B", "C"]
 
 
 def test_one_store_resumes_ledger_row_instead_of_creating_again(monkeypatch):
@@ -268,7 +300,7 @@ def test_probe_downloads_but_never_writes(monkeypatch):
     log = _wire(monkeypatch, rows=_ROWS, current={"A": None, "B": "old"})
     r = wf._one_store(STORE, 60, 120, probe=True)
     assert r["outcome"] == "probe"
-    assert log["written"] == {} and log["applied"] == []
+    assert log["written"] == {} and log["applied"] == [] and "report_rows" not in log
     assert r["sample"][0] == ("A", "11", "11") and r["publish"] and "header" in r
     assert log["downloaded"] == [(7, 3)]                 # 台账停在 ready + 已下载
     # 原件留存(conftest 已把 reports_dir 指到临时目录)+ 体检 dict

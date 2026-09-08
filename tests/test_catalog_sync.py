@@ -802,6 +802,8 @@ def test_sync_one_store_pulls_inventory_bulk_only(monkeypatch):
                         lambda conn, rows: 0)
     monkeypatch.setattr(catalog_sync.walmart_catalog, "mark_missing",
                         lambda conn, name, run_at: 0)
+    monkeypatch.setattr(catalog_sync.walmart_catalog, "report_live_skus",
+                        lambda conn, name, hours: set())
 
     r = catalog_sync._sync_one_store(STORE, datetime.now(timezone.utc),
                                      False, "fast")
@@ -1098,3 +1100,102 @@ def test_drop_node_rows_removes_only_that_store_and_sku():
     assert "DELETE FROM catalog.item_node_inventory" in sql
     assert "store = %(store)s AND sku = %(sku)s" in sql   # 两个键都在,少一个就是清全店
     assert params == {"store": "T1", "sku": "B0OLDCODE01"}
+
+
+# ── 2026-09-08 所有者定稿:offset 补漏撤销;按 totalItems 动态切片;ITEM 报表兜底在线品 ──
+
+def _paged(request, totals: dict, per_page=2):
+    """按 (lifecycle, published) 查 totals 出总数;不认识的组合 404;每页 per_page 条。"""
+    p = request.url.params
+    key = (p.get("lifecycleStatus"), p.get("publishedStatus"))
+    if key not in totals:
+        return httpx.Response(404, json={})
+    total = totals[key]
+    offset = int(p.get("offset"))
+    tag = f"{key[0] or 'ALL'}-{key[1] or 'ALL'}"
+    page = [{"sku": f"{tag}-{i}"} for i in range(offset, min(offset + per_page, total))]
+    return httpx.Response(200, json={"ItemResponse": page, "totalItems": total, "nextCursor": "C"})
+
+
+def test_fast_mode_splits_by_lifecycle_then_published_when_total_over_cap(monkeypatch):
+    """首页 totalItems 超 offset 上限 ⇒ 无参轮让位,按生命周期切;ACTIVE 仍超再按发布状态切;
+    切过的组合不再重扫(fast 的 RETIRED 兜底轮跳过);首页不浪费;不认识的组合 404 = 空轮。"""
+    monkeypatch.setattr(items, "OFFSET_CAP", 4)
+    totals = {(None, None): 9, ("ACTIVE", None): 6, ("RETIRED", None): 3,
+              ("ACTIVE", "PUBLISHED"): 3, ("ACTIVE", "UNPUBLISHED"): 2, ("ACTIVE", "SYSTEM_PROBLEM"): 1}
+    seen_params = []
+
+    def handler(request):
+        p = request.url.params
+        seen_params.append((p.get("lifecycleStatus"), p.get("publishedStatus"), int(p.get("offset"))))
+        return _paged(request, totals)
+
+    _use(monkeypatch, handler)
+    stats = {}
+    got = [i["sku"] for i in items.iter_all_items(STORE, stats, mode="fast")]
+    # 无参首页 2 条留用 → ACTIVE 首页 2 条留用 → ACTIVE 六个发布状态(三个 404)→ RETIRED 整轮 → ARCHIVED 404
+    assert got[:2] == ["ALL-ALL-0", "ALL-ALL-1"] and "ACTIVE-ALL-0" in got
+    assert {s for s in got if s.startswith("ACTIVE-PUBLISHED")} == {f"ACTIVE-PUBLISHED-{i}" for i in range(3)}
+    assert {s for s in got if s.startswith("RETIRED")} == {f"RETIRED-ALL-{i}" for i in range(3)}
+    assert stats["splits"] == {"ALL/ALL": 9, "ACTIVE/ALL": 6} and stats["truncated"] is False
+    rounds = [(lc, ps) for lc, ps, off in seen_params if off == 0]
+    assert rounds.count(("RETIRED", None)) == 1                 # 切片扫过,fast 的兜底轮不再重扫
+    assert ("ARCHIVED", None) in rounds and ("ACTIVE", "STAGE") in rounds
+    assert (None, None) in rounds and seen_params.count((None, None, 2)) == 0   # 无参轮只拿了首页
+
+
+def test_fast_mode_leaf_over_cap_is_truncated_not_filled(monkeypatch):
+    """切到最细(生命周期 × 发布状态)仍超上限 ⇒ 只标 truncated,不再用已知 SKU 单查补漏。"""
+    monkeypatch.setattr(items, "OFFSET_CAP", 4)
+    totals = {(None, None): 9, ("ACTIVE", None): 9, ("ACTIVE", "PUBLISHED"): 9,
+              ("RETIRED", None): 0}
+    _use(monkeypatch, lambda r: _paged(r, totals))
+    stats = {}
+    got = list(items.iter_all_items(STORE, stats, mode="fast"))
+    assert stats["truncated"] is True and stats["splits"] == {"ALL/ALL": 9, "ACTIVE/ALL": 9}
+    assert len([s for s in got if s["sku"].startswith("ACTIVE-PUBLISHED")]) == 4   # 只翻到上限
+    assert not hasattr(walmart_catalog, "known_skus")           # 补漏候选函数已删
+
+
+def test_full_mode_never_splits(monkeypatch):
+    monkeypatch.setattr(items, "OFFSET_CAP", 4)
+    totals = {("ACTIVE", "PUBLISHED"): 9, ("ACTIVE", "UNPUBLISHED"): 0, ("ACTIVE", "SYSTEM_PROBLEM"): 0,
+              ("ACTIVE", "STAGE"): 0, ("RETIRED", None): 0}
+    _use(monkeypatch, lambda r: _paged(r, totals))
+    stats = {}
+    list(items.iter_all_items(STORE, stats, mode="full"))
+    assert stats["splits"] == {} and stats["truncated"] is True
+
+
+def test_sync_one_store_backstops_live_report_skus(monkeypatch):
+    """报表兜底:最近一份 ITEM 报表里 PUBLISHED 而本轮扫描没见到的 SKU 单查补入;404 只计数。"""
+    import contextlib
+    from datetime import datetime, timezone
+    from workflows import catalog_sync
+
+    monkeypatch.setattr(catalog_sync.items, "iter_all_items",
+                        lambda store, stats, mode: iter([{"sku": "A"}, {"sku": "B"}]))
+    monkeypatch.setattr(catalog_sync.walmart_catalog, "report_live_skus",
+                        lambda conn, name, hours: {"A", "C", "D"})
+    monkeypatch.setattr(catalog_sync.items, "get_item",
+                        lambda store, sku: {"sku": "C", "publishedStatus": "PUBLISHED"} if sku == "C" else None)
+    merged = {}
+    monkeypatch.setattr(catalog_sync.inv_api, "list_inventory_nodes", lambda store, expected_skus=None: {})
+    monkeypatch.setattr(catalog_sync.walmart_catalog, "upsert_node_inventory", lambda conn, name, inv, run_at: 0)
+    monkeypatch.setattr(catalog_sync.db, "pg_conn", lambda *a, **kw: contextlib.nullcontext(object()))
+    monkeypatch.setattr(catalog_sync.walmart_catalog, "merge_rows",
+                        lambda name, summaries, inv, run_at: merged.__setitem__("skus", [s["sku"] for s in summaries]) or [])
+    monkeypatch.setattr(catalog_sync.walmart_catalog, "upsert_items", lambda conn, rows: 0)
+    monkeypatch.setattr(catalog_sync.walmart_catalog, "mark_missing", lambda conn, name, run_at: 0)
+
+    r = catalog_sync._sync_one_store(STORE, datetime.now(timezone.utc), False, "fast")
+    assert merged["skus"] == ["A", "B", "C"]                    # C 补入;D 404 不入
+    assert (r["backstop"], r["backstop_filled"], r["backstop_gone"]) == (2, 1, 1)
+
+
+def test_report_rows_helpers_sql_shapes():
+    conn = _FakeConn(rows=[("A",), ("B",)])
+    assert walmart_catalog.live_skus(conn, "T1") == {"A", "B"}
+    assert walmart_catalog.report_live_skus(conn, "T1", 48) == {"A", "B"}
+    assert walmart_catalog.replace_report_rows(conn, "T1", "REQ", [
+        {"sku": "A", "item_id": "1", "lifecycle_status": "ACTIVE", "publish_status": "PUBLISHED"}]) == 1

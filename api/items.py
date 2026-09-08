@@ -4,9 +4,9 @@
   search_walmart()       GET /v3/items/walmart/search(DEFAULT)  全站目录搜索    [product_query]
   search_walmart_spec()  同端点 responseFormat=SPEC             跟卖路由/标识互转 [product_query]
   catalog_search()       POST /v3/items/catalog/search          本店目录精确查询  [product_query]
-  list_items()           GET /v3/items                          分页模型1        [catalog_sync]
-  iter_all_items()       5 轮组合全量扫店(去重生成器)                            [catalog_sync]
-  get_item()             GET /v3/items/{sku}                    单查补漏         [catalog_sync]
+  list_items()           GET /v3/items                          分页模型1(首页 totalItems 超限即让位切片)[catalog_sync]
+  iter_all_items()       全量扫店(去重生成器;fast 模式按 totalItems 动态切片)   [catalog_sync]
+  get_item()             GET /v3/items/{sku}                    单查(报表兜底 / 上架核对)[catalog_sync]
 
 其余函数(count_items / get_spec)按蓝图 §7 签名预留,随对应工作流迁移时实现
 ——不自创签名(CLAUDE.md api 层收录规则)。
@@ -88,17 +88,33 @@ def _guard_store_dead(status: int, store: dict) -> None:
         raise _client.StoreDeadError(store["name"], status)
 
 
+OFFSET_CAP = 10000   # 官方明文 offset ≤ 10000:一次查询这一路最多翻到这里
+
+# 动态切片的两级维度(所有者定稿 2026-09-08):首页 totalItems 超 OFFSET_CAP 就按生命周期
+# 切,某个生命周期仍超就再按发布状态切。不认识的组合官方回 404 = 空轮,多花一个请求而已。
+LIFECYCLES = ("ACTIVE", "RETIRED", "ARCHIVED")
+PUBLISHED_STATUSES = ("PUBLISHED", "UNPUBLISHED", "SYSTEM_PROBLEM", "IN_PROGRESS",
+                      "STAGE", "READY_TO_PUBLISH")
+
+
 def list_items(store: dict, *, published_status: str | None = None,
                lifecycle_status: str | None = None,
-               limit: int = 1000, max_offset: int = 10000) -> tuple[list[dict], bool]:
-    """输入:店铺 + 状态过滤 → 输出:(商品列表, 是否因 offset 上限被截断)。
+               limit: int = 1000, max_offset: int = OFFSET_CAP,
+               bail_over: int | None = None,
+               stats: dict | None = None) -> tuple[list[dict], bool]:
+    """输入:店铺 + 状态过滤(+ bail_over:首页 totalItems 超过它就让位)→ 输出:(商品列表, 是否被 offset 上限截断)。
 
     GET /v3/items,分页模型 1(蓝图 §4):首页 nextCursor='*' 换取真 cursor 后
     全程不变(快照会话 ID),真翻页靠 offset 递增;offset 硬上限 10000(超限 400);
-    cursor 约 2 分钟过期(400 → 重置 '*' 整轮重试一次)。截断部分调用方用
-    get_item() 单查补漏。
+    cursor 约 2 分钟过期(400 → 重置 '*' 整轮重试一次)。
+    首页的 totalItems 就说明了这个查询有多少条(stats["total"]):超过 bail_over 时
+    不再翻页,把首页原样返回并置 stats["bailed"]=True,由 iter_all_items 切片重扫。
+    「截断后用 PG 已知 SKU 单查补漏」的老路 2026-09-08 撤销(所有者:平常不需要、
+    与需求不沾边 —— 已知的查不出未知的,一轮几千个 404 只烧时间)。
     """
     token = _client.get_token(store["client_id"], store["client_secret"], store["proxy"])
+    if stats is not None:
+        stats.update(total=None, bailed=False)
 
     def _sweep() -> tuple[list[dict], bool]:
         collected: list[dict] = []
@@ -128,15 +144,25 @@ def list_items(store: dict, *, published_status: str | None = None,
                 raise RuntimeError(f"GET /v3/items 返回 {status}(店铺 {store['name']}): {data}")
             page = (data or {}).get("ItemResponse") or []
             total = (data or {}).get("totalItems") or 0
-            if cursor == "*":
+            first = cursor == "*"
+            if first:
                 cursor = (data or {}).get("nextCursor") or cursor
+                if stats is not None:
+                    stats["total"] = total
             collected.extend(page)
             offset += len(page)
+            if first and bail_over is not None and total > bail_over:
+                logger.info("GET /v3/items %s/%s total=%d 超 %d,首页留用、整扫让位切片(店铺 %s)",
+                            lifecycle_status, published_status, total, bail_over, store["name"])
+                if stats is not None:
+                    stats["bailed"] = True
+                return collected, False
             if not page or offset >= total:
                 return collected, False
             if offset >= max_offset:
-                logger.warning("GET /v3/items 店铺 %s 达 offset 上限 %d(total=%d),截断待补漏",
-                               store["name"], max_offset, total)
+                logger.warning("GET /v3/items %s/%s 店铺 %s 达 offset 上限 %d(total=%d),"
+                               "超出部分这一路翻不到",
+                               lifecycle_status, published_status, store["name"], max_offset, total)
                 return collected, True
 
     try:
@@ -151,34 +177,61 @@ class _CursorExpired(Exception):
 
 
 def iter_all_items(store: dict, stats: dict | None = None, mode: str = "full"):
-    """输入:店铺(可选 stats dict 收集统计;mode=full|fast)→ 输出:去重生成器。
+    """输入:店铺(可选 stats dict 收集统计;mode=fast|full)→ 输出:去重生成器。
 
     按 _SWEEP_MODES[mode] 组合全量扫店,跨轮按 sku 去重(以先出现的为准)。
-    stats 若传入,填充 {"truncated": bool, "total": int, "rounds": {轮标识: 条数}}
-    ——truncated=True 时调用方须用 get_item() 对已知 SKU 单查补漏。
+    **fast 模式按 totalItems 动态切片**(所有者定稿 2026-09-08):某一轮首页 totalItems
+    超 OFFSET_CAP,就把这一轮换成按生命周期逐个扫(ACTIVE / RETIRED / ARCHIVED),某个
+    生命周期仍超再按发布状态扫;切到最细仍超才算真截断(stats["truncated"]),超出的
+    部分由 catalog_sync 的 ITEM 报表兜底护住真正在线的品。已作为切片扫过的组合不再重扫
+    (无参轮切成三个生命周期后,fast 的 RETIRED 兜底轮自然跳过)。full 模式不切片。
+    stats 若传入,填充 {"truncated": bool, "total": int, "rounds": {轮: 条数},
+    "splits": {被切的轮: totalItems}}。
     """
     seen: set[str] = set()
-    truncated_any = False
+    scanned: set[tuple[str | None, str | None]] = set()
     rounds_stat: dict[str, int] = {}
-    for lifecycle, published in _SWEEP_MODES[mode]:
-        items, truncated = list_items(store, lifecycle_status=lifecycle,
-                                      published_status=published)
-        truncated_any = truncated_any or truncated
+    splits: dict[str, int] = {}
+    flags = {"truncated": False}
+
+    def _round(lifecycle, published, allow_split):
+        if (lifecycle, published) in scanned:
+            return
+        scanned.add((lifecycle, published))
+        s: dict = {}
+        splittable = allow_split and (lifecycle is None or published is None)
+        page_items, truncated = list_items(store, lifecycle_status=lifecycle,
+                                           published_status=published, max_offset=OFFSET_CAP,
+                                           bail_over=OFFSET_CAP if splittable else None,
+                                           stats=s)
         key = f"{lifecycle or 'ALL'}/{published or 'ALL'}"
-        rounds_stat[key] = len(items)
-        for item in items:
+        rounds_stat[key] = len(page_items)
+        yield from page_items                    # 让位时首页也不浪费
+        if s.get("bailed"):
+            splits[key] = int(s.get("total") or 0)
+            children = ([(lc, published) for lc in LIFECYCLES] if lifecycle is None
+                        else [(lifecycle, ps) for ps in PUBLISHED_STATUSES])
+            for lc, ps in children:
+                yield from _round(lc, ps, allow_split)
+            return
+        flags["truncated"] = flags["truncated"] or truncated
+
+    for lifecycle, published in _SWEEP_MODES[mode]:
+        for item in _round(lifecycle, published, allow_split=(mode == "fast")):
             sku = item.get("sku")
             if sku and sku not in seen:
                 seen.add(sku)
                 yield item
     if stats is not None:
-        stats.update(truncated=truncated_any, total=len(seen), rounds=rounds_stat)
+        stats.update(truncated=flags["truncated"], total=len(seen), rounds=rounds_stat,
+                     splits=splits)
 
 
 def get_item(store: dict, sku: str) -> dict | None:
     """输入:店铺 + SKU → 输出:单品 dict,404 返回 None(真 NOT_FOUND 语义)。
 
-    只作补漏用,禁止用于批量拿数据(旧教训:454 SKU 单查 = 8 分钟)。
+    只作点查用(catalog_sync 的 ITEM 报表兜底、上架核对),禁止用于批量拿数据
+    (旧教训:454 SKU 单查 = 8 分钟;「截断后用已知 SKU 补漏」2026-09-08 撤销)。
     """
     _client.rate_acquire("items.get", store["client_id"])
     token = _client.get_token(store["client_id"], store["client_secret"], store["proxy"])

@@ -79,6 +79,30 @@ TRO 跨仓边界(暂放)。
 maintenance/list_new)→ 按域停旧切换。
 **✅ 2026-08-17 全部完成** —— 验收记录见 `docs/production_cutover.md` §九。
 
+### 2026-09-08 catalog_sync 扫店定稿:offset 补漏撤销、按 totalItems 动态切片、ITEM 报表兜底在线品(所有者定稿)
+
+**背景**:item_id_sync 探针把两件事实打出来了 —— ① ITEM 报表对**真正在线**的品覆盖
+3355/3358(A109);② GET /v3/items 列表会把已删品当在售返回(库里 235 行
+"ACTIVE/PUBLISHED" 单查 232 行 404),而 offset 上限 10000 之外的行这一路根本翻不到。
+所有者定稿:「catalog_sync 里那串 GET /v3/items/{sku} 的 404 是 offset 截断补漏,平常不
+需要,与需求不沾边;用已知的去查没什么作用。响应里的 totalItems 在第一页就告诉了这个查询
+有多少条,超过一万就按生命周期分片,然后用 ITEM 报表兜底真正在线的产品即可。」
+
+**改法**:
+- `api/items.list_items` 首页读 totalItems,超 `bail_over` 就让位(首页留用);
+  `iter_all_items` fast 模式:某轮超 `OFFSET_CAP` 就换成按 lifecycleStatus(ACTIVE /
+  RETIRED / ARCHIVED)逐个扫,某个生命周期仍超再按 publishedStatus 扫;切过的组合不重扫;
+  切到最细仍超才算 truncated。full 模式不切片(备用对拍)。
+- catalog_sync:「截断 → PG 已知 SKU 单查补漏」整段撤线(`walmart_catalog.known_skus` 删);
+  新增**报表兜底**:最近 48 小时的 ITEM 报表里 PUBLISHED 而本轮扫描没见到的 SKU 单查补入,
+  404 只计数(报表生成后又删了)。摘要点名切片 / 真截断 / 兜底补入数。
+- 新表 `catalog.item_report_rows`(item_id_sync 真跑整店替换,探针不写),读者只有兜底。
+  **加表后须 `python cli.py db_init`**。
+- item_id_sync **缺口与覆盖率只算在售行**(在架且 ACTIVE / PUBLISHED):报表不给 RETIRED /
+  SYSTEM_PROBLEM,再把它们算进分母就是每天为存档白建报表;写入仍按全部在架行。
+- **幽灵行(列表说在售、单查 404)本轮不处理**:标缺席会牵动弃码规则(删除经观测核验),
+  单独立项;报表兜底不碰它们。
+
 ### 2026-09-07 itemId 补齐:独立工作流 item_id_sync(所有者定稿)
 
 **需求**:`catalog.walmart_items.item_id` 一直是空的;数字 itemId 只有沃尔玛 On-request

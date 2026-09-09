@@ -14,15 +14,27 @@
     withdraw_stale()    本轮不再建议的 suggested 行置 withdrawn
     claim()             执行件领取待执行建议(只读,不改状态——提交成功才改)
     mark_executing()    提交成功后落 feed_id 并转 executing
-    settle()            按观测事件把 executing 判成 confirmed / ineffective
+    settle()            把 executing 判成 confirmed / ineffective(见下三种来源)
     settle_maintenance() 同上,但判的是"值改过来了没有"(标题/价格/库存)
     expire_executing()  超期没等到观测的 executing 行放行,免得永久堵住同一 SKU
+
+破坏类落定的**三种来源**(2026-09-09 补后两种),`detail.settled_by` 区分:
+  · 观测      —— delete_verified / delete_not_effective(不信回执信观测);
+  · receipt_gone   —— 回执码 ∈ `resources.WALMART_ERR_ITEM_GONE`:沃尔玛说这个
+                      SKU 已经不在了(删了/退役了/停用了/匹配库里查无)⇒ confirmed;
+  · receipt_failed —— 回执 failed/missing ⇒ ineffective,下轮重新建议。
+补前两种之前**回执失败没有任何落定路径**:全船队约 800 条 delete/retire 停在
+executing 数周,部分唯一索引挡住同 SKU 再建议 ⇒ 永不重删(见 _SETTLE_RECEIPT_SQL)。
+⚠ `receipt_gone` 是**处置账的收尾,不是身份层的结论**:本模块不弃码、不改
+catalog.walmart_items、不记 product_events。弃码点仍是四个(conventions §九),
+目录里死档行本身的根治归 docs/backlog.md §十三。
 
 ⚠ **生效判定不在本模块实现**。settle() 读的是 catalog.product_events 里
 catalog_sync 经 services/product_events.verify_deletions 落的
 delete_verified / delete_not_effective ——"不信回执信观测"那套规则(含 48h
 宽限期、RETIRED/缺席算 gone)已经在跑,这里再写一份判定只会产生两份会漂移的
-真相。本模块只做"把已有判决登记到建议行上"。
+真相。本模块只做"把已有判决登记到建议行上";回执那一档同理,判据(哪些码算
+"已经不在了")的唯一出处是 registry/resources.py 的两个码集。
 
 ⚠ **两条链共用一张表,交界处五条纪律**(2026-08-16 定,2026-08-24 大修)。
 起因是所有者在 08-19 的维护记录里翻到一行「删除 | 审核判拒仍在架:(理由未留存)」
@@ -56,6 +68,8 @@ delete_verified / delete_not_effective ——"不信回执信观测"那套规则
 """
 
 import logging
+
+from registry import resources
 
 logger = logging.getLogger("services.dispositions")
 
@@ -184,6 +198,69 @@ WHERE d.status = 'executing' AND d.action = 'relist'
   AND w.last_seen_at > d.executed_at
 RETURNING d.status
 """
+
+
+# ── 回执落定(2026-09-09,所有者实证「动手做」)────────────────────────────────
+# 病根:破坏类处置**只有观测一条落定路径**。feed_poll 把 ops.feed_items 落成
+# failed/missing、product_events 也记了失败回执事件,而上面那条
+# _SETTLE_DELETE_SQL 只认 delete_verified / delete_not_effective —— 那两个事件
+# 的起点是**成功**回执那条事件(见 product_events._VERIFY_SQL),**失败的回执
+# 一条都进不去**。于是全船队约 800 条 delete/retire 停在 executing 数周,
+# 部分唯一索引 dispositions_open_uidx 挡住同 SKU 再建议 ⇒ 永不重删,而
+# sku_migrate 的「无未了结破坏建议」判据又把它们剔出改码面(A085朱丽霖 8 条)。
+#
+# 判据(码集的唯一出处是 registry.resources,本模块不认识任何具体的码):
+#   · `error_code ∈ ITEM_GONE`(**不论 status**)⇒ confirmed / receipt_gone
+#     —— 沃尔玛说这个 SKU 已经不在了,破坏动作的目的已达成。不看 status 是因为
+#     QARTH 那个死档码是 `status=success` 带回来的;
+#   · 否则 status ∈ (failed, missing) ⇒ ineffective / receipt_failed
+#     —— 永久拒(WFS/PDI_0004)与临时失败**都落这一档**:处置账先收掉,该不该
+#     再建议由 problem_scan 的死档/永久拒闸按最近一次回执码判,两件事分开;
+#   · `submitted`(还没轮询到)⇒ 不动,那是 feed_poll 的活;
+#   · success 且不带死档码 ⇒ 不动,那是观测核验的活(48h 宽限期内等着)。
+#
+# ⚠ **本条只动处置账,不动身份层**:不弃码、不改 catalog.walmart_items、不记
+# product_events。弃码点仍是四个(conventions §九),`receipt_gone` 是**处置账
+# 的收尾,不是身份层的结论** —— 目录里那些死档行(walmart_items 仍
+# missing_since IS NULL)的根治另有其事,归 docs/backlog.md §十三。
+#
+# ⚠ **顺序是语义**:settle() 先跑两条观测 SQL 再跑这条。观测判决优先,本条只
+# 收观测收不到的那些;反过来跑的话,一条回执 failed 但商品其实已经消失的行会
+# 被记成 ineffective(下轮重新建议、重发),而观测本来能给出 confirmed。
+#
+# ⚠ **回执行按主键取,不加 DISTINCT ON、更不用 LATERAL**,两条都是实测出来的:
+#   ① `FROM LATERAL (… WHERE fi.feed_id = d.feed_id … LIMIT 1)` —— PG **不允许**
+#      UPDATE 的 FROM 子句里的 LATERAL 反向引用目标表,实测报
+#      `invalid reference to FROM-clause entry for table "d"`(写成这样连不上库
+#      的单测照绿,只在生产上炸 —— 与本模块头注那三次 cast 事故同一个坑);
+#   ② `(SELECT DISTINCT ON (feed_id, sku) … ORDER BY feed_id, sku, submitted_at
+#      DESC)` 虽然能跑,但 `ops.feed_items` 的主键**就是** (feed_id, sku) ——
+#      一个 (feed, SKU) 天生只有一行,"取最近一次"是句空话,代价却是每轮把这张
+#      几百万行的流水表整个排一遍。直接按主键 JOIN 走 PK 索引。
+_SETTLE_RECEIPT_SQL = """
+UPDATE ops.dispositions d
+SET status = CASE WHEN r.error_code = ANY(%(gone)s::text[])
+                  THEN 'confirmed' ELSE 'ineffective' END,
+    settled_at = now(),
+    detail = d.detail || jsonb_build_object(
+        'settled_by', CASE WHEN r.error_code = ANY(%(gone)s::text[])
+                           THEN 'receipt_gone' ELSE 'receipt_failed' END,
+        'receipt_status', r.status,
+        'error_code', r.error_code,
+        'error_desc', left(r.error_desc, 300))
+FROM ops.feed_items r
+WHERE d.status = 'executing'
+  AND d.action = ANY(%(actions)s::text[])
+  AND d.feed_id IS NOT NULL
+  AND r.feed_id = d.feed_id AND r.sku = d.sku
+  AND (r.status = ANY(%(settling)s::text[])
+       OR r.error_code = ANY(%(gone)s::text[]))
+RETURNING d.status, d.detail->>'settled_by' AS settled_by
+"""
+
+#: 「回执已经是终局」的两个台账状态。success 不在里面:那一档归观测核验
+#: (48h 宽限);submitted 也不在:那一档还没轮询到,归 feed_poll。
+_RECEIPT_SETTLING = ("failed", "missing")
 
 
 def suggest_many(conn, rows: list[dict]) -> int:
@@ -602,21 +679,47 @@ def mark_executing(conn, ids: list[int], feed_id, by: str = "") -> int:
 
 
 def settle(conn) -> dict:
-    """输入:连接 → 输出:{confirmed: n, ineffective: n}(本轮落定的建议行)。
+    """输入:连接 → 输出:{confirmed, ineffective, receipt_gone, receipt_failed}。
 
-    只登记**已有**的观测判决,不自己判生效(见模块头注)。还没等到
-    catalog_sync 重新观测的行保持 executing,不落判 —— 与
-    product_events.verify_deletions 的 'wait' 语义对齐。
+    落定有**三种来源**(2026-09-09 补第二、三种),`detail.settled_by` 区分:
+      · `observed`(实际写的是事件名 delete_verified / delete_not_effective)
+        —— 观测判决,catalog_sync 经 product_events.verify_deletions 落的;
+      · `receipt_gone`   —— 回执说这个 SKU 已经不在了 ⇒ confirmed;
+      · `receipt_failed` —— 回执失败(含永久拒与临时失败)⇒ ineffective。
+    confirmed / ineffective 两个计数是**总数**(含回执来源),后两个是其中
+    回执判的那部分 —— 摘要两行都要报,别只报总数。
+
+    ⚠ **观测优先**:两条观测 SQL 先跑,回执那条只收观测收不到的
+    (见 _SETTLE_RECEIPT_SQL 头注)。还没等到 catalog_sync 重新观测、回执也还
+    没落终态的行保持 executing,不落判 —— 与 verify_deletions 的 'wait' 同义。
+
+    本函数**只动处置账**:不弃码、不改 walmart_items、不记 product_events。
     """
-    out = {"confirmed": 0, "ineffective": 0}
+    out = {"confirmed": 0, "ineffective": 0,
+           "receipt_gone": 0, "receipt_failed": 0}
     with conn.cursor() as cur:
         for sql in (_SETTLE_DELETE_SQL, _SETTLE_RELIST_SQL):
             cur.execute(sql)
             for (st,) in cur.fetchall():
                 out[st] = out.get(st, 0) + 1
-    if out["ineffective"]:
+        observed_bad = out["ineffective"]
+        cur.execute(_SETTLE_RECEIPT_SQL, {
+            "gone": sorted(resources.WALMART_ERR_ITEM_GONE),
+            "actions": list(DESTRUCTIVE_ACTIONS),
+            "settling": list(_RECEIPT_SETTLING)})
+        for st, by in cur.fetchall():
+            out[st] = out.get(st, 0) + 1
+            out[by] = out.get(by, 0) + 1
+    if observed_bad:
         logger.warning("处置建议落定:%d 条**未生效**(回执成功但观测显示没动)"
-                       "——下轮扫描会重新建议", out["ineffective"])
+                       "——下轮扫描会重新建议", observed_bad)
+    if out["receipt_gone"] or out["receipt_failed"]:
+        # 必须见人:这两档以前**根本没有落定路径**,行一路卡在 executing,
+        # 而部分唯一索引挡着同 SKU 再建议(全船队实测卡了约 800 条数周)
+        logger.warning("处置建议按回执落定:已不存在 %d 条(沃尔玛说这个 SKU "
+                       "已经删了/退役了/查无,破坏动作目的已达成),回执失败 "
+                       "%d 条(下轮按最近一次回执码决定还建不建议)",
+                       out["receipt_gone"], out["receipt_failed"])
     return out
 
 

@@ -1920,3 +1920,38 @@ suggested 就与它做的事对不上;**不留别名、不留两个函数** —�
 - **不加任何对影子行的自动删除**(写操作永不自动兜底);真双挂仍留 `double` 人工处置。
 - 不动 catalog_sync / problem_scan / 维护链的取数 SQL。
 - `_verdict` 的其余六条规则与优先级一字未改(顺序即语义)。
+
+#### 五、死档不改码(2026-09-09 追加)
+
+上面第三节说的是"改码**之后**那本账怎么收";这一节说的是"这一条**根本不该**改码"。
+
+沃尔玛侧已不存在的 item(最近一次 DELETE/RETIRE 回执码 ∈
+`registry.resources.WALMART_ERR_ITEM_GONE`:Invalid Item ID / deleted-retired /
+already de-activated / QARTH「No matching record」)发 MP_ITEM_MATCH **不是改码,
+是新建一条 listing** —— 它匹配不到任何现存 item,于是照着载荷建了个新的。
+
+实证:**A131吕灿荣 B09L3WXJ96** 的那条**真双挂**(与本节第一段讲的"影子双挂"
+不是一回事,两码 wpid **不同**):旧码是 RETIRED 死档、新码是这样新建出来的 item,
+两条同时挂在店里。回执全绿、摘要正常,没有任何东西会说它建了个新品。
+
+落地:`workflows/sku_migrate._candidates` 的**第三道后置闸**(与在途闸、撞号闸并列,
+`_pick_report` 里是第七类落选理由:「沃尔玛回执说该 SKU 已经不在了(死档),改码会
+新建 listing —— 不迁」),摘要首行单独报「死档 N」。判据经
+`services/feed_track.receipt_blocked`,与 `problem_scan` 的死档闸**同一个函数、同一份
+SQL**;dry-run 同样生效(三道后置闸全是只读判据)。
+
+**不进 `_CONDS`** 是有意的:那份判据文本是"目录 × 登记簿"的行判据,而这一条读的是
+`ops.feed_items` 的回执历史(还要经 `catalog.sku_aliases` 继承一跳)—— 塞进候选 SQL
+等于在判据文本里再嵌一段两层子查询,而它的唯一出处已经在 services 里。
+
+目录里那些死档行**本身**仍未根治(`walmart_items.missing_since` 仍是 NULL,维护链
+对它们照旧发 feed 照旧失败),归 `docs/backlog.md` §十三的后半段。
+
+#### 六、后置闸不占本轮名额(2026-09-09 追加)
+
+A131吕灿荣 实证:`-p limit=500` 只发出 45 条 —— 候选 SQL 先按 `LIMIT 500` 截断,
+在途闸再从这 500 里剔掉 455,被剔的行**白占了本轮名额**,候选面上还有几百条合格的
+一条没轮到。改法:候选 SQL 按 `CANDIDATE_FETCH_CAP`(20000,远大于任何一家店的
+在架行)整店取回,三道后置闸(在途 feed / 死档 / Product ID 撞号)过完**再**按
+`-p limit` 截,截掉的在摘要里说出口(「合格候选 N 个,只发前 M 个,其余下一轮」)。
+上限 0 的早退不变,`_pick_report` 的「没轮到」理由不变。

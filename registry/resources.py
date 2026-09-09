@@ -190,6 +190,47 @@ WALMART_ERR_ASYNC_REVIEW = ("EXT_DATA_ERROR_56026862530206",
 # 清掉 O 列即可重回通道(与 PROHIBITED 的"永不"语义有别,故单列一类)。
 WALMART_ERR_CONTENT = frozenset({"EXT_DATA_ERROR_07705958490105"})
 
+# ── 破坏类回执的两个终局码集(所有者 2026-09-09 实证定稿;唯一出处)──────────
+# 背景:全船队约 800 条 delete/retire 处置停在 executing 数周,根因不是僵尸列表,
+# 是**回执失败之后没有任何落定路径** —— feed_poll 把 ops.feed_items 落成
+# failed/missing、product_events 也记了失败回执事件,而 dispositions.settle
+# 只认 delete_verified / delete_not_effective 两种**观测**事件。处置卡住 ⇒ 部分
+# 唯一索引 dispositions_open_uidx 挡住同 SKU 再建议 ⇒ 永不重删;同时 sku_migrate
+# 的「无未了结破坏建议」判据把这些 SKU 剔出改码面(A085朱丽霖 8 条实证)。
+# 两张表是**例外清单**:不在这两集合里的 failed / missing(含 NULL 码)一律按
+# **临时失败**办 —— 下一轮重新建议、重发。缺省即临时,所以**不为临时类建清单**
+# (建了就要维护两张会漂的表,而漏登记一个临时码的后果是永久停发)。
+#
+# 「沃尔玛说这个 SKU 已经不在了」:删了 / 退役了 / 停用了 / 匹配库里查无 ——
+# **破坏动作的目的已经达成**,再发一次也只会拿到同一句话。
+# ⚠ 这一档**不看回执 status**:QARTH 那个码是 `status=success` 带着它回来的
+# (backlog §十三 A085 611 条),只认 failed 就永远收不到它们。
+# 条数 = 2026-09-09 全船队回执分布实测。
+WALMART_ERR_ITEM_GONE = frozenset({
+    # ~450「[Invalid Item ID] Incoming Itemid does not exist in Matching」
+    "EXT_DATA_ERROR_01716105515970",
+    # ~200「[PCF] This SKU has been deleted/retired and cannot be updated」
+    "EXT_DATA_ERROR_56516760015174",
+    # ~55「Product set up error occurred as the product is already de-activated」
+    "EXT_DATA_ERROR_60706056565050",
+    # ~5「[ASSET] Duplicate URLs…; [Invalid Item ID] … does not exist in Matching」
+    #   (两句拼在一条回执里,后半句才是判据)
+    "EXT_DATA_ERROR_61685350666762",
+    # 数百「[QARTH] No matching record found for the SKU」—— **status=success
+    #   却带这个码**,正是 §十三 里 A085 那 611 条卡死的来源
+    "EXT_DATA_ERROR_60745664660159",
+})
+# 「重发必再拒,只能人工」:沃尔玛不是说做不到,是说**不给做**。自动链再试
+# 一万次也是同一句话,唯一出路是人去 Seller Center 处理(转出 WFS 等)。
+WALMART_ERR_DESTRUCTIVE_PERMANENT = frozenset({
+    # ~12「WFS eligible items can not be deleted」(2026-08-24 官方原话:
+    #   "The item you are trying to delete is WFS eligible. At this time, you
+    #    can not delete WFS eligible items.";DELETE_ITEM 仅 SFF/FBM 支持)
+    "ERR_EXT_DATA_0101218",
+    # ~30 RETIRE_ITEM 的通用异常(近 30 天全船队 RETIRE 三万余条几乎 100% 同款)
+    "ERR_PDI_0004",
+})
+
 # 每店 **item setup limit** 的缺省值(沃尔玛按「店内现有 item 数 + 本 feed 条数」
 # 对每店的上限做**整 feed 拒收**,报错挂在 feed 级 ingestionError 上,零逐条明细)。
 # 出处:沃尔玛 **EXT_DATA_ERROR_50575703577001** 原文「You have exceeded your item

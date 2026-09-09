@@ -7,11 +7,13 @@
   ④ 转态必须落 executed_by —— 合并之后"最终是谁干的"要在库里有答案。
 """
 
+import inspect
 import pathlib
 import re
 
 import pytest
 
+from registry import resources
 from services import dispositions as ds
 
 
@@ -608,3 +610,197 @@ def test_open_executing_count_is_scoped_to_the_store_and_the_status(pg):
     assert ds.open_executing_count(pg, _DSTORE) == 1
     assert ds.open_executing_count(pg, "DISP_T2") == 1
     assert ds.open_executing_count(pg, "DISP_NOBODY") == 0
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  回执落定(2026-09-09):破坏类处置的第二、三种落定来源
+#
+#  病根:破坏类**只有观测一条落定路径**,而观测流的起点是 delete_feed_success
+#  —— 失败的回执一条都进不去。全船队约 800 条 delete/retire 因此停在 executing
+#  数周,部分唯一索引挡住同 SKU 再建议 ⇒ 永不重删,改码链也把它们剔出候选面。
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _SettleCur:
+    """假游标:按执行顺序返回三条 settle SQL 的结果(观测两条 → 回执一条)。"""
+
+    def __init__(self, receipt_rows):
+        self.receipt_rows, self.sqls, self._rows = receipt_rows, [], []
+
+    def __enter__(self): return self
+
+    def __exit__(self, *a): return False
+
+    def execute(self, sql, params=None):
+        # 回执那条是**唯一带实参**的(两条观测 SQL 一个参数都不带)——
+        # 别拿 'settled_by' 当判据:观测那两条的 jsonb_build_object 里也有它
+        self.sqls.append((sql, params))
+        self._rows = list(self.receipt_rows) if params else []
+
+    def fetchall(self): return self._rows
+
+
+class _SettleConn:
+    def __init__(self, receipt_rows=()):
+        self.cur = _SettleCur(receipt_rows)
+
+    def cursor(self): return self.cur
+
+
+def _settle_params(conn):
+    """回执那条 SQL 的实参(它是唯一带 %(gone)s 的一条)。"""
+    return next(pr for sql, pr in conn.cur.sqls if pr and "gone" in pr)
+
+
+def test_settle_runs_the_observed_verdicts_before_the_receipt_one():
+    """**顺序是语义**:两条观测 SQL 先跑,回执那条只收观测收不到的。
+
+    反过来跑的话,一条回执 failed 但商品其实已经消失的行会被记成 ineffective
+    (下轮重新建议、重发一次注定失败的 feed),而观测本来能给出 confirmed。
+    """
+    conn = _SettleConn()
+    ds.settle(conn)
+    sqls = [sql for sql, _pr in conn.cur.sqls]
+    assert len(sqls) == 3
+    assert sqls[0] is ds._SETTLE_DELETE_SQL and sqls[1] is ds._SETTLE_RELIST_SQL
+    assert sqls[2] is ds._SETTLE_RECEIPT_SQL
+    # 判据(哪些码算"已经不在了")从 registry 传进来,本模块不认识任何具体的码
+    assert _settle_params(conn)["gone"] == sorted(resources.WALMART_ERR_ITEM_GONE)
+    assert _settle_params(conn)["actions"] == list(ds.DESTRUCTIVE_ACTIONS)
+
+
+def test_receipt_settle_counts_both_buckets_on_top_of_the_totals():
+    """confirmed / ineffective 是**总数**(含回执来源),两个 receipt_* 是其中
+    回执判的那部分 —— 摘要两行都要报,只报总数就看不出是谁判的。"""
+    out = ds.settle(_SettleConn([("confirmed", "receipt_gone"),
+                                 ("confirmed", "receipt_gone"),
+                                 ("ineffective", "receipt_failed")]))
+    assert out == {"confirmed": 2, "ineffective": 1,
+                   "receipt_gone": 2, "receipt_failed": 1}
+
+
+def test_receipt_settle_sql_shape_covers_the_four_receipt_cases():
+    """四种回执各归各的(SQL 文本层面钉住判据的形状):
+
+      · 码 ∈ GONE(**不论 status**)⇒ confirmed / receipt_gone
+        —— QARTH 那个死档码是 status=success 带回来的,只认 failed 就收不到;
+      · failed / missing ⇒ ineffective / receipt_failed;
+      · submitted ⇒ 不动(还没轮询到,归 feed_poll);
+      · success 不带死档码 ⇒ 不动(归观测核验的 48h 宽限)。
+    """
+    q = ds._SETTLE_RECEIPT_SQL
+    assert ds._RECEIPT_SETTLING == ("failed", "missing")     # success 不在里面
+    assert "r.status = ANY(%(settling)s::text[])" in q
+    assert "OR r.error_code = ANY(%(gone)s::text[])" in q    # status 之外的另一支
+    assert "d.status = 'executing'" in q and "d.feed_id IS NOT NULL" in q
+    assert "'receipt_gone'" in q and "'receipt_failed'" in q
+    # detail 三件套:回执状态 / 码 / 描述(截 300),查账时不用再回 feed_items 翻
+    for key in ("'receipt_status'", "'error_code'", "'error_desc'"):
+        assert key in q
+    assert "left(r.error_desc, 300)" in q
+    # ⚠ 不许写成 `FROM LATERAL (… WHERE fi.feed_id = d.feed_id …)`:PG **不允许**
+    # UPDATE 的 FROM 里的 LATERAL 反向引用目标表,实测报
+    # `invalid reference to FROM-clause entry for table "d"` —— 而本仓的 SQL
+    # 用例只断言文本子串,不连库就发现不了(与"每个参数带 cast"同一条教训)。
+    assert "LATERAL" not in q
+    # 回执行按**主键** (feed_id, sku) 取:一个 (feed, SKU) 天生只有一行,套一层
+    # `DISTINCT ON … ORDER BY submitted_at DESC` 只是每轮把几百万行的流水表
+    # 整个排一遍(结果一模一样)。下面那条真库用例证明语义等价。
+    assert "FROM ops.feed_items r" in q and "DISTINCT ON" not in q
+    assert "r.feed_id = d.feed_id AND r.sku = d.sku" in q
+
+
+def test_receipt_settle_writes_nothing_outside_the_disposition_table():
+    """**只动处置账**:不弃码、不改 walmart_items、不记 product_events。
+
+    弃码点仍是四个(conventions §九),`receipt_gone` 是处置账的收尾、不是身份层
+    的结论 —— 目录里死档行本身的根治归 docs/backlog.md §十三。
+    """
+    q = ds._SETTLE_RECEIPT_SQL
+    assert "catalog.walmart_items" not in q and "product_events" not in q
+    assert "listing_sources" not in q
+    src = inspect.getsource(ds.settle)
+    for forbidden in ("sku_codec", "abandon", "record_many"):
+        assert forbidden not in src
+
+
+@needs_pg
+def test_receipt_settle_on_a_real_database(pg):
+    """真库一轮:五种回执各归各的。文本断言证明不了 UPDATE…FROM 的连接语义。"""
+    def _feed(feed_id, sku, status, code=None, desc=None):
+        with pg.cursor() as cur:
+            cur.execute(
+                "INSERT INTO ops.feed_items (feed_id, sku, workflow, store,"
+                " feed_type, status, error_code, error_desc)"
+                " VALUES (%s, %s, 'problem_product_cleanup', %s, 'DELETE_ITEM',"
+                " %s, %s, %s)", (feed_id, sku, _DSTORE, status, code, desc))
+
+    def _exec_row(sku, feed_id, action="delete"):
+        with pg.cursor() as cur:
+            cur.execute(
+                "INSERT INTO ops.dispositions (store, sku, source, action,"
+                " status, feed_id, executed_at) VALUES (%s, %s, 'scan', %s,"
+                " 'executing', %s, now() - interval '2 days')",
+                (_DSTORE, sku, action, feed_id))
+
+    gone_code = sorted(resources.WALMART_ERR_ITEM_GONE)[0]
+    perm_code = sorted(resources.WALMART_ERR_DESTRUCTIVE_PERMANENT)[0]
+    cases = [
+        # (sku, 回执 status, 码, 期望状态, 期望 settled_by)
+        ("K_GONE_OK", "success", gone_code, "confirmed", "receipt_gone"),
+        ("K_GONE_BAD", "failed", gone_code, "confirmed", "receipt_gone"),
+        ("K_PERM", "failed", perm_code, "ineffective", "receipt_failed"),
+        ("K_TEMP", "failed", "EXT_DATA_ERROR_69730864580258",
+         "ineffective", "receipt_failed"),
+        ("K_MISSING", "missing", None, "ineffective", "receipt_failed"),
+        ("K_WAIT", "submitted", None, "executing", None),
+        ("K_SUCCESS", "success", None, "executing", None),
+    ]
+    for i, (sku, st, code, _want, _by) in enumerate(cases):
+        _feed(f"F{i}", sku, st, code, "沃尔玛原文" if code else None)
+        _exec_row(sku, f"F{i}")
+    # 停用动作也收(顽固件的 retire 那一半):不收就继续每天空烧配额
+    _feed("FR", "K_RETIRE", "failed", gone_code, None)
+    _exec_row("K_RETIRE", "FR", action="retire")
+
+    out = ds.settle(pg)
+    assert out["receipt_gone"] == 3 and out["receipt_failed"] == 3
+    with pg.cursor() as cur:
+        cur.execute("SELECT sku, status, detail ->> 'settled_by',"
+                    " detail ->> 'error_code' FROM ops.dispositions"
+                    " WHERE store = %s ORDER BY sku", (_DSTORE,))
+        got = {sku: (st, by, code) for sku, st, by, code in cur.fetchall()}
+    for sku, _st, code, want, by in cases:
+        assert got[sku][:2] == (want, by), sku
+        if by:
+            assert got[sku][2] == code, sku
+    assert got["K_RETIRE"][:2] == ("confirmed", "receipt_gone")
+
+
+@needs_pg
+def test_the_observed_verdict_wins_over_the_receipt_one(pg):
+    """观测判决优先:回执 failed、而 catalog_sync 已核验它确实消失了 ⇒ confirmed。
+
+    先跑观测那两条 SQL 的**唯一**作用就在这里 —— 行被观测判掉之后就不再是
+    executing,回执那条 UPDATE 自然扫不到它。
+    """
+    with pg.cursor() as cur:
+        cur.execute(
+            "INSERT INTO ops.dispositions (store, sku, source, action, status,"
+            " feed_id, executed_at) VALUES (%s, 'K_BOTH', 'scan', 'delete',"
+            " 'executing', 'FB', now() - interval '2 days')", (_DSTORE,))
+        cur.execute(
+            "INSERT INTO ops.feed_items (feed_id, sku, workflow, store,"
+            " feed_type, status, error_code) VALUES ('FB', 'K_BOTH', 'wf', %s,"
+            " 'DELETE_ITEM', 'failed', 'EXT_DATA_ERROR_69730864580258')",
+            (_DSTORE,))
+        cur.execute(
+            "INSERT INTO catalog.product_events (sku, store, event, source)"
+            " VALUES ('K_BOTH', %s, 'delete_verified', 'catalog_sync')",
+            (_DSTORE,))
+    out = ds.settle(pg)
+    assert (out["confirmed"], out["receipt_gone"], out["receipt_failed"]) \
+        == (1, 0, 0)
+    with pg.cursor() as cur:
+        cur.execute("SELECT status, detail ->> 'settled_by' FROM"
+                    " ops.dispositions WHERE store = %s", (_DSTORE,))
+        assert cur.fetchone() == ("confirmed", "delete_verified")

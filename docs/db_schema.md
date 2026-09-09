@@ -1095,6 +1095,7 @@ CREATE INDEX report_requests_open_idx ON ops.report_requests (store, report_type
 | `executed_by` | 最终**是谁**提交的 feed | 2026-08-24 新增;此前只能靠 source 猜 |
 | `detail->>'ship_node'` | 这条建议要写**哪个发货节点**(多仓批次 2) | 未配置「维护仓库」的店**不带这个键**(建议行与改造前逐字节一致,执行件走 legacy 路径)。带了就决定两件事:写通道(分节点 PUT / MP_INVENTORY feed)与落定判据(按 `catalog.item_node_inventory` 而非 `walmart_items.avail_qty`) |
 | `sources` | 每个支撑来源各一格:`{来源: {action, code, reason, at}}` | 展示用的 reason/category 由 `claim()` 按它现算(单来源逐字不变,多来源拼成「维护:… \| 审核:…」);`reason`/`category` 两列是**首次建议**的病历,不再被后写方覆盖 |
+| `detail->>'settled_by'` | **是谁判的**这条落定 | 破坏类三种来源(2026-09-09):`delete_verified`/`delete_not_effective` = 观测判;`receipt_gone` = 回执码 ∈ `registry.resources.WALMART_ERR_ITEM_GONE`(沃尔玛说这个 SKU 已经不在了 ⇒ confirmed,**不论回执 status** —— QARTH「No matching record」是 status=success 带回来的);`receipt_failed` = 回执 failed/missing(含 WFS 不许删等永久拒)⇒ ineffective。维护三类是 `observed`/`value_unchanged`,超期放行是 `expired`。同时并进 `detail` 的还有 `receipt_status`/`error_code`/`error_desc`(截 300),查账不用再回 `ops.feed_items` 翻 |
 
 改码(批次 3)只准经两个积木碰这张表:`dispositions.open_executing_count`
 (前置闸:改码前该店必须无 `executing` 行 —— 它等的观测判决会随身份列一起换掉,
@@ -1106,6 +1107,14 @@ CREATE INDEX report_requests_open_idx ON ops.report_requests (store, report_type
 维护三类的判决对象就是新码那一行;**破坏组(delete/retire)的 `executing` 仍一概不碰**
 (它们等的是「这个 SKU 不见了」,改码后旧码正好消失)。`executed_at` **不刷新**。工作流里裸写 `UPDATE ops.dispositions SET sku = …`
 即违规:它绕过状态机、撞得上下面那条部分唯一索引、还漏掉 asin 列。
+
+⚠ **回执落定是 2026-09-09 补的第二、三条路**(`dispositions._SETTLE_RECEIPT_SQL`)。
+此前破坏类**只有观测一条落定路径**,而观测流的起点是**成功**回执 —— 失败的回执
+一条都进不去,全船队约 800 条 delete/retire 停在 executing 数周,下面那条部分唯一
+索引又挡住同 SKU 再建议 ⇒ 永不重删(诊断与码表 `docs/backlog.md` §十三)。
+`receipt_gone` 只是**处置账的收尾,不是身份层的结论**:那条 SQL 不弃码、不改
+`catalog.walmart_items`、不记 `catalog.product_events`。「还建不建议」是另一个问题,
+由 `problem_scan` 按**最近一次**回执码判(`services/feed_track.receipt_blocked`)。
 
 未落定唯一性是 `(store, sku, action)` 的部分唯一索引 —— **动作在键里不能去掉**:
 `problem_scan` 对顽固件同时建议 retire 与 delete(双 feed 齐发),合成一条会让

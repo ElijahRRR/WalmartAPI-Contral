@@ -365,7 +365,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
   **真缺口**,只是它属于订单审核域 —— 哪天做,照 `store_config` 的形状抄一份
   (整表原文快照 + 逐格 diff + `ops.cursors` 存最近一版)即可,别新造口径。
 
-## 十三、僵尸列表与破坏类处置卡死(2026-09-07 生产诊断,所有者定:**不在 PR #104 做,另议**)
+## 十三、僵尸列表与破坏类处置卡死(2026-09-07 生产诊断;**2026-09-09 前半段已落地**,后半段仍待办)
 
 现象(A085朱丽霖):ops.dispositions 里 delete 655 / retire 592 条自 08-17/08-24 起停在
 executing。回执分布:611 条删除回执 success 但带 `EXT_DATA_ERROR_60745664660159`
@@ -400,3 +400,63 @@ record」的 (店, SKU) 逐条单查(api/items.get_item),404 ⇒ 标 missing_sin
 定案 / 弃码 / 释放 UPC 全走现有路径;单查配额有限,每轮限额几天清完;查到 200 的
 (WFS 等)处置落 failed 终态放行维护,是否再建议按错误码定规则;problem_scan 对
 「已判 No matching record」的行是否停止再建议一并定。
+
+### 2026-09-09 前半段已落地(所有者实证 + 原话「动手做」)
+
+诊断修正:**根因不是僵尸列表本身,是回执失败后没有任何落定路径**。feed_poll 把
+`ops.feed_items` 落成 failed/missing、`catalog.product_events` 也记了失败回执事件,
+而 `dispositions.settle` **只认观测事件**(delete_verified / delete_not_effective),
+而观测流的起点是**成功**回执 —— 失败的回执一条都进不去。于是全船队约 800 条
+delete/retire 停在 executing 数周;部分唯一索引 `dispositions_open_uidx` 挡住同 SKU
+再建议 ⇒ 永不重删;`sku_migrate` 的候选判据「无未了结破坏建议」又把这些 SKU 剔出
+改码面(A085朱丽霖 8 条实证)。
+
+回执错误码分布(failed,全船队,2026-09-09 实测):
+
+| 码 | 条数 | 原文 | 归类 |
+|---|---|---|---|
+| EXT_DATA_ERROR_01716105515970 | ~450 | [Invalid Item ID] Incoming Itemid does not exist in Matching | 沃尔玛侧已不存在 |
+| EXT_DATA_ERROR_56516760015174 | ~200 | [PCF] This SKU has been deleted/retired and cannot be updated | 沃尔玛侧已不存在 |
+| EXT_DATA_ERROR_60706056565050 | ~55 | Product set up error occurred as the product is already de-activated | 沃尔玛侧已不存在(已停用) |
+| EXT_DATA_ERROR_61685350666762 | ~5 | [ASSET] Duplicate URLs…; [Invalid Item ID] does not exist in Matching | 沃尔玛侧已不存在(含 not exist) |
+| EXT_DATA_ERROR_60745664660159 | 数百(**status=success 却带此码**,即上文 A085 的 611 条) | [QARTH] No matching record found for the SKU | 沃尔玛侧已不存在 |
+| ERR_EXT_DATA_0101218 | ~12 | WFS eligible items can not be deleted | 永久拒(人工转出 WFS) |
+| ERR_PDI_0004(RETIRE_ITEM) | ~30(近 30 天全船队 RETIRE 三万条几乎 100% 同款) | 通用异常 | 永久拒(人工) |
+| EXT_DATA_ERROR_69730864580258 | ~170 | Error occurred while Product Reingestion during SKU delete operation | 临时,重发 |
+| ERR_INT_SYS_01010010 | ~5 | 沃尔玛内部错误 | 临时,重发 |
+| NULL 错误码 / missing | ~30 | feed 级失败 / 明细查无 | 临时,重发 |
+
+回执 success 且**不带**死档码的那几百条不是卡死:它们在 48h 宽限内等观测核验,
+现有 `verify_deletions` 路径会收,**一个字没动**。
+
+落地的三件事:
+
+1. **错误码分类,唯一出处 `registry/resources.py`**:`WALMART_ERR_ITEM_GONE`
+   (上表前五个码)与 `WALMART_ERR_DESTRUCTIVE_PERMANENT`(WFS / PDI_0004)。
+   两集合不相交;**临时类不建清单**(缺省即临时,清单只登记例外 —— 建了第二张表
+   就要维护两份会漂的口径,而漏登记一个临时码的后果是永久停发)。
+   `problem_scan._WFS_BLOCKED_CODE` 那个散落的字面量随之删除,守门用例钉住
+   `.py`(registry / tests 除外)里不再出现这七个码。
+2. **失败回执落定**:`dispositions._SETTLE_RECEIPT_SQL` —— executing 的
+   delete/retire 行按 `(feed_id, sku)` 取回执,码 ∈ GONE(**不论 status**)⇒
+   `confirmed` / `settled_by='receipt_gone'`;failed/missing ⇒ `ineffective` /
+   `settled_by='receipt_failed'`;submitted 与 success-无码**不动**(分别归
+   feed_poll 与观测核验)。观测判决优先(顺序:两条观测 SQL → 本条)。
+   **不弃码、不改 walmart_items、不记 product_events** —— `receipt_gone` 是处置账
+   的收尾,不是身份层的结论。
+3. **两道再建议闸**(`services/feed_track.receipt_blocked`,SQL 只有这一份):
+   `problem_scan` 对最近一次 DELETE/RETIRE 回执命中 GONE / PERMANENT 的 (店,SKU)
+   不再建议(两桶分开计数、摘要点名,不静默);`sku_migrate` 对命中 GONE 的旧码
+   不改码 —— 对沃尔玛侧已不存在的 item 发 MP_ITEM_MATCH **会新建一条 listing**
+   而不是改码(A131吕灿荣 B09L3WXJ96 真双挂:旧码 RETIRED 死档、新码是新建 item)。
+   闸按**最近一次尝试**判、没有时间窗:人工把件转出 WFS 之后,下一次尝试的回执
+   自然把它放出来。
+
+### 仍待办(本条的后半段,范围不变)
+
+**目录里的死档行本身**:`catalog.walmart_items` 对它们仍是 `missing_since IS NULL`
+(标了也会被下一轮 upsert 翻回 NULL,见 `docs/sku_plan.md` §9.15),于是它们照旧留在
+**维护面**上,维护链对它们发的 feed 照旧失败 —— 上面三件事只挡住了破坏面与改码面。
+根治方案不变:**ITEM 报表 / 单条 GET 当观测缺席**(对可疑行逐条 `api/items.get_item`,
+404 ⇒ 标 `missing_since`),定案 / 弃码 / 释放 UPC 全走现有路径;单查配额有限,每轮
+限额、几天清完。与 §9.15 的自救用的是同一个端点,可一并落地。

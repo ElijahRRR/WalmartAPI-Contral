@@ -240,6 +240,13 @@ DEFAULT_LIMIT = 10
 #: 在途口径**有意不分 feed 类型** —— 一条刚发出去的 MP_ITEM/DELETE_ITEM 在途时改码,
 #: 会让那条 feed 打在一个即将不存在的 SKU 上。
 INFLIGHT_HOURS = 48
+#: 候选 SQL 一次取回的**取数上限**(不是本轮提交上限)。2026-09-09 A131吕灿荣
+#: 实证:`-p limit=500` 只发出 45 条 —— 候选 SQL 先按 LIMIT 500 截断,三道后置闸
+#: (在途 feed / 死档 / Product ID 撞号)再从这 500 里剔掉 455,被剔的行**白占了
+#: 本轮名额**,而候选面上还有几百条合格的在排队。所以候选 SQL 按这个上限整店
+#: 取回,后置闸过完才按 `-p limit` 截;一家店的在架行远小于它(最大的店 ~7000)。
+#: 上限 0 的早退不变(一条 SQL 都不发)。
+CANDIDATE_FETCH_CAP = 20000
 #: dry-run 摘要里列几行样例(人眼确认用,不是上限)。
 PREVIEW_ROWS = 10
 
@@ -1148,17 +1155,19 @@ def _stage_cap(conn, store_name: str, asked_limit: int) -> tuple[int, str]:
 
 def _pick_report(store_name: str, only_skus, only_keys, excl_skus, excl_keys,
                  kept: list[dict], why_rows: list[dict], inflight: set,
-                 dupe_skus: set, limit: int) -> list[str]:
+                 dupe_skus: set, limit: int,
+                 gone_skus: set = frozenset()) -> list[str]:
     """输入:点名/排除四组名字 + 本轮留下的候选 + `_SQL_WHY` 的逐条判据 + 两道
     后置闸的落选集 + 本轮上限 → 输出:摘要行(点名 N 个、命中 H 个,落选的**逐条**给理由)。
 
     「点名了却没出现」必须有名有姓的理由。静默丢的表现是:摘要看起来像"这家店
     没候选",而所有者以为自己点的名生效了 —— 于是他等一个永远不会来的结果。
-    六类理由,来源各不相同:
+    七类理由,来源各不相同:
 
       · 被 `-p exclude_*` 排除(排除优先于点名)—— 参数自己说了算;
       · 不满足十条判据之一 —— 来自 `_SQL_WHY`,与候选 SQL **同一份判据文本**;
-      · 旧码上有在途 feed;· 同批 Product ID 撞号 —— 两道后置闸;
+      · 旧码上有在途 feed;· 同批 Product ID 撞号;· 沃尔玛回执说它已经不在了
+        (死档,改码会新建 listing)—— 三道后置闸;
       (**重量不再是落选理由**:2026-09-06 晚所有者定稿,解析不出或 > 11 磅
        一律写 1 磅照发,兜底行在预览与摘要里点名,不再剔候选)
       · 满足全部条件但**本轮节奏闸没轮到**(按 SKU 升序先来后到,下轮再来);
@@ -1185,6 +1194,11 @@ def _pick_report(store_name: str, only_skus, only_keys, excl_skus, excl_keys,
         if w["old_sku"] in inflight:
             return (f"旧码上有 {INFLIGHT_HOURS}h 内的在途 feed(改了码,那条 feed "
                     f"就打在一个即将不存在的 SKU 上)")
+        if w["old_sku"] in gone_skus:
+            return ("沃尔玛回执说该 SKU 已经不在了(死档):对它发 "
+                    "MP_ITEM_MATCH 会**新建一条 listing**而不是改码"
+                    "(A131吕灿荣 B09L3WXJ96 真双挂实证)—— 不迁;"
+                    "目录里的死档行根治归 docs/backlog.md §十三")
         if w["old_sku"] in dupe_skus:
             return ("同一批里 Product ID 撞号(官方不许两个 SKU 挂同一个 "
                     "Product ID),本轮只留了先到的那条")
@@ -1234,7 +1248,8 @@ def _pick_report(store_name: str, only_skus, only_keys, excl_skus, excl_keys,
 def _candidates(conn, store_name: str, limit: int, *,
                 only_skus=(), only_keys=(),
                 exclude_skus=(), exclude_keys=()) -> tuple[list[dict], list[str]]:
-    """输入:连接 + 店 + 上限(+ 点名/排除四组名字)→ 输出:(候选行, 逐候选被跳过的点名)。
+    """输入:连接 + 店 + 上限(+ 点名/排除四组名字)→ 输出:(候选行, 摘要行,
+    {后置闸: 剔除数})。
 
     候选 = 在架 ∧ 已上架 ∧ 活码 ∧ 未在改 ∧ 出身在 SOURCE_TYPES ∧ **不是**不透明码
     ∧ 观测到的 gtin/upc 至少有一个 ∧ **有现挂价格** ∧ 该 (店, 旧码)
@@ -1260,12 +1275,23 @@ def _candidates(conn, store_name: str, limit: int, *,
 
     再过 W2 第⑥道闸:旧码上有在途 feed 的**逐个跳过并点名**(不整店拦)——
     一条刚发出去的 feed 在途时改码,会让它打在一个即将不存在的 SKU 上。
+
+    最后一道后置闸是**死档**(2026-09-09):最近一次 DELETE/RETIRE 回执的错误码
+    落在 `resources.WALMART_ERR_ITEM_GONE` 里的旧码一律剔除 —— 沃尔玛侧已不存在
+    的 item 发 MP_ITEM_MATCH **会新建一条 listing**,不是改码(A131吕灿荣
+    B09L3WXJ96 真双挂实证:旧码是 RETIRED 死档、新码是新建出来的 item)。
+    它与在途闸并列、**不进 `_CONDS`**:判据源在 ops.feed_items 的回执历史上
+    (还要经 sku_aliases 继承一跳),而那份查询的唯一出处是
+    `services.feed_track.receipt_blocked`,problem_scan 的死档闸读的是同一份。
+    **dry-run 同样生效**:三道后置闸全是只读判据,execute 与否一字不差。
     """
     if limit <= 0:
-        return [], []
+        return [], [], {}
     named = bool(only_skus or only_keys)
+    # ⚠ SQL 的 LIMIT 是**取数上限**,不是本轮上限:后置闸剔掉的行不许白占名额
+    # (2026-09-09 A131 实证 limit=500 只发 45 条),本轮上限在后置闸之后再截
     args = {"store": store_name, "source_types": list(SOURCE_TYPES),
-            "limit": limit, "unnamed": not named,
+            "limit": CANDIDATE_FETCH_CAP, "unnamed": not named,
             "marketplace": amz_source.MARKETPLACE,
             "only_skus": list(only_skus), "only_keys": list(only_keys),
             "excl_skus": list(exclude_skus), "excl_keys": list(exclude_keys)}
@@ -1282,12 +1308,29 @@ def _candidates(conn, store_name: str, limit: int, *,
         if named:                      # 点名了就必须能解释,哪怕一条候选都没选出来
             cur.execute(_SQL_WHY, args)
             why = _rows(cur)
+    # 死档后置闸(2026-09-09):与在途闸并列,**不进 `_CONDS`** —— 它读的是
+    # ops.feed_items 的回执历史(还要经 sku_aliases 继承一跳),塞进候选 SQL
+    # 就是在那份判据文本里再嵌一段两层子查询,而它的唯一出处已经在
+    # services.feed_track.receipt_blocked(problem_scan 的死档闸读同一份)。
+    # 为什么必须剔:沃尔玛侧已不存在的 item 发 MP_ITEM_MATCH **不是改码,是
+    # 新建一条 listing** —— A131吕灿荣 B09L3WXJ96 的真双挂就是这么来的(旧码是
+    # RETIRED 死档,新码是新建出来的 item,两条同时挂在店里)。改码链事后只能
+    # 靠人工收拾,而回执全绿、摘要正常,没有任何东西会说它建了个新品。
+    gone_pairs = feed_track.receipt_blocked(
+        conn, resources.WALMART_ERR_ITEM_GONE, store=store_name)
+    gone = {r["old_sku"] for r in rows if (store_name, r["old_sku"]) in gone_pairs}
     notes: list[str] = []
     if inflight:
         notes.append(f"  ⚠ 跳过 {len(inflight)} 个:旧码上有 {INFLIGHT_HOURS}h 内的在途 feed"
                      f"(改了码那条 feed 就打在一个即将不存在的 SKU 上):"
                      f"{sorted(inflight)[:5]}")
-    keep = [r for r in rows if r["old_sku"] not in inflight]
+    if gone:
+        notes.append(f"  ⚠ 跳过 {len(gone)} 个:沃尔玛回执说这些 SKU 已经不在了"
+                     f"(死档)—— 对它们发 MP_ITEM_MATCH 会**新建一条 listing**"
+                     f"而不是改码(A131吕灿荣 B09L3WXJ96 真双挂实证);"
+                     f"目录里的死档行根治归 docs/backlog.md §十三:"
+                     f"{sorted(gone)[:5]}")
+    keep = [r for r in rows if r["old_sku"] not in inflight and r["old_sku"] not in gone]
 
     # 一个 Product ID 只允许挂一个 SKU(官方:"You are not allowed to submit two
     # SKUs with the same Product Identifier")—— 同一批里撞号的只留第一条
@@ -1306,15 +1349,25 @@ def _candidates(conn, store_name: str, limit: int, *,
     if dupes:
         notes.append(f"  ⚠ 跳过 {len(dupes)} 个:同一批里 Product ID 撞号"
                      f"(官方不许两个 SKU 挂同一个 Product ID):{dupes[:3]}")
+    # 本轮上限**在三道后置闸之后**才截(取数用的是 CANDIDATE_FETCH_CAP):被闸剔掉
+    # 的行不占名额,合格的排在后面的照样能进本轮 —— 按 SKU 升序先来后到
+    n_eligible = len(out)
+    if n_eligible > limit:
+        out = out[:limit]
+        notes.append(f"  本轮上限 {limit}:合格候选 {n_eligible} 个,只发前 {limit} 个,"
+                     f"其余 {n_eligible - limit} 个下一轮(按 SKU 升序先来后到)")
     if named:
         notes += _pick_report(store_name, only_skus, only_keys,
                               exclude_skus, exclude_keys, out, why,
-                              inflight, dupe_skus, limit)
+                              inflight, dupe_skus, limit, gone)
     elif exclude_skus or exclude_keys:
         notes.append(f"  排除 -p exclude_skus {len(exclude_skus)} 个 / "
                      f"-p exclude_asins {len(exclude_keys)} 个"
                      f"(已在候选 SQL 里剔除,没点名 ⇒ 其余照常按 SKU 升序取)")
-    return out, notes
+    # 第三个返回值是**三道后置闸各剔了几个**:摘要首行要把「死档」单独报出来
+    # (cli 的链通知只取首行),而首行拿不到 notes 里的那句人话
+    return out, notes, {"inflight": len(inflight), "gone": len(gone),
+                        "dupe": len(dupe_skus)}
 
 
 #: 兜底归因 → 预览里那句人话(键 = `mp_mapper.WEIGHT_REASONS`,
@@ -1671,10 +1724,10 @@ def run(params: dict) -> str:
             # 硬闸,不看 execute:dry-run 列出"将改码 N 个"同样是误导
             cap, cap_note = 0, f"⛔ 提交通道停用(本轮只定案):{SUBMIT_DISABLED}"
         lines.append(f"  {cap_note}")
-        cands, cand_notes = _candidates(conn, store_name, cap,
-                                        only_skus=only_skus, only_keys=only_keys,
-                                        exclude_skus=excl_skus,
-                                        exclude_keys=excl_keys)
+        cands, cand_notes, cand_skips = _candidates(
+            conn, store_name, cap,
+            only_skus=only_skus, only_keys=only_keys,
+            exclude_skus=excl_skus, exclude_keys=excl_keys)
         lines += cand_notes
         # 上限 0 时 _candidates 一条 SQL 都不发(闸未过 / settle_only / 上一批没清)——
         # 点名的说明只能在这里出,否则摘要看起来像"这家店没候选"。
@@ -1720,6 +1773,10 @@ def run(params: dict) -> str:
     gist = (f"定案 confirmed {n_conf} / rolled_back {n_roll} / stalled {n_stall}"
             f"(仍 pending {n_pend}),"
             f"本轮提交 {n_sub},跳过 {max(n_skip, 0)}")
+    if cand_skips.get("gone"):
+        # 死档单独报(不并进上面那个「跳过」):它不是"这轮没轮到",是"这批码
+        # 永远不该走改码" —— 对死档 item 发 MP_ITEM_MATCH 会新建一条 listing
+        gist += f";死档 {cand_skips['gone']}(回执说已不存在,改码会新建 listing)"
     if n_named:
         # 首行必须说清"点了几个、中了几个、为什么只中这么几个":cli 的链通知只取
         # 首行,而"命中 0 个"与"这家店没候选"是两件事(后者不该让人去查参数)。

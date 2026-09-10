@@ -7,6 +7,7 @@
 - 新表建好后:在「表格清单」区补一个 Bitable 条目,并同步更新 docs/feishu_tables.md。
 """
 
+import datetime as _dt
 import os
 from dataclasses import dataclass, field
 from types import SimpleNamespace
@@ -757,29 +758,49 @@ PT_TEMPLATE_SHEET = Spreadsheet(
     wiki=True,
 )
 
-# ── LLM 计价表(2026-08-21 加;单位 USD / 每 100 万 token)──────────────
+# ── LLM 计价表(2026-09-10 改;单位 **人民币元 / 每 100 万 token**)──────────
 # **DeepSeek 没有任何端点能查到单价或某次调用的花费**(核过官方文档:
 # `/user/balance` 只回余额;`/chat/completions` 的 usage 只回 token 数),
 # 所以单价只能落在本地。放这里是铁律 3:一切配置从 registry 取。
 #
-# 数据来源:api-docs.deepseek.com/quick_start/pricing,**2026-08-21 核**。
-# 官方会调价,对不上账时先来这里核一遍日期。
+# ⚠ **币种是人民币**(2026-09-10 改):官方定价页**只标人民币**,账也按人民币扣。
+#   此前这张表存的是按 7.14 折过的美元 —— 每次多折一道汇率、而汇率还在漂,
+#   对账对不上时第一嫌疑就是它。折算与渲染统一在 `services/llm_cost.money`,
+#   符号只从 LLM_PRICE_SYMBOL 取(别处写死 '$' 就是又一处暗坑)。
 #
-# ⚠ **峰谷价差整整一倍**,峰值时段(UTC)01:00–04:00 与 06:00–10:00
-#   —— 换算成北京时间就是 **09:00–12:00 与 14:00–18:00**;其余时段半价。
-#   所以十几万条的大重审排在**北京时间晚 18:00 到次日早 08:00**跑,直接省一半。
-LLM_PRICING_SOURCE = "api-docs.deepseek.com/quick_start/pricing(2026-08-21 核)"
+# 数据来源:官方定价页 + **2026-09-10 官方调价公告**(所有者转述原文):
+#   「在 V4.1 Flash 正式上线之后、V4.1 Pro 上线之前,我们会将对 V4 Pro 的请求
+#     全部路由到 V4.1 Flash,并按 V4.1 Flash 单价计费。新价格将于北京时间
+#     2026 年 9 月 10 日 12 时开始生效。」
+# ⚠ **待复核一次**:定价页在 9/10 11:13(生效前 47 分钟)复核时**仍挂旧价**
+#   (flash 空闲 0.05 / 1.5 / 4.5)。12:00 生效后**再看一眼定价页**:若
+#   `deepseek-v4-flash` 没跟着降到下面这组数,就把本行改回旧价、只给 V4.1 Flash
+#   那一行用新价 —— 宁可估贵不估便宜(与 llm_cost 同一条纪律)。
+LLM_PRICING_SOURCE = ("api-docs.deepseek.com/zh-cn/quick_start/pricing"
+                      " + 2026-09-10 12:00(北京)官方调价公告")
 
-# 峰值时段(UTC 小时,左闭右开)。谷时段 = 其余全部
-LLM_PEAK_HOURS_UTC = ((1, 4), (6, 10))
+# 金额单位与符号:摘要渲染只准从这里取
+LLM_PRICE_CURRENCY = "CNY"
+LLM_PRICE_SYMBOL = "¥"
 
-# model → {tier: (cache_hit, cache_miss, output)},USD / 1M token。
-# 键是**定价页上的产品名**;请求里发的 `model` 可能是别名,先过 LLM_MODEL_ALIASES。
+# 高峰时段(**北京时间**小时,左闭右开)+ 高峰**只在工作日**。谷时段 = 其余全部。
+# 官方原句:「高峰时段为北京时间周一至周五 9:00 - 12:00、14:00 - 18:00
+#            (其余为空闲时段)」;空闲时段价 = 高峰时段价的一半。
+# ⚠ 2026-09-10 修:此前只按 UTC 小时判、**不看星期**,于是周末的那两段也被算成
+#   高峰 —— 账估贵了,而"排谷时段省一半"正是拿这个判据做排班的。周末全天谷价。
+LLM_PEAK_HOURS_CST = ((9, 12), (14, 18))
+LLM_PEAK_WEEKDAYS_CST = (0, 1, 2, 3, 4)          # Monday=0 … Friday=4
+_CST = _dt.timezone(_dt.timedelta(hours=8))      # 北京时间(无夏令时)
+
+# model → {tier: (cache_hit, cache_miss, output)},**元** / 100 万 token。
+# 键是**定价页上的产品名**;请求里发的 `model` 可能是别名、也可能被官方路由到
+# 另一个模型计费,一律先过 LLM_MODEL_ALIASES。
+# ⚠ 表里**没有**的模型:摘要只报 token 不报钱并点名(见 llm_cost)——
+#   按 0 计价会产出一个看着像钱、其实是编的数字。视觉 L4 走火山方舟(另一家
+#   供应商),单价不在本表,故 `deepseek-v4-flash-vision-exp` 也不登记。
 LLM_PRICING = {
-    "deepseek-v4-flash": {"peak":    (0.014, 0.44, 1.32),
-                          "offpeak": (0.007, 0.22, 0.66)},
-    "deepseek-v4-pro":   {"peak":    (0.044, 1.32, 3.96),
-                          "offpeak": (0.022, 0.66, 1.98)},
+    "deepseek-v4-flash": {"peak":    (0.04, 2.0, 8.0),
+                          "offpeak": (0.02, 1.0, 4.0)},
 }
 
 # 旧别名 → 定价页产品名(2026-08-21 核官方更新日志)。
@@ -792,6 +813,13 @@ LLM_LEGACY_ALIASES = {"deepseek-chat", "deepseek-reasoner"}
 LLM_MODEL_ALIASES = {
     "deepseek-chat": "deepseek-v4-flash",       # 非思考模式
     "deepseek-reasoner": "deepseek-v4-flash",   # 思考模式,同一张价表
+    # 官方 2026-09-10 公告:V4.1 Flash 上线后、V4.1 Pro 上线前,**对 V4 Pro 的
+    # 请求全部路由到 V4.1 Flash 并按 V4.1 Flash 单价计费** ⇒ 计价走 flash 行。
+    # ⚠ **V4.1 Pro 上线时必须撤掉这一行**并给 Pro 恢复自己的价(定价页
+    #   2026-09-10 值:空闲 0.15 / 4.5 / 13.5,高峰翻倍)—— 不撤就把 Pro 的账
+    #   按 Flash 少算四倍多。本仓缺省不用 Pro(缺省 deepseek-v4-flash),
+    #   这一行是给 .env 显式设了 Pro 的情况兜底。
+    "deepseek-v4-pro": "deepseek-v4-flash",
 }
 
 
@@ -825,10 +853,14 @@ def llm_cache_model(model: str) -> str:
 def llm_price_tier(dt) -> str:
     """输入:带时区的 datetime → 输出:'peak' 或 'offpeak'。
 
+    高峰只在**北京时间的工作日**那两段(官方口径),周末与夜间全是谷时段。
     换模型/换供应商不改这里 —— 时段规则是 DeepSeek 的,新供应商加自己的表。
     """
-    h = dt.astimezone(__import__("datetime").timezone.utc).hour
-    return "peak" if any(a <= h < b for a, b in LLM_PEAK_HOURS_UTC) else "offpeak"
+    cst = dt.astimezone(_CST)
+    if cst.weekday() not in LLM_PEAK_WEEKDAYS_CST:
+        return "offpeak"
+    return ("peak" if any(a <= cst.hour < b for a, b in LLM_PEAK_HOURS_CST)
+            else "offpeak")
 
 
 # 审核规则集版本(批次 B7 定稿):规则代码/seed yaml/词表任何变更时**手动递增**,

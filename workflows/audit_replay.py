@@ -1183,7 +1183,7 @@ def run(params: dict) -> str:
         model = _llm.model_for(audit_l3.L3_PURPOSE)
         tier = resources.llm_price_tier(datetime.now(timezone.utc))
         est, prefix_tok = estimate_cost(len(samples), prefix_chars, model, tier)
-        est_line = (f"预估成本 ≈ ${est:.4f}" if est is not None
+        est_line = (f"预估成本 ≈ {llm_cost.money(est)}" if est is not None
                     else f"⚠ 模型 {model} 没有计价(registry.LLM_PRICING 补一行),"
                          f"本轮不估钱")
         cost_head = (f"{est_line}(样本 {len(samples)} 条 × [前缀 {prefix_tok} "

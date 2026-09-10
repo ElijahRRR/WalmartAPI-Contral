@@ -28,6 +28,7 @@
 """
 
 import datetime as dt
+import re
 
 import pytest
 
@@ -553,19 +554,33 @@ class _GapConn:
         return _GapCur(self._q)
 
 
+def _st(asin, *, in_db=True, title=True, status=None, seen=None,
+        outcome=None, fresh=False):
+    """一行 `_SQL_GAP_STATE`:(asin, 在库, 有标题, 结论, 最近快照时刻, 结局, 12h 内)。
+    夹具里没列出的 ASIN = 库里压根没有、从没采过。"""
+    return (asin, in_db, title, status, seen, outcome, fresh)
+
+
+_T0 = dt.datetime(2026, 9, 10, 2, 0, tzinfo=dt.timezone.utc)    # 推送前那份快照
+_T1 = dt.datetime(2026, 9, 10, 10, 30, tzinfo=dt.timezone.utc)  # 本轮采回来的时刻
+
 _ROWS = [{"rownum": 2, "asin": "B0HAVE0001"},
          {"rownum": 3, "asin": "B0GONE0001"},     # 库里压根没有
          {"rownum": 4, "asin": "B0THIN0001"},     # 有行但没标题
          {"rownum": 5, "asin": "B0GONE0001"}]     # 同 ASIN 多店铺:两行都写
 _WANT = ["B0GONE0001", "B0HAVE0001", "B0THIN0001"]
 
-# 推送前:只有 B0HAVE 完整,B0THIN 无标题,B0GONE 不在库
-_BEFORE = [("B0HAVE0001", False), ("B0THIN0001", True)]
+# 完整且 12 小时内采过的一行:不推
+_FRESH_HAVE = _st("B0HAVE0001", seen=_T0, outcome="ok", fresh=True)
+# 推送前:只有 B0HAVE 完整且新鲜;B0THIN 有行无标题、从没采到;B0GONE 不在库
+_BEFORE = [_FRESH_HAVE, _st("B0THIN0001", title=False)]
 # 采回来之后:两个都补齐了
-_AFTER_ALL = [("B0HAVE0001", False), ("B0THIN0001", False),
-              ("B0GONE0001", False)]
-# 采回来之后:只补上了 B0THIN,B0GONE 采集失败
-_AFTER_PART = [("B0HAVE0001", False), ("B0THIN0001", False)]
+_AFTER_ALL = [_FRESH_HAVE,
+              _st("B0THIN0001", seen=_T1, outcome="ok", fresh=True),
+              _st("B0GONE0001", seen=_T1, outcome="ok", fresh=True)]
+# 采回来之后:只补上了 B0THIN,B0GONE 采集失败(采集侧连记录都没有)
+_AFTER_PART = [_FRESH_HAVE,
+               _st("B0THIN0001", seen=_T1, outcome="ok", fresh=True)]
 
 
 def _stub(monkeypatch, states, *, pushed=None, notes=None, calls=None,
@@ -644,17 +659,126 @@ def test_reasons_are_recomputed_after_ingest_not_before(monkeypatch):
     assert notes == []          # 复查后一个都不缺 ⇒ 一行原因都不该写
 
 
-def test_rows_already_in_db_are_not_rescraped(monkeypatch):
-    """在库的待审行**不做**"先刷新再审"(所有者复议定稿 2026-08-19):
-    审核判的是"这个产品卖的是什么",第一次就定性了,改标题/描述不改变它
-    是什么——强刷带来的翻案更大可能是 LLM 随机性。缺口为空 ⇒ 零采集调用。
-    (上架链相反:必须先刷新,那边写的是真金白银的价格库存。)"""
-    have_all = [("B0GONE0001", False), ("B0HAVE0001", False),
-                ("B0THIN0001", False)]
-    calls = _stub(monkeypatch, [have_all, have_all], pushed=[], notes=[],
-                  calls=[])
+_MIX_BEFORE = [_st("B0AAAA0001", seen=_T0),                     # 未审,快照过旧
+               _st("B0BBBB0001", status="approved", seen=_T0),  # 有结论
+               _st("B0CCCC0001", status="pending", seen=_T0),   # 中间态 = 没结论
+               _st("B0DDDD0001", status="rejected", seen=_T0),
+               _st("B0EEEE0001", seen=_T1, fresh=True)]         # 未审但 12h 内采过
+_MIX_AFTER = [_st(a, status=s, seen=_T1, outcome="ok", fresh=True) for a, s in
+              (("B0AAAA0001", None), ("B0BBBB0001", "approved"),
+               ("B0CCCC0001", "pending"), ("B0DDDD0001", "rejected"),
+               ("B0EEEE0001", None))]
+_MIX_WANT = [r[0] for r in _MIX_BEFORE]
+_MIX_ROWS = [{"rownum": i + 2, "asin": a} for i, a in enumerate(_MIX_WANT)]
+
+
+def test_stale_unjudged_rows_are_rescraped_and_concluded_ones_are_not(monkeypatch):
+    """所有者定稿 2026-09-10:重审关 ⇒ 只推「没有结论且 12 小时内没有快照」的。
+
+    在库有标题的行不再"永不刷新"(2026-08-19 那条复议已被本定稿取代):快照过旧
+    且没结论的照推;有结论(approved/rejected)的不推;pending 不是结论,照推;
+    12 小时内采过的不推。
+    """
+    pushed, notes = [], []
+    calls = _stub(monkeypatch, [_MIX_BEFORE, _MIX_AFTER], pushed=pushed,
+                  notes=notes, calls=[])
+    out = "\n".join(pa._close_gap(_MIX_WANT, _MIX_ROWS, True, 20))
+    assert calls == ["push", "prioritize", "wait20", "ingest"]
+    assert pushed[0][1] == ["B0AAAA0001", "B0CCCC0001"]
+    assert "待审但快照过旧 2 个" in out and "推采集 2 个" in out
+    assert "重审关" in out and "刷新到 2 个" in out
+    assert notes == []                # 全都在库有标题,没有"审不了"的行
+
+
+def test_force_rescrapes_every_stale_row_including_concluded(monkeypatch):
+    """重审开(-p force=1)⇒ 推「12 小时内没有快照」的全部,含库里已有结论的;
+    12 小时内采过的照样不推。"""
+    pushed = []
+    _stub(monkeypatch, [_MIX_BEFORE, _MIX_AFTER], pushed=pushed, notes=[])
+    out = "\n".join(pa._close_gap(_MIX_WANT, _MIX_ROWS, True, 20, force=True))
+    assert pushed[0][1] == ["B0AAAA0001", "B0BBBB0001", "B0CCCC0001",
+                            "B0DDDD0001"]
+    assert "重审开" in out and "已有结论的 2 个" in out
+
+
+def test_rows_with_a_snapshot_within_12h_are_never_rescraped(monkeypatch):
+    """12 小时内采过的一个都不推 —— 哪怕没结论、哪怕重审开。没缺口 ⇒ 零采集调用。"""
+    fresh = [_st("B0GONE0001", seen=_T1, fresh=True),
+             _st("B0HAVE0001", seen=_T1, fresh=True, status="approved"),
+             _st("B0THIN0001", seen=_T1, fresh=True, status="pending")]
+    calls = _stub(monkeypatch, [fresh, fresh], pushed=[], notes=[], calls=[])
+    assert pa._close_gap(_WANT, _ROWS, True, 20, force=True) == []
+    assert calls == []
+
+
+def test_batch_name_is_a_timestamp_not_a_day(monkeypatch):
+    """所有者 2026-09-10 实遇:按日界命名时,手动跑过一次、表里再换一批品,新品
+    撞名 409 被"沿用既有批次",一个都推不出去,表格却写"已推采集"。按时间戳
+    命名后同一天再跑就是新批次;防重靠 12 小时新鲜度判据,不靠名字。"""
+    pushed = []
+    _stub(monkeypatch, [_BEFORE, _AFTER_ALL], pushed=pushed, notes=[])
     pa._close_gap(_WANT, _ROWS, True, 20)
-    assert calls == []                       # 不推不等不摄取
+    assert re.fullmatch(r"audit_gap_\d{8}T\d{6}", pushed[0][0]), pushed[0][0]
+    assert pushed[0][0].startswith(pa._GAP_PREFIX)    # check_open 仍按前缀圈
+
+
+def test_same_day_rerun_pushes_the_asins_added_since(monkeypatch):
+    """上午推过 {GONE};下午表里新加了 THIN(有行无标题)。再跑一次:THIN 必须
+    被推,而不是撞上午的批次名沿用。"""
+    pushed = []
+    before1 = [_FRESH_HAVE]
+    after1 = [_FRESH_HAVE, _st("B0GONE0001", seen=_T1, outcome="ok", fresh=True)]
+    _stub(monkeypatch, [before1, after1], pushed=pushed, notes=[])
+    pa._close_gap(["B0GONE0001", "B0HAVE0001"], _ROWS[:2], True, 20)
+    before2 = after1 + [_st("B0THIN0001", title=False)]
+    after2 = after1 + [_st("B0THIN0001", seen=_T1, outcome="ok", fresh=True)]
+    _stub(monkeypatch, [before2, after2], pushed=pushed, notes=[])
+    pa._close_gap(_WANT, _ROWS, True, 20)
+    assert [x[1] for x in pushed] == [["B0GONE0001"], ["B0THIN0001"]]
+
+
+def test_not_found_is_the_reason_and_cools_down_for_12h(monkeypatch):
+    """采回来是 not_found(商品页没了):理由要写真话,不是"没等到";而且 12 小时内
+    不再重推 —— 此前这种品每天换名重推、永不收敛。"""
+    notes = []
+    after = [_FRESH_HAVE,
+             _st("B0THIN0001", seen=_T1, outcome="ok", fresh=True),
+             _st("B0GONE0001", in_db=False, title=False, seen=_T1,
+                 outcome="not_found", fresh=True)]
+    _stub(monkeypatch, [_BEFORE, after], pushed=[], notes=notes)
+    out = "\n".join(pa._close_gap(_WANT, _ROWS, True, 20))
+    assert "仍缺 1 个" in out
+    by_row = dict(notes)
+    assert "not_found" in by_row[3] and "商品页不存在" in by_row[3]
+    assert "没等到" not in by_row[3]
+    # 同一天再跑:GONE 12 小时内采过 ⇒ 不推;理由写"已采过",不写"没等到"
+    notes2, pushed2 = [], []
+    calls = _stub(monkeypatch, [after, after], pushed=pushed2, notes=notes2,
+                  calls=[])
+    out2 = "\n".join(pa._close_gap(_WANT, _ROWS, True, 20))
+    assert calls == [] and pushed2 == []
+    assert "不重推" in out2
+    assert "12 小时内已采过" in dict(notes2)[3] and "not_found" in dict(notes2)[3]
+
+
+def test_push_failure_is_not_disguised_as_waiting(monkeypatch):
+    """推送根本没成时,表格理由必须说"推送失败",不能写"已推采集但没等到"。"""
+    notes = []
+    _stub(monkeypatch, [_BEFORE, _BEFORE], notes=notes)
+
+    def _boom(name, asins):
+        raise RuntimeError("采集服务 502")
+    monkeypatch.setattr(pa.scraper, "submit_batch", _boom)
+    pa._close_gap(_WANT, _ROWS, True, 20)
+    assert "推送采集失败" in dict(notes)[3] and "已推采集" not in dict(notes)[3]
+
+
+def test_default_wait_ceiling_is_one_hour():
+    """所有者定稿 2026-09-10:等待上限 60 分钟(此前 20)。调度表备注要说同一个数。"""
+    from registry import schedule
+    assert pa._GAP_WAIT_MIN == 60
+    note = next(j for j in schedule.JOBS if j["label"] == "audit_sheet")["note"]
+    assert "60 分钟" in note and "12 小时" in note and "时间戳" in note
 
 
 def test_gap_wait_zero_pushes_without_waiting(monkeypatch):
@@ -737,7 +861,7 @@ def test_ledger_is_settled_even_when_nothing_is_missing(monkeypatch):
     只在有缺口时才关台账的话,那笔遗留会一直挂到下一次刚好有缺口 —— 而
     "在途批次挂着没人管"正是 ops.scrape_batches 那张表要防的事。
     """
-    calls = _stub(monkeypatch, [[("B0HAVE0001", False)]], pushed=[], notes=[],
+    calls = _stub(monkeypatch, [[_FRESH_HAVE]], pushed=[], notes=[],
                   calls=[],
                   open_lines=["  audit_gap_20260816:⏰ 超时(3/10)"])
     out = "\n".join(pa._close_gap(["B0HAVE0001"], [_ROWS[0]], True, 20))
@@ -757,7 +881,7 @@ def test_dry_run_does_not_touch_the_ledger(monkeypatch):
 
 def test_no_gap_no_noise(monkeypatch):
     """一个都不缺时不推、不等、也不产生空节 —— 空节本身就是噪声。"""
-    calls = _stub(monkeypatch, [[("B0HAVE0001", False)]], pushed=[], notes=[],
+    calls = _stub(monkeypatch, [[_FRESH_HAVE]], pushed=[], notes=[],
                   calls=[])
     assert pa._close_gap(["B0HAVE0001"], [_ROWS[0]], True, 20) == []
     assert calls == []

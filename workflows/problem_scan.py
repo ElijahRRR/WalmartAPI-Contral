@@ -39,7 +39,9 @@
 的 ops.feed_log 里(提交时判,返回 outcome=dedup)。预筛只是省得把注定被拦下的
 行也建成建议。
 
-店铺闸:ops.store_kpi_daily 最新 store_status 非 ACTIVE 的店整体跳过。
+店铺状态**不设闸**(所有者定稿 2026-09-10:「非 ACTIVE 店也需要在扫描范围内」):
+ops.store_kpi_daily 里 store_status 非 ACTIVE 的店照扫照建议;此前整店跳过。
+状态只用来在摘要里按店点名,让人眼闸门看得见这批建议来自非 ACTIVE 店。
 
 调度顺序:catalog_sync → problem_scan → problem_product_cleanup(真跑)。
 """
@@ -229,6 +231,9 @@ ORDER BY store, sku, occurred_at DESC
 # delete_not_effective 属上一代刊登,不再顽固——按正常归类路径走
 # (否则重上架的同 ASIN 首次出问题就被双 feed 直删——顽固加压只该给
 # 本代际已实证「删除未生效」的行)。
+# 店铺状态**只做摘要标注,不做闸**(所有者定稿 2026-09-10:「非 ACTIVE 店也需要在
+# 扫描范围内」)。此前非 ACTIVE 店整店跳过;现在 plan() / _audit_rejected_rows
+# 都不读它,run() 只拿它给建议行按店点名(_inactive_note)。
 _SQL_STATUS = """
 SELECT DISTINCT ON (store) store, store_status FROM ops.store_kpi_daily
 ORDER BY store, data_date DESC
@@ -279,7 +284,7 @@ def _load_state():
             inactive, stubborn, gone_blocked, perm_blocked)
 
 
-def plan(items, inflight, inactive, stubborn=frozenset(),
+def plan(items, inflight, stubborn=frozenset(),
          inflight_disposal=frozenset(), gone_blocked=frozenset(),
          perm_blocked=frozenset()):
     """输入:扫描面全部行与去重状态 → 输出:(计划 dict, 计数 dict)。纯函数,可测。
@@ -292,26 +297,24 @@ def plan(items, inflight, inactive, stubborn=frozenset(),
     一律删除」与 2026-09-06「RETIRED 全豁免」):
       · 无原因(unpublished_reasons 空)→ 不是候选(clean 桶):在售行的常态;
         非 PUBLISHED 而无原因的行也不删 —— 没有原文就没有判据,判不准就判活。
-        这一档排在在途/店铺闸**之前**:那两个计数只该数真正的问题行。
+        这一档排在在途闸**之前**:在途计数只该数真正的问题行。
       · 原子集合 ⊆ RECOVERABLE_CODES(`error_taxonomy.is_recoverable_only`)
         → 不删(recoverable 桶),归类照记进病历。
       · 其余一律删除,**不看 published_status / lifecycle**:复合原文里哪怕只有
         一个非可恢复原子(「End Date 过期; 禁售政策」)也删;OTHER 未识别的也删
         (所有者:「其他的都删除」),但逐条进摘要告警(_unknown_note)。
-    顽固双击(retire+delete 齐发)与死档/永久拒回执闸、在途、非 ACTIVE 店预筛
-    不变 —— 那些是操作层防重,不是"该不该删"的判据。
+    顽固双击(retire+delete 齐发)与死档/永久拒回执闸、在途预筛不变 —— 那些是
+    操作层防重,不是"该不该删"的判据。**店铺状态不再是闸**(所有者同日追加:
+    「非 ACTIVE 店也需要在扫描范围内」),非 ACTIVE 店的行与别的店一视同仁。
     """
     out: dict[str, dict] = {}
-    n = {"inflight": 0, "inflight_listing": 0, "inactive": 0,
+    n = {"inflight": 0, "inflight_listing": 0,
          "delete": 0, "stubborn": 0, "gone": 0, "permanent": 0,
          "clean": 0, "recoverable": 0, "unknown": 0}
     for it in items:
         key = (it["store"], it["sku"])
         if not (it.get("reasons") or "").strip():
             n["clean"] += 1             # 无原因 = 无判据,不是候选
-            continue
-        if it["store"] in inactive:
-            n["inactive"] += 1
             continue
         if key in inflight:
             # 分开数:处置在途(我们的删/停还没落定)vs 上架/维护在途
@@ -427,8 +430,7 @@ def _summarize(allrows: list[dict], audit_rows: list[dict], n: dict,
            f"永久拒跳过 {n['permanent']},"
            f"处置在途/待观测跳过 {n['inflight']},"
            f"上架/维护在途跳过 {n['inflight_listing']}"
-           f"(多为新品合规复审,复审完自动进扫描),"
-           f"非 ACTIVE 店跳过 {n['inactive']}"]
+           f"(多为新品合规复审,复审完自动进扫描)"]
     per_store: dict[str, dict] = {}
     for r in allrows:
         b = per_store.setdefault(r["store"], {"delete": [], "retire": []})
@@ -469,6 +471,24 @@ def _blocked_notes(gone_skipped: list, perm_skipped: list) -> list[str]:
             f"转出 WFS;转出后下一次尝试的回执会自动把它放出来):"
             f"{sorted(perm_skipped)[:5]}")
     return out
+
+
+def _inactive_note(allrows: list[dict], inactive: set) -> str:
+    """输入:最终建议行 + 非 ACTIVE 店集合 → 输出:按店点名行(无则空串)。
+
+    所有者 2026-09-10:「非 ACTIVE 店也需要在扫描范围内」—— 这批店此前整店跳过,
+    现在照常建议。建议本身不区别对待,但人眼闸门要看得见"这几条来自一家
+    沃尔玛标成非 ACTIVE 的店"(店被停时后台的品往往整批异常,删除面会突然变大)。
+    """
+    by_store: dict[str, int] = {}
+    for r in allrows:
+        if r["store"] in inactive:
+            by_store[r["store"]] = by_store.get(r["store"], 0) + 1
+    if not by_store:
+        return ""
+    return ("  ⚠ 非 ACTIVE 店照常建议(店铺状态不设闸,2026-09-10):"
+            + ",".join(f"{st}×{c}" for st, c in
+                        sorted(by_store.items(), key=lambda kv: -kv[1])))
 
 
 def _record_categories(conn, items: list[dict], last_cat: dict) -> int:
@@ -670,13 +690,12 @@ def _push_sheets() -> str:
     return blacklist_sheet.push_after()
 
 
-def _audit_rejected_rows(conn, inflight: set, inactive: set,
-                         only: str | None,
+def _audit_rejected_rows(conn, inflight: set, only: str | None,
                          gone_blocked: set = frozenset(),
                          perm_blocked: set = frozenset()) -> list[dict]:
     """输入:连接 + 去重状态 → 输出:判拒仍在架的建议行。
 
-    与 scan 来源共用同一套闸(非 ACTIVE 店跳过、在途不建议),但**不走归类**
+    与 scan 来源共用同一套闸(在途不建议、两道回执闸;店铺状态不设闸),但**不走归类**
     ——审核已经给出结论了,这里不需要再猜沃尔玛为什么不高兴。
 
     ⚠ **本函数不再截单店上限**(2026-08-24 归一):限额表「下架限制」由执行件
@@ -693,7 +712,7 @@ def _audit_rejected_rows(conn, inflight: set, inactive: set,
             rows, key=lambda r: (str(r[0]), str(r[1]))):
         if only and store != only:
             continue
-        if store in inactive or (store, sku) in inflight:
+        if (store, sku) in inflight:
             continue
         if (store, sku) in gone_blocked or (store, sku) in perm_blocked:
             # 审核说该删,但沃尔玛最近一次回执说"这个 SKU 已经不在了"(死档)
@@ -740,16 +759,15 @@ def run(params: dict) -> str:
     if absent:
         items = [i for i in items if i["store"] not in absent]
 
-    plans, n = plan(items, inflight, inactive, stubborn,
+    plans, n = plan(items, inflight, stubborn,
                     inflight_disposal, gone_blocked, perm_blocked)
     rows = to_dispositions(plans)
     # 被两道回执闸挡下的**本轮候选**(不是库里全部命中码的行):摘要要点名,
     # 而点名的对象必须是"今天本来会被建议删的那些",否则数字与总览那行对不上。
-    # ⚠ 排除顺序必须与 `plan()` 里那几支 continue **逐条对齐**(非 ACTIVE 店 →
-    # 在途 → 死档 → 永久拒):对不齐的话总览那行报 n['gone'],这里报另一个数,
-    # 而两个数都"看起来对" —— 本仓 2026-08-14 摘要对不上账的老坑同款。
-    # 2026-09-10 起 plan() 在店铺闸/在途之后还有归类与可恢复两档,到得了回执闸的
-    # 行 = 归了类(有 category ⇔ 过了非 ACTIVE 店与在途两关)且不是仅可恢复原子。
+    # ⚠ 排除顺序必须与 `plan()` 里那几支 continue **逐条对齐**(无原因 → 在途 →
+    # 归类 → 仅可恢复 → 死档 → 永久拒):对不齐的话总览那行报 n['gone'],这里报
+    # 另一个数,而两个数都"看起来对" —— 本仓 2026-08-14 摘要对不上账的老坑同款。
+    # 到得了回执闸的行 = 归了类(有 category ⇔ 有原因且不在途)且不是仅可恢复原子。
     # 直接读 plan() 留在行上的标记,不在这里再抄一遍它的分流顺序。
     keys = {(i["store"], i["sku"]) for i in items
             if "category" in i and not i.get("recoverable")}
@@ -758,7 +776,7 @@ def run(params: dict) -> str:
     lines: list[str] = []
 
     with db.pg_conn() as conn:
-        audit_rows = _audit_rejected_rows(conn, inflight, inactive, only,
+        audit_rows = _audit_rejected_rows(conn, inflight, only,
                                           gone_blocked, perm_blocked)
         if absent:
             n_audit_avoided = sum(1 for r in audit_rows
@@ -791,6 +809,8 @@ def run(params: dict) -> str:
         lines[:0] = head        # 总览 + 分店明细排在最前,审核/剔除说明跟其后
         # 两道回执闸的点名紧跟总览:它们是"今天为什么少了这么多建议"的答案
         lines[len(head):len(head)] = _blocked_notes(gone_skipped, perm_skipped)
+        if (note := _inactive_note(allrows, inactive)):
+            lines.append(note)
         # 观察面用 items_all(缺席不连坐,见上)
         for note in (_recoverable_note(items_all), _unknown_note(items_all),
                      _k_cluster_note(items_all), _policy_gap_note(conn, items_all)):

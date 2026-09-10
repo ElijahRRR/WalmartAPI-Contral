@@ -165,7 +165,8 @@ warning 计数 —— 它不许混进"标题 N 条"里无声发生。
 `workflows/problem_scan._SQL_ITEMS` 扫描面 = 目录里**一切未缺席**的行,不看
 published_status / lifecycle(在途改码的旧码仍排除)。走向由归类的**原子集合**判
 (`services/error_taxonomy.is_recoverable_only`):只含 EXPIRED / STAGE → 不删;无原因
-→ 不是候选;其余一律删(含未识别,摘要告警)。逐原子明细落
+→ 不是候选;其余一律删(含未识别,摘要告警)。**店铺状态不设闸**(所有者同日追加:
+「非 ACTIVE 店也需要在扫描范围内」),非 ACTIVE 店照扫照建议,摘要按店点名。逐原子明细落
 `product_events.detail.atoms` / `ops.dispositions.detail.atoms`。摘要首行报
 「扫描 N 行(无原因 / 仅可恢复原子不删)→ 建议删除 …」,并按店列「仅可恢复原子不删」。
 09-06 那条 RETIRED 全豁免的依据(08-28 可见性变更翻回来的死档删不掉)已随 09-09

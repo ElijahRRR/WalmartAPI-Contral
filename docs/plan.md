@@ -93,7 +93,9 @@ maintenance/list_new)→ 按域停旧切换。
    无原因 → 不是候选(在售行的常态,非 PUBLISHED 而无原因的也不删,判不准就判活);
    其余一律删,含 OTHER 未识别(摘要 `_unknown_note` 告警)。看集合不看主码:主码序里
    EXPIRED/STAGE 垫底,复合原文永远赢不了主码,只有集合能表达「单独才留」。
-   在途 48h / WFS / 非 ACTIVE 店 / 顽固双击四道操作层预筛不变。
+   在途 48h / 死档与永久拒回执闸(#123)/ 顽固双击三道操作层预筛不变。
+   **非 ACTIVE 店不再整店跳过**(所有者同日追加:「非 ACTIVE 店也需要在扫描范围内」):
+   `plan()` 与审核判拒行都不再读店铺状态,摘要用 `_inactive_note` 按店点名这批建议。
 3. **逐原子落库**:`Result.atoms`(码/政策名/原文)→
    `product_events.problem_categorized.detail.atoms` + `recoverable`,
    `ops.dispositions.detail.atoms`。归类事件"变没变"从主码改为原子码集合签名

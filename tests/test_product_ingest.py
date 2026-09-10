@@ -353,6 +353,9 @@ def test_list_new_stock_three_way(monkeypatch):
                       "channel": "FBM", "shipping": 0.0},
     }
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    # 2026-09-10 起 _push_scrape 先查快照新鲜度(读库):本例不连库,当"从没采过"
+    monkeypatch.setattr(ln.amz_source, "latest_seen", lambda asins: {
+        a: ln.amz_source.Seen(None, None, False) for a in asins})
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
         set(), {}, set(), {}, set(),

@@ -17,8 +17,13 @@
 > (`sku_codec`)、`catalog.listing_sources` 成为 SKU 身份唯一登记簿,eBay 一期
 > 因此改为**复用 `sku_codec.mint`** 而非原稿的"SKU=ASIN 原文"(四条理由与
 > 用法见 §3.3);连带改 §4.1 登记簿行、§4.3 asin 反解理由、§6.4 与 §6.9
-> (变体组号走 `mint_group_code`)。⚠ 本文引用的仓库行号以 **2026-09-07 的
-> main** 为快照,批次实施时现场重定位。
+> (变体组号走 `mint_group_code`)。
+> **2026-09-10 对齐 main(#122~#128)**:补两条纪律边界——快照新鲜度与补采
+> 判据唯一出生地 `amz_source.SNAPSHOT_FRESH_HOURS/latest_seen`(§2.3)、
+> LLM 模型与 thinking 登记走 `registry.LLM_THINKING`(§5.3);其余(catalog_sync
+> 切片、item_id 报表、problem_scan 原子归类、sku_migrate 影子双挂)与一期
+> 无交集。⚠ 本文引用的仓库行号以 **2026-09-07 的 main** 为快照,批次实施时
+> 现场重定位。
 
 ## 〇、批次 0 拍板记录(2026-08-30,所有者)
 
@@ -149,6 +154,13 @@ SKU↔offerId/listingId 权威在 `ops.feed_items`)。
 
 - 库存:上架时 `availableQuantity` 来自 `catalog.latest_snapshot` 三态
   (NULL≠0 铁律沿用),缺货/未采到不上。持续同步是二期维护链。
+  🔴 **补采与新鲜度判据只有一个出生地**(2026-09-10 对齐 main #126):
+  `services/amz_source.SNAPSHOT_FRESH_HOURS = 12` 与 `latest_seen()`——
+  「12 小时内采过就不重推」,**快照不分结局**(not_found/blocked 也算采过,
+  这条同时是失败重推的冷却期),新鲜与否在库端按 `now()` 算。eBay 一期若要
+  为选中行补采,**必须调 `latest_seen()` 判、走既有补采通道**,严禁自定义
+  新鲜期或另写一套判据——#126 消灭的正是"一边认为新鲜一边认为过旧"。
+  一期默认**不自己推采集**,吃沃尔玛链当轮的刷新结果即可。
 - 审核:入料谓词 `p.audit_status='approved'`(结论是沃尔玛政策口径,代价=
   品类连坐收窄;`risk_product_types` 内连接 + `walmart_pt<>'unknown'` 三重
   收窄**一期保留**作 fail-safe,P1-4 验收量化一次"去掉后候选数变化")。
@@ -399,7 +411,11 @@ is_leaf,不过标 stale 摘要首行点名;`getExpiredCategories` 登记不实�
   写死;`-p limit` 硬上限);召回=`getCategorySuggestions`(**只在
   production 跑**,env=sandbox 直接抛错——sandbox 返回样板文本假成功;
   q 传商品标题;`relevancy` 官方 "Reserved for internal use" 禁当置信度,
-  顺序才是信号);LLM=排序器(走 `api/llm`+`llm_cache`;输出
+  顺序才是信号);LLM=排序器(走 `api/llm`+`llm_cache`,**不写死模型名**
+  ——模型缺省值与 thinking 开关的唯一出处是 `registry.LLM_THINKING` +
+  `resources.llm_thinking(model)`(2026-09-10 起,模型名以 `GET /models`
+  为准);eBay 侧若要指定模型,**先在那张表补一行登记**,未登记会告警且
+  thinking 形状不可控;输出
   ebay_category_id/confidence 高中低/reason);落库两道机器闸:∈ 本次候选集
   + JOIN `audit.ebay_categories AND is_leaf`。🔴 LLM 只写 suggested 永不
   自写 approved(照 `products.pt_source` 洗白教训)。

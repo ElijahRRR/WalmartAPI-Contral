@@ -221,16 +221,31 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 **LLM 花了多少钱**:每轮摘要按**用途**报 token 与估算金额(`audit_l1` /
 `audit_l3` / `list_new` 各占多少、缓存命中率多少)。token 是接口回的事实,
 记在 `api/llm.py`;单价是会变的参数,表在 `registry.LLM_PRICING`
-(DeepSeek **没有任何端点**能查单价或单次花费,只能落本地)。
-⚠ **峰谷价差一倍** —— 峰值 UTC 01:00–04:00 与 06:00–10:00(北京时间
-09:00–12:00 与 14:00–18:00),其余半价。大批量重审排在北京时间
-**晚 18:00 至次日早 08:00** 跑,直接省一半。
+(DeepSeek **没有任何端点**能查单价或单次花费,只能落本地)。**币种人民币**
+(2026-09-10 起;官方定价页只标人民币,此前表里存的是折过汇率的美元)。
+⚠ **峰谷价差一倍** —— 高峰 = 北京时间**周一至周五** 09:00–12:00 与
+14:00–18:00,其余半价,**周末全天谷价**。大批量重审排在北京时间
+**晚 18:00 至次日早 08:00** 或周末跑,直接省一半。
+⚠ **`deepseek-v4-pro` 现在按 Flash 单价计费**(官方 2026-09-10 公告:
+V4.1 Flash 上线后、V4.1 Pro 上线前,对 V4 Pro 的请求全部路由到 V4.1 Flash);
+V4.1 Pro 上线时要撤掉 `registry.LLM_MODEL_ALIASES` 里那一行。
 不认识的模型**只报 token 不报钱**并点名 —— 按 0 计价 = 假账。
-**模型统一 `deepseek-v4-flash`**(审核与上架同一个,2026-08-21 定稿),
-不填 `.env` 也是它。**别填 `deepseek-chat` / `deepseek-reasoner`** —— 官方
-已宣布停用的旧别名(公告停用日 2026-07-24 已过,还能用是宽限期):切断当天
-**全仓 LLM 调用一起失败**,而且 `thinking 必须显式 disabled` 那道闸按
-`"flash" in model` 门控,别名下**整条失效**。用了别名摘要会点名警告。
+**模型统一 `deepseek-flash`**(= V4.1 Flash 的正式 id;审核与上架同一个,
+所有者定稿 2026-09-10),不填 `.env` 也是它。
+⚠ **模型名的唯一判据是 `GET /models` 的返回,不是定价页**:2026-09-10 实测只回
+`deepseek-flash` 与 `deepseek-v4-pro` 两个,而同一天的定价页还列着
+`deepseek-v4-flash` / `-vision-exp`、更新日志最新一条还是 8/21 —— **文档站滞后
+于线上**。`deepseek-flash` 去掉了版本号、原生多模态,所以 vision-exp 一并退役。
+⚠ 切换当轮 `catalog.llm_cache` **全量作废**(V4.1 与 V4 是两个模型、两套答案,
+名字只差一个版本号,键空间故意分开),下一轮审核/上架全额重付,大批重审排谷
+时段或周末。**别填已退役的名字**(`deepseek-chat` / `deepseek-reasoner` /
+`deepseek-v4-flash`):真的切断那天**全仓 LLM 调用一起失败**;用了摘要会点名。
+`deepseek-v4-pro` 仍可用,但官方路由期一结束(V4.1 Pro 上线)它会变回真 Pro、
+单价跳四倍多,所以不拿它当缺省。
+`thinking 必须显式 disabled` 那道闸按 **`registry.LLM_THINKING` 登记表**门控
+(2026-09-10 由 `"flash" in model` 子串匹配改来 —— 缺省模型切成 v4-pro 的那一刻
+子串门控整条失效,而那正是它最该生效的时候);表里没有的模型不下发该字段并
+点名警告一次。
 | **影刀 RPA** | 日报的店铺状态抓取 | 仅生产 macOS 有效;文件交接(`input.json` / `latest.json`)。⚠ 启动**必须经 launchd 代理**(`com.walmartapi.yingdao`,`launchd_install` 落盘后在图形会话里 `launchctl load -w`):日报链跑在智能体上下文里,没有 Aqua GUI session,直接 spawn 会在 `_RegisterApplication` 崩溃(2026-09-01 实证) |
 | **USPTO 商标库** | **本仓当前无消费方**(2026-09-03 C 批删了 L2 R5 商标反查;连接登记 `registry/db.uspto_conn` 保留待重建) | 跨库只读 |
 

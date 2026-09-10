@@ -22,6 +22,7 @@
 
 import logging
 import os
+from dataclasses import dataclass
 
 from registry import db, resources
 
@@ -217,4 +218,56 @@ def fetch_products(asins: list[str]) -> dict[str, dict]:
         shown = ",".join(absent[:20]) + ("…" if len(absent) > 20 else "")
         logger.info("产品中心缺 %d/%d 个 ASIN 的可用数据(本轮跳过,采集后自动"
                     "续上):%s", len(absent), len(asins), shown)
+    return out
+
+
+# ── 快照新鲜度(所有者定稿 2026-09-10)────────────────────────────────────────
+#
+# 「12 小时内采过就不重推」是审核链补采(product_audit._plan_gap)与上架链刷新
+# (list_new._push_scrape)**共用**的一条口径,常量与判据只在这里出生:两边各写
+# 一份的话,改一处漏一处,表现是审核刚刷过的品两小时后上架又采一遍(烧配额),
+# 或者反过来一边认为新鲜一边认为过旧。
+# 快照**不分结局**:采到 not_found / blocked 也算"采过" —— 12 小时内再推大概率
+# 还是同一结果,这条同时就是失败重推的冷却期。新鲜与否在库端按 now() 算,
+# 不拿应用侧时钟比 timestamptz(时区一错就是 8 小时)。
+SNAPSHOT_FRESH_HOURS = 12
+
+
+@dataclass(frozen=True)
+class Seen:
+    """一个 ASIN 最近一次快照:时刻(从没采过为 None)、结局、是否在新鲜期内。"""
+    scraped_at: object
+    outcome: str | None
+    fresh: bool
+
+
+_SQL_LATEST_SEEN = """
+SELECT w.asin, s.scraped_at, s.outcome,
+       coalesce(s.scraped_at >= now() - make_interval(hours => %(fresh_h)s::int),
+                false) AS fresh
+FROM unnest(%(asins)s::text[]) AS w(asin)
+LEFT JOIN LATERAL (
+    SELECT scraped_at, outcome
+    FROM catalog.snapshots s
+    WHERE s.marketplace = %(mkt)s AND s.asin = w.asin
+    ORDER BY scraped_at DESC
+    LIMIT 1) s ON true
+"""
+
+
+def latest_seen(asins) -> dict[str, Seen]:
+    """输入:ASIN 列表 → 输出:{asin: Seen}(每个都有;从没采过的 scraped_at=None、fresh=False)。
+
+    走 (marketplace, asin, scraped_at DESC) 索引,几千个 ASIN 一次 LATERAL 就够。
+    """
+    want = sorted({str(a) for a in asins if a})
+    if not want:
+        return {}
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(_SQL_LATEST_SEEN, {"asins": want, "mkt": MARKETPLACE,
+                                       "fresh_h": SNAPSHOT_FRESH_HOURS})
+        rows = cur.fetchall()
+    out = {r[0]: Seen(r[1], r[2], bool(r[3])) for r in rows}
+    for a in want:
+        out.setdefault(a, Seen(None, None, False))
     return out

@@ -4,7 +4,9 @@ feishu_sync.py/relisting.py,2026-08-06 从 erpAPI@d5237fb 提取)。
 归类输入只有一个:unpublished_reasons 文本(多条以 " | " 拼接),小写子串匹配。
 
 ⚠ **反补机制 2026-08-28 所有者定稿退役**:「publishedStatus 不是 PUBLISHED 的
-都进行删除,不再修改 End Date 救商品」。归类不再决定处置走向(一律删除),
+都进行删除,不再修改 End Date 救商品」。归类不再决定处置走向(一律删除;
+**2026-09-10 起改为按原子集合判**:只含 EXPIRED/STAGE 不删,其余删,见
+workflows/problem_scan 头注与 error_taxonomy.RECOVERABLE_CODES),
 只服务三件事:病历(problem_categorized 事件)、黑名单收集(2026-09-04 换轨后
 改吃 `error_taxonomy.PERMANENT_CODES`,本模块不再参与入选判据)、
 摘要按类计数。反补构造器(build_relist_item/pick_product_id/NEW_END_DATE)

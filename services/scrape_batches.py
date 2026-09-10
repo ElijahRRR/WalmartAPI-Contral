@@ -90,7 +90,7 @@ def prioritize(batch_name: str, batch_id) -> bool:
     **哪些链该插队**(所有者定稿 2026-08-17):`order_audit`、`product_refresh`
     与 `product_audit` 的补采(`audit_gap_*`)—— 它们的共同点是**本侧在等这批
     采集**(order_audit 默认 wait=1 阻塞 20 分钟;product_refresh 在产品线串联里,
-    wait=1 时后面六步全在等;product_audit 同轮闭环等 20 分钟,等不到那批产品
+    wait=1 时后面六步全在等;product_audit 同轮闭环等最多 60 分钟(2026-09-10 起;此前 20),等不到那批产品
     今天就审不了、20:00 的上架也上不了)。排在常规批次后面就是干等到超时。
 
     ⚠ `audit_gap_*` 是 2026-08-17 加的第三条,加它的**理由是时间账**:
@@ -103,7 +103,7 @@ def prioritize(batch_name: str, batch_id) -> bool:
     —— 它们是"采到了下轮自然用上"的形态,没有谁在等。全都插队 = 谁都没
     插队,那条车道就成了新的常规车道。
     ⚠ `listing_gap_*` 自 2026-08-18 起**也插队**:list_new 改成与审核链
-    同款的同轮闭环(推完等 20 分钟、就地摄取、本轮续走),本侧在等,
+    同款的同轮闭环(推完等一段、就地摄取、本轮续走),本侧在等,
     时间账与 `audit_gap_*` 完全一样;此前"list_new 补采不插队"的口径随
     "本轮跳过"语义一并作废。它同样一天一次、几十个 ASIN,稀释风险可接受。
 

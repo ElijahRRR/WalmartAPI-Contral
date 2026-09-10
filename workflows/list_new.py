@@ -42,10 +42,14 @@ UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
     ⚠ 占用闸与快照闸**并存**(A1 阶段):台账回填完整前,快照闸仍是主力;
     两道都过才放行,理由分开写,谁拦的一目了然
   ⑤ 数据源(services/amz_source):**上架必须用当天最新数据**(所有者定稿
-    2026-08-19)——**全部候选**先推采集刷新(日界批次名防重)+ 插队 →
-    等它采完(默认 20 分钟,`-p gap_wait=` 可调)→ 就地按批摄取(批次
-    端点,无锁)→ 才取数定价;超时不是失败,没刷到的行用库中现值上架
-    (维护链次日纠正),库里压根没有的照旧不写终态、次日续
+    2026-08-19;2026-09-10 收敛为「12 小时内采过的不再刷」,判据与审核链
+    共用、只在 amz_source 出生)——候选里 12 小时内没有快照的先推采集刷新
+    (批次名 listing_gap_<时间戳>,不按日界:日界名会让同日再跑时新增候选
+    撞名推不出去)+ 插队 → 等它采完(默认 20 分钟,`-p gap_wait=` 可调)→
+    就地按批摄取(批次端点,无锁)→ 才取数定价;超时不是失败,没刷到的行
+    用库中现值上架(维护链次日纠正),库里压根没有的照旧不写终态、次日续。
+    审核链 18:10 刚刷过的品因此不会在 20:00 再采一遍,slow_hash 也就不会在
+    审核与上架之间被翻成 pending
   ⑥ 数据过滤:库存 <5 淘汰;配送超时上架但库存写 0;品牌/制造商黑名单
     (两字段都查,brand=Generic 真品牌在 manufacturer 是常态);
     **店铺渠道闸**(限额表「配送限制」:标了 fba/fbm 就只上该渠道的货,
@@ -518,44 +522,58 @@ def _dump_llm_debug(asin: str, visible: dict, orderable: dict,
 
 def _push_scrape(want: list[str], execute: bool
                  ) -> tuple[str | None, list[str]]:
-    """输入:本轮要刷新的 ASIN 列表 + 是否真跑 → 输出:(摘要行, 可等待的批次名)。
+    """输入:本轮候选 ASIN 列表 + 是否真跑 → 输出:(摘要行, 可等待的批次名)。
 
-    2026-08-19 所有者定稿「上架必须用最新数据」之后,这里推的是**全部候选**
-    的刷新(此前只推缺数据的)。批次名带北京日界,天然防重——当天第二轮
-    撞名(BatchExistsError)沿用既有批次:那轮的新增候选刷不到,用库中现值
-    上架,次日随新批次刷。最快形态(不切邮编不截图);按批摄取后主链续走。
+    2026-08-19 所有者定稿「上架必须用最新数据」之后,这里推的是候选的刷新
+    (此前只推缺数据的);2026-09-10 收敛为**只推 12 小时内没有快照的**
+    (`amz_source.latest_seen`,与审核链补采同一口径、同一出处):审核 18:10
+    刚刷过的品 20:00 不再采一遍,既省配额,也让 slow_hash 不会在审核与上架
+    之间被翻成 pending。
+    批次名 `listing_gap_<北京时间戳>`(此前按日界):同一天再跑不撞名 —— 日界名
+    会让新增候选撞名 409 被"沿用既有批次",一个都刷不到。防重靠新鲜度判据,
+    不靠名字;409 分支只保留「上一次推送其实成功了」的安全重试语义。
+    最快形态(不切邮编不截图);按批摄取后主链续走。
     推送失败只告警不阻塞上架:有数据的行用现值,缺数据的照旧跳过不写终态。
     """
     if not want:
         return None, []
-    day = datetime.now(kpi.CN_TZ).strftime("%Y%m%d")
-    name = f"listing_gap_{day}"
+    seen = amz_source.latest_seen(want)
+    stale = [a for a in want if not seen[a].fresh]
+    n_fresh = len(want) - len(stale)
+    fresh_note = (f"{n_fresh} 个 {amz_source.SNAPSHOT_FRESH_HOURS} 小时内采过、不重刷"
+                  if n_fresh else "")
+    if not stale:
+        return (f"  候选 {len(want)} 个 ASIN 都在 "
+                f"{amz_source.SNAPSHOT_FRESH_HOURS} 小时内采过,本轮不推采集"), []
+    name = f"listing_gap_{datetime.now(kpi.CN_TZ).strftime('%Y%m%dT%H%M%S')}"
     if not execute:
-        return (f"  [DRY-RUN] 候选 {len(want)} 个 ASIN,"
-                f"真跑时将推采集批次 {name} 刷新"), []
+        return (f"  [DRY-RUN] 候选 {len(want)} 个 ASIN"
+                f"{'(' + fresh_note + ')' if fresh_note else ''},"
+                f"真跑时将推采集批次 {name} 刷新 {len(stale)} 个"), []
     # 2026-08-18 所有者定稿同轮闭环之后,这批采集**本侧在等**(下游 20 分钟
     # 窗口),所以:①落 ops.scrape_batches 台账(check_open/监控能圈到它);
     # ②插队(与 audit_gap 同一条时间账:不插队几乎注定等不到)。此前
     # "list_new 补采不插队"的口径随"本轮跳过"语义一并作废。
     try:
-        r = scraper.submit_batch(name, want)
+        r = scraper.submit_batch(name, stale)
         bid = r.get("batch_id")
-        scrape_batches.record(name, bid, len(want), "pushed",
+        scrape_batches.record(name, bid, len(stale), "pushed",
                               f"list_new 同轮闭环 inserted={r.get('inserted')}")
-        note = (f"  候选 {len(want)} 个 ASIN 已推采集刷新"
-                f"(批次 {name},入库 {r.get('inserted')})"
+        note = (f"  候选 {len(want)} 个 ASIN:推采集刷新 {len(stale)} 个"
+                f"(批次 {name},入库 {r.get('inserted')}"
+                f"{';' + fresh_note if fresh_note else ''})"
                 + ("" if scrape_batches.prioritize(name, bid)
                    else ",⚠ 插队没成功(按常规优先级采,可能等不到)"))
         return note, [name]
     except scraper.BatchExistsError as e:
-        scrape_batches.record(name, e.batch_id, len(want), "pushed",
-                              "同日已推,沿用既有批次")
+        scrape_batches.record(name, e.batch_id, len(stale), "pushed",
+                              "撞名 409:上一次推送其实成功了,沿用")
         scrape_batches.prioritize(name, e.batch_id)
-        return (f"  候选 {len(want)} 个 ASIN:今日批次 {name} 已推过,"
-                f"沿用既有批次接着等(本轮新增候选刷不到,用库中现值)"), [name]
+        return (f"  候选 {len(want)} 个 ASIN:批次 {name} 采集侧已有同名"
+                f"(上一次推送其实成功了),接着等它"), [name]
     except Exception as e:
         logger.warning("推采集失败(不阻塞上架,有数据的行用现值): %s", e)
-        scrape_batches.record(name, None, len(want), "failed", str(e)[:200])
+        scrape_batches.record(name, None, len(stale), "failed", str(e)[:200])
         return f"  ⚠ 候选 {len(want)} 个 ASIN 推采集刷新失败:{e}", []
 
 
@@ -1728,9 +1746,9 @@ def run(params: dict) -> str:
     for k, v in sg.counts.items():
         n[k] += v
 
-    # 上架必须用当天最新数据(所有者定稿 2026-08-19):**全部候选**先推采集
-    # 刷新(不再只推缺数据的),等窗口 + 按批摄取之后才取数定价。日界批次名
-    # 天然防重:当天第二轮撞名沿用(新增候选那轮刷不到,用库中现值,次日续)。
+    # 上架必须用当天最新数据(所有者定稿 2026-08-19;2026-09-10 收敛为
+    # 「12 小时内采过的不再刷」):候选里快照过旧的先推采集刷新,等窗口 +
+    # 按批摄取之后才取数定价。批次名按时间戳,防重靠新鲜度判据(见 _push_scrape)。
     all_want = sorted({r["asin"] for r in candidates})
     scrape_note, gap_names = _push_scrape(all_want, execute)
     gap_line = None

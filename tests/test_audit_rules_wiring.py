@@ -1857,17 +1857,17 @@ def test_record_usage_buckets_by_model_purpose_and_tier():
     off = dt.datetime(2026, 8, 21, 20, tzinfo=dt.timezone.utc)
     u = {"prompt_tokens": 1000, "completion_tokens": 100,
          "prompt_cache_hit_tokens": 900, "prompt_cache_miss_tokens": 100}
-    _llm.record_usage("deepseek-v4-flash", "audit_l3", u, at=peak)
-    _llm.record_usage("deepseek-v4-flash", "audit_l3", u, at=peak)
-    _llm.record_usage("deepseek-v4-flash", "audit_l3", u, at=off)
-    assert _llm.USAGE_STATS[("deepseek-v4-flash", "audit_l3", "peak")] == {
+    _llm.record_usage("deepseek-flash", "audit_l3", u, at=peak)
+    _llm.record_usage("deepseek-flash", "audit_l3", u, at=peak)
+    _llm.record_usage("deepseek-flash", "audit_l3", u, at=off)
+    assert _llm.USAGE_STATS[("deepseek-flash", "audit_l3", "peak")] == {
         "calls": 2, "prompt": 2000, "completion": 200,
         "cache_hit": 1800, "cache_miss": 200}
-    assert _llm.USAGE_STATS[("deepseek-v4-flash", "audit_l3", "offpeak")
+    assert _llm.USAGE_STATS[("deepseek-flash", "audit_l3", "offpeak")
                             ]["calls"] == 1
     # 供应商不回 usage:只累加次数,其余留 0 —— 少算不瞎算
-    _llm.record_usage("deepseek-v4-flash", "audit_l1", None, at=off)
-    assert _llm.USAGE_STATS[("deepseek-v4-flash", "audit_l1", "offpeak")] == {
+    _llm.record_usage("deepseek-flash", "audit_l1", None, at=off)
+    assert _llm.USAGE_STATS[("deepseek-flash", "audit_l1", "offpeak")] == {
         "calls": 1, "prompt": 0, "completion": 0,
         "cache_hit": 0, "cache_miss": 0}
     _llm.reset_usage_stats()
@@ -1887,7 +1887,7 @@ def test_llm_cost_never_invents_a_number_for_unpriced_models():
     out = "\n".join(llm_cost.summarize(
         {("no-such-model", "list_new", "peak"): row}))
     assert "该模型无计价" in out and "未计价模型" in out
-    assert "$0.00" not in out
+    assert "¥0.00" not in out and "$" not in out        # 币种只从 registry 取
 
 
 def test_llm_cost_peak_is_exactly_double_offpeak():
@@ -1896,8 +1896,8 @@ def test_llm_cost_peak_is_exactly_double_offpeak():
 
     row = {"calls": 1, "prompt": 0, "completion": 1_000_000,
            "cache_hit": 500_000, "cache_miss": 500_000}
-    peak = llm_cost.cost_of("deepseek-v4-flash", "peak", row)
-    off = llm_cost.cost_of("deepseek-v4-flash", "offpeak", row)
+    peak = llm_cost.cost_of("deepseek-flash", "peak", row)
+    off = llm_cost.cost_of("deepseek-flash", "offpeak", row)
     assert abs(peak - 2 * off) < 1e-9
 
 
@@ -1910,8 +1910,8 @@ def test_llm_cost_falls_back_to_miss_price_when_split_absent():
              "cache_hit": 0, "cache_miss": 1_000_000}
     nosplit = {"calls": 1, "prompt": 1_000_000, "completion": 0,
                "cache_hit": 0, "cache_miss": 0}
-    assert (llm_cost.cost_of("deepseek-v4-flash", "peak", nosplit)
-            == llm_cost.cost_of("deepseek-v4-flash", "peak", split))
+    assert (llm_cost.cost_of("deepseek-flash", "peak", nosplit)
+            == llm_cost.cost_of("deepseek-flash", "peak", split))
 
 
 def test_llm_cost_small_amounts_keep_enough_digits():
@@ -1925,16 +1925,71 @@ def test_llm_cost_small_amounts_keep_enough_digits():
     row = {"calls": 9, "prompt": 70_000, "completion": 1_400,
            "cache_hit": 64_400, "cache_miss": 5_600}
     out = "\n".join(llm_cost.summarize(
-        {("deepseek-v4-flash", "audit_l3", "peak"): row}, items=200))
+        {("deepseek-flash", "audit_l3", "peak"): row}, items=200))
     import re as _re
-    # 金额不能被四舍五入成正好 $0.00(后面还跟着位数的 $0.0052 才是要的)
-    assert not _re.search(r"\$0\.00(?!\d)", out), out
+    # 金额不能被四舍五入成正好 ¥0.00(后面还跟着位数的 ¥0.0052 才是要的)
+    assert not _re.search(r"¥0\.00(?!\d)", out), out
     assert "/ 千条" in out          # 抽样直接给出可外推的单价
     # 大额仍按两位小数,不会变成一串小数点后的噪声
     big = {"calls": 1, "prompt": 0, "completion": 100_000_000,
            "cache_hit": 0, "cache_miss": 0}
-    assert "$132.00" in "\n".join(llm_cost.summarize(
-        {("deepseek-v4-flash", "audit_l3", "peak"): big}))
+    assert "¥800.00" in "\n".join(llm_cost.summarize(
+        {("deepseek-flash", "audit_l3", "peak"): big}))
+
+
+def test_price_tier_peaks_only_on_beijing_weekdays():
+    """官方口径:高峰 = 北京时间**周一至周五** 9-12、14-18,其余(含周末全天)谷价。
+
+    2026-09-10 修:此前只按 UTC 小时判、不看星期,周末那两段被算成高峰 ——
+    账估贵了,而"排谷时段省一半"正是拿这个判据做排班的。
+    """
+    import datetime as dt
+    from registry import resources
+
+    cst = dt.timezone(dt.timedelta(hours=8))
+    thu, sat, sun = 10, 12, 13          # 2026-09-10 是周四,12/13 是周六周日
+    assert resources.llm_price_tier(dt.datetime(2026, 9, thu, 11, tzinfo=cst)) == "peak"
+    assert resources.llm_price_tier(dt.datetime(2026, 9, thu, 15, tzinfo=cst)) == "peak"
+    assert resources.llm_price_tier(dt.datetime(2026, 9, thu, 13, tzinfo=cst)) == "offpeak"
+    assert resources.llm_price_tier(dt.datetime(2026, 9, thu, 20, tzinfo=cst)) == "offpeak"
+    # 周末:同样的钟点也是谷价
+    for day in (sat, sun):
+        for hour in (11, 15):
+            assert resources.llm_price_tier(
+                dt.datetime(2026, 9, day, hour, tzinfo=cst)) == "offpeak", (day, hour)
+    # 传 UTC 的时间也要判对(调用方给的是 UTC now)
+    assert resources.llm_price_tier(
+        dt.datetime(2026, 9, thu, 3, tzinfo=dt.timezone.utc)) == "peak"   # 北京 11:00
+
+
+def test_v4_pro_is_priced_as_flash_during_official_routing():
+    """官方 2026-09-10 公告:V4.1 Flash 上线后、V4.1 Pro 上线前,对 V4 Pro 的
+    请求全部路由到 V4.1 Flash 并**按 V4.1 Flash 单价计费**。
+
+    ⚠ V4.1 Pro 上线时要撤掉 LLM_MODEL_ALIASES 里那一行并恢复 Pro 自己的价,
+    否则 Pro 的账会按 Flash 少算四倍多。这条用例是那个动作的提醒。
+    """
+    from registry import resources
+    from services import llm_cost
+
+    assert resources.llm_priced_model("deepseek-v4-pro") == "deepseek-flash"
+    row = {"calls": 1, "prompt": 0, "completion": 1_000_000,
+           "cache_hit": 0, "cache_miss": 0}
+    assert (llm_cost.cost_of("deepseek-v4-pro", "offpeak", row)
+            == llm_cost.cost_of("deepseek-flash", "offpeak", row))
+
+
+def test_pricing_table_is_cny_and_offpeak_is_half():
+    """价表单位是**人民币元**(官方只标人民币),空闲价 = 高峰价的一半。"""
+    from registry import resources
+
+    assert resources.LLM_PRICE_CURRENCY == "CNY"
+    assert resources.LLM_PRICE_SYMBOL == "¥"
+    for model, tiers in resources.LLM_PRICING.items():
+        peak, off = tiers["peak"], tiers["offpeak"]
+        assert all(abs(p - 2 * o) < 1e-9 for p, o in zip(peak, off)), model
+        # 人民币量级:输出单价是元级,折过汇率的美元表会掉到 1 以下
+        assert peak[2] >= 1.0, (model, peak)
 
 
 # ── 大批量不许把候选全装进内存(2026-08-21 生产 OOM 后加)────────────────

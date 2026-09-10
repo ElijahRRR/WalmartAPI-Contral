@@ -56,21 +56,28 @@ L0 品牌文案扫描扫到的黑名单词里,来源标着 TRO 的那些在真�
 表里审核结果为空只说明表里没有结论,库里可能早就有。
 已有结论的直接投影回表(零 LLM),只有 `_DEFAULT_CANDIDATE` 认定的真待审
 (未审 / pending 过退避)才进判定引擎 —— 什么时候才重审见那条常量的注释。
+投影按**整表对账**(2026-09-10):没领的行也逐行与库里比,「审核结果」与库不一致的
+改写(表 pass / 库 pending 的行由此回到待审通道),见 `_project_to_sheet`。
 领取口径含 **「审核结果」=pending**(2026-08-17):pending 是中间态不是结论,
 写进那一格之后若不再领回来,那批就永久停在表上的 `pending`(见 `listing_sheet.audit_targets`)。
 
-**缺数据同轮补采闭环**(所有者定稿 2026-08-17:「产品审核不能等下一次,要轮询
-等采完拿数据审核,下一次运行是第二天,时间很长,并且不审核,后面的上架也做不了」):
-表里轮到审、但库里压根没有(或有行无标题=采集降级)的 ASIN → 推采集批次
-`audit_gap_<日界>` → **轮询等它采完**(缺省 20 分钟,`-p gap_wait=N` 调,0=只推
-不等)→ **就地按批摄取**(批次端点,无锁)→ 采回来的**这一轮就判掉**。
-仍缺的把采集侧真实 `error_type` 写进表格 **「具体内容」列、「审核结果」留空**
-(留空才会被下轮重领)。
+**缺数据 / 数据过旧同轮补采闭环**(所有者定稿 2026-08-17 同轮闭环:「产品审核不能
+等下一次,要轮询等采完拿数据审核,下一次运行是第二天,时间很长,并且不审核,后面的
+上架也做不了」;补采判据 2026-09-10 重定):
+领到待审 ASIN 后先看**重审开关**(`-p force=1`):
+  · 重审关(缺省):推「库里没有审核结论(未审/pending)且 12 小时内没有快照」的;
+  · 重审开:推「12 小时内没有快照」的全部待审 ASIN(含库里已有结论的)。
+不在库 / 有行无标题(采集降级)的行本来就没结论,自然在第一档;12 小时内采过的
+(不分结局:not_found / blocked 也算采过)一律不重推 —— 这同时是失败重推的冷却期。
+批次名 `audit_gap_<北京时间戳>`(2026-09-10 起按时间不按日界:手动跑过一次、表里
+再换一批品,同日撞名会让新品一个都推不出去)→ **轮询等它采完**(缺省 60 分钟,
+`-p gap_wait=N` 调,0=只推不等)→ **就地按批摄取**(批次端点,无锁)→ 采回来的
+**这一轮就判掉**;没等到的:在库的用现有数据审,审不了的把真实原因写进表格
+**「具体内容」列、「审核结果」留空**(留空才会被下轮重领)。
 整段跑在候选查询**之前**,所以不需要第二遍判定循环。见 `_close_gap`。
-⚠ **在库的待审行不做"先刷新再审"**(所有者复议定稿 2026-08-19):审核判的是
-"这个产品卖的是什么",第一次就定性了,改标题/描述不改变它是什么——
-强刷带来的翻案更大可能是 LLM 随机性(上架链相反,**必须**先刷新:价格库存
-是要写到沃尔玛的真金白银)。
+> 历史:2026-08-19 曾复议「在库的待审行不做先刷新再审」(审核判的是"它是什么",
+> 第一次就定性);2026-09-10 所有者改按新鲜度判 —— 上架表里的品在审核前没有任何
+> 刷新路径(13:00 product_refresh 只推在架品),审核用的常是几个月前的快照。
 
 dry-run 语义(计划 B4 定稿):判定照跑、runs/hits 照落,但不碰 products
 审核六列、不发事件、不投影。⚠ 批次 C 起 dry-run **同样产生真实 LLM 调用与费用**
@@ -102,7 +109,7 @@ from datetime import datetime
 
 from api import scraper
 from registry import db, resources
-from services import audit_l3, audit_pool, audit_reason, audit_rules, \
+from services import amz_source, audit_l3, audit_pool, audit_reason, audit_rules, \
     audit_store, db_guard, kpi, \
     listing_sheet, policy_names, product_events, product_ingest, risk_trace, \
     scrape_batches, store_events, stores
@@ -923,11 +930,22 @@ def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
       摘要里点名有多少行卡在这。
     · 同一个 ASIN 可能在表里有**多行**(不同店铺),按 ASIN 回填到每一行。
 
+    **整表对账**(2026-09-10):本轮领的行照旧全写;没领的行(表上已有结论)也逐行
+    与库里比,「审核结果」与库不一致的**改写**。没有这一步的话,上架链刷新时
+    slow_hash 一变、库里 approved 翻回 pending,表上仍写着 pass —— 审核只领 E 空
+    或 pending 的行,上架只认库里的 approved,这行从此没有任何调度再碰它
+    (2026-09-09 链路核对实证)。改写后 E 变 pending,下轮自然重领、重判、再投影。
+    表有结论而库里没有(人工填的)的行不动,只在摘要点名:要审就把那格清空。
+
     回填失败只告警不失败:结论已经落 PG 了(products 审核六列 + audit_runs),
     飞书只是人机界面 —— 与订单中心那条同款纪律。
     """
     try:
-        asins = sorted({r["asin"] for r in sheet_rows})
+        claimed = {r["asin"] for r in sheet_rows}
+        # 整表窄读(只到「审核结果」那一列,与 audit_targets 同款,离 10MB 上限远)
+        all_rows = [r for r in listing_sheet.read_rows(upto="audit_result")
+                    if r.get("asin")]
+        asins = sorted({r["asin"] for r in all_rows} | claimed)
         with db.pg_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(_SQL_VERDICT, (asins,))
@@ -944,37 +962,63 @@ def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
             #   而其中 `General-Use Products` 是"以上全不中"的兜底 —— 单把它
             #   摆在一把锤子、一个土豆压泥器上时人只会一头雾水。真正的原因在
             #   命中的规则里,所以类别归类别列,人话归「具体内容」。
-            reasons = audit_store.reject_reasons(conn, asins)
-        updates, absent = [], 0
-        for r in sheet_rows:
-            row = got.get(r["asin"])
-            if not row or not row[3]:       # 库里没有 / 还没结论 → 留空
-                absent += 1
-                continue
+            # 先定要写哪些行,再只为这些行查命中明细(整表几千个 ASIN 不必全查)
+            to_write, absent, manual, reconciled = [], 0, 0, 0
+            # 本轮领的行:库里有结论就写(与 2026-08-16 起的行为逐字相同)
+            for r in sheet_rows:
+                row = got.get(r["asin"])
+                if not row or not row[3]:       # 库里没有 / 还没结论 → 留空
+                    absent += 1
+                    continue
+                to_write.append((r["rownum"], r["asin"]))
+            # 没领的行(表上已有结论):与库里对账,只改写不一致的
+            done = {rn for rn, _ in to_write}
+            for r in all_rows:
+                if r["rownum"] in done or r["asin"] in claimed:
+                    continue
+                row = got.get(r["asin"])
+                if not row or not row[3]:
+                    manual += 1                 # 表有结论、库没有:人工填的,不动
+                    continue
+                shown = (r.get("audit_result") or "").strip().lower()
+                want_val = listing_sheet.AUDIT_RESULT_CN.get(row[3], row[3])
+                if shown == want_val.lower():
+                    continue
+                to_write.append((r["rownum"], r["asin"]))
+                reconciled += 1
+            reasons = audit_store.reject_reasons(
+                conn, sorted({a for _, a in to_write}))
+
+        def _six(asin: str, row) -> list:
             _, title, pt, status, reason, at, detail = row
             why = detail or ""
             if not why and status == "rejected":     # 老行:按命中规则渲染
-                why = audit_reason.explain_hits(reasons.get(r["asin"], []))
+                why = audit_reason.explain_hits(reasons.get(asin, []))
             elif not why and status == "pending":    # 老行:待定原因在类别列里
                 why = reason or ""
-            updates.append((r["rownum"], [
-                title or "", pt or "",
-                listing_sheet.AUDIT_RESULT_CN.get(status, status),
-                (reason or "") if status == "rejected" else "",
-                why[:500],
-                at.strftime("%Y-%m-%d") if at else ""]))
+            return [title or "", pt or "",
+                    listing_sheet.AUDIT_RESULT_CN.get(status, status),
+                    (reason or "") if status == "rejected" else "",
+                    why[:500],
+                    at.strftime("%Y-%m-%d") if at else ""]
+
+        updates = [(rn, _six(a, got[a])) for rn, a in to_write]
         listing_sheet.write_audit_cols(updates, execute)
-        # ⚠ 回填的是**整张表里所有已有结论的行**,不是本轮判的那 limit 个 ——
-        # 库里早有结论的行本来就该把结论投影出来(那正是"从库里读结果")。
         # dry-run 必须说出真跑会写多少行:所有者 2026-08-16 实遇 dry-run 6 秒、
         # 真跑写了几万行,差异全在这一步而摘要当时只说"回填 0 行"
         out = (f"上架表{'回填' if execute else '**将**回填'} {len(updates)} 行审核六列"
-               f"(标题/PT/审核结果/类别/具体内容/审核日期;"
-               f"整表已有结论的都投影,不只本轮判的那些)"
+               f"(标题/PT/审核结果/类别/具体内容/审核日期;本轮领的 "
+               f"{len(updates) - reconciled} 行 + 整表对账改写 {reconciled} 行)"
                f"{'' if execute else ';dry-run 一格未写'}")
+        if reconciled:
+            out += (f";⚠ 对账改写的 {reconciled} 行是表上结论与库不一致的"
+                    f"(如表 pass / 库 pending:改成 pending 后下轮重领重判)")
         if absent:
             out += (f";⚠ {absent} 行库里没有结论,**「审核结果」留空**"
                     f"(下轮自动重领;没数据的那些见下方补采段,已推采集)")
+        if manual:
+            out += (f";{manual} 行表上有结论、库里没有(人工填的):不领不审不上架,"
+                    f"要审就把「审核结果」清空")
         return out
     except Exception as e:                                      # noqa: BLE001
         logger.warning("上架表回填失败(结论已在 PG,不影响本轮): %s", e)
@@ -983,59 +1027,159 @@ def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
                 f"`python cli.py product_audit -p from_sheet=1` 补写)")
 
 
-# 缺数据自动补采(所有者定稿 2026-08-17)。批次名带北京日界 ⇒ 天然防重:
-# 当天第二轮撞名走 409(BatchExistsError),沿用不重推。前缀独立成一档,
-# 这样 check_open 圈自己的批次不会碰到 listing_gap_/scrape_missing 的
+# 缺数据 / 数据过旧自动补采(所有者定稿 2026-08-17 同轮闭环;补采判据与批次命名
+# 2026-09-10 重定)。前缀独立成一档,这样 check_open 圈自己的批次不会碰到
+# listing_gap_/scrape_missing 的
 _GAP_PREFIX = "audit_gap_"
 _GAP_CHUNK = 5000          # 单批上限(表驱动的缺口通常几十个,这是护栏不是常态)
-_GAP_TIMEOUT_H = 24        # 超过一天没采完就标 timeout(下一轮日界批次会重推)
-# 等采集多久(分钟)。与 order_audit 的 _SCRAPE_TIMEOUT_MIN 同量级,理由相同:
-# 采集侧对可重试类型走 cap=3 + 最多 2 轮自动重试(间隔 5 分钟),总尝试上限
-# 约 9 次 —— 一个批次收敛得多慢由它决定,20 分钟是那条曲线的兜底位置。
-# ⚠ 上限还有一层来自调度:审核 18:10、上架 20:00,中间只有 110 分钟,
-# 而这段等待是**串在审核里**的(锁被本进程握着)。调大到吃掉上架的时间,
-# 表现是上架那条链拿不到锁退 3 空跑一轮 —— 看起来一切正常
-_GAP_WAIT_MIN = 20
+_GAP_TIMEOUT_H = 24        # 超过一天没采完就标 timeout(下一轮按新鲜度判据重推)
+#: 「N 小时内有快照」就不重推(所有者定稿 2026-09-10)。**常量与判据只在
+#: `services/amz_source` 出生**(上架链刷新同一口径),这里只是取个短名。
+_FRESH_HOURS = amz_source.SNAPSHOT_FRESH_HOURS
+#: 库里算"有结论"的状态。pending 是中间态不是结论(2026-08-17 定稿),未审 = NULL。
+_CONCLUDED = frozenset({"approved", "rejected"})
+# 等采集多久(分钟)。所有者 2026-09-10 定稿上限调到 60(此前 20):采集侧对可重试
+# 类型走 cap=3 + 最多 2 轮自动重试(间隔 5 分钟),20 分钟常常等不到第二轮。
+# ⚠ 时间账要算清:审核 18:10 起跑,上架 20:00 起跑,**锁按工作流名各一把**,审核
+# 拖过 20:00 不会让上架退 3 —— 上架照常起跑,把还没判完的行按「审核未过:未审」
+# 跳过、次日续(list_new.load_verdicts)。等待上限吃掉多少、判定还要多久,摘要要报;
+# 待审量大的日子要么给 -p limit=N,要么把上架往后挪。
+_GAP_WAIT_MIN = 60
 
-# 哪些 ASIN 叫"审不了":库里压根没有,或者有行但没标题(采集降级)。
-# 两类的处置一样(重采),但写进表格的话要说得不一样 —— 运营看到"没采集过"
-# 和"采过但抓不到标题"该做的事不同(后者多半是详情页结构变了/被拦)
-_SQL_GAP = """
-SELECT asin, (title IS NULL OR title = '') AS no_title
-FROM catalog.products
-WHERE marketplace = 'US' AND asin = ANY(%s)
+# 采集结局的人话(catalog.snapshots.outcome,契约扩展字段;不在表里的原样透出)
+_OUTCOME_CN = {
+    "not_found": "商品页不存在或已下架",
+    "blocked": "被亚马逊拦截",
+    "parse_failed": "页面解析失败",
+    "stale": "采集器判为过期数据",
+}
+
+# 每个待审 ASIN 在库里的身份现状:在不在库 / 有没有标题 / 有没有结论。
+# 最近一次快照那一腿走 `amz_source.latest_seen`(新鲜判据唯一出处)。
+_SQL_GAP_PRODUCTS = """
+SELECT w.asin,
+       p.asin IS NOT NULL               AS in_db,
+       coalesce(p.title, '') <> ''      AS has_title,
+       p.audit_status
+FROM unnest(%(asins)s::text[]) AS w(asin)
+LEFT JOIN catalog.products p
+       ON p.marketplace = 'US' AND p.asin = w.asin
 """
 
 
-def _find_gap(want: list[str]) -> tuple[list[str], list[str]]:
-    """输入:待审 ASIN → 输出:(不在库的, 在库但没标题的)。都是"审不了"的。"""
-    with db.pg_conn() as conn, conn.cursor() as cur:
-        cur.execute(_SQL_GAP, (want,))
-        got = dict(cur.fetchall())
-    return (sorted(set(want) - set(got)),
-            sorted(a for a, no_title in got.items() if no_title))
+@dataclass(frozen=True)
+class _GapRow:
+    """一个待审 ASIN 在库里的现状(`_SQL_GAP_STATE` 一行)。"""
+    in_db: bool
+    has_title: bool
+    status: str | None
+    last_seen: object          # timestamptz;库里没有快照时 None
+    outcome: str | None
+    fresh: bool                # 最近一次快照在 _FRESH_HOURS 内
+
+    @property
+    def broken(self) -> bool:
+        """审不了:库里压根没有,或有行但没标题(采集降级)。"""
+        return not self.in_db or not self.has_title
+
+    @property
+    def concluded(self) -> bool:
+        return self.status in _CONCLUDED
 
 
-# ⚠ 审核**不做**"先推采集刷新拿最新数据"(所有者定稿 2026-08-19,当天曾
-# 短暂加过又按所有者复议撤回):审核判的是**这个产品卖的是什么**(标题里的
-# 品牌词是不是真品牌、是否碰沃尔玛政策)——第一次审核就定性了,改标题/描述
-# 不改变它是什么,重采+重审带来的"翻案"更大可能只是 LLM 的随机性。
-# 缺口(不在库/无标题)照旧同轮补采——那是"审不了",不是"数据旧"。
+def _gap_state(want: list[str]) -> dict[str, _GapRow]:
+    """输入:待审 ASIN → 输出:{asin: _GapRow}(每个都有一行;查不到的按不在库算)。
 
-
-def _push_gap(gap: list[str], day: str,
-              out: list[str]) -> list[tuple[str, object]]:
-    """输入:缺口 ASIN + 日界 → 输出:[(批次名, batch_id)];摘要写进 out。
-
-    日界批次名 ⇒ 天然防重:当天第二轮撞名走 409,沿用既有批次不重复烧配额
-    (沿用的那个也要返回 —— 后面要拿它的 batch_id 查失败明细)。
-    单批推送失败不连坐其余批次。
+    两腿:身份现状查 `catalog.products`;最近一次快照走 `amz_source.latest_seen`
+    (先查身份再查快照,测试夹具按这个次序喂数)。
     """
-    sent = []
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(_SQL_GAP_PRODUCTS, {"asins": list(want)})
+        rows = cur.fetchall()
+    seen = amz_source.latest_seen(want)
+    out: dict[str, _GapRow] = {}
+    for r in rows:
+        s = seen.get(r[0]) or amz_source.Seen(None, None, False)
+        out[r[0]] = _GapRow(bool(r[1]), bool(r[2]), r[3],
+                            s.scraped_at, s.outcome, bool(s.fresh))
+    for a in want:
+        s = seen.get(a) or amz_source.Seen(None, None, False)
+        out.setdefault(a, _GapRow(False, False, None, s.scraped_at, s.outcome,
+                                  bool(s.fresh)))
+    return out
+
+
+def _fmt_seen(ts) -> str:
+    """输入:timestamptz → 输出:北京时间 `MM-DD HH:MM`(不是时间就原样)。"""
+    try:
+        return ts.astimezone(kpi.CN_TZ).strftime("%m-%d %H:%M")
+    except Exception:                                           # noqa: BLE001
+        return str(ts)
+
+
+@dataclass
+class _GapPlan:
+    """本轮补采计划(`_plan_gap` 产出)。"""
+    push: list[str]            # 要推采集的
+    hold: dict[str, str]       # 审不了、但新鲜期内刚采过而不重推的:asin → 理由
+    n_broken: int = 0          # push 里审不了的(不在库 / 无标题)
+    n_absent: int = 0          # push 里不在库的
+    n_stale: int = 0           # push 里在库有标题、只是快照过旧的
+    n_concluded: int = 0       # push 里库里已有结论的(只有重审开才会有)
+
+
+def _plan_gap(state: dict[str, _GapRow], force: bool) -> _GapPlan:
+    """输入:库里现状 + 重审开关 → 输出:推谁、扣谁(所有者定稿 2026-09-10)。
+
+    · 重审关(缺省):推「没有结论(未审/pending)且 N 小时内没有快照」的;
+    · 重审开(`-p force=1`):推「N 小时内没有快照」的全部待审 ASIN(含已有结论的)。
+    不在库 / 无标题的行本来就没结论,自然落在第一档;N 小时内采过的一律不推 ——
+    审不了又不推的进 `hold`,理由要写到表格里(不然表现是"卡着没人管")。
+    有结论却审不了的行(极少)重审关时不推:它有结论,投影回表就行。
+    """
+    plan = _GapPlan([], {})
+    for asin in sorted(state):
+        r = state[asin]
+        if r.fresh:
+            if r.broken and not r.concluded:
+                cn = _OUTCOME_CN.get(r.outcome or "")
+                plan.hold[asin] = (
+                    f"{_FRESH_HOURS} 小时内已采过(结局 {r.outcome or 'ok'}"
+                    f"{',' + cn if cn else ''},{_fmt_seen(r.last_seen)}),"
+                    f"本轮不重推,下轮再看")
+            continue
+        if r.concluded and not force:
+            continue
+        plan.push.append(asin)
+        if r.broken:
+            plan.n_broken += 1
+            if not r.in_db:
+                plan.n_absent += 1
+        else:
+            plan.n_stale += 1
+        if r.concluded:
+            plan.n_concluded += 1
+    return plan
+
+
+def _push_gap(gap: list[str], stamp: str, out: list[str]
+              ) -> tuple[list[tuple[str, object]], dict[str, str]]:
+    """输入:要推的 ASIN + 时间戳 → 输出:([(批次名, batch_id)], {推送失败的 asin: 错误})。
+
+    批次名 `audit_gap_<北京时间戳>`(2026-09-10 起;此前按日界):同一天再跑不会撞名。
+    日界命名的病:手动跑过一次、表里再换一批品,新品撞名 409 被"沿用既有批次",
+    一个都推不出去,表格却写"已推采集"(所有者 2026-09-10 实遇)。防重不靠名字,
+    靠 `_plan_gap` 的新鲜度判据(N 小时内采过的根本不进 push)。
+    409 分支留着:POST 网络超时后重发、上一次其实成功了,采集侧返 409 + 那个
+    batch_id(api/scraper 的安全重试语义),接着等它就对。
+    单批推送失败不连坐其余批次;失败的 ASIN 原样返回,理由要落到表格。
+    """
+    sent: list[tuple[str, object]] = []
+    failed: dict[str, str] = {}
     for i in range(0, len(gap), _GAP_CHUNK):
         chunk = gap[i:i + _GAP_CHUNK]
-        name = (f"{_GAP_PREFIX}{day}" if len(gap) <= _GAP_CHUNK
-                else f"{_GAP_PREFIX}{day}-{i // _GAP_CHUNK + 1:02d}")
+        name = (f"{_GAP_PREFIX}{stamp}" if len(gap) <= _GAP_CHUNK
+                else f"{_GAP_PREFIX}{stamp}-{i // _GAP_CHUNK + 1:02d}")
         try:
             res = scraper.submit_batch(name, chunk)
             bid = res.get("batch_id")
@@ -1048,17 +1192,19 @@ def _push_gap(gap: list[str], day: str,
                           else ",⚠ 插队没成功(按常规优先级采,可能等不到)"))
         except scraper.BatchExistsError as e:
             scrape_batches.record(name, e.batch_id, len(chunk), "pushed",
-                                  "同日已推,沿用既有批次")
+                                  "撞名 409:上一次推送其实成功了,沿用")
             sent.append((name, e.batch_id))
             scrape_batches.prioritize(name, e.batch_id)
-            out.append(f"  {name}:今天已推过,沿用既有批次 {e.batch_id}"
-                       f"(接着等它采完)")
+            out.append(f"  {name}:采集侧已有同名批次 {e.batch_id}"
+                       f"(上一次推送其实成功了),接着等它")
         except Exception as e:                                  # noqa: BLE001
             logger.exception("补采批次 %s 推送失败", name)
             scrape_batches.record(name, None, len(chunk), "failed",
                                   str(e)[:200])
+            for a in chunk:
+                failed[a] = str(e)[:120]
             out.append(f"  ❌ {name} 推送失败:{e}(表格照样写原因,下轮重推)")
-    return sent
+    return sent, failed
 
 
 def _ingest_batches(names: list[str]) -> str:
@@ -1100,8 +1246,8 @@ def _gap_reasons(sent: list[tuple[str, object]]) -> dict[str, str]:
 
 
 def _close_gap(want: list[str], sheet_rows: list[dict], execute: bool,
-               wait_min: int) -> list[str]:
-    """输入:待审 ASIN + 待审行 + 真跑? + 等采集分钟 → 输出:摘要行。
+               wait_min: int, force: bool = False) -> list[str]:
+    """输入:待审 ASIN + 待审行 + 真跑? + 等采集分钟 + 重审开关 → 输出:摘要行。
 
     **同轮闭环**(所有者定稿 2026-08-17):「产品审核不能等下一次,要轮询等采完
     拿数据审核,下一次运行是第二天,时间很长,并且不审核,后面的上架也做不了」。
@@ -1111,17 +1257,24 @@ def _close_gap(want: list[str], sheet_rows: list[dict], execute: bool,
     (首版把它放在判定之后,只推不等 ⇒ 采回来要等第二天 18:10 才审、20:00 才上,
     整条上架链每引进一批新品就白等一天。)
 
+    **推谁**(所有者定稿 2026-09-10,见 `_plan_gap`):领到待审 ASIN 后先看重审开关 ——
+    重审关:推「库里没有结论且 N 小时内没有快照」的;重审开:推「N 小时内没有快照」
+    的全部。不在库 / 无标题的行没结论,自然在第一档;N 小时内采过的一律不推。
+    > 历史:2026-08-19 曾复议「在库待审行不做先刷新再审」(审核判的是"它是什么",
+    > 第一次就定性);2026-09-10 所有者改按新鲜度判 —— 上架表里的品在审核前没有
+    > 任何刷新路径(13:00 product_refresh 只推在架品),审核用的常是几个月前的快照。
+
     五步:
 
-      ① 推今天的缺口(日界批次名,撞名沿用)+ 插队。**只推缺口**:在库的
-         待审行不做"先刷新再审"(所有者复议定稿 2026-08-19,理由见模块头注
-         ——审核判的是"它是什么",第一次就定性了)。
+      ① 推(批次名 `audit_gap_<北京时间戳>`,不按日界;见 `_push_gap`)+ 插队。
       ② **轮询等它采完**(`wait_settled`)。超时不是失败:已采到的照常进增量流。
       ③ **就地按批摄取**(批次端点,见 `_ingest_batches`;不需要锁)——
          批次 completed **不等于**我们库里有数据,中间还隔着一次导出。
          少这一步的话等了半天照样"库里没有",而且看起来像采集侧没干活。
-      ④ 复查还缺谁,把**采集侧给的真实 error_type** 写进表格「具体内容」列
-         (`_gap_reasons`);「审核结果」一个字不动(`write_audit_notes` 头注说了为什么)。
+      ④ 复查谁回来了、谁还审不了;审不了的把**真实原因**写进表格「具体内容」列
+         (`_explain_still`:推送失败 > 本轮采回的结局 > 采集侧失败明细 > 新鲜期内
+         没推 > 推了没等到);「审核结果」一个字不动(`write_audit_notes` 头注说了为什么)。
+         在库有标题、只是没刷到的:用现有数据审,摘要点名数量。
       ⑤ **落定台账**(`check_open`)。
 
     ⚠ ⑤ 为什么在最后、而不是开头报"上一批"(所有者 2026-08-17 质疑:「我都已经
@@ -1142,7 +1295,7 @@ def _close_gap(want: list[str], sheet_rows: list[dict], execute: bool,
 
     **插队**(`scrape_batches.prioritize`,判据就是"本侧在等这批采集")。
     这是时间账逼出来的:审核 18:10 起跑,而 `product_refresh` 13:00 推的十几万个
-    任务这时很可能还在排。不插队的话那 20 分钟几乎注定等不到 —— 同轮闭环写了
+    任务这时很可能还在排。不插队的话那几十分钟几乎注定等不到 —— 同轮闭环写了
     但从不生效,而且表现是"每天都超时",看着像采集侧慢。插队失败只告警
     (best-effort),摘要里点明"可能等不到"。
 
@@ -1153,12 +1306,12 @@ def _close_gap(want: list[str], sheet_rows: list[dict], execute: bool,
     if not want:
         return []
     out: list[str] = []
-    absent, degraded = _find_gap(want)
-    gap = absent + degraded
-    if gap:
-        _run_gap_round(gap, absent, degraded, sheet_rows, execute, wait_min,
-                       want, out)
-    # ⑤ 台账落定:**本轮缺口为空也要跑**。缺口为空只说明今天没新批次,
+    state = _gap_state(want)
+    plan = _plan_gap(state, force)
+    if plan.push or plan.hold:
+        _run_gap_round(want, state, plan, force, sheet_rows, execute, wait_min,
+                       out)
+    # ⑤ 台账落定:**本轮没推也要跑**。没推只说明今天没新批次,
     #    不说明没有遗留(上一轮超时/gap_wait=0/中途被打断的那批还挂着)——
     #    只在有缺口时才关台账的话,那笔遗留会一直挂到有下一次缺口
     out += _settle_ledger(execute)
@@ -1184,55 +1337,119 @@ def _settle_ledger(execute: bool) -> list[str]:
     return ["补采批次台账:"] + lines
 
 
-def _run_gap_round(gap: list[str], absent: list[str], degraded: list[str],
-                   sheet_rows: list[dict], execute: bool, wait_min: int,
-                   want: list[str], out: list[str]) -> None:
-    """输入:本轮缺口 + 上下文 → 输出:无(摘要写进 out)。见 `_close_gap` 头注。"""
-    day = datetime.now(kpi.CN_TZ).strftime("%Y%m%d")
-    head = (f"⚠ 审不了 {len(gap)} 个 ASIN:不在库 {len(absent)}"
-            + (f" / 采集降级无标题 {len(degraded)}" if degraded else ""))
+def _came_back(before: _GapRow, after: _GapRow) -> bool:
+    """输入:推送前后的现状 → 输出:本轮有没有采回新快照(不分结局)。"""
+    return (after.last_seen is not None
+            and (before.last_seen is None or after.last_seen > before.last_seen))
+
+
+def _run_gap_round(want: list[str], state: dict[str, _GapRow], plan: _GapPlan,
+                   force: bool, sheet_rows: list[dict], execute: bool,
+                   wait_min: int, out: list[str]) -> None:
+    """输入:本轮计划 + 上下文 → 输出:无(摘要写进 out)。见 `_close_gap` 头注。"""
+    stamp = datetime.now(kpi.CN_TZ).strftime("%Y%m%dT%H%M%S")
+    head = (f"⚠ 审不了 {plan.n_broken} 个 ASIN(不在库 {plan.n_absent} / "
+            f"无标题 {plan.n_broken - plan.n_absent}),待审但快照过旧 {plan.n_stale} 个"
+            f" → 推采集 {len(plan.push)} 个({_FRESH_HOURS} 小时内没有快照的)"
+            + (f";⚡ 重审开(-p force=1):含库里已有结论的 {plan.n_concluded} 个"
+               if force else ";重审关:库里已有结论的不推"))
+    if plan.hold:
+        head += (f";另有 {len(plan.hold)} 个审不了但 {_FRESH_HOURS} 小时内刚采过,"
+                 f"不重推(理由写表)")
+    out.append(head)
+    broken_push = {a for a in plan.push if state[a].broken}
+    if not plan.push:
+        # 只有 hold:什么都不推,只把"为什么不推"写进表
+        _note_gap(sheet_rows, set(plan.hold),
+                  {a for a in plan.hold if not state[a].in_db},
+                  dict(plan.hold), stamp, execute, out)
+        return
     if not execute:
-        out.append(f"{head} —— 真跑时会推采集批次 {_GAP_PREFIX}{day}、"
-                   f"等它采完(最多 {wait_min} 分钟)、就地按批摄取,"
-                   f"**采回来的这一轮就审掉**;仍缺的把理由写进表格「具体内容」列"
-                   f"(dry-run 一格未写)")
-        _note_gap(sheet_rows, set(gap), set(absent), {}, day, False, out)
+        out.append(f"  真跑时会推采集批次 {_GAP_PREFIX}{stamp}、等它采完"
+                   f"(最多 {wait_min} 分钟)、就地按批摄取,**采回来的这一轮就审掉**;"
+                   f"审不了又没等到的把理由写进表格「具体内容」列(dry-run 一格未写)")
+        reasons = {a: f"将推采集 {_GAP_PREFIX}{stamp}(dry-run,未推)"
+                   for a in broken_push}
+        reasons.update(plan.hold)
+        _note_gap(sheet_rows, broken_push | set(plan.hold),
+                  {a for a in broken_push | set(plan.hold) if not state[a].in_db},
+                  reasons, stamp, execute, out)
         return
 
-    out.append(head)
-    sent = _push_gap(gap, day, out)
-
+    sent, push_failed = _push_gap(plan.push, stamp, out)
     if not sent:
-        out.append("  一个批次都没推成:本轮这些行审不了,理由照写")
+        out.append("  一个批次都没推成:审不了的这些行本轮判不了,理由照写")
     elif wait_min <= 0:
-        out.append(f"  gap_wait=0:只推不等,这批退回下轮审"
-                   f"(采回来在 {_GAP_PREFIX}{day},下一轮自动捞起)")
+        out.append(f"  gap_wait=0:只推不等,审不了的这批退回下轮审"
+                   f"(采回来在 {', '.join(n for n, _ in sent)},下一轮自动捞起)")
     else:
         line, stuck = scrape_batches.wait_settled([n for n, _ in sent],
                                                   wait_min)
         out.append(f"  {line}")
         if stuck:
-            out.append(f"  ⚠ {stuck} 个批次超时仍在跑:这部分退回下轮审"
-                       f"(已采到的下面就摄进来)")
+            out.append(f"  ⚠ {stuck} 个批次超时仍在跑:审不了的退回下轮审,"
+                       f"在库的用现有数据审(已采到的下面就摄进来)")
         out.append(f"  {_ingest_batches([n for n, _ in sent])}")
 
-    # ④ 复查:摄取之后还缺谁。**必须重查库** —— 拿推送前那份 gap 写理由的话,
-    #    刚采回来的那些会被误报成"未采集",而它们其实这一轮就要被判掉
-    still_absent, still_degraded = _find_gap(want)
-    still = set(still_absent) | set(still_degraded)
-    rescued = len(gap) - len(still & set(gap))
+    # ④ 复查:摄取之后谁回来了、谁还审不了。**必须重查库** —— 拿推送前那份
+    #    写理由的话,刚采回来的那些会被误报成"未采集",而它们其实这一轮就要被判掉
+    after = _gap_state(want)
+    back = {a for a in plan.push if _came_back(state[a], after[a])}
+    rescued = [a for a in broken_push if not after[a].broken]
     if rescued:
-        out.append(f"  ✅ 补采回来 {rescued} 个,**本轮就审**(已进候选)")
+        out.append(f"  ✅ 补采回来 {len(rescued)} 个,**本轮就审**(已进候选)")
+    if plan.n_stale:
+        refreshed = sum(1 for a in plan.push
+                        if not state[a].broken and a in back)
+        out.append(f"  🔄 快照过旧的 {plan.n_stale} 个:刷新到 {refreshed} 个"
+                   f",没等到的 {plan.n_stale - refreshed} 个用现有数据审")
+    still = {a for a in want if after[a].broken and not after[a].concluded}
     if still:
         out.append(f"  ⚠ 仍缺 {len(still)} 个:理由写进表格「具体内容」列,下轮重试")
-    _note_gap(sheet_rows, still, set(still_absent),
-              _gap_reasons(sent) if still else {}, day, True, out)
+    reasons = _explain_still(still, plan, state, after, sent, push_failed,
+                             wait_min)
+    _note_gap(sheet_rows, still, {a for a in still if not after[a].in_db},
+              reasons, stamp, execute, out)
+
+
+def _explain_still(still: set, plan: _GapPlan, before: dict[str, _GapRow],
+                   after: dict[str, _GapRow], sent: list[tuple[str, object]],
+                   push_failed: dict[str, str], wait_min: int) -> dict[str, str]:
+    """输入:仍审不了的 ASIN + 本轮上下文 → 输出:{asin: 一句真话}。
+
+    优先级:推送失败 > 新鲜期内没推 > 本轮采回来的结局(not_found 等)> 采集侧
+    失败明细(error_type)> 推了没等到。此前四种失败都写"已推采集但本轮没等到":
+    推送根本没成、采回来是 404、批次在采集侧消失,运营看到的都是"在排队"。
+    """
+    by_batch = _gap_reasons(sent) if still else {}
+    pushed = set(plan.push)
+    out: dict[str, str] = {}
+    for a in still:
+        b, r = before[a], after[a]
+        if a in push_failed:
+            out[a] = f"推送采集失败:{push_failed[a]}"
+        elif a in plan.hold:
+            out[a] = plan.hold[a]
+        elif _came_back(b, r) and r.outcome not in (None, "ok"):
+            out[a] = (f"本轮采到但结局 {r.outcome}"
+                      f"({_OUTCOME_CN.get(r.outcome, '未登记结局')})")
+        elif _came_back(b, r):
+            out[a] = "本轮采到了但没有标题(页面结构变了或被拦)"
+        elif a in by_batch:
+            out[a] = f"采集失败:{by_batch[a]}"
+        elif a in pushed and wait_min <= 0:
+            out[a] = "已推采集(gap_wait=0 只推不等),下轮重试"
+        elif a in pushed:
+            out[a] = f"已推采集但等了 {wait_min} 分钟没等到,下轮重试"
+        else:
+            out[a] = "本轮没推(不在推送范围),下轮再看"
+    return out
 
 
 def _note_gap(sheet_rows: list[dict], still: set, absent: set,
-              reasons: dict[str, str], day: str, execute: bool,
+              reasons: dict[str, str], stamp: str, execute: bool,
               out: list[str]) -> None:
-    """输入:待审行 + 仍缺集合 + 采集侧理由 → 输出:无(写「具体内容」列,摘要进 out)。
+    """输入:待审行 + 仍缺集合 + 理由 → 输出:无(写「具体内容」列,摘要进 out)。
 
     ⚠ **只写「具体内容」,「审核结果」一个字不动**。「审核结果」一有值这行就不再被
     `audit_targets` 领走,
@@ -1247,10 +1464,8 @@ def _note_gap(sheet_rows: list[dict], still: set, absent: set,
             continue
         why = ("未采集(库里没有这个 ASIN)" if r["asin"] in absent
                else "采集降级(采到了但没有标题)")
-        det = reasons.get(r["asin"])
-        notes.append((r["rownum"],
-                      f"{why};采集失败:{det}({day})" if det
-                      else f"{why},已推采集但本轮没等到,下轮重试({day})"))
+        det = reasons.get(r["asin"]) or "原因未知,下轮重试"
+        notes.append((r["rownum"], f"{why};{det}({stamp[:8]})"))
     try:
         n = listing_sheet.write_audit_notes(notes, execute)
         out.append(f"  表格「具体内容」列{'已写' if execute else '**将**写'} "
@@ -1259,6 +1474,7 @@ def _note_gap(sheet_rows: list[dict], still: set, absent: set,
     except Exception as e:                                      # noqa: BLE001
         logger.warning("缺数据原因回写失败(不影响本轮): %s", e)
         out.append(f"  ⚠ 原因回写飞书失败:{e}(采集已推,下轮重试回写)")
+
 
 
 # 连接余量钳制已抽到 services/db_guard(list_new 的 LLM 出参期共用同一护栏);
@@ -1671,7 +1887,8 @@ def run(params: dict) -> str:
         # —— 不需要第二遍判定循环,也不用等到第二天
         sheet_head += _close_gap(sheet_want, sheet_rows, execute,
                                  int(params.get("gap_wait",
-                                                _GAP_WAIT_MIN)))
+                                                _GAP_WAIT_MIN)),
+                                 force=_forced_sheet(params))
         params = {**params, "asins": ",".join(sheet_want)}
 
     where, extra = _pick_where(params)

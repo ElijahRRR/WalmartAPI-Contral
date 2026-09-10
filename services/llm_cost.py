@@ -21,23 +21,26 @@ from registry import resources
 _M = 1_000_000
 
 
-def _money(usd: float) -> str:
-    """输入:金额 → 输出:带**足够有效位**的字符串。
+def money(v: float) -> str:
+    """输入:金额(币种见 registry.LLM_PRICE_CURRENCY)→ 输出:带**足够有效位**的字符串。
 
     ⚠ 固定两位小数在这里等于没报:一轮 200 条的抽样常常只花几厘钱,
-    打出来就是 `$0.00` —— 而"拿抽样推整轮预算"正是这行字存在的唯一理由
-    (所有者 2026-08-21 实遇:合计与两个用途全是 $0.00,推不出任何东西)。
+    打出来就是 `¥0.00` —— 而"拿抽样推整轮预算"正是这行字存在的唯一理由
+    (所有者 2026-08-21 实遇:合计与两个用途全是 0.00,推不出任何东西)。
     小额自动加位到能看出量级为止。
+    符号从 registry 取:2026-09-10 币种由美元改回人民币(官方只标人民币),
+    写死符号会让"改一处币种"变成满仓找 '$'。**渲染金额只准走本函数**。
     """
-    if usd >= 0.01:
-        return f"${usd:.2f}"
-    if usd >= 0.0001:
-        return f"${usd:.4f}"
-    return f"${usd:.6f}" if usd else "$0"
+    sym = resources.LLM_PRICE_SYMBOL
+    if v >= 0.01:
+        return f"{sym}{v:.2f}"
+    if v >= 0.0001:
+        return f"{sym}{v:.4f}"
+    return f"{sym}{v:.6f}" if v else f"{sym}0"
 
 
 def cost_of(model: str, tier: str, row: dict) -> float | None:
-    """输入:模型 + 时段 + 一行用量计数 → 输出:USD 金额,或 None(该模型无计价)。
+    """输入:模型 + 时段 + 一行用量计数 → 输出:金额(元),或 None(该模型无计价)。
 
     输入 token 分两档算:命中前缀缓存的便宜一个数量级。供应商没回
     cache_hit/cache_miss 拆分时(两者都是 0)退回按 prompt_tokens 全额
@@ -81,27 +84,38 @@ def summarize(usage_stats: dict, items: int = 0) -> list[str]:
             agg["cost"] += c
             total_cost += c
 
-    legacy = {m for (m, _, _) in usage_stats if m in resources.LLM_LEGACY_ALIASES}
+    retired = {m: resources.LLM_RETIRED_MODELS[m] for (m, _, _) in usage_stats
+               if m in resources.LLM_RETIRED_MODELS}
     lines = []
     for purpose, a in sorted(by_purpose.items()):
         hit, miss = a["cache_hit"], a["cache_miss"]
         cache = f",缓存命中 {hit / (hit + miss):.0%}" if (hit + miss) else ""
-        money = (f" ≈ {_money(a['cost'])}"
-                 if not (a["models"] & unpriced) else "(该模型无计价)")
+        cost_txt = (f" ≈ {money(a['cost'])}"
+                    if not (a["models"] & unpriced) else "(该模型无计价)")
         lines.append(
             f"  {purpose}:调用 {a['calls']} 次,"
             f"入 {a['prompt'] / _M:.2f}M / 出 {a['completion'] / _M:.2f}M token"
-            f"{cache}{money}")
-    per_k = (f",合 {_money(total_cost / items * 1000)} / 千条"
+            f"{cache}{cost_txt}")
+    per_k = (f",合 {money(total_cost / items * 1000)} / 千条"
              if items and total_cost else "")
-    head = (f"LLM 用量合计 ≈ {_money(total_cost)}{per_k}"
+    head = (f"LLM 用量合计 ≈ {money(total_cost)}{per_k}"
             if total_cost else "LLM 用量(无可计价模型)")
-    if legacy:
-        # 停用日期已过还在用 = 随时可能整条链一起挂,且不会提前预警
-        head += (f";⚠ **{sorted(legacy)} 是官方已宣布停用的旧别名**"
-                 f"(现路由到 {sorted({resources.llm_priced_model(m) for m in legacy})}),"
-                 f"生产请在 .env 写死 DEEPSEEK_MODEL=<正式模型名> —— "
-                 f"别名一旦切断,全仓 LLM 调用同时失败")
+    if retired:
+        # 退役名还在用 = 随时可能整条链一起挂,且不会提前预警
+        head += (";⚠ **在用已退役的模型名**:" + "、".join(
+            f"{m}({why})" for m, why in sorted(retired.items()))
+            + f";计价按 {sorted({resources.llm_priced_model(m) for m in retired})} 折算,"
+              "生产请在 .env 把 DEEPSEEK_MODEL 写成 GET /models 返回的名字 —— "
+              "退役名一旦真的切断,全仓 LLM 调用同时失败")
+    routed = {m: resources.LLM_ROUTED_MODELS[m] for (m, _, _) in usage_stats
+              if m in resources.LLM_ROUTED_MODELS}
+    if routed:
+        # 路由期结束(V4.1 Pro 上线)单价与实际模型都会变,官方不来通知 ——
+        # 每轮点名比"记得几个月后复核"靠得住
+        head += (";ℹ 官方路由期:" + "、".join(
+            f"{m} 的请求实际跑 {tgt}、按 {tgt} 单价计费" for m, tgt in sorted(routed.items()))
+            + "(V4.1 Pro 上线后单价与实际模型都会变,复核 "
+              "registry.LLM_MODEL_ALIASES)")
     if unpriced:
         # 静默按 0 计价 = 假账。点名说哪个模型没价,让人知道这个数字不全
         head += (f";⚠ 未计价模型 {sorted(unpriced)} —— 在 "
@@ -110,4 +124,4 @@ def summarize(usage_stats: dict, items: int = 0) -> list[str]:
     return [head, *lines]
 
 
-__all__ = ["cost_of", "summarize"]
+__all__ = ["cost_of", "money", "summarize"]

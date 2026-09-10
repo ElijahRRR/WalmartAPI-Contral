@@ -39,6 +39,16 @@ from workflows import product_audit as pa
 from tests.test_list_new import _sheet_row
 
 
+@pytest.fixture(autouse=True)
+def _freshness_without_db(monkeypatch):
+    """`list_new._push_scrape` 2026-09-10 起先查 `amz_source.latest_seen`(读库)。
+    本文件的用例全靠打桩不连库,缺省当"从没采过"(全部过旧 ⇒ 推全部,即 2026-09-10
+    之前的形态);要验新鲜判据的用例自己再打一次桩(后打的赢)。"""
+    monkeypatch.setattr(ln.amz_source, "latest_seen", lambda asins: {
+        a: ln.amz_source.Seen(None, None, False) for a in asins})
+
+
+
 # ── ① 领任务:A 有值且 E 为空 ─────────────────────────────────────────────
 
 def test_audit_targets_takes_blank_audit_result_only(monkeypatch):
@@ -175,14 +185,17 @@ def test_project_to_sheet_writes_the_audit_columns_and_leaves_absent_blank(
     writes = []
     monkeypatch.setattr(listing_sheet, "write_audit_cols",
                         lambda ups, execute: (writes.extend(ups), len(ups))[1])
-    out = pa._project_to_sheet([
+    claimed = [
         {"rownum": 2, "asin": "B0OK"},
         {"rownum": 3, "asin": "B0NO"},
         {"rownum": 4, "asin": "B0NONE"},
         {"rownum": 5, "asin": "B0OK"},        # 同 ASIN 多行(不同店铺)都要写
         {"rownum": 6, "asin": "B0NEW"},
         {"rownum": 7, "asin": "B0PEND"},
-    ], True)
+    ]
+    monkeypatch.setattr(listing_sheet, "read_rows",
+                        lambda upto=None: [{**r, "audit_result": ""} for r in claimed])
+    out = pa._project_to_sheet(claimed, True)
     by_row = dict(writes)
     assert set(by_row) == {2, 3, 5, 6, 7}          # 第 4 行留空,一格没动
     assert by_row[2] == ["沃标题", "Cups", "pass", "", "", "2026-08-16"]
@@ -202,9 +215,46 @@ def test_project_failure_only_warns(monkeypatch):
     def _boom():
         raise RuntimeError("飞书 5xx")
     monkeypatch.setattr(pa.db, "pg_conn", _boom)
+    monkeypatch.setattr(listing_sheet, "read_rows", lambda upto=None: [])
     out = pa._project_to_sheet([{"rownum": 2, "asin": "B0OK"}], True)
     assert "回填失败" in out and "飞书 5xx" in out
     assert "from_sheet=1" in out            # 告诉人怎么补写
+
+
+def test_projection_reconciles_rows_whose_sheet_result_drifted_from_db(monkeypatch):
+    """整表对账(2026-09-10):没领的行也与库里比,「审核结果」不一致的改写。
+
+    命门是「表 pass / 库 pending」:上架链刷新时 slow_hash 一变,库里 approved 翻回
+    pending,表上仍写着 pass —— 审核只领 E 空/pending 的行,上架只认库里 approved,
+    这行从此没人再碰。对账把它改回 pending,下轮就重领重判。
+    表有结论、库里没有的行(人工填的)不动,只点名。
+    """
+    at = dt.datetime(2026, 9, 10, 9, 30)
+    monkeypatch.setattr(pa.db, "pg_conn", lambda: _Conn([
+        ("B0SYNC", "t1", "Cups", "approved", "", at, None),        # 表 pass = 库 approved
+        ("B0FLIP", "t2", "Pans", "pending", "", at, "内容变了,待重审"),  # 表 pass / 库 pending
+        ("B0BACK", "t3", "Mugs", "approved", "", at, None),        # 表 reject / 库 approved(点名重审翻案)
+        ("B0NEWR", "t4", "Pots", "approved", "", at, None),        # 本轮领的行
+    ]))
+    monkeypatch.setattr(listing_sheet, "read_rows", lambda upto=None: [
+        {"rownum": 2, "asin": "B0SYNC", "audit_result": "pass"},
+        {"rownum": 3, "asin": "B0FLIP", "audit_result": "pass"},
+        {"rownum": 4, "asin": "B0BACK", "audit_result": "reject"},
+        {"rownum": 5, "asin": "B0HAND", "audit_result": "pass"},   # 库里没有:人工填的
+        {"rownum": 6, "asin": "B0NEWR", "audit_result": ""},
+    ])
+    writes = []
+    monkeypatch.setattr(listing_sheet, "write_audit_cols",
+                        lambda ups, execute: (writes.extend(ups), len(ups))[1])
+    out = pa._project_to_sheet([{"rownum": 6, "asin": "B0NEWR"}], True)
+    by_row = dict(writes)
+    assert set(by_row) == {3, 4, 6}            # 同步的第 2 行、人工的第 5 行一格不动
+    assert by_row[3][2] == "pending" and by_row[3][4] == "内容变了,待重审"
+    assert by_row[4][2] == "pass"
+    assert by_row[6][2] == "pass"
+    assert "本轮领的 1 行 + 整表对账改写 2 行" in out
+    assert "表 pass / 库 pending" in out
+    assert "1 行表上有结论、库里没有" in out and "清空" in out
 
 
 def test_write_audit_cols_stays_inside_the_audit_columns(monkeypatch):
@@ -521,11 +571,31 @@ def test_header_drift_stops_every_read(monkeypatch):
 #   · 每一种失败都要出现在摘要里。
 
 
-class _GapCur:
-    """假游标:_SQL_GAP 每次调用返回队列里的下一份"库里现状"。"""
+class _GapWorld:
+    """假的"库里现状"队列:`_gap_state` 每调一次消费一份(推送前一份、摄取后一份)。
+
+    一份现状同时喂两条腿 —— 身份 SQL(在库/标题/结论)与 `amz_source.latest_seen`
+    (最近快照/结局/新鲜)—— 两腿必须读同一份,否则复查时一腿看到"推送前"、
+    一腿看到"摄取后",正是这段代码要防的错位。
+    """
 
     def __init__(self, queue):
-        self._q, self._out = queue, ()
+        self._q, self.cur = queue, []
+
+    def pop(self):
+        self.cur = self._q.pop(0) if self._q else []
+        return self.cur
+
+    def seen(self, asins):
+        by = {r[0]: r for r in self.cur}
+        return {a: (pa.amz_source.Seen(by[a][4], by[a][5], bool(by[a][6]))
+                    if a in by else pa.amz_source.Seen(None, None, False))
+                for a in asins}
+
+
+class _GapCur:
+    def __init__(self, world):
+        self._w, self._out = world, ()
 
     def __enter__(self):
         return self
@@ -534,15 +604,16 @@ class _GapCur:
         return False
 
     def execute(self, sql, args=None):
-        self._out = self._q.pop(0) if self._q else []
+        assert "catalog.products" in sql          # 身份那一腿
+        self._out = [r[:4] for r in self._w.pop()]
 
     def fetchall(self):
         return self._out
 
 
 class _GapConn:
-    def __init__(self, queue):
-        self._q = queue
+    def __init__(self, world):
+        self._w = world
 
     def __enter__(self):
         return self
@@ -551,7 +622,7 @@ class _GapConn:
         return False
 
     def cursor(self):
-        return _GapCur(self._q)
+        return _GapCur(self._w)
 
 
 def _st(asin, *, in_db=True, title=True, status=None, seen=None,
@@ -589,8 +660,9 @@ def _stub(monkeypatch, states, *, pushed=None, notes=None, calls=None,
     trace = calls if calls is not None else []
     # ⚠ 队列必须**跨连接共享**:_find_gap 每次开一条新连接,每条各拿一份
     #   完整副本的话第二次复查又读到"推送前"那一份 —— 那正是这段要防的 bug
-    shared = [list(x) for x in states]
-    monkeypatch.setattr(pa.db, "pg_conn", lambda: _GapConn(shared))
+    world = _GapWorld([list(x) for x in states])
+    monkeypatch.setattr(pa.db, "pg_conn", lambda: _GapConn(world))
+    monkeypatch.setattr(pa.amz_source, "latest_seen", world.seen)
     monkeypatch.setattr(pa.scrape_batches, "check_open",
                         lambda p, h: open_lines or ["无在途采集批次"])
     monkeypatch.setattr(pa.scrape_batches, "record", lambda *a, **k: None)

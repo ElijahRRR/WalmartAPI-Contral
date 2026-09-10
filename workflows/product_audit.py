@@ -56,6 +56,8 @@ L0 品牌文案扫描扫到的黑名单词里,来源标着 TRO 的那些在真�
 表里审核结果为空只说明表里没有结论,库里可能早就有。
 已有结论的直接投影回表(零 LLM),只有 `_DEFAULT_CANDIDATE` 认定的真待审
 (未审 / pending 过退避)才进判定引擎 —— 什么时候才重审见那条常量的注释。
+投影按**整表对账**(2026-09-10):没领的行也逐行与库里比,「审核结果」与库不一致的
+改写(表 pass / 库 pending 的行由此回到待审通道),见 `_project_to_sheet`。
 领取口径含 **「审核结果」=pending**(2026-08-17):pending 是中间态不是结论,
 写进那一格之后若不再领回来,那批就永久停在表上的 `pending`(见 `listing_sheet.audit_targets`)。
 
@@ -107,7 +109,7 @@ from datetime import datetime
 
 from api import scraper
 from registry import db, resources
-from services import audit_l3, audit_pool, audit_reason, audit_rules, \
+from services import amz_source, audit_l3, audit_pool, audit_reason, audit_rules, \
     audit_store, db_guard, kpi, \
     listing_sheet, policy_names, product_events, product_ingest, risk_trace, \
     scrape_batches, store_events, stores
@@ -928,11 +930,22 @@ def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
       摘要里点名有多少行卡在这。
     · 同一个 ASIN 可能在表里有**多行**(不同店铺),按 ASIN 回填到每一行。
 
+    **整表对账**(2026-09-10):本轮领的行照旧全写;没领的行(表上已有结论)也逐行
+    与库里比,「审核结果」与库不一致的**改写**。没有这一步的话,上架链刷新时
+    slow_hash 一变、库里 approved 翻回 pending,表上仍写着 pass —— 审核只领 E 空
+    或 pending 的行,上架只认库里的 approved,这行从此没有任何调度再碰它
+    (2026-09-09 链路核对实证)。改写后 E 变 pending,下轮自然重领、重判、再投影。
+    表有结论而库里没有(人工填的)的行不动,只在摘要点名:要审就把那格清空。
+
     回填失败只告警不失败:结论已经落 PG 了(products 审核六列 + audit_runs),
     飞书只是人机界面 —— 与订单中心那条同款纪律。
     """
     try:
-        asins = sorted({r["asin"] for r in sheet_rows})
+        claimed = {r["asin"] for r in sheet_rows}
+        # 整表窄读(只到「审核结果」那一列,与 audit_targets 同款,离 10MB 上限远)
+        all_rows = [r for r in listing_sheet.read_rows(upto="audit_result")
+                    if r.get("asin")]
+        asins = sorted({r["asin"] for r in all_rows} | claimed)
         with db.pg_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(_SQL_VERDICT, (asins,))
@@ -949,37 +962,63 @@ def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
             #   而其中 `General-Use Products` 是"以上全不中"的兜底 —— 单把它
             #   摆在一把锤子、一个土豆压泥器上时人只会一头雾水。真正的原因在
             #   命中的规则里,所以类别归类别列,人话归「具体内容」。
-            reasons = audit_store.reject_reasons(conn, asins)
-        updates, absent = [], 0
-        for r in sheet_rows:
-            row = got.get(r["asin"])
-            if not row or not row[3]:       # 库里没有 / 还没结论 → 留空
-                absent += 1
-                continue
+            # 先定要写哪些行,再只为这些行查命中明细(整表几千个 ASIN 不必全查)
+            to_write, absent, manual, reconciled = [], 0, 0, 0
+            # 本轮领的行:库里有结论就写(与 2026-08-16 起的行为逐字相同)
+            for r in sheet_rows:
+                row = got.get(r["asin"])
+                if not row or not row[3]:       # 库里没有 / 还没结论 → 留空
+                    absent += 1
+                    continue
+                to_write.append((r["rownum"], r["asin"]))
+            # 没领的行(表上已有结论):与库里对账,只改写不一致的
+            done = {rn for rn, _ in to_write}
+            for r in all_rows:
+                if r["rownum"] in done or r["asin"] in claimed:
+                    continue
+                row = got.get(r["asin"])
+                if not row or not row[3]:
+                    manual += 1                 # 表有结论、库没有:人工填的,不动
+                    continue
+                shown = (r.get("audit_result") or "").strip().lower()
+                want_val = listing_sheet.AUDIT_RESULT_CN.get(row[3], row[3])
+                if shown == want_val.lower():
+                    continue
+                to_write.append((r["rownum"], r["asin"]))
+                reconciled += 1
+            reasons = audit_store.reject_reasons(
+                conn, sorted({a for _, a in to_write}))
+
+        def _six(asin: str, row) -> list:
             _, title, pt, status, reason, at, detail = row
             why = detail or ""
             if not why and status == "rejected":     # 老行:按命中规则渲染
-                why = audit_reason.explain_hits(reasons.get(r["asin"], []))
+                why = audit_reason.explain_hits(reasons.get(asin, []))
             elif not why and status == "pending":    # 老行:待定原因在类别列里
                 why = reason or ""
-            updates.append((r["rownum"], [
-                title or "", pt or "",
-                listing_sheet.AUDIT_RESULT_CN.get(status, status),
-                (reason or "") if status == "rejected" else "",
-                why[:500],
-                at.strftime("%Y-%m-%d") if at else ""]))
+            return [title or "", pt or "",
+                    listing_sheet.AUDIT_RESULT_CN.get(status, status),
+                    (reason or "") if status == "rejected" else "",
+                    why[:500],
+                    at.strftime("%Y-%m-%d") if at else ""]
+
+        updates = [(rn, _six(a, got[a])) for rn, a in to_write]
         listing_sheet.write_audit_cols(updates, execute)
-        # ⚠ 回填的是**整张表里所有已有结论的行**,不是本轮判的那 limit 个 ——
-        # 库里早有结论的行本来就该把结论投影出来(那正是"从库里读结果")。
         # dry-run 必须说出真跑会写多少行:所有者 2026-08-16 实遇 dry-run 6 秒、
         # 真跑写了几万行,差异全在这一步而摘要当时只说"回填 0 行"
         out = (f"上架表{'回填' if execute else '**将**回填'} {len(updates)} 行审核六列"
-               f"(标题/PT/审核结果/类别/具体内容/审核日期;"
-               f"整表已有结论的都投影,不只本轮判的那些)"
+               f"(标题/PT/审核结果/类别/具体内容/审核日期;本轮领的 "
+               f"{len(updates) - reconciled} 行 + 整表对账改写 {reconciled} 行)"
                f"{'' if execute else ';dry-run 一格未写'}")
+        if reconciled:
+            out += (f";⚠ 对账改写的 {reconciled} 行是表上结论与库不一致的"
+                    f"(如表 pass / 库 pending:改成 pending 后下轮重领重判)")
         if absent:
             out += (f";⚠ {absent} 行库里没有结论,**「审核结果」留空**"
                     f"(下轮自动重领;没数据的那些见下方补采段,已推采集)")
+        if manual:
+            out += (f";{manual} 行表上有结论、库里没有(人工填的):不领不审不上架,"
+                    f"要审就把「审核结果」清空")
         return out
     except Exception as e:                                      # noqa: BLE001
         logger.warning("上架表回填失败(结论已在 PG,不影响本轮): %s", e)
@@ -994,10 +1033,9 @@ def _project_to_sheet(sheet_rows: list[dict], execute: bool) -> str:
 _GAP_PREFIX = "audit_gap_"
 _GAP_CHUNK = 5000          # 单批上限(表驱动的缺口通常几十个,这是护栏不是常态)
 _GAP_TIMEOUT_H = 24        # 超过一天没采完就标 timeout(下一轮按新鲜度判据重推)
-#: 「N 小时内有快照」就不重推(所有者定稿 2026-09-10:「12 小时内没有快照的才推」)。
-#: 快照**不分结局**:采到 not_found / blocked 也算"采过" —— 12 小时内再推大概率还是
-#: 同一结果,这条同时就是失败重推的冷却期(此前 not_found 的品每天换名重推、永不收敛)。
-_FRESH_HOURS = 12
+#: 「N 小时内有快照」就不重推(所有者定稿 2026-09-10)。**常量与判据只在
+#: `services/amz_source` 出生**(上架链刷新同一口径),这里只是取个短名。
+_FRESH_HOURS = amz_source.SNAPSHOT_FRESH_HOURS
 #: 库里算"有结论"的状态。pending 是中间态不是结论(2026-08-17 定稿),未审 = NULL。
 _CONCLUDED = frozenset({"approved", "rejected"})
 # 等采集多久(分钟)。所有者 2026-09-10 定稿上限调到 60(此前 20):采集侧对可重试
@@ -1016,28 +1054,16 @@ _OUTCOME_CN = {
     "stale": "采集器判为过期数据",
 }
 
-# 一次查清每个待审 ASIN:在不在库 / 有没有标题 / 有没有结论,以及**最近一次快照**
-# (不分结局)的时刻、结局、是否在新鲜期内。快照那一腿走
-# (marketplace, asin, scraped_at DESC) 索引,几百个 ASIN 一次 LATERAL 就够。
-# ⚠ 新鲜与否在库端按 now() 算,不拿应用侧时钟比 timestamptz(时区一错就是 8 小时)。
-_SQL_GAP_STATE = """
+# 每个待审 ASIN 在库里的身份现状:在不在库 / 有没有标题 / 有没有结论。
+# 最近一次快照那一腿走 `amz_source.latest_seen`(新鲜判据唯一出处)。
+_SQL_GAP_PRODUCTS = """
 SELECT w.asin,
-       p.asin IS NOT NULL                                       AS in_db,
-       coalesce(p.title, '') <> ''                              AS has_title,
-       p.audit_status,
-       s.scraped_at                                             AS last_seen,
-       s.outcome                                                AS last_outcome,
-       coalesce(s.scraped_at >= now() - make_interval(hours => %(fresh_h)s::int),
-                false)                                          AS fresh
+       p.asin IS NOT NULL               AS in_db,
+       coalesce(p.title, '') <> ''      AS has_title,
+       p.audit_status
 FROM unnest(%(asins)s::text[]) AS w(asin)
 LEFT JOIN catalog.products p
        ON p.marketplace = 'US' AND p.asin = w.asin
-LEFT JOIN LATERAL (
-    SELECT scraped_at, outcome
-    FROM catalog.snapshots s
-    WHERE s.marketplace = 'US' AND s.asin = w.asin
-    ORDER BY scraped_at DESC
-    LIMIT 1) s ON true
 """
 
 
@@ -1062,15 +1088,24 @@ class _GapRow:
 
 
 def _gap_state(want: list[str]) -> dict[str, _GapRow]:
-    """输入:待审 ASIN → 输出:{asin: _GapRow}(每个都有一行;查不到的按不在库算)。"""
+    """输入:待审 ASIN → 输出:{asin: _GapRow}(每个都有一行;查不到的按不在库算)。
+
+    两腿:身份现状查 `catalog.products`;最近一次快照走 `amz_source.latest_seen`
+    (先查身份再查快照,测试夹具按这个次序喂数)。
+    """
     with db.pg_conn() as conn, conn.cursor() as cur:
-        cur.execute(_SQL_GAP_STATE,
-                    {"asins": list(want), "fresh_h": _FRESH_HOURS})
+        cur.execute(_SQL_GAP_PRODUCTS, {"asins": list(want)})
         rows = cur.fetchall()
-    out = {r[0]: _GapRow(bool(r[1]), bool(r[2]), r[3], r[4], r[5], bool(r[6]))
-           for r in rows}
+    seen = amz_source.latest_seen(want)
+    out: dict[str, _GapRow] = {}
+    for r in rows:
+        s = seen.get(r[0]) or amz_source.Seen(None, None, False)
+        out[r[0]] = _GapRow(bool(r[1]), bool(r[2]), r[3],
+                            s.scraped_at, s.outcome, bool(s.fresh))
     for a in want:
-        out.setdefault(a, _GapRow(False, False, None, None, None, False))
+        s = seen.get(a) or amz_source.Seen(None, None, False)
+        out.setdefault(a, _GapRow(False, False, None, s.scraped_at, s.outcome,
+                                  bool(s.fresh)))
     return out
 
 

@@ -82,6 +82,11 @@
 > 历史:2026-08-19 曾复议「在库待审行不做先刷新再审」;2026-09-10 改按新鲜度判
 > (上架表里的品在审核前没有任何刷新路径,13:00 `product_refresh` 只推在架品)。
 
+**投影整表对账**(2026-09-10):`_project_to_sheet` 除本轮领的行外,也把表上已有结论的行
+逐行与库里比,「审核结果」不一致的改写。命门是「表 pass / 库 pending」:上架链刷新时
+slow_hash 一变、库里 approved 翻回 pending,表上仍是 pass,审核不领、上架不放,没人再碰它;
+对账改回 pending 后下轮重领重判。新鲜判据(12 小时)审核链与上架链共用 `amz_source.latest_seen`。
+
 **历史结论短路**(`mode=backfill`):先查 `audit.audit_runs` 有没有旧结论,
 有就直接采用(零 LLM,detail 里带 `referenced_run_id`,不写新 run)。
 谓词必须排除 `stage_stopped_at='SHORTCUT'` 的影子行。

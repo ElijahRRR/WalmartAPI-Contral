@@ -8,6 +8,7 @@ api 层只做接口适配:认证(key 从环境变量,旧系统明文写 config.p
 映射用 max_tokens=4096;5xx/超时指数退避重试。
 """
 
+import datetime
 import json
 import threading
 import logging
@@ -19,20 +20,26 @@ import httpx
 logger = logging.getLogger("api.llm")
 
 _BASE_URL = "https://api.deepseek.com/chat/completions"
-# 全仓统一 **deepseek-v4-flash**(所有者定稿 2026-08-21:「LLM 都用
-# deepseek-v4-flash,审核和上架都是」)。模型名仍可经 .env 逐用途覆盖,
-# 换模型即换 llm_cache 键空间(缓存键含 model,自动失效无需清理)。
+# 全仓统一 **deepseek-v4-pro**(所有者定稿 2026-09-10:「把模型切换为 V4 Pro」),
+# 审核与上架同一个。模型名仍可经 .env 逐用途覆盖(registry.LLM_PURPOSE_ENV)。
 #
-# ⚠ 2026-08-21 把缺省值从 `deepseek-chat` 改成正式模型名。原因不是洁癖:
-#   ① `deepseek-chat` 是官方**已宣布停用**的旧别名(2026-04-24 公告:三个月后
-#      即 2026-07-24 停用;改这行时是 08-21,过期近一个月还能用纯属宽限)。
-#      一旦切断,L1 rerank / L3 / 上架属性映射 / variant_remap **同时失败**;
-#   ② 下面 `if "flash" in model` 那道「thinking 必须永远显式 disabled」的旧铁律
-#      在别名下**整条失效** —— 至今没出事只因 deepseek-chat 恰好就是非思考模式,
-#      那道保险一直是空的。改成正式名后它才真正生效。
-#   生产实见:.env 里 DEEPSEEK_MODEL 没设,一直在吃这个缺省值,而注释却写着
-#   "所有者确认生产用 deepseek-v4-flash" —— 自述与实际不符,靠缺省值兜住才对。
-_DEFAULT_MODEL = "deepseek-v4-flash"
+# 为什么切 Pro 反而是切到 V4.1 Flash:官方 2026-09-10 公告「在 V4.1 Flash 正式
+# 上线之后、V4.1 Pro 上线之前,我们会将对 V4 Pro 的请求全部路由到 V4.1 Flash,
+# 并按 V4.1 Flash 单价计费」。于是拿**官方文档里已有的 id** 就能用上 V4.1 Flash,
+# 不必去猜官方尚未公布的 V4.1 id(9/10 当天定价页与更新日志都还没有它)。
+#
+# ⚠ **路由期结束就是一次涨价**:V4.1 Pro 上线后这个 id 会变回真 Pro
+#   (未命中 4.5 倍、输出 3.4 倍),而官方不会来通知。所以摘要每轮点名路由期
+#   (registry.LLM_ROUTED_MODELS),复核动作写在 LLM_MODEL_ALIASES 那一行。
+# ⚠ **换模型 = 换 llm_cache 键空间**:v4-pro 故意不与 v4-flash 共用键空间
+#   (背后是两个模型、两套答案),所以切换当轮存量缓存全量作废、全额重付。
+#   大批重审排北京时间 18:00–次日 08:00 或周末(谷价)。
+# ⚠ 缺省值**不许**填 `deepseek-chat` / `deepseek-reasoner`(官方已宣布停用的
+#   旧别名,停用日 2026-07-24 已过,还能用纯属宽限期):一旦切断,L1 rerank /
+#   L3 / 上架属性映射 / variant_remap **同时失败**。
+#   生产实见:.env 里 DEEPSEEK_MODEL 没设,一直在吃这个缺省值 —— 所以这一行
+#   就是生产的实际模型,改它才是真的切换。
+_DEFAULT_MODEL = "deepseek-v4-pro"
 
 
 def _default_model() -> str:
@@ -83,22 +90,36 @@ def _extract_json(text: str) -> dict:
     return json.loads(s[start:end + 1])
 
 
+#: 已经为哪些模型抱怨过"thinking 未登记"(每个模型只吵一次,别刷满日志)
+_THINKING_WARNED: set = set()
+
+
 def _request_body(messages: list[dict], temperature: float,
                   max_tokens: int, purpose: str) -> dict:
     """输入:请求要素 → 输出:DeepSeek chat 请求体(纯函数,便于测试)。
 
-    v4-flash 家族官方**默认开 thinking**,旧仓铁律"必须永远显式下发
-    disable"(llm_routes.py:91-93/701;所有者确认生产 DEEPSEEK_MODEL=
-    deepseek-v4-flash,2026-08-13)——按模型名门控,非 flash 家族不发
-    该字段(未知字段可能被拒)。开关无条件生效、不存在两种变体并存,
-    故 llm_cache 键不含它(既有缓存零失效)。
+    DeepSeek 家族官方**默认开 thinking**,旧仓铁律"必须永远显式下发 disable"
+    (llm_routes.py:91-93/701)——本仓全链要的是非思考的 JSON 出参。
+    ⚠ 2026-09-10 从 `"flash" in model` 子串匹配改成 **registry.LLM_THINKING
+    登记表**:缺省模型切成 `deepseek-v4-pro` 的那一刻,子串门控整条失效
+    (名字里没有 flash),而那正是它最该生效的时候。表里没有的模型不下发该
+    字段(未知模型可能拒未知字段),但**点名警告一次** —— 静默跑在思考模式下
+    = 多花输出 token 且出参形状可能变,不该看不见。
+    开关无条件生效、不存在两种变体并存,故 llm_cache 键不含它。
     """
+    from registry import resources
     model = model_for(purpose)
     body = {"model": model, "messages": messages,
             "temperature": temperature, "max_tokens": max_tokens,
             "response_format": {"type": "json_object"}}
-    if "flash" in model:
-        body["thinking"] = {"type": "disabled"}
+    thinking = resources.llm_thinking(model)
+    if thinking is not None:
+        body["thinking"] = thinking
+    elif model not in _THINKING_WARNED:
+        _THINKING_WARNED.add(model)
+        logger.warning("模型 %s 未登记 thinking 开关(registry.LLM_THINKING),"
+                       "本次不下发该字段 —— 若它默认开思考模式,输出 token 会"
+                       "多花且出参形状可能变;请补一行登记", model)
     return body
 
 
@@ -145,9 +166,8 @@ def record_usage(model: str, purpose: str, usage: dict | None,
     一轮跑几小时会跨越峰谷分界,事后按"现在是什么时段"统一折算必然算错。
     `usage` 缺失(供应商不回)只累加 calls,其余留 0 —— 少算不瞎算。
     """
-    import datetime as _dt
     from registry import resources
-    now = at or _dt.datetime.now(_dt.timezone.utc)
+    now = at or datetime.datetime.now(datetime.timezone.utc)
     tier = resources.llm_price_tier(now)
     u = usage or {}
     key = (model, purpose, tier)

@@ -574,6 +574,14 @@ CREATE TABLE listing.sku_migrations (   -- 改码过程台账(2026-09-02,SKU 改
     submitted_at / settled_at timestamptz,
     sheet_synced_at timestamptz,        -- 2026-09-06 起**不再使用**,恒 NULL(见下)
     error text, detail jsonb DEFAULT '{}', created_at timestamptz DEFAULT now()
+                                        -- detail 的键:提交时留的凭据
+                                        -- product_id / product_id_type / price /
+                                        -- weight / weight_reason;
+                                        -- **receipt_code**(2026-09-10 加,回滚时才写)
+                                        -- = 沃尔玛逐条回执码,给候选判据
+                                        -- 「非改码永久拒」当判据源(见状态段末尾)。
+                                        -- 码为空(观测反证回滚,压根没有回执)就
+                                        -- **一个键都不写**:别把"没有码"记成"码是空"
 );
 -- 索引:sku_migrations_open_uidx UNIQUE (store, old_sku) WHERE status='pending'
 --       (同 (店,旧码) 只允许一条在途改码 = 崩溃重入的防重键;**不含 double 行**,
@@ -602,6 +610,11 @@ CREATE TABLE listing.sku_migrations (   -- 改码过程台账(2026-09-02,SKU 改
 -- 吐回(僵尸列表,docs/backlog.md §十三),A131吕灿荣 43 条 double 里 41 条属于此类。
 -- 两条证据缺一不可;探不出来(凭证/GET 失败)一律 fail-closed 仍判 double。留在 double
 -- 里的是**真双挂**(wpid 不同,或旧码单查 200),仍等人工。
+-- ⚠ **2026-09-10 起 rolled_back 行会带 detail.receipt_code**(§9.15 七):回执码落进
+-- detail(不写进 error —— error 是人话,会随沃尔玛措辞漂),候选判据第十一条
+-- 「非改码永久拒」按 detail->>'receipt_code' = ANY(resources.WALMART_ERR_MIGRATE_PERMANENT)
+-- 把那条旧码剔出改码候选面:Product ID 本身不合规(GS1 受限号段),同一个号重发必再拒,
+-- 出路是换一个合规 UPC(换号 ≠ 改码)。存量行的一次性回填 SQL 在 docs/sku_plan.md §9.15 七。
 -- sheet_synced_at:**2026-09-06 起不再使用**(所有者定稿:改码不回写上架表 ——
 -- 「我们批量修改在线产品的 sku 无需回填上架表行,上架表我经常会清理,我们的 sku
 -- 和对应的来源码已经填写到在线产品表格中了。上架表中的 sku 列由上架的填写即可。」)。

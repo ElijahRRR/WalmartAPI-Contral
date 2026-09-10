@@ -1955,3 +1955,91 @@ A131吕灿荣 实证:`-p limit=500` 只发出 45 条 —— 候选 SQL 先按 `L
 在架行)整店取回,三道后置闸(在途 feed / 死档 / Product ID 撞号)过完**再**按
 `-p limit` 截,截掉的在摘要里说出口(「合格候选 N 个,只发前 M 个,其余下一轮」)。
 上限 0 的早退不变,`_pick_report` 的「没轮到」理由不变。
+
+#### 七、Product ID 不合规的品不改码(2026-09-10 追加,所有者实证)
+
+**现场**:A171罗尹鸿 两条改码被沃尔玛拒,逐条回执码
+`EXT_DATA_ERROR_54514906640101`,原文
+
+> [GTINValidation] This Product ID is designated for special applications in
+> restricted environments and cannot be used. Please provide a valid Product ID
+> to complete setup.
+
+两个品的 GTIN(`00263641141000` / `02153217103755`)落在 GS1 的**受限流通号段**
+(只发给特殊场景用,不许挂公开零售 listing)。
+
+**回滚机制本身是对的**:新码弃、旧码复活、**不自动补交**(写操作永不自动兜底)。
+坏在**回滚之后** —— 旧码复活就又满足其余十条判据,下一轮又进候选面、又 mint 一个
+新码、又发一条 MP_ITEM_MATCH、又被同一句话拒。**每轮白烧一个码和一次 feed**,而
+回执、摘要、日志全都"正常"(本仓最怕的那种坏法:错了不报错)。
+
+**被拒的是那个号,不是我们的载荷**:换一个合规 UPC 是**换号**(要走 UPC 池 +
+重上/改标那条路),不是改码 —— 不在本工作流范围。所以这类品的正解是
+**从候选面剔除并点名**,让所有者知道该去换号,而不是让改码链一轮一轮地重试。
+
+落地三处:
+
+1. `registry.resources.WALMART_ERR_MIGRATE_PERMANENT`(码集唯一出处,业务代码不写
+   字面量)。⚠ 它与 `WALMART_ERR_DESTRUCTIVE_PERMANENT` 是**两个 feed 面**,故意
+   不合并:那一集是 DELETE_ITEM / RETIRE_ITEM 的「不给做」(处置是人去 Seller
+   Center 转出 WFS),这一集是 MP_ITEM_MATCH 的「这个号不能用」(处置是换一个合规
+   UPC)。合成一集就等于让破坏面的码去挡改码、改码面的码去挡破坏。
+2. `_roll_back` 把**回执码**写进台账 `detail.receipt_code`(`_SQL_LEDGER_SETTLE` 里
+   `detail || jsonb_build_object(...)`,参数显式 `::text`)。为什么进 `detail` 而不是
+   接着用 `error`:`error` 存的是人话,会随沃尔玛措辞漂,拿它 LIKE 匹配就是把判据挂
+   在一句会漂的中文上。**码为空就一个键都不写** —— 观测反证的回滚根本没有回执,
+   写个空键会让"没有码"看起来像"码是空"。
+3. 候选判据**第十一条「非改码永久拒」**(`_CONDS`,候选 SQL 与理由 SQL 同源):
+   该 (店, 旧码) 没有一条 `rolled_back` 台账的 `detail->>'receipt_code'` 落在那张
+   码集里。落选人话直接给出路:「被拒的是**那个号**……要改码得先换一个合规 UPC ——
+   那是换号不是改码 —— 所以不再选它」。**首行不加计数**:它在候选面之外,与其余
+   十条判据一样,只在点名时逐条解释。
+
+⚠ **不为它开第二条路**:不按 error 文本兜底匹配(那是双轨,§六)、不自动换号、
+不自动补交。除这张码集之外的失败码一律按**临时**办(缺省即临时,与 registry 里
+两张终局清单同一条纪律),下一轮照旧重来。
+
+**存量回填(所有者手动跑一次,只跑一次)**:A171 那两条 `rolled_back` 行是改动**之前**
+写的,`detail` 里没有 `receipt_code`,判据看不见它们。回填 SQL:
+
+```sql
+UPDATE listing.sku_migrations
+   SET detail = detail || '{"receipt_code": "EXT_DATA_ERROR_54514906640101"}'::jsonb
+ WHERE status = 'rolled_back'
+   AND error LIKE '%EXT_DATA_ERROR_54514906640101%'
+   AND detail->>'receipt_code' IS NULL;
+```
+
+**为什么不让代码自动回填**:自动回填要按 `error` 文本反查(判据源从"码"退回"人话"),
+那就是同一条判据的第二条实现路径(§六 双轨禁止)——而且它会**每轮都跑一遍**去修
+一件只发生过一次的历史。存量只有这两条,人跑一次 SQL 是最小修法;跑完之后所有
+新回滚的行都自带 `receipt_code`,这段 SQL 再也用不上。跑之前建议先 `SELECT` 看一眼
+命中几行(应当就是 A171 那两条)。
+
+#### 八、摘要归并 + 通知超长保护(2026-09-10 追加,所有者实证)
+
+**现场**:A131吕灿荣 `-p settle_only=1` 一轮,上面第三节那句「旧码名下 executing 的
+{actions} 已迁到新码……」**逐条各占一行**,几百行;飞书应用通知回 400
+`code=230025`「The length of the message content reaches its limit」,而那家店又没配
+webhook 退路 ⇒ **整轮摘要一个字都没推出去**。
+
+两处各修各的病:
+
+- **摘要侧(病根)**:那句话是**信息不是告警** —— 每条都对、没有一条要人动手
+  (它是 §9.15 第三节设计好的后果)。`_confirm` 不再逐条拼这行,只把迁走的动作名
+  交回 `_settle`,由 `_settle` 汇总成**一行**:「维护账随码迁 N 条(inventory a、
+  price b、title c;样本 old→new ×5)—— 由维护链按新码观测落定,executed_at 不改」。
+  ⚠ `taken`(撞车,新码名下已有同动作未落定)与**破坏组**那两条 ⚠ **仍逐条** ——
+  它们才是待办,而且天然就少。归并的判据是"要不要人动手",不是"行数多不多"。
+- **通道侧(保险丝)**:`api/feishu.notify` 加长度闸。官方文本消息上限 150 KB
+  (错误码 230025 原句:「文本消息最大不能超过 150 KB、卡片及富文本消息最大不能
+  超过 30 KB」),按限额规矩取 ×95% = **145,920 字节**,常量
+  `_MESSAGE_TEXT_MAX_BYTES` 只在「限额登记表」出生(对照行同步进
+  `refdata/feishu_limits.tsv`)。超长时**保首行 + 尾部截断说明**(首行是链通知的
+  唯一内容,cli 只取它),截断**记 `logger.warning`**,不静默;闸放在应用直发与
+  webhook 的**分叉之前**,两条路都过 —— 放进某一条就是"换条路发就没有闸",而
+  webhook 恰恰是应用发不出去时的退路。⚠ 单位是**字节不是字符**:一个汉字 UTF-8
+  占 3 字节,按字符估会差三倍;切完 `decode(errors="ignore")`,不许切在半个字上。
+
+保险丝不是主防线(§六):摘要该短的还是要短 —— 通知超长这件事本身就是"摘要在逐条
+报不该逐条报的东西"的症状,警告文案里也把这句写给了下一个人。

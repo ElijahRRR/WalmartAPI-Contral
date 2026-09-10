@@ -638,6 +638,41 @@ def test_no_receipt_code_literals_in_business_sql():
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+#  ⑩′ 沃尔玛终局错误码不写字面量(2026-09-10,改码永久拒进场时补)
+# ══════════════════════════════════════════════════════════════════════════════
+
+#: 码集之家(铁律 3:一切表 ID / 口径只准从 registry 取)。
+_ERR_CODE_HOME = "registry/resources.py"
+
+#: 守的是"**判据用**的终局码集"三张:破坏面死档 / 破坏面永久拒 / 改码面永久拒。
+#: 它们各自挡着一条链的重发,散一个字面量出去就是第二处判据源 —— 而它坏起来
+#: **不报错**:registry 里加了新码,写字面量的那一处照旧只认老的那一个。
+_TERMINAL_CODE_SETS = ("WALMART_ERR_ITEM_GONE",
+                       "WALMART_ERR_DESTRUCTIVE_PERMANENT",
+                       "WALMART_ERR_MIGRATE_PERMANENT")
+
+
+def test_terminal_walmart_error_codes_are_not_spelled_out_in_code():
+    """终局错误码只准在 registry 出生,业务代码引用**常量名**。
+
+    2026-09-10 的实例:改码永久拒 `WALMART_ERR_MIGRATE_PERMANENT`
+    (GTINValidation:Product ID 落在 GS1 受限号段,重发必再拒)。它既是候选判据
+    的参数,又是落选人话里那句「码 X」—— 两处都从 registry 取,所以
+    `workflows/sku_migrate.py` 里一个码字面量都没有。
+    """
+    codes = {c for name in _TERMINAL_CODE_SETS
+             for c in getattr(resources, name)}
+    assert codes, "三张终局码集全空了?那是搬家了,不是清理完了"
+    offenders = [f"{rel}:{n} {code}" for rel, path in _prod_files()
+                 if rel != _ERR_CODE_HOME
+                 for n, line in enumerate(
+                     path.read_text(encoding="utf-8").splitlines(), 1)
+                 for code in codes if code in line]
+    assert not offenders, _fmt(
+        offenders, f"沃尔玛终局错误码写成了字面量:改引用 {_ERR_CODE_HOME} 的常量:")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 #  ⑥ 编码规则:一份字母表,一条活码索引,一条回填口径
 # ══════════════════════════════════════════════════════════════════════════════
 

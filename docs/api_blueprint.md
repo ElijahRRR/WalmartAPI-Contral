@@ -252,6 +252,17 @@ MP_MAINTENANCE 官方明确限制:**COO(原产国)不可改**;必填仅 SKU+GTIN
 SKU_LOCKED=ERR_EXT_DATA_0101211(解法:RETIRE→24h→新 UPC 重上)、
 UPC 冲突=ERR_EXT_DATA_0101119、异步审核、可重试类、PROHIBITED 类——集中进 registry 常量。
 
+**终局码集**(三张,判据用;不在册的失败码一律按**临时**办,缺省即临时):
+
+| 常量 | feed 面 | 码 | 含义与处置 |
+|---|---|---|---|
+| `WALMART_ERR_ITEM_GONE` | DELETE_ITEM / RETIRE_ITEM 回执 | 5 个(Invalid Item ID / PCF deleted-retired / already de-activated / QARTH「No matching record」…)| 沃尔玛说这个 SKU 已经不在了 = **破坏动作的目的已达成**,不重发;改码链也拿它当死档闸(对死档发 MP_ITEM_MATCH 会**新建一条 listing**) |
+| `WALMART_ERR_DESTRUCTIVE_PERMANENT` | DELETE_ITEM / RETIRE_ITEM 回执 | `ERR_EXT_DATA_0101218`(WFS eligible 不许删)、`ERR_PDI_0004` | **不给做**,自动链再试也是同一句话,唯一出路是人去 Seller Center |
+| `WALMART_ERR_MIGRATE_PERMANENT` | **MP_ITEM_MATCH(改码)逐条回执** | `EXT_DATA_ERROR_54514906640101`「[GTINValidation] This Product ID is designated for special applications in restricted environments and cannot be used.…」(2026-09-10 A171罗尹鸿 实证:GTIN 落在 GS1 受限流通号段)| **Product ID 本身不合规**,同一个号重发必再拒 ⇒ 该旧码退出改码候选面并点名(判据 `sku_migrate._CONDS` 第十一条,判据源是台账 `detail.receipt_code`)。出路是**换一个合规 UPC** —— 那是换号不是改码,另走 UPC 池 + 重上/改标那条路。详见 `docs/sku_plan.md` §9.15 七 |
+
+⚠ 三张表**故意不合并**:feed 面不同、处置不同(转出 WFS / 换号 / 不重发),合成一张
+就是让一条链的终局码去挡另一条链。
+
 **feed 级错误码**(挂在 head 的 `ingestionErrors` 上,**没有任何逐条明细**;
 与上面那些 SKU 级的码不是一回事——整个 feed 被退回,`itemsReceived=0`):
 

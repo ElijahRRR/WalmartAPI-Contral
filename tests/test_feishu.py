@@ -1,5 +1,7 @@
-"""api/feishu.py 行为回归:token 缓存与失效重试 / 瞬时退避 / 批量切块 / 分页 / 错误模型。"""
+"""api/feishu.py 行为回归:token 缓存与失效重试 / 瞬时退避 / 批量切块 / 分页 / 错误模型
++ 通知文本超长保护(2026-09-10)。"""
 
+import pathlib
 import time
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -161,6 +163,85 @@ def test_unregistered_table_rejected():
     with pytest.raises(LookupError):
         feishu.list_records(empty)
 
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  通知超长保护(2026-09-10 实证:230025 整条被拒,那一轮摘要一个字都没推出去)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _long_summary(n_lines=4000):
+    """一条"首行结论 + 一大堆明细"的摘要 —— A131吕灿荣 那一轮的形状。"""
+    return "【sku_migrate|T1】定案 confirmed 300\n" + "\n".join(
+        f"  维护账 {i}:旧码名下 executing 的 price 已迁到新码" for i in range(n_lines))
+
+
+def test_an_oversize_notification_keeps_the_first_line_and_says_it_truncated():
+    """超长时**保首行 + 尾部截断说明**,而且截完真的在上限内。
+
+    飞书文本消息超上限是**整条被拒**(code=230025),不是截断发出:2026-09-10
+    A131吕灿荣 `settle_only` 一轮几百条明细就这么整轮没推出去。首行是链通知的
+    唯一内容(cli 只取首行进飞书/推送),所以砍的只能是尾巴。
+    """
+    text = _long_summary()
+    assert len(text.encode("utf-8")) > feishu._MESSAGE_TEXT_MAX_BYTES
+    fitted, dropped = feishu._fit_message(text)
+    assert dropped > 0
+    assert len(fitted.encode("utf-8")) <= feishu._MESSAGE_TEXT_MAX_BYTES
+    assert fitted.splitlines()[0] == text.splitlines()[0]      # 首行一字不差
+    assert "已截掉尾部" in fitted and f"{dropped:,}" in fitted  # 截了多少说出口
+    # 按字节切、按字符解码:不许在半个汉字上切断(切断了 decode 会留 U+FFFD)
+    assert "\ufffd" not in fitted
+
+
+def test_a_short_notification_is_untouched():
+    """没超限的一个字都不动(绝大多数轮次走的是这条路)。"""
+    assert feishu._fit_message("【上架|T1】提交 3 件") == ("【上架|T1】提交 3 件", 0)
+
+
+def test_truncation_is_logged_not_silent(monkeypatch, caplog):
+    """截断**记 warning**:摘要少了半截而没人知道,比发不出去更坏。"""
+    monkeypatch.setattr(feishu.resources, "feishu_notify_to", lambda: "")
+    monkeypatch.setattr(feishu.resources, "feishu_webhook_url", lambda: "")
+    with caplog.at_level("WARNING", logger="api.feishu"):
+        assert feishu.notify(_long_summary()) is False
+    assert any("超长" in r.getMessage() for r in caplog.records)
+
+
+def test_both_delivery_paths_go_through_the_length_gate(monkeypatch):
+    """闸在分叉**之前**:应用直发与 webhook 退路发的是同一段(已截断的)文字。
+
+    放到某一条路里就是"换条路发就没有闸",而 webhook 那条恰恰是应用发不出去时
+    的退路 —— A131 那天两条都没成:应用被 230025 拒、webhook 没配。
+    """
+    sent: list[str] = []
+    monkeypatch.setattr(feishu.resources, "feishu_notify_to", lambda: "")
+    monkeypatch.setattr(feishu.resources, "feishu_webhook_url",
+                        lambda: "https://open.feishu.cn/hook/X")
+    monkeypatch.setattr(
+        feishu, "_http",
+        lambda: SimpleNamespace(post=lambda url, json=None, timeout=None: (
+            sent.append(json["content"]["text"]),
+            httpx.Response(200, json={"code": 0}))[1]))
+    assert feishu.notify(_long_summary()) is True
+    assert len(sent[0].encode("utf-8")) <= feishu._MESSAGE_TEXT_MAX_BYTES
+    assert "已截掉尾部" in sent[0]
+
+
+def test_the_message_length_limit_is_born_in_the_registry_only():
+    """长度上限是**限额常量**:只在「限额登记表」出生,带官方原值 + URL + 核对日期。
+
+    (常量不许在登记表外出生这件事由 tests/test_feishu_guard.py 全域守;这里钉的是
+     这一条的取值口径 —— 官方 150 KB × 95%,单位是**字节不是字符**。)
+    """
+    assert feishu._MESSAGE_TEXT_MAX_BYTES == 150 * 1024 * 95 // 100 == 145_920
+    src = pathlib.Path(feishu.__file__).read_text(encoding="utf-8")
+    line = next(ln for ln in src.splitlines()
+                if ln.startswith("_MESSAGE_TEXT_MAX_BYTES = "))
+    assert "官方 150 KB" in line and "https://" in line and "核对 2026-09-10" in line
+    # 对照全表也要有这一条(登记表与 TSV 改一处同步另一处)
+    tsv = (pathlib.Path(feishu.__file__).resolve().parents[1]
+           / "refdata" / "feishu_limits.tsv").read_text(encoding="utf-8")
+    assert "_MESSAGE_TEXT_MAX_BYTES" in tsv and "230025" in tsv
 
 
 def test_sheet_write_ranges_splits_big_range_and_scrubs(monkeypatch):

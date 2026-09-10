@@ -84,7 +84,8 @@ def summarize(usage_stats: dict, items: int = 0) -> list[str]:
             agg["cost"] += c
             total_cost += c
 
-    legacy = {m for (m, _, _) in usage_stats if m in resources.LLM_LEGACY_ALIASES}
+    retired = {m: resources.LLM_RETIRED_MODELS[m] for (m, _, _) in usage_stats
+               if m in resources.LLM_RETIRED_MODELS}
     lines = []
     for purpose, a in sorted(by_purpose.items()):
         hit, miss = a["cache_hit"], a["cache_miss"]
@@ -99,12 +100,13 @@ def summarize(usage_stats: dict, items: int = 0) -> list[str]:
              if items and total_cost else "")
     head = (f"LLM 用量合计 ≈ {money(total_cost)}{per_k}"
             if total_cost else "LLM 用量(无可计价模型)")
-    if legacy:
-        # 停用日期已过还在用 = 随时可能整条链一起挂,且不会提前预警
-        head += (f";⚠ **{sorted(legacy)} 是官方已宣布停用的旧别名**"
-                 f"(现路由到 {sorted({resources.llm_priced_model(m) for m in legacy})}),"
-                 f"生产请在 .env 写死 DEEPSEEK_MODEL=<正式模型名> —— "
-                 f"别名一旦切断,全仓 LLM 调用同时失败")
+    if retired:
+        # 退役名还在用 = 随时可能整条链一起挂,且不会提前预警
+        head += (";⚠ **在用已退役的模型名**:" + "、".join(
+            f"{m}({why})" for m, why in sorted(retired.items()))
+            + f";计价按 {sorted({resources.llm_priced_model(m) for m in retired})} 折算,"
+              "生产请在 .env 把 DEEPSEEK_MODEL 写成 GET /models 返回的名字 —— "
+              "退役名一旦真的切断,全仓 LLM 调用同时失败")
     routed = {m: resources.LLM_ROUTED_MODELS[m] for (m, _, _) in usage_stats
               if m in resources.LLM_ROUTED_MODELS}
     if routed:

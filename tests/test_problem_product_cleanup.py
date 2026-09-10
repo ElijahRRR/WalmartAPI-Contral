@@ -24,9 +24,12 @@ def _wire(monkeypatch, rows, stores=("T1",), settled=None):
     """把 DB 侧全部换成假的:claim 给定建议行,settle 给定落定数,转态记账。"""
     from registry import db as _db
     from services import store_retry as _sr
+    # settle() 的返回**四个键**(2026-09-09 起):confirmed/ineffective 是总数,
+    # receipt_gone/receipt_failed 是其中按**回执**判的那部分(摘要两行分开报)
     seen = {"events": [], "marked": [], "marked_by": set(), "sheet": [],
-            "settled": settled or
-            {"confirmed": 0, "ineffective": 0}}
+            "settled": {"confirmed": 0, "ineffective": 0,
+                        "receipt_gone": 0, "receipt_failed": 0,
+                        **(settled or {})}}
     # 二轮补试走 store_retry,每店前有 _client.backoff(0) 抖动等待:
     # 用例只钉行为,不必真等(与 tests/test_store_retry_standard 同款)
     monkeypatch.setattr(_sr.time, "sleep", lambda s: None)
@@ -184,6 +187,30 @@ def test_settle_runs_before_claim_and_is_reported(monkeypatch):
     _wire(monkeypatch, [], settled={"confirmed": 3, "ineffective": 2})
     out = ppc.run({"execute": True})
     assert "生效 3" in out and "未生效 2" in out
+
+
+def test_receipt_settled_rows_are_reported_on_their_own_line(monkeypatch):
+    """按**回执**落定的那两档单独一行(2026-09-09 补的第二、三种落定来源)。
+
+    与上面那行分开报,是因为下一步不同:回执判"已不存在"= 事情办成了,
+    不再建议;回执失败 = 下轮按最近一次回执码决定还建不建议(死档/永久拒的
+    由 problem_scan 那两道闸挡)。合成一个数就等于把待办混进已完成。
+    """
+    _wire(monkeypatch, [], settled={"confirmed": 5, "ineffective": 4,
+                                    "receipt_gone": 5, "receipt_failed": 4})
+    out = ppc.run({"execute": True})
+    assert "回执判已不存在 5" in out and "回执失败 4" in out
+
+
+def test_dry_run_never_settles_anything(monkeypatch):
+    """空跑不调 settle:落定是**写**(UPDATE ops.dispositions),
+    --dry-run 的承诺是这一轮一个字都不写。"""
+    _wire(monkeypatch, [])
+    monkeypatch.setattr(ppc.dispositions, "settle",
+                        lambda conn: (_ for _ in ()).throw(
+                            AssertionError("dry-run 不许落定")))
+    out = ppc.run({"execute": False})
+    assert "回执判已不存在" not in out
 
 
 def test_no_suggestions_points_at_the_scanner(monkeypatch):

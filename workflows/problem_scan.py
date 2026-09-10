@@ -48,8 +48,9 @@ import logging
 import re
 
 from registry import db
+from registry import resources
 from services import blacklist, blacklist_sheet, dispositions
-from services import error_taxonomy
+from services import error_taxonomy, feed_track
 from services import product_events, store_absence
 
 DANGEROUS = False       # 只读沃尔玛;写库仅限事件与建议行,都可重跑
@@ -76,9 +77,9 @@ logger = logging.getLogger("workflows.problem_scan")
 #     (10,191 行)发 DELETE_ITEM 删不掉;2026-09-09 沃尔玛已把列表可见性改回去
 #     (A109 在册 6858 → 3371,3487 行当轮判缺席),死档随 missing_since 出了
 #     扫描面。RETIRED 行照扫:退市 = Site End Date 设成过去,通常只带「End Date
-#     过期」一个原子,按可恢复留;带政策原子的照删。删不掉的回执会落在
-#     ops.feed_items 与摘要里;要不要给「已停用」回执加 WFS 同款的最近回执闸,
-#     等拿到实际错误码再议(不按记忆编码)。
+#     过期」一个原子,按可恢复留;带政策原子的照删;删不掉的(回执「已停用」
+#     60706056565050 等死档码)由 2026-09-09 的死档/永久拒两道回执闸兜住,
+#     见 _load_state 的 receipt_blocked,不会每天重发。
 #   · published_status IS NULL 也进扫描面:判据是原文不是状态;没采到状态的行
 #     原文照样是当轮扫回来的(walmart_catalog 每轮整行覆盖)。
 # 保留的两条是**操作层**边界,不是判据:
@@ -124,7 +125,9 @@ WHERE w.missing_since IS NULL
 # (而本 SQL 的在途口径**有意不分 feed 类型**,见上)。别名一律经
 # catalog.sku_aliases(代际继承的唯一出处),只继承一跳;视图在改码前是空集,
 # UNION ALL 加空集 ⇒ 结果集逐行不变。
-_DISPOSAL_FEEDS = ("DELETE_ITEM", "RETIRE_ITEM")
+#: 破坏类 feed 的两个类型:**唯一出处在 services.feed_track**
+#: (同一份清单也是 receipt_blocked 的取数面,各写一份迟早只改一处)。
+_DISPOSAL_FEEDS = feed_track.DESTRUCTIVE_FEED_TYPES
 _SQL_INFLIGHT = """
 SELECT store, sku, bool_or(disposal) AS disposal FROM (
     SELECT f.store, f.sku,
@@ -146,41 +149,36 @@ SELECT store, sku, bool_or(disposal) AS disposal FROM (
 ) t
 GROUP BY store, sku
 """
-# WFS 件删不掉(2026-08-24,多仓批次 0)。沃尔玛回执原话:
-# "The item you are trying to delete is WFS eligible. At this time, you can not
-#  delete WFS eligible items." —— 官方也记着 DELETE_ITEM 仅 SFF/FBM 支持
-# (docs/legacy_survey.md:1265)。这类件**每天重建议、每天重发、每天同一个错**,
-# 生产实见 11 条(L001/A152/A154/A170)连着几轮空烧配额。
-# 口径:取该 (店铺,SKU) **最近一次**删除回执,是这个错误码才拦 —— 不是"历史上
-# 出现过就永久拉黑":商品转出 WFS 之后就该能删了,下一次删除尝试的回执会把它
-# 放出来。没有时间窗(WFS 状态不会自己变,靠人在 Seller Center 转出)。
-# ⚠ **拦掉不等于改判 retire**:RETIRE_ITEM 对 WFS 件行不行官方没有明文
-# (docs/multi_node_plan.md §2.4 的同款空白),按本仓纪律不许按推断编码 ——
-# 这里只跳过并**响亮报数**,把"要不要转出 WFS"交回给人。
-# ⚠ 下面三段判据 + 上面的在途防重,都是按 (store, sku) 读历史的 —— 改码之后
-# 新码在 product_events / ops.feed_items 里**一条历史都没有**,四段会同时失明。
-# 四段一律经 catalog.sku_aliases 沿改码链继承**一跳**(前提:旧码改码后
-# 立即弃码、永不再改码;要连改两次得把视图改成递归 CTE,见 schema.sql 的视图注释)。
-# 为什么不在这里各写一遍登记簿指针的 JOIN:"这个新码继承那个
-# 旧码的历史"是**一条判据**,判据只能有一处出生(conventions §六),写四遍就是
-# 四份会各自漂移的实现,而漂了不报错、只是某一处从此看不见历史。
+# 破坏类回执的两道闸(2026-09-09 由原「WFS 件删不掉」那一道泛化而来)。
+# 判据与 SQL 都不在本文件:码集的唯一出处是 `registry.resources` 的两个
+# frozenset,查询的唯一出处是 `services.feed_track.receipt_blocked`
+# (sku_migrate 的死档闸读的是同一份 —— 两份 SQL 一漂,两条链对"这个 SKU 还在
+# 不在"就会给出不同答案,而且不报错)。
+#   · `WALMART_ERR_ITEM_GONE`(死档)沃尔玛说这个 SKU 已经不在了(删了/退役了/
+#     停用了/匹配库里查无)⇒ 破坏动作的目的已达成,不再建议。这些行在**列表
+#     接口里仍以 PUBLISHED/UNPUBLISHED 出现**(2026-08-28 起的僵尸列表),本闸
+#     让它们不再每天烧 DELETE/RETIRE 配额;目录里死档行本身的根治归 backlog §十三。
+#   · `WALMART_ERR_DESTRUCTIVE_PERMANENT`(永久拒)WFS 件不许删、RETIRE 的
+#     通用异常 —— 重发必再拒,只能人工。
+#     WFS 那一条的历史依据(2026-08-24,多仓批次 0)照旧成立,现在它只是**永久拒
+#     集合里的一员**:沃尔玛回执原话 "The item you are trying to delete is WFS
+#     eligible. At this time, you can not delete WFS eligible items.",官方也记着
+#     DELETE_ITEM 仅 SFF/FBM 支持(docs/legacy_survey.md:1265);生产实见 11 条
+#     (L001/A152/A154/A170)连着几轮空烧配额。
+#     ⚠ **拦掉不等于改判 retire**:RETIRE_ITEM 对 WFS 件行不行官方没有明文
+#     (docs/multi_node_plan.md §2.4 的同款空白),按本仓纪律不许按推断编码 ——
+#     这里只跳过并**响亮报数**,把"要不要转出 WFS"交回给人。
+# ⚠ 语义:按**最近一次尝试**的回执判,**没有时间窗**。下一次尝试若回执变了
+# (人工把件转出 WFS 之后重删成功)它自然就放出来了 —— 不是"历史上出现过就
+# 永久拉黑"。
+# ⚠ 下面两段判据 + 上面的在途防重,都是按 (store, sku) 读历史的 —— 改码之后
+# 新码在 product_events / ops.feed_items 里**一条历史都没有**,会同时失明。
+# 一律经 catalog.sku_aliases 沿改码链继承**一跳**(前提:旧码改码后立即弃码、
+# 永不再改码;要连改两次得把视图改成递归 CTE,见 schema.sql 的视图注释)。
+# 为什么不在这里各写一遍登记簿指针的 JOIN:"这个新码继承那个旧码的历史"是
+# **一条判据**,判据只能有一处出生(conventions §六),写几遍就是几份会各自
+# 漂移的实现,而漂了不报错、只是某一处从此看不见历史。
 # ⚠ 占位符改成命名式:UNION 之后同一个值要用两次,`%s` 位置参数给不了两遍。
-_WFS_BLOCKED_CODE = "ERR_EXT_DATA_0101218"
-_SQL_WFS_BLOCKED = """
-SELECT store, sku FROM (
-    SELECT DISTINCT ON (store, sku) store, sku, error_code FROM (
-        SELECT f.store, f.sku, f.error_code, f.submitted_at
-        FROM ops.feed_items f
-        WHERE f.feed_type = 'DELETE_ITEM' AND f.status IN ('failed', 'missing')
-        UNION ALL
-        SELECT a.store, a.sku, f.error_code, f.submitted_at
-        FROM catalog.sku_aliases a
-        JOIN ops.feed_items f
-          ON f.store = a.store AND f.sku = a.alias_sku
-        WHERE f.feed_type = 'DELETE_ITEM' AND f.status IN ('failed', 'missing')
-    ) u ORDER BY store, sku, submitted_at DESC
-) t WHERE error_code = %(code)s::text
-"""
 # 最近一次归类的**签名**(2026-09-10):有 atoms 的事件取原子码集合(去重、字典序、
 # 逗号拼),没有的(存量)退回 detail.category。单原子行的签名与主码相同,换判据
 # 不会让整库在第一轮重记一遍;复合行会补记一次 —— 那正是此前缺的账。
@@ -271,14 +269,19 @@ def _load_state():
         cur.execute(_SQL_STATUS)
         inactive = {s for s, st in cur.fetchall()
                     if st and st.upper() != "ACTIVE"}
-        cur.execute(_SQL_WFS_BLOCKED, {"code": _WFS_BLOCKED_CODE})
-        wfs_blocked = {(st, k) for st, k in cur.fetchall()}
+        # 两桶各查一次(同一条 SQL、同一个函数,只是码集不同)——
+        # 判据在 registry,查询在 services,本文件一份 SQL 都不留
+        gone_blocked = feed_track.receipt_blocked(
+            conn, resources.WALMART_ERR_ITEM_GONE)
+        perm_blocked = feed_track.receipt_blocked(
+            conn, resources.WALMART_ERR_DESTRUCTIVE_PERMANENT)
     return (items, inflight, inflight_disposal, last_cat,
-            inactive, stubborn, wfs_blocked)
+            inactive, stubborn, gone_blocked, perm_blocked)
 
 
 def plan(items, inflight, inactive, stubborn=frozenset(),
-         inflight_disposal=frozenset(), wfs_blocked=frozenset()):
+         inflight_disposal=frozenset(), gone_blocked=frozenset(),
+         perm_blocked=frozenset()):
     """输入:扫描面全部行与去重状态 → 输出:(计划 dict, 计数 dict)。纯函数,可测。
 
     计划形如 {店铺: {"delete": [item行], "retire": [item行]}},每行附
@@ -295,12 +298,12 @@ def plan(items, inflight, inactive, stubborn=frozenset(),
       · 其余一律删除,**不看 published_status / lifecycle**:复合原文里哪怕只有
         一个非可恢复原子(「End Date 过期; 禁售政策」)也删;OTHER 未识别的也删
         (所有者:「其他的都删除」),但逐条进摘要告警(_unknown_note)。
-    顽固双击(retire+delete 齐发)与 WFS/在途/非 ACTIVE 店预筛不变 —— 那些是
-    操作层防重,不是"该不该删"的判据。
+    顽固双击(retire+delete 齐发)与死档/永久拒回执闸、在途、非 ACTIVE 店预筛
+    不变 —— 那些是操作层防重,不是"该不该删"的判据。
     """
     out: dict[str, dict] = {}
     n = {"inflight": 0, "inflight_listing": 0, "inactive": 0,
-         "delete": 0, "stubborn": 0, "wfs": 0,
+         "delete": 0, "stubborn": 0, "gone": 0, "permanent": 0,
          "clean": 0, "recoverable": 0, "unknown": 0}
     for it in items:
         key = (it["store"], it["sku"])
@@ -340,21 +343,24 @@ def plan(items, inflight, inactive, stubborn=frozenset(),
             n["recoverable"] += 1       # 只含可恢复原子:不删,等它自己/运营恢复
             continue
         bucket = out.setdefault(it["store"], {"delete": [], "retire": []})
+        # 两道回执闸(见上面 receipt_blocked 那段注释)。**死档优先于永久拒**:
+        # 一个 SKU 只可能命中其中之一(判据是同一次回执的同一个码,两个码集
+        # 不相交,守门用例钉着),这里的先后只是让读的人不用猜。
+        # 顽固件(retire+delete 双发)与普通件走同一道闸:delete 注定被拒,
+        # 而 RETIRE_ITEM 对这两类行不行官方都没有明文 —— 按本仓纪律不许按推断
+        # 编码,整条跳过并**响亮报数**,不静默。
+        if key in gone_blocked:
+            n["gone"] += 1
+            continue
+        if key in perm_blocked:
+            n["permanent"] += 1
+            continue
         if key in stubborn:
             # 删除未生效的顽固 SKU(所有者定稿):
             # 停用+删除双 feed 齐发——能删的删,删不掉的至少停用
-            if key in wfs_blocked:
-                n["wfs"] += 1       # 顽固件里的 WFS 件同样删不掉,见下
-                continue
             bucket["retire"].append(it)
             bucket["delete"].append(it)
             n["stubborn"] += 1
-            continue
-        if key in wfs_blocked:
-            # WFS 件:上一次删除回执明说删不掉(见 _SQL_WFS_BLOCKED)。
-            # 本函数产出的全部是破坏动作 —— WFS 件一条都发不出去,跳过并报数,
-            # 把"要不要转出 WFS"交回给人。
-            n["wfs"] += 1
             continue
 
         bucket["delete"].append(it)
@@ -417,7 +423,8 @@ def _summarize(allrows: list[dict], audit_rows: list[dict], n: dict,
            f"{by_act.get('delete', 0)}"
            f"(其中审核判拒 {sum(1 for r in allrows if r.get('source') == 'audit')}),"
            f"顽固停用 {by_act.get('retire', 0)};"
-           f"WFS 删不掉跳过 {n['wfs']},"
+           f"已死档跳过 {n['gone']},"
+           f"永久拒跳过 {n['permanent']},"
            f"处置在途/待观测跳过 {n['inflight']},"
            f"上架/维护在途跳过 {n['inflight_listing']}"
            f"(多为新品合规复审,复审完自动进扫描),"
@@ -438,6 +445,29 @@ def _summarize(allrows: list[dict], audit_rows: list[dict], n: dict,
         if b["delete"]:
             line += f",删除样本={[(r['sku'], r.get('category')) for r in b['delete'][:5]]}"
         out.append(line)
+    return out
+
+
+def _blocked_notes(gone_skipped: list, perm_skipped: list) -> list[str]:
+    """输入:本轮被两道回执闸跳过的 (店,SKU) → 输出:摘要说明行(各带 5 个样本)。
+
+    **不静默**:这两道闸挡掉的是成百上千条本来会天天重发的破坏建议,不报的话
+    摘要看起来就是"今天问题商品少了"——本仓口诀:静默的闸没人记得它关着。
+    """
+    out = []
+    if gone_skipped:
+        out.append(
+            f"  已死档跳过 {len(gone_skipped)}(沃尔玛回执说这个 SKU 已经不在了"
+            f"——删了/退役了/停用了/匹配库里查无,破坏动作的目的已达成,不再建议;"
+            f"它们仍在列表接口里以 PUBLISHED/UNPUBLISHED 出现,那是僵尸列表,"
+            f"目录里的死档行根治归 docs/backlog.md §十三):"
+            f"{sorted(gone_skipped)[:5]}")
+    if perm_skipped:
+        out.append(
+            f"  永久拒跳过 {len(perm_skipped)}(WFS 件不许删 / RETIRE 通用异常:"
+            f"重发必再拒,只能人工去 Seller Center 处理,例如把件"
+            f"转出 WFS;转出后下一次尝试的回执会自动把它放出来):"
+            f"{sorted(perm_skipped)[:5]}")
     return out
 
 
@@ -642,7 +672,8 @@ def _push_sheets() -> str:
 
 def _audit_rejected_rows(conn, inflight: set, inactive: set,
                          only: str | None,
-                         wfs_blocked: set = frozenset()) -> list[dict]:
+                         gone_blocked: set = frozenset(),
+                         perm_blocked: set = frozenset()) -> list[dict]:
     """输入:连接 + 去重状态 → 输出:判拒仍在架的建议行。
 
     与 scan 来源共用同一套闸(非 ACTIVE 店跳过、在途不建议),但**不走归类**
@@ -664,10 +695,11 @@ def _audit_rejected_rows(conn, inflight: set, inactive: set,
             continue
         if store in inactive or (store, sku) in inflight:
             continue
-        if (store, sku) in wfs_blocked:
-            # 审核说该删,但 WFS 件照样删不掉(与 scan 来源同一道闸)。
-            # 这里不单独计数:摘要那行报的是总数,分不分来源无碍于"要人去
-            # Seller Center 转出 WFS"这个唯一动作
+        if (store, sku) in gone_blocked or (store, sku) in perm_blocked:
+            # 审核说该删,但沃尔玛最近一次回执说"这个 SKU 已经不在了"(死档)
+            # 或"不许删"(WFS / PDI_0004)—— 与 scan 来源同两道闸。
+            # 这里不单独计数:摘要那两行报的是总数,分不分来源无碍于"要人去
+            # Seller Center 处理"这个唯一动作
             continue
         out.append({
             "store": store, "sku": sku, "asin": asin, "source": "audit",
@@ -687,7 +719,7 @@ def run(params: dict) -> str:
                or bool(params.get("dry_run")))
     only = params.get("store")
     (items, inflight, inflight_disposal, last_cat,
-     inactive, stubborn, wfs_blocked) = _load_state()
+     inactive, stubborn, gone_blocked, perm_blocked) = _load_state()
     if only:
         items = [i for i in items if i["store"] == only]
     # 缺席避让(店级重试标准③,所有者定稿 2026-08-26):缺席店的在架状态
@@ -709,13 +741,25 @@ def run(params: dict) -> str:
         items = [i for i in items if i["store"] not in absent]
 
     plans, n = plan(items, inflight, inactive, stubborn,
-                    inflight_disposal, wfs_blocked)
+                    inflight_disposal, gone_blocked, perm_blocked)
     rows = to_dispositions(plans)
+    # 被两道回执闸挡下的**本轮候选**(不是库里全部命中码的行):摘要要点名,
+    # 而点名的对象必须是"今天本来会被建议删的那些",否则数字与总览那行对不上。
+    # ⚠ 排除顺序必须与 `plan()` 里那几支 continue **逐条对齐**(非 ACTIVE 店 →
+    # 在途 → 死档 → 永久拒):对不齐的话总览那行报 n['gone'],这里报另一个数,
+    # 而两个数都"看起来对" —— 本仓 2026-08-14 摘要对不上账的老坑同款。
+    # 2026-09-10 起 plan() 在店铺闸/在途之后还有归类与可恢复两档,到得了回执闸的
+    # 行 = 归了类(有 category ⇔ 过了非 ACTIVE 店与在途两关)且不是仅可恢复原子。
+    # 直接读 plan() 留在行上的标记,不在这里再抄一遍它的分流顺序。
+    keys = {(i["store"], i["sku"]) for i in items
+            if "category" in i and not i.get("recoverable")}
+    gone_skipped = sorted(keys & set(gone_blocked))
+    perm_skipped = sorted((keys & set(perm_blocked)) - set(gone_blocked))
     lines: list[str] = []
 
     with db.pg_conn() as conn:
         audit_rows = _audit_rejected_rows(conn, inflight, inactive, only,
-                                          wfs_blocked)
+                                          gone_blocked, perm_blocked)
         if absent:
             n_audit_avoided = sum(1 for r in audit_rows
                                   if r["store"] in absent)
@@ -745,6 +789,8 @@ def run(params: dict) -> str:
                         f"({n_avoided} 条候选不参与本轮处置)")
         head[0] += absence_gap
         lines[:0] = head        # 总览 + 分店明细排在最前,审核/剔除说明跟其后
+        # 两道回执闸的点名紧跟总览:它们是"今天为什么少了这么多建议"的答案
+        lines[len(head):len(head)] = _blocked_notes(gone_skipped, perm_skipped)
         # 观察面用 items_all(缺席不连坐,见上)
         for note in (_recoverable_note(items_all), _unknown_note(items_all),
                      _k_cluster_note(items_all), _policy_gap_note(conn, items_all)):

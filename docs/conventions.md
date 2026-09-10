@@ -51,6 +51,27 @@
 维护记录,谁也说不清是哪条链干的;更早的后果是同一个 SKU 被两条链先后删了
 两次(提交期防重按**整批载荷指纹**算,两条链批次不同就撞不上)。
 
+**破坏类处置的落定有三种来源**(2026-09-09 补后两种,`detail.settled_by` 区分):
+观测(`delete_verified` / `delete_not_effective`)、**回执死档**(`receipt_gone`,
+回执码说这个 SKU 已经不在了 ⇒ confirmed)、**回执失败**(`receipt_failed`,
+failed/missing ⇒ ineffective)。三条都在 `dispositions.settle()` 里,顺序即语义:
+观测先跑,回执那条只收观测收不到的。补前两种之前**回执失败没有任何落定路径**
+——观测流的起点是成功回执,失败的回执一条都进不去,全船队约 800 条 delete/retire
+因此停在 executing 数周,而部分唯一索引挡住同 SKU 再建议 ⇒ 永不重删
+(诊断与码表 `docs/backlog.md` §十三)。⚠ `receipt_gone` 是**处置账的收尾,不是
+身份层的结论**:不弃码、不改 `catalog.walmart_items`、不记 product_events
+(弃码点仍是四个,§九)。
+
+**再建议与否按最近一次回执码判,清单只在 registry**。两个码集
+(`WALMART_ERR_ITEM_GONE` / `WALMART_ERR_DESTRUCTIVE_PERMANENT`)出生在
+`registry/resources.py`,查询出生在 `services/feed_track.receipt_blocked`,
+`problem_scan`(不再建议)与 `sku_migrate`(不改码)都读这一份 —— 业务代码里
+**不许出现错误码字面量**(铁律 3,守门用例钉着)。判据是「最近一次尝试」而不是
+「历史上出现过」:人工把件转出 WFS 之后,下一次尝试的回执自然把它放出来;写成
+EXISTS 的话它永远删不了,而且没人看得出是被自己的闸拦着。**不为临时失败建清单**
+——缺省即临时,清单只登记例外(建第二张表就要维护两份会漂的口径,而漏登记一个
+临时码的后果是永久停发)。两道闸都**分桶计数、摘要点名**:静默的闸没人记得它关着。
+
 ## 四、店维工作流的失败处理标准(所有者定稿 2026-08-26)
 
 起因:两家店 SOCKS 代理报 "Malformed reply"(socksio 异常不在 httpx 异常树上,

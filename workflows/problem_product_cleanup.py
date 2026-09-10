@@ -135,7 +135,8 @@ def run(params: dict) -> str:
     only = params.get("store")
     with db.pg_conn() as conn:
         settled = dispositions.settle(conn) if execute else {
-            "confirmed": 0, "ineffective": 0}
+            "confirmed": 0, "ineffective": 0,
+            "receipt_gone": 0, "receipt_failed": 0}
         # ⚠ 限**动作**不限来源(2026-08-24 改):本工作流是破坏动作的唯一
         # 出口,维护链建议的删除(source='maint', action='delete')也由它执行。
         # 不限动作会领到 title/price/inventory,group_by_store 直接抛。
@@ -181,6 +182,15 @@ def run(params: dict) -> str:
         lines.append(f"上一轮落定:生效 {settled['confirmed']},"
                      f"**未生效 {settled['ineffective']}**"
                      f"(回执成功但观测显示没动,下轮 problem_scan 会重新建议)")
+    if execute and (settled["receipt_gone"] or settled["receipt_failed"]):
+        # 上面那行是**观测**判的,这行是**回执**判的(2026-09-09 补的第二、三种
+        # 落定来源,detail.settled_by 里分得清)。分开报是因为两者的下一步不同:
+        # 回执判已不存在 = 事情办成了,不再建议;回执失败 = 下轮按最近一次
+        # 回执码决定还建不建议(死档/永久拒的由 problem_scan 那两道闸挡)。
+        lines.append(f"  其中按回执落定:回执判已不存在 "
+                     f"{settled['receipt_gone']}(沃尔玛说这个 SKU 已经删了/"
+                     f"退役了/查无,破坏动作目的已达成),回执失败 "
+                     f"{settled['receipt_failed']}(含 WFS 不许删等永久拒)")
     if n_absent_held:
         lines.append(f"⚠ 缺席避让:{n_absent_held} 条建议属于缺席店(目录未刷新),"
                      f"留在 suggested 原地 —— 隔夜观测不配开破坏 feed")

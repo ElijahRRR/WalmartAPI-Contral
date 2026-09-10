@@ -15,12 +15,13 @@
 """
 
 import ast
+import inspect
 import pathlib
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from registry import schedule
+from registry import resources, schedule
 from workflows import sku_migrate as sm
 
 _ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -271,16 +272,64 @@ def test_the_real_guard_moved_to_a_per_candidate_condition():
     assert "删除成功" in why and "假确认" in why    # 最狠的那条后果要写在人话里
 
 
-def test_stranded_executing_maintenance_rows_are_named_not_silent():
-    """维护组的 executing 行改码后滞留在旧码上(rekey 故意不碰),由
-    expire_executing 判成 ineffective 收尾 —— 自愈,但**不许静默**:
-    滞留几条、哪些动作要进摘要。破坏组若出现在这里是异常,要额外喊。"""
+def test_executing_rows_are_named_and_the_two_groups_go_different_ways():
+    """两组的去向 2026-09-08 起**不一样**(§9.15),摘要要分开说:
+
+      · 维护组(title/price/inventory)的 executing **已随 rekey_open 迁到新码**,
+        由维护链按新码观测落定(同 wpid = 同一条 listing,新码的现值就是那条 feed
+        作用的对象);
+      · 破坏组(delete/retire)**仍不迁**,滞留旧码等 expire_executing 收尾,
+        而且它本不该出现在这里 —— 要额外喊「请人工核」。
+    """
     import inspect
     src = inspect.getsource(sm._confirm)
     assert "executing_actions_on" in src
-    # 先读后改:rekey 之后 suggested 已经搬走,再读就读不到了
-    assert src.index("executing_actions_on") < src.index("rekey_suggested")
+    # 先读后改:rekey 之后旧码名下的行已经搬走,再读就读不到了
+    assert src.index("executing_actions_on") < src.index("rekey_open")
+    assert "MAINT_ACTIONS" in src and "已迁到新码" in src
     assert "DESTRUCTIVE_ACTIONS" in src and "请人工核" in src
+
+
+def _confirm_wired(monkeypatch, *, stranded=(), taken=()):
+    """`_confirm` 的五处写全部打桩 → 只看它怎么点名。"""
+    monkeypatch.setattr(sm.db, "pg_conn", lambda *a, **k: _Conn(tag="tx"))
+    monkeypatch.setattr(sm.sku_codec, "settle_replacement", lambda *a, **k: None)
+    monkeypatch.setattr(sm.upc_pool, "retag_sku", lambda *a, **k: None)
+    monkeypatch.setattr(sm.walmart_catalog, "drop_node_rows", lambda *a, **k: 1)
+    monkeypatch.setattr(sm.dispositions, "executing_actions_on",
+                        lambda *a, **k: list(stranded))
+    monkeypatch.setattr(sm.dispositions, "rekey_open",
+                        lambda *a, **k: (1, list(taken)))
+    return {"id": 1, "old_sku": "B0OLD00001", "new_sku": "AAAAAAAAAAAA",
+            "source_type": "amz", "source_key": "B0OLD00001"}
+
+
+def test_a_migrated_maintenance_executing_row_is_reported_as_migrated(monkeypatch):
+    """维护组的 executing 迁走之后,摘要说的是「已迁到新码,由维护链按新码观测落定」
+    —— 不再是「不迁,由 expire_executing 判成 ineffective」(A171罗尹鸿 691466 那句)。"""
+    row = _confirm_wired(monkeypatch, stranded=["price"])
+    warns = sm._confirm("T1", row)
+    ln = next(ln for ln in warns if "price" in ln)
+    assert "已迁到新码" in ln and "维护链" in ln
+    assert "executed_at 不改" in ln          # 宽限期照旧从原提交时刻算
+    assert "expire_executing" not in ln
+
+
+def test_a_destructive_executing_row_is_still_never_migrated(monkeypatch):
+    """破坏组的告警**原样保留**:不迁、滞留旧码、请人工核。"""
+    row = _confirm_wired(monkeypatch, stranded=["delete"])
+    warns = sm._confirm("T1", row)
+    ln = next(ln for ln in warns if "delete" in ln)
+    assert "不迁" in ln and "expire_executing" in ln and "请人工核" in ln
+    assert "已迁到新码" not in ln
+
+
+def test_a_maintenance_row_that_collides_is_named_not_reported_as_migrated(monkeypatch):
+    """撞车(新码名下已有同动作未落定行)的**不算迁走**:只报「请人工处置」那一句。"""
+    row = _confirm_wired(monkeypatch, stranded=["price"], taken=["price"])
+    warns = sm._confirm("T1", row)
+    assert any("请人工处置" in ln for ln in warns)
+    assert not any("已迁到新码" in ln for ln in warns)
 
 
 def test_open_retire_cooldown_blocks_the_store(monkeypatch):
@@ -364,18 +413,81 @@ def test_candidate_with_an_inflight_feed_is_skipped_and_named():
     conn = _Conn([("FROM catalog.walmart_items w", (_CAND_COLS,
                                                     [_cand("B0AAA00001"),
                                                      _cand("B0AAA00002", "0002")])),
-                  ("FROM ops.feed_items", (["sku"], [("B0AAA00001",)]))])
-    rows, notes = sm._candidates(conn, "T1", 10)
+                  ("SELECT DISTINCT sku FROM ops.feed_items", (["sku"], [("B0AAA00001",)]))])
+    rows, notes, _skips = sm._candidates(conn, "T1", 10)
     assert [r["old_sku"] for r in rows] == ["B0AAA00002"]
     assert notes and "在途 feed" in notes[0]
+
+
+def test_post_gate_skips_do_not_eat_the_round_limit():
+    """后置闸剔掉的行**不占本轮名额**(2026-09-09 A131吕灿荣 实证:limit=500 只发
+    出 45 条 —— 候选 SQL 先按 LIMIT 500 截断,在途闸再剔掉 455,合格的排在后面
+    的几百条一条都没轮到)。
+
+    候选 SQL 按 CANDIDATE_FETCH_CAP 取数,本轮上限在三道后置闸**之后**才截;
+    截掉的要说出口(合格几个、只发几个、其余下轮)。
+    """
+    conn = _Conn([("FROM catalog.walmart_items w",
+                   (_CAND_COLS, [_cand("B0AAA00001"), _cand("B0AAA00002", "0002"),
+                                 _cand("B0AAA00003", "0003"),
+                                 _cand("B0AAA00004", "0004")])),
+                  ("SELECT DISTINCT sku FROM ops.feed_items",
+                   (["sku"], [("B0AAA00001",), ("B0AAA00002",)]))])
+    rows, notes, skips = sm._candidates(conn, "T1", 1)
+    # 取数上限不是本轮上限:SQL 收到的是 CANDIDATE_FETCH_CAP
+    assert _args_of(conn)["limit"] == sm.CANDIDATE_FETCH_CAP
+    assert sm.CANDIDATE_FETCH_CAP >= 10000
+    # 两条在途被剔,本轮上限 1 落在**合格**的第一条上,不是被剔的那条
+    assert [r["old_sku"] for r in rows] == ["B0AAA00003"]
+    assert skips["inflight"] == 2
+    assert any("合格候选 2 个" in n and "只发前 1 个" in n for n in notes)
+
+
+def test_a_dead_listing_old_code_is_never_migrated():
+    """死档的旧码**不改码**(2026-09-09 后置闸)。
+
+    沃尔玛侧已不存在的 item 发 MP_ITEM_MATCH **会新建一条 listing**,不是改码
+    —— A131吕灿荣 B09L3WXJ96 的真双挂就是这么来的(旧码是 RETIRED 死档、新码是
+    新建出来的 item,两条同时挂在店里),而回执全绿、摘要正常,没有任何东西会
+    说它建了个新品。判据与 problem_scan 的死档闸**同一个函数、同一份 SQL**。
+    """
+    conn = _Conn([("FROM catalog.walmart_items w",
+                   (_CAND_COLS, [_cand("B0AAA00001"), _cand("B0AAA00002", "0002")])),
+                  ("SELECT DISTINCT sku FROM ops.feed_items", (["sku"], [])),
+                  ("catalog.sku_aliases a",
+                   (["store", "sku"], [("T1", "B0AAA00001")]))])
+    rows, notes, skips = sm._candidates(conn, "T1", 10)
+    assert [r["old_sku"] for r in rows] == ["B0AAA00002"]
+    assert skips["gone"] == 1
+    assert any("已经不在了" in n and "新建一条 listing" in n for n in notes)
+    # 码集从 registry 传进去,工作流里不写字面量
+    codes = [a for sql, a in conn.sqls if a and "codes" in a][0]["codes"]
+    assert set(codes) == set(resources.WALMART_ERR_ITEM_GONE)
+
+
+def test_the_dead_listing_gate_is_a_post_gate_not_a_candidate_condition():
+    """死档闸**不进 `_CONDS`**:它读的是回执历史(还要经 sku_aliases 继承一跳),
+    唯一出处是 services.feed_track.receipt_blocked —— 判据只能有一处出生。"""
+    assert "receipt_blocked" not in sm._SQL_CANDIDATES
+    assert all("feed_items" not in sql for _n, _w, sql in sm._CONDS)
+    assert "feed_track.receipt_blocked(" in inspect.getsource(sm._candidates)
+
+
+def test_a_named_dead_listing_row_says_which_gate_blocked_it():
+    """点名了却没出现,必须有名有姓的理由 —— 死档是第七类。"""
+    conn = _pick_conn(cand_rows=[_cand("B0AAA00001")],
+                      why_rows=[_why("B0AAA00001")], gone=["B0AAA00001"])
+    rows, notes, skips = sm._candidates(conn, "T1", 10, only_skus=["B0AAA00001"])
+    assert rows == [] and skips["gone"] == 1
+    assert any("已经不在了(死档)" in n and "B09L3WXJ96" in n for n in notes)
 
 
 def test_two_candidates_sharing_a_product_id_keep_only_the_first():
     """官方:一个 Product ID 只允许挂一个 SKU。同批撞号不去重 = 整批被拒。"""
     conn = _Conn([("FROM catalog.walmart_items w",
                    (_CAND_COLS, [_cand("B0AAA00001", "9"), _cand("B0AAA00002", "9")])),
-                  ("FROM ops.feed_items", (["sku"], []))])
-    rows, notes = sm._candidates(conn, "T1", 10)
+                  ("SELECT DISTINCT sku FROM ops.feed_items", (["sku"], []))])
+    rows, notes, _skips = sm._candidates(conn, "T1", 10)
     assert [r["old_sku"] for r in rows] == ["B0AAA00001"]
     assert any("Product ID 撞号" in n for n in notes)
 
@@ -383,7 +495,7 @@ def test_two_candidates_sharing_a_product_id_keep_only_the_first():
 def test_zero_cap_asks_the_database_nothing():
     """上限 0(前置闸未过 / settle_only / 上一批没清)⇒ 一条候选 SQL 都不发。"""
     conn = _Conn()
-    assert sm._candidates(conn, "T1", 0) == ([], [])
+    assert sm._candidates(conn, "T1", 0) == ([], [], {})
     assert conn.sqls == []
 
 
@@ -404,12 +516,17 @@ def _why(old_sku, key=None, bad=()):
         n not in bad for n, _w, _sql in sm._CONDS)
 
 
-def _pick_conn(cand_rows=(), why_rows=(), inflight=()):
+def _pick_conn(cand_rows=(), why_rows=(), inflight=(), gone=()):
     """点名用的假连接。**理由 SQL 的答案必须排在候选之前**:两条 SQL 共用同一个
-    FROM 片段(它们本来就同源),按片段匹配的假连接只认先来的那条。"""
+    FROM 片段(它们本来就同源),按片段匹配的假连接只认先来的那条。
+
+    `gone` = 死档闸(services.feed_track.receipt_blocked)返回的 SKU;它的
+    结果是 (店, SKU) 两列,别与在途闸那条单列 SQL 共用片段。"""
     return _Conn([("AS c0", (_WHY_COLS, list(why_rows))),
                   ("FROM catalog.walmart_items w", (_CAND_COLS, list(cand_rows))),
-                  ("FROM ops.feed_items", (["sku"], [(s,) for s in inflight]))])
+                  ("SELECT DISTINCT sku FROM ops.feed_items", (["sku"], [(s,) for s in inflight])),
+                  ("catalog.sku_aliases a",
+                   (["store", "sku"], [("T1", s) for s in gone]))])
 
 
 def _args_of(conn, frag="LIMIT %(limit)s"):
@@ -442,7 +559,7 @@ def test_only_published_rows_are_candidates():
 def test_a_named_but_unpublished_row_is_reported_not_silently_dropped():
     """点名了一个非 PUBLISHED 的旧码:不许静默消失,要逐条说"不满足 已上架"。"""
     conn = _pick_conn([], [_why("B0AAA00001", bad=("已上架",))])
-    rows, notes = sm._candidates(conn, "T1", 10, only_skus=["B0AAA00001"])
+    rows, notes, _skips = sm._candidates(conn, "T1", 10, only_skus=["B0AAA00001"])
     assert rows == []
     # 点名用短名、落选点名用**人话**(摘要是给人读的,短名只在代码里)
     assert any("B0AAA00001" in n and "非 PUBLISHED" in n for n in notes), notes
@@ -467,7 +584,7 @@ def test_pick_and_exclude_are_conditions_on_the_one_candidate_sql():
 
 def test_naming_a_sku_narrows_the_face_and_says_how_many_hit():
     conn = _pick_conn([_cand("B0AAA00001")], [_why("B0AAA00001")])
-    rows, notes = sm._candidates(conn, "T1", 10, only_skus=["B0AAA00001"])
+    rows, notes, _skips = sm._candidates(conn, "T1", 10, only_skus=["B0AAA00001"])
     assert [r["old_sku"] for r in rows] == ["B0AAA00001"]
     args = _args_of(conn)
     assert args["only_skus"] == ["B0AAA00001"] and args["unnamed"] is False
@@ -478,7 +595,7 @@ def test_naming_by_asin_uses_the_registry_source_key():
     """所有者更习惯按 ASIN 说话:`-p asins=` 打在登记簿 `source_key` 上。"""
     conn = _pick_conn([_cand("B0AAA00001", key="B0ASIN0001")],
                       [_why("B0AAA00001", key="B0ASIN0001")])
-    rows, notes = sm._candidates(conn, "T1", 10, only_keys=["B0ASIN0001"])
+    rows, notes, _skips = sm._candidates(conn, "T1", 10, only_keys=["B0ASIN0001"])
     assert [r["old_sku"] for r in rows] == ["B0AAA00001"]
     assert _args_of(conn)["only_keys"] == ["B0ASIN0001"]
     assert any("命中 1 个" in n for n in notes)
@@ -487,7 +604,7 @@ def test_naming_by_asin_uses_the_registry_source_key():
 def test_a_named_row_that_misses_a_condition_is_named_with_the_reason():
     """点名了却不满足候选条件 ⇒ **逐条**说为什么,不静默丢。"""
     conn = _pick_conn([], [_why("B0AAA00002", bad=("活码",))])
-    rows, notes = sm._candidates(conn, "T1", 10, only_skus=["B0AAA00002"])
+    rows, notes, _skips = sm._candidates(conn, "T1", 10, only_skus=["B0AAA00002"])
     assert rows == []
     assert any("命中 0 个" in n for n in notes)
     assert any("B0AAA00002" in n and "码已弃用" in n for n in notes)
@@ -495,7 +612,7 @@ def test_a_named_row_that_misses_a_condition_is_named_with_the_reason():
 
 def test_a_named_asin_that_misses_a_condition_names_both_asin_and_sku():
     conn = _pick_conn([], [_why("B0AAA00003", key="B0ASIN0003", bad=("在架",))])
-    rows, notes = sm._candidates(conn, "T1", 10, only_keys=["B0ASIN0003"])
+    rows, notes, _skips = sm._candidates(conn, "T1", 10, only_keys=["B0ASIN0003"])
     assert rows == []
     assert any("B0ASIN0003(ASIN→B0AAA00003)" in n and "已缺席" in n for n in notes)
 
@@ -503,7 +620,7 @@ def test_a_named_asin_that_misses_a_condition_names_both_asin_and_sku():
 def test_a_named_row_the_store_never_heard_of_is_named_too():
     """拼错一个字母不许表现成"这家店没候选"。"""
     conn = _pick_conn([], [])
-    rows, notes = sm._candidates(conn, "T1", 10, only_skus=["B0TYPO0001"],
+    rows, notes, _skips = sm._candidates(conn, "T1", 10, only_skus=["B0TYPO0001"],
                                  only_keys=["B0TYPO0002"])
     assert rows == []
     assert any("B0TYPO0001" in n and "查无此 SKU" in n for n in notes)
@@ -514,7 +631,7 @@ def test_a_named_row_blocked_by_the_inflight_gate_says_which_gate():
     """点名不放松逐候选的在途闸 —— 但落选要说清是被哪道闸挡的。"""
     conn = _pick_conn([_cand("B0AAA00001")], [_why("B0AAA00001")],
                       inflight=["B0AAA00001"])
-    rows, notes = sm._candidates(conn, "T1", 10, only_skus=["B0AAA00001"])
+    rows, notes, _skips = sm._candidates(conn, "T1", 10, only_skus=["B0AAA00001"])
     assert rows == []
     assert any("命中 0 个" in n for n in notes)
     assert any(n.strip().startswith("· B0AAA00001:") and "在途 feed" in n
@@ -524,7 +641,7 @@ def test_a_named_row_blocked_by_the_inflight_gate_says_which_gate():
 def test_exclude_beats_the_pick_and_says_so():
     """排除优先:同一条既被点名又被排除 ⇒ 不改,而且理由是"你自己排除了它"。"""
     conn = _pick_conn([], [_why("B0AAA00001")])
-    rows, notes = sm._candidates(conn, "T1", 10, only_skus=["B0AAA00001"],
+    rows, notes, _skips = sm._candidates(conn, "T1", 10, only_skus=["B0AAA00001"],
                                  exclude_skus=["B0AAA00001"])
     assert rows == []
     args = _args_of(conn)
@@ -536,7 +653,7 @@ def test_exclude_beats_the_pick_and_says_so():
 def test_exclude_alone_keeps_the_rest_of_the_face_and_asks_no_reason_sql():
     """只给排除、不点名 ⇒ 其余照常按 SKU 升序取,理由 SQL 一条都不发。"""
     conn = _pick_conn([_cand("B0AAA00002", "0002")])
-    rows, notes = sm._candidates(conn, "T1", 10, exclude_skus=["B0AAA00001"])
+    rows, notes, _skips = sm._candidates(conn, "T1", 10, exclude_skus=["B0AAA00001"])
     assert [r["old_sku"] for r in rows] == ["B0AAA00002"]
     assert _args_of(conn)["unnamed"] is True
     assert not any("AS c0" in sql for sql, _ in conn.sqls)
@@ -548,11 +665,13 @@ def test_named_rows_beyond_the_cap_are_told_they_are_next_round():
     conn = _pick_conn([_cand("B0AAA00001")],
                       [_why("B0AAA00001"), _why("B0AAA00002"),
                        _why("B0AAA00003")])
-    rows, notes = sm._candidates(conn, "T1", 1,
+    rows, notes, _skips = sm._candidates(conn, "T1", 1,
                                  only_skus=["B0AAA00001", "B0AAA00002",
                                             "B0AAA00003"])
     assert [r["old_sku"] for r in rows] == ["B0AAA00001"]
-    assert _args_of(conn)["limit"] == 1
+    # 本轮上限不进 SQL(SQL 按 CANDIDATE_FETCH_CAP 取数,后置闸之后才截,
+    # 见 test_post_gate_skips_do_not_eat_the_round_limit)
+    assert _args_of(conn)["limit"] == sm.CANDIDATE_FETCH_CAP
     assert any("点名 3 个" in n and "命中 1 个" in n for n in notes)
     assert any("B0AAA00002、B0AAA00003" in n and "没轮到它" in n for n in notes)
 
@@ -693,11 +812,13 @@ def test_the_workflow_never_reads_feishu_itself(monkeypatch):
 #  W3 · 三态判决(纯函数)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _obs(new_present=False, old_gone=False, fresh=True, hours=1):
+def _obs(new_present=False, old_gone=False, fresh=True, hours=1,
+         new_wpid=None, old_wpid=None, old_probe=None):
     return {"id": 1, "old_sku": "B0OLD00001", "new_sku": "AAAAAAAAAAAA",
             "source_type": "amz", "source_key": "B0OLD00001", "feed_id": "F1",
             "submitted_at": NOW - timedelta(hours=hours),
-            "new_present": new_present, "old_gone": old_gone, "fresh": fresh}
+            "new_present": new_present, "old_gone": old_gone, "fresh": fresh,
+            "new_wpid": new_wpid, "old_wpid": old_wpid, "old_probe": old_probe}
 
 
 def test_confirmed_needs_new_present_and_old_gone():
@@ -714,6 +835,41 @@ def test_receipt_success_alone_does_not_settle():
 def test_both_codes_live_is_a_double_listing_and_never_settles():
     v, why = sm._verdict(_obs(True, False, hours=100), ("success", ""), NOW)
     assert v == "double" and "同时在架" in why
+
+
+def test_a_shadow_double_settles_confirmed_on_two_pieces_of_evidence():
+    """判词 (a′):**同 wpid + 旧码单查 404** ⇒ confirmed(2026-09-08,§9.15)。
+
+    A131吕灿荣 43 条停在 double 的改码里 41 条新旧 wpid **相同** —— 同 wpid =
+    同一条 listing 原地换码,改码其实成功了;"旧码还在架"只是 2026-08-28 起
+    列表接口把已删档案照旧吐回(僵尸列表,backlog §十三),单条 GET 是 404。
+    按现状那 41 条永远停在 double:旧码永不弃码、UPC 永不改标、处置永不迁键。
+    """
+    v, why = sm._verdict(_obs(True, False, hours=100, new_wpid="W9",
+                              old_wpid="W9", old_probe=404), None, NOW)
+    assert v == "confirmed"
+    assert "同 wpid" in why and "404" in why and "影子" in why
+
+
+def test_a_same_wpid_double_whose_old_code_answers_200_stays_double():
+    """单查 200 = 旧码**真的还在**沃尔玛那儿 ⇒ 仍判 double,不许定案。"""
+    v, why = sm._verdict(_obs(True, False, hours=100, new_wpid="W9",
+                              old_wpid="W9", old_probe=200), None, NOW)
+    assert v == "double" and "同时在架" in why
+
+
+def test_a_404_without_the_same_wpid_stays_double():
+    """**两条证据缺一不可**:只有 404 而 wpid 不同 ⇒ 那是真的多了一条 listing
+    (A131 那 2 条:B08DR3TKQK 两个 wpid 都 PUBLISHED;B09L3WXJ96 旧码是 RETIRED
+    死档、新码是新建 item),仍判 double 交人工。"""
+    v, _ = sm._verdict(_obs(True, False, hours=100, new_wpid="WNEW",
+                            old_wpid="WOLD", old_probe=404), None, NOW)
+    assert v == "double"
+    # 反过来同理:只有同 wpid、没探测过(old_probe 为 None)也不许定案 —— 探不出来
+    # 就当它是真双挂(fail-closed),不猜
+    v2, _ = sm._verdict(_obs(True, False, hours=100, new_wpid="W9",
+                             old_wpid="W9"), None, NOW)
+    assert v2 == "double"
 
 
 def test_failed_receipt_rolls_back():
@@ -750,8 +906,11 @@ def test_observe_and_stale_hours_are_overridable_per_run():
 #: `_SQL_OBSERVE` 的列(顺序与 SQL 逐字对齐)。`status` 是 2026-09-07 加的:
 #: 观测面从 pending 扩成 **pending ∪ double**(§9.14),`_settle` 要靠它分辨
 #: "这轮刚判成双挂"与"上轮已经是 double"(后者一条 UPDATE 都不该发)。
+#: 两列 wpid 是 2026-09-08 加的(§9.15):判词 (a′)「影子双挂」的第一条证据就是
+#: **两码 wpid 相同**(同一条 listing 原地换码),第二条是旧码单查 404。
 _OBS_COLS = ["id", "old_sku", "new_sku", "source_type", "source_key", "feed_id",
-             "submitted_at", "status", "new_present", "old_gone", "fresh"]
+             "submitted_at", "status", "new_wpid", "old_wpid",
+             "new_present", "old_gone", "fresh"]
 
 
 def _settle_wired(monkeypatch, obs_rows, receipts=None, calls=None):
@@ -768,7 +927,7 @@ def _settle_wired(monkeypatch, obs_rows, receipts=None, calls=None):
                             ("settle", s, o, n, v)))
     monkeypatch.setattr(sm.upc_pool, "retag_sku",
                         lambda c, triples: calls.append(("retag", list(triples))))
-    monkeypatch.setattr(sm.dispositions, "rekey_suggested",
+    monkeypatch.setattr(sm.dispositions, "rekey_open",
                         lambda c, s, o, n, asin=None: (
                             calls.append(("rekey", o, n, asin)), (1, []))[1])
     monkeypatch.setattr(sm.walmart_catalog, "drop_node_rows",
@@ -776,8 +935,10 @@ def _settle_wired(monkeypatch, obs_rows, receipts=None, calls=None):
     return read, calls, tx
 
 
+#: 旧码真的缺席了的那种 confirmed(old_wpid 自然是 NULL:LEFT JOIN 取不到行)。
 _OBS_COLS_CONFIRM = (1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001",
-                     "F1", NOW - timedelta(hours=2), "pending", True, True, True)
+                     "F1", NOW - timedelta(hours=2), "pending", "W1", None,
+                     True, True, True)
 
 
 def test_confirmed_retags_upc_rekeys_dispositions_and_drops_node_rows(monkeypatch):
@@ -808,7 +969,7 @@ def test_confirmed_never_touches_the_listing_sheet(monkeypatch):
 
 def test_failed_receipt_settles_as_rolled_back_and_never_resubmits(monkeypatch):
     row = (1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001", "F1",
-           NOW - timedelta(hours=2), "pending", False, True, True)
+           NOW - timedelta(hours=2), "pending", None, None, False, True, True)
     read, calls, _tx = _settle_wired(
         monkeypatch, [row], receipts={"AAAAAAAAAAAA": ("failed", "ERR_9")})
     monkeypatch.setattr(sm.feeds, "submit_feed",
@@ -820,9 +981,12 @@ def test_failed_receipt_settles_as_rolled_back_and_never_resubmits(monkeypatch):
 
 
 #: 一条"新码在架、旧码也在架"的观测行(同店双挂)。`status` 是它当前的台账状态。
-def _double_row(status="pending", rid=1):
+def _double_row(status="pending", rid=1, new_wpid="WNEW", old_wpid="WOLD"):
+    """缺省是**真双挂**:两码 wpid 不同 ⇒ 影子探测不碰它(`_shadow_candidates`),
+    判词照旧走 (b)。同 wpid 的那种传 `new_wpid=old_wpid=…`(§9.15 的影子)。"""
     return (rid, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001", "F1",
-            NOW - timedelta(hours=2), status, True, False, True)
+            NOW - timedelta(hours=2), status, new_wpid, old_wpid,
+            True, False, True)
 
 
 def test_double_listing_warns_and_settles_nothing(monkeypatch):
@@ -886,11 +1050,187 @@ def test_a_double_row_turns_into_confirmed_once_the_old_code_is_gone(monkeypatch
     **而且没有任何东西会报**。
     """
     row = (1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001", "F1",
-           NOW - timedelta(hours=2), "double", True, True, True)   # 旧码已缺席
+           NOW - timedelta(hours=2), "double", "W1", None,
+           True, True, True)   # 旧码已缺席
     read, calls, _tx = _settle_wired(monkeypatch, [row])
     counts, lines = _settle_at(sm, read, True)
     assert counts["confirmed"] == 1 and counts["double"] == 0
     assert ("settle", "T1", "B0OLD00001", "AAAAAAAAAAAA", "confirmed") in calls
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  W3a · 影子双挂逐条单查(2026-09-08 所有者实证,docs/sku_plan.md §9.15)
+#
+#  探测是**读**(GET /v3/items/{sku},走 api/items → api/_client 的每店固定出口
+#  代理与 items.get 桶),业务判断留在 `_verdict`(铁律 2:api 层不写业务判断)。
+#  fail-closed:探不出来**不猜**,那些行照旧判 double —— 反过来(当 404)会拿一次
+#  网络抖动去弃码、改 UPC、迁处置键,而且全程不报错。
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _probe_wired(monkeypatch, rows, *, probe=None, boom=None, creds=("T1",)):
+    """把 `_settle` 的读连接与探测两侧一起打桩 → (read, calls, tx, probe_log)。
+
+    probe: {旧码: None(404) | dict(200)};boom: {旧码: 异常} —— 逐条抛。
+    creds: None ⇒ load_stores 抛(凭证读不到);() ⇒ 返回空(店不可调用)。
+    """
+    read, calls, tx = _settle_wired(monkeypatch, rows)
+    log = {"stores": 0, "gets": []}
+
+    def _load(filter_names=None):
+        log["stores"] += 1
+        if creds is None:
+            raise RuntimeError("飞书抖了")
+        return [{"name": n, "client_id": "C1"} for n in creds]
+
+    def _get(store, sku):
+        log["gets"].append(sku)
+        if boom and sku in boom:
+            raise boom[sku]
+        return (probe or {}).get(sku)
+
+    monkeypatch.setattr(sm.stores_svc, "load_stores", _load)
+    monkeypatch.setattr(sm.items_api, "get_item", _get)
+    return read, calls, tx, log
+
+
+def test_only_same_wpid_doubles_are_probed_and_credentials_load_once(monkeypatch):
+    """**只对需要的行**单查:调用次数 = 同 wpid 的双挂行数,凭证只读一次。
+
+    多探一条就是白烧 items.get 配额(A085 那条教训:454 SKU 单查 = 8 分钟);
+    每行读一次凭证就是每行打一次飞书。真双挂(wpid 不同)与已缺席的行一条都不查。
+    """
+    rows = [_double_row(rid=1, new_wpid="W1", old_wpid="W1"),   # 影子:要查
+            _double_row(rid=2, new_wpid="WNEW", old_wpid="WOLD"),  # 真双挂:不查
+            _OBS_COLS_CONFIRM]                                   # 旧码已缺席:不查
+    rows[1] = tuple(["B0OLD00002" if i == 1 else v
+                     for i, v in enumerate(rows[1])])
+    read, calls, tx, log = _probe_wired(monkeypatch, rows,
+                                        probe={"B0OLD00001": None})
+    counts, lines = _settle_at(sm, read, True)
+    assert log["gets"] == ["B0OLD00001"]          # 只查了那一条
+    assert log["stores"] == 1                     # 凭证只读一次
+    assert counts["confirmed"] == 2 and counts["shadow"] == 1
+    assert counts["double"] == 1                  # 真双挂原样留着
+    assert any("影子改码定案" in ln for ln in lines)
+
+
+def test_no_shadow_candidate_means_no_credentials_and_no_walmart_call(monkeypatch):
+    """一条同 wpid 的双挂都没有 ⇒ **一次凭证都不读、一次沃尔玛都不调**。
+
+    (纯定案的一轮本来就不该碰凭证 —— 定案不回写库存,所有者 2026-09-07 定稿。)
+    """
+    read, calls, tx, log = _probe_wired(monkeypatch, [_OBS_COLS_CONFIRM])
+    monkeypatch.setattr(sm.stores_svc, "load_stores",
+                        lambda **k: pytest.fail("没有影子候选就不该读凭证"))
+    monkeypatch.setattr(sm.items_api, "get_item",
+                        lambda *a: pytest.fail("没有影子候选就不该调沃尔玛"))
+    counts, _lines = _settle_at(sm, read, True)
+    assert counts["confirmed"] == 1 and counts["shadow"] == 0
+
+
+def test_a_credential_failure_is_fail_closed_and_named(monkeypatch):
+    """凭证读不到 ⇒ **不探测**,那些行照旧判 double,并**点名一次**。
+
+    静默的表现是:所有者以为影子都自救了,而它们还停在 double —— 没有任何
+    东西会报。判不准就判活(conventions §五)。
+    """
+    read, calls, tx, log = _probe_wired(
+        monkeypatch, [_double_row(new_wpid="W1", old_wpid="W1")], creds=None)
+    counts, lines = _settle_at(sm, read, True)
+    assert counts["double"] == 1 and counts["shadow"] == 0
+    assert log["gets"] == []
+    ln = next(ln for ln in lines if "影子探测失败" in ln)
+    assert "RuntimeError" in ln and "1 条按 double 处理" in ln
+
+
+def test_a_store_that_cannot_be_called_is_fail_closed_and_named(monkeypatch):
+    """店不在可调用列表里(没配代理/没凭证)⇒ 同样不探测、点名。**严禁直连**。"""
+    read, calls, tx, log = _probe_wired(
+        monkeypatch, [_double_row(new_wpid="W1", old_wpid="W1")], creds=())
+    counts, lines = _settle_at(sm, read, True)
+    assert counts["double"] == 1 and log["gets"] == []
+    assert any("影子探测失败" in ln and "不在可调用列表" in ln for ln in lines)
+
+
+def test_a_get_that_blows_up_is_fail_closed_and_named(monkeypatch):
+    """单查抛异常(429/超时/代理波动)⇒ 那一条不挂探测结果 ⇒ 判 double,点名一次。
+
+    另一条查得到的**照常定案** —— 逐条隔离:一条抖动不该把整批影子拖回 double。
+    """
+    rows = [_double_row(rid=1, new_wpid="W1", old_wpid="W1"),
+            _double_row(rid=2, new_wpid="W2", old_wpid="W2")]
+    rows[1] = tuple(["B0OLD00002" if i == 1 else
+                     ("BBBBBBBBBBBB" if i == 2 else v)
+                     for i, v in enumerate(rows[1])])
+    read, calls, tx, log = _probe_wired(
+        monkeypatch, rows, probe={"B0OLD00001": None},
+        boom={"B0OLD00002": TimeoutError("代理波动")})
+    counts, lines = _settle_at(sm, read, True)
+    assert log["gets"] == ["B0OLD00001", "B0OLD00002"]
+    assert counts["shadow"] == 1 and counts["confirmed"] == 1
+    assert counts["double"] == 1
+    ln = next(ln for ln in lines if "影子探测失败" in ln)
+    assert "TimeoutError×1" in ln and "fail-closed" in ln
+
+
+def test_dry_run_probes_but_writes_nothing(monkeypatch):
+    """dry-run **照样探测**(只读),但一行库都不写 —— 空跑正是人眼确认
+    "这批到底是影子还是真双挂"的那一步。"""
+    read, calls, tx, log = _probe_wired(
+        monkeypatch, [_double_row(new_wpid="W1", old_wpid="W1")],
+        probe={"B0OLD00001": None})
+    counts, lines = _settle_at(sm, read, False)
+    assert log["gets"] == ["B0OLD00001"]              # 探了
+    assert counts["confirmed"] == 1 and counts["shadow"] == 1
+    assert not tx.sqls and "open:tx" not in calls     # 一行库都没写
+    assert not [c for c in calls if isinstance(c, tuple)]
+    ln = next(ln for ln in lines if "[DRY-RUN] 将定案" in ln)
+    assert "confirmed" in ln and "同 wpid" in ln and "404" in ln
+
+
+def test_a_row_already_double_turns_confirmed_through_the_shadow_probe(monkeypatch):
+    """**已经是 double 的行**(A131 那 41 条)经 (a′) 转 confirmed,走现成 `_confirm`。
+
+    `_SQL_OBSERVE` 的面本来就是 pending ∪ double(§9.14),所以这批不需要任何
+    额外的取数改动;定案后果与"旧码真缺席"那条**逐字相同**,不新增写动作。
+    """
+    read, calls, tx, log = _probe_wired(
+        monkeypatch, [_double_row(status="double", new_wpid="W1", old_wpid="W1")],
+        probe={"B0OLD00001": None})
+    counts, lines = _settle_at(sm, read, True)
+    assert counts["confirmed"] == 1 and counts["double"] == 0
+    kinds = [c[0] for c in calls if isinstance(c, tuple)]
+    assert kinds[:4] == ["settle", "retag", "rekey", "drop"]   # 现成的五处后果
+    assert ("settle", "T1", "B0OLD00001", "AAAAAAAAAAAA", "confirmed") in calls
+    assert not any("status = 'double'" in sql for sql, _ in tx.sqls)  # 不再写 double
+
+
+def test_the_first_line_counts_shadows_apart_from_real_doubles(monkeypatch):
+    """首行「影子改码 N」与「⚠ 同店双挂 N」**分开报**:前者已解决,后者是待办。"""
+    rows = [_double_row(rid=1, new_wpid="W1", old_wpid="W1"),
+            _double_row(rid=2, new_wpid="WNEW", old_wpid="WOLD")]
+    rows[1] = tuple(["B0OLD00002" if i == 1 else v
+                     for i, v in enumerate(rows[1])])
+    _wire(monkeypatch)
+    _read_conn(monkeypatch, [
+        ("FROM listing.sku_migrations m", (_OBS_COLS, rows)),
+        ("FROM listing.sku_migrations WHERE store", (["confirmed", "open"],
+                                                     [(50, 0)])),
+    ])
+    monkeypatch.setattr(sm.feed_track, "item_results", lambda fid: {})
+    monkeypatch.setattr(sm.stores_svc, "load_stores",
+                        lambda filter_names=None: [{"name": "T1"}])
+    monkeypatch.setattr(sm.items_api, "get_item", lambda store, sku: None)
+    monkeypatch.setattr(sm.sku_codec, "settle_replacement", lambda *a, **k: None)
+    monkeypatch.setattr(sm.upc_pool, "retag_sku", lambda *a, **k: None)
+    monkeypatch.setattr(sm.dispositions, "rekey_open", lambda *a, **k: (1, []))
+    monkeypatch.setattr(sm.dispositions, "executing_actions_on",
+                        lambda *a, **k: [])
+    monkeypatch.setattr(sm.walmart_catalog, "drop_node_rows", lambda *a, **k: 1)
+    first = sm.run({"store": "T1", "execute": True,
+                    "settle_only": "1"}).splitlines()[0]
+    assert "影子改码 1" in first
+    assert "⚠ 同店双挂 1" in first
 
 
 def test_the_observe_face_covers_double_rows_too():
@@ -991,7 +1331,7 @@ def test_the_first_line_no_longer_carries_an_inventory_restore(monkeypatch):
     monkeypatch.setattr(sm.sku_codec, "settle_replacement",
                         lambda *a, **k: None)
     monkeypatch.setattr(sm.upc_pool, "retag_sku", lambda *a, **k: None)
-    monkeypatch.setattr(sm.dispositions, "rekey_suggested",
+    monkeypatch.setattr(sm.dispositions, "rekey_open",
                         lambda *a, **k: (1, []))
     monkeypatch.setattr(sm.walmart_catalog, "drop_node_rows", lambda *a, **k: 1)
     monkeypatch.setattr(sm.dispositions, "executing_actions_on",
@@ -1312,10 +1652,11 @@ def test_first_line_carries_the_four_warnings(monkeypatch):
     read = _read_conn(monkeypatch, [
         ("FROM listing.sku_migrations m", (_OBS_COLS,
             [(1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001", "F1",
-              NOW - timedelta(hours=200), "pending", True, False, True),
+              NOW - timedelta(hours=200), "pending", "WNEW", "WOLD",
+              True, False, True),
              (2, "B0OLD00002", "BBBBBBBBBBBB", "amz", "B0OLD00002", "F1",
               datetime.now(timezone.utc) - timedelta(hours=200), "pending",
-              False, False, False)])),
+              None, None, False, False, False)])),
         ("FROM listing.sku_migrations WHERE store", (["confirmed", "open"],
                                                      [(0, 2)])),
     ])
@@ -1336,7 +1677,7 @@ def test_dry_run_prefix_stays_at_the_head_of_the_first_line(monkeypatch):
         ("FROM listing.sku_migrations WHERE store", (["confirmed", "open"],
                                                      [(0, 0)])),
         ("FROM catalog.walmart_items w", (_CAND_COLS, [_cand("B0AAA00001")])),
-        ("FROM ops.feed_items", (["sku"], [])),
+        ("SELECT DISTINCT sku FROM ops.feed_items", (["sku"], [])),
     ])
     out = sm.run({"store": "T1", "execute": False, "dry_run": True})
     first = out.splitlines()[0]
@@ -1353,7 +1694,7 @@ def test_the_summary_reports_the_headroom_in_dry_run_too(monkeypatch):
                                                      [(50, 0)])),
         ("count(*) FROM catalog.walmart_items", (["n"], [(4998,)])),
         ("FROM catalog.walmart_items w", (_CAND_COLS, [_cand("B0AAA00001")])),
-        ("FROM ops.feed_items", (["sku"], [])),
+        ("SELECT DISTINCT sku FROM ops.feed_items", (["sku"], [])),
     ])
     out = sm.run({"store": "T1", "execute": False})
     assert "上架上限闸:上限 5000(缺省,该店未填「商品上限」),在架 4998," \
@@ -1423,7 +1764,7 @@ def test_naming_five_still_bows_to_the_stage_cap(monkeypatch):
         ("FROM listing.sku_migrations WHERE store", (["confirmed", "open"],
                                                      [(0, 0)])),
         ("FROM catalog.walmart_items w", (_CAND_COLS, [_cand("B0AAA00001")])),
-        ("FROM ops.feed_items", (["sku"], [])),
+        ("SELECT DISTINCT sku FROM ops.feed_items", (["sku"], [])),
     ])
     out = sm.run({"store": "T1", "execute": False,
                   "skus": "B0AAA00001, B0AAA00002\nB0AAA00003 B0AAA00004,"
@@ -1476,7 +1817,7 @@ def test_exclude_reaches_the_sql_from_run(monkeypatch):
                                                      [(50, 0)])),
         ("FROM catalog.walmart_items w", (_CAND_COLS, [_cand("B0AAA00002",
                                                              "0002")])),
-        ("FROM ops.feed_items", (["sku"], [])),
+        ("SELECT DISTINCT sku FROM ops.feed_items", (["sku"], [])),
     ])
     out = sm.run({"store": "T1", "execute": False,
                   "exclude_skus": "B0AAA00001, B0AAA00001",
@@ -1498,7 +1839,8 @@ def test_exclude_reaches_the_sql_from_run(monkeypatch):
 #  而本工作流的 SQL 全是新写的,拼错一个列名在单测里一路绿灯。
 # ══════════════════════════════════════════════════════════════════════════════
 
-import contextlib   # noqa: E402  —— 集成段自带的依赖,与上面的单测段分开
+import contextlib
+import inspect   # noqa: E402  —— 集成段自带的依赖,与上面的单测段分开
 import socket       # noqa: E402
 
 _PG_HOST, _PG_PORT = "127.0.0.1", 55432
@@ -1544,7 +1886,10 @@ def pg(monkeypatch):
 
 
 def _seed(conn, sku, source_type="amz", source_key=None, upc="000000000001",
-          missing=None):
+          missing=None, price=29.99):
+    """夹具行。⚠ `price` 不能省:候选判据「有现挂价格」(2026-09-06 随 REPLACE
+    语义加)要求 `w.price > 0` —— 不给价的夹具行一条都进不了候选面,而这一整节
+    的用例都以"它是候选"为前提(沙箱 PG 起来之前它们一直被 skip,发现不了)。"""
     with conn.cursor() as cur:
         cur.execute(
             "INSERT INTO catalog.listing_sources "
@@ -1553,9 +1898,10 @@ def _seed(conn, sku, source_type="amz", source_key=None, upc="000000000001",
             (_STORE, sku, source_type, source_key or sku))
         cur.execute(
             "INSERT INTO catalog.walmart_items "
-            "(store, sku, upc, published_status, last_seen_at, missing_since) "
-            "VALUES (%s, %s, %s, 'PUBLISHED', now(), %s)",
-            (_STORE, sku, upc, missing))
+            "(store, sku, upc, price, published_status, last_seen_at,"
+            " missing_since) "
+            "VALUES (%s, %s, %s, %s, 'PUBLISHED', now(), %s)",
+            (_STORE, sku, upc, price, missing))
 
 
 @needs_pg
@@ -1572,7 +1918,7 @@ def test_pg_candidates_take_only_legacy_amz_live_rows(pg):
         cur.execute("INSERT INTO catalog.walmart_items "
                     "(store, sku, published_status, last_seen_at) "
                     "VALUES (%s, 'B0PGMIG004', 'PUBLISHED', now())", (_STORE,))
-    rows, _notes = sm._candidates(pg, _STORE, 50)
+    rows, _notes, _skips = sm._candidates(pg, _STORE, 50)
     assert [r["old_sku"] for r in rows] == [_OLD]
     assert rows[0]["product_id"] == "000000000001"
     assert rows[0]["product_id_type"] == "UPC"
@@ -1600,7 +1946,7 @@ def test_pg_pick_and_exclude_run_through_the_same_candidate_sql(pg):
             sm._candidates(pg, _STORE, 50, only_skus=[_OLD],
                            only_keys=["B0PGMIG005"])[0]] == [_OLD, "B0PGMIG005"]
     # 排除优先(既点名又排除)
-    rows, notes = sm._candidates(pg, _STORE, 50, only_skus=[_OLD],
+    rows, notes, _skips = sm._candidates(pg, _STORE, 50, only_skus=[_OLD],
                                  exclude_skus=[_OLD])
     assert rows == [] and any("排除优先于点名" in n for n in notes)
     # 只排除、不点名:其余照常
@@ -1608,7 +1954,7 @@ def test_pg_pick_and_exclude_run_through_the_same_candidate_sql(pg):
             sm._candidates(pg, _STORE, 50,
                            exclude_skus=[_OLD])[0]] == ["B0PGMIG005"]
     # 点名一条跟卖 ⇒ 落选**并给理由**(点名不放松判据,也不静默丢)
-    rows, notes = sm._candidates(pg, _STORE, 50, only_skus=["B0PGMIG006"])
+    rows, notes, _skips = sm._candidates(pg, _STORE, 50, only_skus=["B0PGMIG006"])
     assert rows == [] and any("B0PGMIG006" in n and "跟卖不迁" in n for n in notes)
 
 
@@ -1619,7 +1965,7 @@ def test_pg_pending_pointers_and_ledger_land_together(pg, monkeypatch):
     monkeypatch.setattr(sm.feeds, "submit_feed", lambda store, ft, items, workflow="":
                         [{"outcome": "submitted", "feed_id": "FPG1",
                           "count": len(items)}])
-    rows, _ = sm._candidates(pg, _STORE, 10)
+    rows, _, _skips = sm._candidates(pg, _STORE, 10)
     counts, _lines = sm._migrate({"name": _STORE}, rows, True)
     assert counts["submitted"] == 1
     new_sku = rows[0]["new_sku"]
@@ -1655,7 +2001,7 @@ def test_pg_confirm_moves_identity_upc_dispositions_and_node_rows(pg, monkeypatc
     monkeypatch.setattr(sm.feeds, "submit_feed", lambda store, ft, items, workflow="":
                         [{"outcome": "submitted", "feed_id": "FPG2",
                           "count": len(items)}])
-    rows, _ = sm._candidates(pg, _STORE, 10)
+    rows, _, _skips = sm._candidates(pg, _STORE, 10)
     sm._migrate({"name": _STORE}, rows, True)
     new_sku = rows[0]["new_sku"]
     # 观测:新码在架、旧码缺席、水位新鲜
@@ -1723,7 +2069,7 @@ def test_pg_rollback_revives_the_old_code_and_burns_nothing(pg, monkeypatch):
                     (_ASIN, _STORE, _OLD))
     monkeypatch.setattr(sm.feeds, "submit_feed", lambda store, ft, items, workflow="":
                         [{"outcome": "failed", "feed_id": None, "count": len(items)}])
-    rows, _ = sm._candidates(pg, _STORE, 10)
+    rows, _, _skips = sm._candidates(pg, _STORE, 10)
     counts, _lines = sm._migrate({"name": _STORE}, rows, True)
     assert counts["rolled_back"] == 1
     new_sku = rows[0]["new_sku"]
@@ -1741,7 +2087,7 @@ def test_pg_rollback_revives_the_old_code_and_burns_nothing(pg, monkeypatch):
         status, err = cur.fetchone()
         assert status == "rolled_back" and err
     # 回滚之后**可以再改一次码**(认领唯一索引只算活行),而且是一个新码
-    rows2, _ = sm._candidates(pg, _STORE, 10)
+    rows2, _, _skips = sm._candidates(pg, _STORE, 10)
     assert [r["old_sku"] for r in rows2] == [_OLD]
     monkeypatch.setattr(sm.feeds, "submit_feed", lambda store, ft, items, workflow="":
                         [{"outcome": "submitted", "feed_id": "FPG3",
@@ -1758,7 +2104,7 @@ def test_pg_stage_cap_and_observe_read_the_real_ledger(pg, monkeypatch):
                         [{"outcome": "submitted", "feed_id": "FPG4",
                           "count": len(items)}])
     assert sm._stage_cap(pg, _STORE, 100)[0] == 1          # 空账:第一级
-    rows, _ = sm._candidates(pg, _STORE, 1)
+    rows, _, _skips = sm._candidates(pg, _STORE, 1)
     sm._migrate({"name": _STORE}, rows, True)
     cap, note = sm._stage_cap(pg, _STORE, 100)
     assert cap == 0 and "只定案不提交" in note              # 有 pending:先清账
@@ -1782,7 +2128,7 @@ def test_pg_a_double_row_frees_the_gate_but_never_resubmits(pg, monkeypatch):
     monkeypatch.setattr(sm.feeds, "submit_feed", lambda store, ft, items, workflow="":
                         [{"outcome": "submitted", "feed_id": "FPG5",
                           "count": len(items)}])
-    rows, _ = sm._candidates(pg, _STORE, 10)
+    rows, _, _skips = sm._candidates(pg, _STORE, 10)
     sm._migrate({"name": _STORE}, rows, True)
     new_sku = rows[0]["new_sku"]
     # 观测:新码在架,而旧码**也**还在架(后台删不掉的那种)
@@ -1834,9 +2180,9 @@ def test_one_bad_row_does_not_stop_the_others(monkeypatch):
     正被缺席抑制着,没人会报。
     """
     rows = [(1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001", "F1",
-             NOW - timedelta(hours=2), "pending", True, True, True),
+             NOW - timedelta(hours=2), "pending", "W1", None, True, True, True),
             (2, "B0OLD00002", "BBBBBBBBBBBB", "amz", "B0OLD00002", "F1",
-             NOW - timedelta(hours=2), "pending", True, True, True)]
+             NOW - timedelta(hours=2), "pending", "W2", None, True, True, True)]
     read, calls, _tx = _settle_wired(monkeypatch, rows)
     boom = {"n": 0}
 
@@ -1975,7 +2321,7 @@ def test_the_candidate_sql_still_carries_the_slow_blob_for_the_parser():
     assert "w.avail_qty AS avail_qty" in sm._SQL_CANDIDATES
     assert "avail_qty" not in " ".join(sql for _n, _w, sql in sm._CONDS)
     conn = _Conn([("FROM catalog.walmart_items w", (_CAND_COLS, [_cand("B0AAA00001")])),
-                  ("FROM ops.feed_items", (["sku"], []))])
+                  ("SELECT DISTINCT sku FROM ops.feed_items", (["sku"], []))])
     sm._candidates(conn, "T1", 10)
     args = [a for sql, a in conn.sqls if "LIMIT %(limit)s" in sql][0]
     assert args["marketplace"] == sm.amz_source.MARKETPLACE   # 口径唯一出处
@@ -1993,8 +2339,8 @@ def test_a_row_whose_weight_cannot_be_parsed_is_no_longer_dropped():
                                  _cand("B0AAA00003", "0003",
                                        slow={"weight": {"package": 300}}),
                                  _cand("B0AAA00004", "0004")])),
-                  ("FROM ops.feed_items", (["sku"], []))])
-    rows, notes = sm._candidates(conn, "T1", 10)
+                  ("SELECT DISTINCT sku FROM ops.feed_items", (["sku"], []))])
+    rows, notes, _skips = sm._candidates(conn, "T1", 10)
     assert [r["old_sku"] for r in rows] == ["B0AAA00001", "B0AAA00002",
                                             "B0AAA00003", "B0AAA00004"]
     assert not any("跳过" in n and "重量" in n for n in notes), notes
@@ -2052,7 +2398,7 @@ def test_a_named_row_without_a_parsable_weight_is_a_hit_now():
     """点名一个采不到重量的旧码:它**命中**(不再落选),重量按 1 磅发。"""
     conn = _pick_conn([_cand("B0AAA00001", slow={"weight": {}})],
                       [_why("B0AAA00001")])
-    rows, notes = sm._candidates(conn, "T1", 10, only_skus=["B0AAA00001"])
+    rows, notes, _skips = sm._candidates(conn, "T1", 10, only_skus=["B0AAA00001"])
     assert [r["old_sku"] for r in rows] == ["B0AAA00001"]
     assert any("命中 1 个" in n for n in notes), notes
     assert not any("shipping_weight" in n for n in notes), notes
@@ -2137,7 +2483,7 @@ def test_a_missing_receipt_on_a_rejected_feed_rolls_back_at_once(monkeypatch):
     「一条都没发出去」,按 failed 当场回滚。"""
     row = (1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001", "F1",
            datetime.now(timezone.utc) - timedelta(hours=1), "pending",
-           False, False, True)
+           None, None, False, False, True)
     _settle_wired.feed_st = {"F1": "failed"}
     try:
         read, calls, _tx = _settle_wired(monkeypatch, [row],
@@ -2155,7 +2501,7 @@ def test_a_missing_receipt_on_a_processed_feed_still_waits(monkeypatch):
     (_settle 用真时钟判观测期,所以夹具的 submitted_at 也按真时钟给:1 小时前。)"""
     row = (1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001", "F1",
            datetime.now(timezone.utc) - timedelta(hours=1), "pending",
-           False, False, True)
+           None, None, False, False, True)
     _settle_wired.feed_st = {"F1": "done"}
     try:
         read, calls, _tx = _settle_wired(monkeypatch, [row],

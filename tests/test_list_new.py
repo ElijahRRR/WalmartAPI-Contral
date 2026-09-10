@@ -11,6 +11,16 @@ from services import feed_track, listing_sheet
 from workflows import list_new as ln
 
 
+@pytest.fixture(autouse=True)
+def _freshness_without_db(monkeypatch):
+    """`list_new._push_scrape` 2026-09-10 起先查 `amz_source.latest_seen`(读库)。
+    本文件的用例全靠打桩不连库,缺省当"从没采过"(全部过旧 ⇒ 推全部,即 2026-09-10
+    之前的形态);要验新鲜判据的用例自己再打一次桩(后打的赢)。"""
+    monkeypatch.setattr(ln.amz_source, "latest_seen", lambda asins: {
+        a: ln.amz_source.Seen(None, None, False) for a in asins})
+
+
+
 def test_classify_receipt_priority():
     c = listing_sheet.classify_receipt
     # SKU_LOCKED 优先于一切(即使 status=success)
@@ -734,8 +744,11 @@ def test_material_gate_drops_before_llm_and_quota(monkeypatch):
     assert "共 1 行将进入" in out         # 只有素材齐全那行进预备期
 
 
-def test_push_scrape_daily_dedup(monkeypatch):
-    """缺数据自动推采集(所有者批复 2026-08-12):日界批次名撞名即防重。"""
+def test_push_scrape_skips_fresh_rows_and_names_batches_by_time(monkeypatch):
+    """上架链刷新(2026-09-10 收敛):只推 12 小时内没有快照的候选,判据出自
+    `amz_source.latest_seen`(与审核链同一出处);批次名按时间戳,不按日界 ——
+    日界名会让同日再跑时新增候选撞名 409 推不出去。"""
+    import re
     calls = []
     monkeypatch.setattr(ln.scraper, "submit_batch",
                         lambda name, asins: (calls.append((name, asins)),
@@ -748,19 +761,26 @@ def test_push_scrape_daily_dedup(monkeypatch):
                             (name, status)))
     monkeypatch.setattr(ln.scrape_batches, "prioritize",
                         lambda name, bid: (jumped.append(name), True)[1])
+    fresh = {"B2"}
+    monkeypatch.setattr(ln.amz_source, "latest_seen", lambda asins: {
+        a: ln.amz_source.Seen(None, None, a in fresh) for a in asins})
     note, names = ln._push_scrape(["B1", "B2"], execute=True)
-    assert "已推采集" in note and calls[0][1] == ["B1", "B2"]
-    assert calls[0][0].startswith("listing_gap_")
+    assert "推采集刷新 1 个" in note and calls[0][1] == ["B1"]   # B2 12h 内采过
+    assert "1 个 12 小时内采过、不重刷" in note
+    assert re.fullmatch(r"listing_gap_\d{8}T\d{6}", calls[0][0]), calls[0][0]
     assert names == [calls[0][0]]            # 可等待的批次名交还调用方
     assert booked == [(calls[0][0], "pushed")] and jumped == [calls[0][0]]
+    # 全部新鲜:一个不推、不等
+    note0, names0 = ln._push_scrape(["B2"], execute=True)
+    assert "都在 12 小时内采过" in note0 and names0 == [] and len(calls) == 1
 
     def boom(name, asins):
         raise ln.scraper.BatchExistsError(7, name)
     monkeypatch.setattr(ln.scraper, "submit_batch", boom)
     note2, names2 = ln._push_scrape(["B3"], execute=True)
-    assert "已推过" in note2 and len(names2) == 1   # 撞名沿用既有批次,照样可等
+    assert "已有同名" in note2 and len(names2) == 1   # 409 = 上一次其实推成了,照样可等
     note3, names3 = ln._push_scrape(["B4"], execute=False)   # dry-run 不推
-    assert "DRY-RUN" in note3 and names3 == []
+    assert "DRY-RUN" in note3 and "刷新 1 个" in note3 and names3 == []
     assert ln._push_scrape([], True) == (None, [])
 
 
@@ -1646,8 +1666,9 @@ def test_still_failed_store_is_absent_in_first_line_and_keeps_its_half_work(
 
 
 def test_same_round_scrape_refreshes_all_candidates(monkeypatch):
-    """同轮闭环(2026-08-19 升级:上架必须用当天最新数据):**全部候选**先推
-    采集刷新(不只缺数据的)→ 等窗口 → 按批摄取 → 才取数定价提交。
+    """同轮闭环(2026-08-19 升级:上架必须用当天最新数据;2026-09-10 起
+    `_push_scrape` 内部只推 12 小时内没快照的,这里打桩不管):候选先推
+    采集刷新 → 等窗口 → 按批摄取 → 才取数定价提交。
 
     wait_settled/_ingest_batches 打桩(它们各自有自己的测试),这里只验接线:
     推的是全候选、次序对(推→等→摄取→才取数)、只拉自己那批、摘要说人话。

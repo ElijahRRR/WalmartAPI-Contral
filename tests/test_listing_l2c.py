@@ -88,16 +88,21 @@ def test_llm_cache_key_stable_and_order_independent():
     assert llm_cache.cache_key(m, 0.3, 4096) != k1      # 温度参与键
 
 
-def test_llm_thinking_disable_gated_by_flash_family(monkeypatch):
-    """v4-flash 官方默认开 thinking,旧仓铁律显式关闭(所有者确认生产
-    模型 2026-08-13);非 flash 家族不发该字段(未知字段可能被拒)。"""
+def test_llm_thinking_disable_gated_by_registry(monkeypatch):
+    """DeepSeek 官方默认开 thinking,旧仓铁律显式关闭;**登记表说了才发**
+    (2026-09-10 由 `"flash" in model` 子串匹配改成 registry.LLM_THINKING)。
+
+    两个旧别名故意不登记 —— 官方没记过它们认不认这个字段,保持今天已验证的
+    "不下发"行为,不替它们做假设。
+    """
     m = [{"role": "user", "content": "x"}]
-    monkeypatch.setenv("DEEPSEEK_MODEL_AUDIT_L3", "deepseek-v4-flash")
-    body = llm._request_body(m, 0.2, 1500, "audit_l3")
-    assert body["thinking"] == {"type": "disabled"}
+    for model in ("deepseek-v4-flash", "deepseek-v4-pro"):
+        monkeypatch.setenv("DEEPSEEK_MODEL_AUDIT_L3", model)
+        body = llm._request_body(m, 0.2, 1500, "audit_l3")
+        assert body["thinking"] == {"type": "disabled"}, model
+        assert body["response_format"] == {"type": "json_object"}
     monkeypatch.setenv("DEEPSEEK_MODEL_AUDIT_L3", "deepseek-chat")
     assert "thinking" not in llm._request_body(m, 0.2, 1500, "audit_l3")
-    assert body["response_format"] == {"type": "json_object"}
 
 
 def test_llm_model_for_purpose(monkeypatch):
@@ -257,29 +262,120 @@ def test_default_model_is_call_time_not_an_import_snapshot(monkeypatch):
     from api import llm
 
     monkeypatch.delenv("DEEPSEEK_MODEL", raising=False)
-    assert llm._default_model() == "deepseek-v4-flash"
-    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
-    assert llm._default_model() == "deepseek-v4-pro"        # 立刻生效
+    assert llm._default_model() == "deepseek-v4-pro"
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-v4-flash")
+    assert llm._default_model() == "deepseek-v4-flash"      # 立刻生效
     monkeypatch.setenv("DEEPSEEK_MODEL", "   ")             # 空白视同未配置
-    assert llm._default_model() == "deepseek-v4-flash"
+    assert llm._default_model() == "deepseek-v4-pro"
 
 
 def test_default_model_is_not_a_retired_alias():
-    """缺省值不许是官方已宣布停用的旧别名(2026-08-21)。
+    """缺省值不许是官方已宣布停用的旧别名,且必须能算出钱、能压掉思考模式。
 
     踩上去的后果不是"某个功能怪怪的",是**全仓 LLM 调用在别名切断当天
-    一起失败**;而且 thinking-disabled 那道闸按 "flash" in model 门控,
-    别名下整条失效。这条用例是那两件事的守门人。
+    一起失败**。缺省值 2026-09-10 由 v4-flash 切成 **v4-pro**(官方路由期
+    → 实际跑 V4.1 Flash、按 Flash 计费),这条用例是三件事的守门人:
+    不是旧别名、算得出钱(经 llm_priced_model 折)、thinking 显式 disabled。
     """
     from registry import resources
     from api import llm
 
+    assert llm._DEFAULT_MODEL == "deepseek-v4-pro"
     assert llm._DEFAULT_MODEL not in resources.LLM_LEGACY_ALIASES
-    assert llm._DEFAULT_MODEL in resources.LLM_PRICING     # 缺省值必须能算出钱
-    # 缺省值必须触发 thinking disabled(v4-flash 家族官方默认开 thinking)
+    # 缺省值必须能算出钱 —— 经别名折算后要落在价表里
+    assert (resources.llm_priced_model(llm._DEFAULT_MODEL)
+            in resources.LLM_PRICING)
+    # 缺省值必须触发 thinking disabled(DeepSeek 家族官方默认开 thinking)
     body = llm._request_body([{"role": "user", "content": "x"}], 0.2, 100,
                              "default")
+    assert body["model"] == "deepseek-v4-pro"
     assert body["thinking"] == {"type": "disabled"}
+
+
+def test_thinking_switch_comes_from_the_registry_not_a_substring(monkeypatch):
+    """2026-09-10:thinking 门控从 `"flash" in model` 子串匹配改成登记表。
+
+    子串门控在缺省模型切成 `deepseek-v4-pro` 的那一刻**整条失效**(名字里
+    没有 flash),而那正是它最该生效的时候。表里没有的模型不下发该字段
+    (未知模型可能拒未知字段),但必须**点名警告**——静默跑在思考模式下会多花
+    输出 token 且出参形状可能变。
+    """
+    import logging
+
+    from registry import resources
+    from api import llm
+
+    # 登记过的正式产品名:一律显式 disabled(名字里有没有 flash 都一样)
+    for model in ("deepseek-v4-pro", "deepseek-v4-flash"):
+        monkeypatch.setenv("DEEPSEEK_MODEL", model)
+        body = llm._request_body([{"role": "user", "content": "x"}], 0.2, 100,
+                                 "default")
+        assert body["thinking"] == {"type": "disabled"}, model
+
+    # **判据是登记表不是名字**:名字里带 flash 但没登记的,一样不下发 ——
+    # 旧的子串门控会给它发,这条差异就是"改成登记表"这件事本身
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-v9-flash-unknown")
+    llm._THINKING_WARNED.discard("deepseek-v9-flash-unknown")
+    assert "thinking" not in llm._request_body(
+        [{"role": "user", "content": "x"}], 0.2, 100, "default")
+
+    # 未登记模型:不下发字段,且点名一次
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-v9-unknown")
+    llm._THINKING_WARNED.discard("deepseek-v9-unknown")
+    logger = logging.getLogger("api.llm")
+    seen: list = []
+    h = logging.Handler()
+    h.emit = lambda rec: seen.append(rec.getMessage())
+    logger.addHandler(h)
+    try:
+        body = llm._request_body([{"role": "user", "content": "x"}], 0.2, 100,
+                                 "default")
+    finally:
+        logger.removeHandler(h)
+    assert "thinking" not in body
+    assert any("未登记 thinking" in m and "deepseek-v9-unknown" in m
+               for m in seen), seen
+    # 每个模型只吵一次,不刷满日志
+    assert "deepseek-v9-unknown" in llm._THINKING_WARNED
+    assert resources.llm_thinking("deepseek-v9-unknown") is None
+
+
+def test_every_model_we_actually_run_has_a_thinking_row():
+    """我们真会去跑的模型(价表键 + 路由期键)都必须在 LLM_THINKING 里有一行。
+
+    两张表分开维护,漏一行就是"某个模型静默跑在思考模式下"——它不会报错,
+    只会悄悄多花输出钱。这条用例是那个漏项的守门人。
+    ⚠ 两个旧别名**故意不在范围内**:官方没记过它们认不认 `thinking`,
+    保持今天已验证的"不下发"行为,不替它们做假设(见 LLM_THINKING 注释)。
+    """
+    from registry import resources
+
+    known = set(resources.LLM_PRICING) | set(resources.LLM_ROUTED_MODELS)
+    missing = known - set(resources.LLM_THINKING)
+    assert not missing, f"这些模型缺 LLM_THINKING 登记:{sorted(missing)}"
+    assert not (set(resources.LLM_THINKING)
+                & resources.LLM_LEGACY_ALIASES), "旧别名不该登记 thinking"
+
+
+def test_official_routing_window_is_named_every_round():
+    """官方路由期(v4-pro 的请求实际跑 V4.1 Flash)必须每轮进摘要。
+
+    路由期一结束(V4.1 Pro 上线)单价与实际模型都会变,而官方不会来通知 ——
+    靠人记住"几个月后要复核"是记不住的,所以让每轮摘要自己说。
+    """
+    from services import llm_cost
+
+    row = {"calls": 1, "prompt": 0, "completion": 1_000_000,
+           "cache_hit": 0, "cache_miss": 0}
+    out = "\n".join(llm_cost.summarize(
+        {("deepseek-v4-pro", "audit_l3", "offpeak"): row}))
+    assert "官方路由期" in out and "V4.1 Flash" in out
+    assert "LLM_MODEL_ALIASES" in out          # 复核动作指到具体那一行
+    assert "¥4.00" in out                      # 按 Flash 单价(出 4 元/百万)
+    # 没用路由期模型的轮次不该出现这条提醒
+    plain = "\n".join(llm_cost.summarize(
+        {("deepseek-v4-flash", "audit_l3", "offpeak"): row}))
+    assert "官方路由期" not in plain
 
 
 def test_legacy_alias_is_priced_and_called_out():

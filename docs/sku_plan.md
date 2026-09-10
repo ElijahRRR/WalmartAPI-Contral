@@ -592,7 +592,7 @@ feedType 与两个桶都已收录,只补注释与测试)。
 但不记 `item_missing`)、`problem_scan` 的扫描面排除在途改码旧码 + 顽固/归类/WFS/在途
 四段判据经 `catalog.sku_aliases` **继承一跳**、`alloc_survey` 销量归属同样继承(决策 H)、
 `sku_migrate` 的回执不进病历也不反哺黑名单;`dispositions.open_executing_count` /
-`rekey_suggested`、`walmart_catalog.drop_node_rows` 两个积木。
+`rekey_open`、`walmart_catalog.drop_node_rows` 两个积木。
 
 第三块(本次)**工作流** `workflows/sku_migrate.py`(DANGEROUS=True、SUPPORTS_STORE=True、
 `-p store=` **必填**、**永不进调度**):
@@ -601,7 +601,8 @@ feedType 与两个桶都已收录,只补注释与测试)。
 
   | 判词 | 证据组合 | 后果 |
   |---|---|---|
-  | `confirmed` | 新码在架 ∧ 旧码缺席 | 旧行 `abandon('sku_update')`(**不烧 UPC**)+ 新码记 `sku_replaced` + `upc_pool.retag_sku` + `dispositions.rekey_suggested` + `drop_node_rows` + 台账 confirmed |
+  | `confirmed` | 新码在架 ∧ 旧码缺席 | 旧行 `abandon('sku_update')`(**不烧 UPC**)+ 新码记 `sku_replaced` + `upc_pool.retag_sku` + `dispositions.rekey_open` + `drop_node_rows` + 台账 confirmed |
+  | `confirmed`(影子) | 新码在架 ∧ 旧码**也**在架 ∧ **两码 wpid 相同** ∧ **旧码单查 404**(`api.items.get_item`)| 判词 (a′)「影子双挂」(2026-09-08 所有者实证,见 §9.15):列表接口把已删档案照旧吐回(僵尸列表,backlog §十三),同 wpid 说明这两个码是同一条 listing、原地换码已生效。**后果与上一行逐字相同,不新增写动作**;两条证据缺一不可,探不出来(凭证/GET 失败)一律 fail-closed 判 `double` |
   | `rolled_back` | 回执 `failed`;或**观测新鲜**且新码超 `OBSERVE_HOURS`(24h)仍未出现;或 POST 当场判 failed | 旧行 `replaced_by` 清空(复活)+ 新码 `abandon('sku_update_failed')` + 台账 rolled_back。**不自动补交**(写操作永不自动兜底);下一轮重来会抽新码 |
   | `stalled` | 超 `STALE_HOURS`(72h)仍判不出 | 只落台账 + 摘要点名人工,**不自动定案**(判不准就判活:回滚一个其实已生效的改码 = 登记簿说旧码、沃尔玛说新码,而且不报错) |
   | `double` | 新码在架 ∧ 旧码**也**在架 | **同店双挂**:台账落持久状态 `double`(2026-09-07 所有者定稿,见 §9.14;此前是「留 pending 只告警」),摘要逐条 + **首行**点名,**不自动处置**。它**不进节奏闸的 open**(后续改码照发)、**不许再开第二条台账**(候选判据含 `'double'`),但每轮仍参与定案 —— 旧码哪天缺席就自动转 `confirmed`。身份层不动 |
@@ -661,7 +662,7 @@ feedType 与两个桶都已收录,只补注释与测试)。
 
 | 键 | 结论 | 依据 |
 |---|---|---|
-| `ops.dispositions` 未落定建议 | **迁**(`rekey_suggested`,撞唯一索引的动作不迁不删、点名人工) | 建议是"这个 item 怎么处置",item 没变、只是身份列换了 |
+| `ops.dispositions` 未落定建议 | **迁**(`rekey_open`,撞唯一索引的动作不迁不删、点名人工) | 建议是"这个 item 怎么处置",item 没变、只是身份列换了 |
 | `ops.dispositions` executing 行 | **不迁**,改由前置闸③挡住(该店有 executing 就不许改码) | 搬键 = 把已提交 feed 的判决对象换掉 |
 | `catalog.item_node_inventory` | **删旧码行**(`drop_node_rows`) | 旧码在沃尔玛侧已不存在,留着是永不更新的幽灵行,而维护链的受管仓判据照读不误 |
 | `catalog.upc_pool` | **改标**(只动 `sku` 列;`asin`/`status`/`used_at` 不动) | 改码不是一次新消耗;领号复用键仍是 (店, ASIN) |
@@ -1090,11 +1091,11 @@ A085朱丽霖 899 条 executing,而这是 13:00 三条链齐发之后的常态)�
 |---|---|---|
 | **破坏组 suggested** | 马上被 `claim` 成一条打在**旧码**上的 DELETE feed | **拦** |
 | **破坏组 executing** | `settle` 的判据是 `delete_verified`(= 这个 SKU 不见了);改码后旧码正好消失 ⇒ **假确认**:商品还挂着,账本记「已确认删除」,不报错 | **拦** |
-| 维护组 suggested | 定案时 `rekey_suggested` 把键从旧码搬到新码 —— 本来就有出路 | 不拦 |
-| 维护组 executing | rekey **故意不碰**(搬键 = 换判决对象)⇒ 滞留在旧码上 ⇒ `expire_executing` 判成 `ineffective` 收尾 | 不拦,但**点名** |
+| 维护组 suggested | 定案时 `rekey_open` 把键从旧码搬到新码 —— 本来就有出路 | 不拦 |
+| 维护组 executing | ~~rekey **故意不碰**(搬键 = 换判决对象)⇒ 滞留在旧码上 ⇒ `expire_executing` 判成 `ineffective` 收尾~~ **2026-09-08 改口(§9.15)**:同 wpid 的原地换码下,新码的现值就是那条 feed 作用的对象 ⇒ **一并迁到新码**,由 `settle_maintenance` 按新码观测落定(`expire_executing` 仍是最终兜底)| 不拦,但**点名** |
 
 **连带修掉一处已经过期的注释**(这次查证的最大收获):
-`services/dispositions.rekey_suggested` 的边界①原文写着「改码的前置闸
+`services/dispositions.rekey_suggested`(2026-09-08 起改名 `rekey_open`,§9.15)的边界①原文写着「改码的前置闸
 (`open_executing_count`)**保证这一刻该店没有 executing 行**,所以这里不需要
 分支,只需要不碰」—— 9.8 拆掉那条整店闸之后,这句话已经不成立。现改写为:
 保证从**整店**变成**逐候选**,且只覆盖破坏组;维护组的 executing 行确实可能存在,
@@ -1782,3 +1783,179 @@ python cli.py sku_migrate -p store=A131吕灿荣 -p settle_only=1   # ③ 自动
 SELECT store, old_sku, new_sku, feed_id, error
   FROM listing.sku_migrations WHERE status = 'double';
 ```
+
+### 9.15 影子双挂定案 + 维护账随码迁移(2026-09-08,所有者实证)
+
+两件事同一天从生产数据里查出来,都是「账比不了」而不是「事没做成」——**改码其实
+早就生效了,只是我们拿来比对的那一行不是它**。
+
+#### 一、现场证据(所有者按 SQL 逐条对过)
+
+**A131吕灿荣:43 条改码台账停在 `double`(§9.14 的持久状态),其中 41 条新旧码
+`wpid` 相同。**
+
+`wpid` 是沃尔玛给**每条 listing** 的内部 id。改码通道 MP_ITEM_MATCH 是「同 GTIN +
+新 SKU + `processMode=REPLACE`」在**同一个 item 上原地换码**(§9.12 所有者 Seller
+Center 实测:新旧码 wpid 相同 `5FK5P1SAT7OM`、库存跟着过来、价格不变、旧码
+GET 404),所以:
+
+> **wpid 相同 = 这两个码是同一条 listing = 改码已经生效**;
+> 「旧码还在架」是 **2026-08-28 起沃尔玛列表接口把已删档案照旧吐回**
+> (僵尸列表,`docs/backlog.md` §十三:列表 PUBLISHED 而**单条** GET 404)的影子。
+
+A085朱丽霖 早先那条实测同款:旧码单查 404、新码 wpid 与旧码相同。
+按 §9.14 的现状,这 41 条**永远**停在 `double` —— 旧码永不弃码、UPC 永不改标、
+处置建议永不迁键,而且没有任何东西会报。
+
+**剩下 2 条是真双挂,仍留 `double` 交人工**(它们正是"为什么证据要两条"的活样本):
+
+| 旧码 | 情形 |
+|---|---|
+| `B08DR3TKQK` | 新旧两个 wpid **都** PUBLISHED —— 真的多了一条 listing |
+| `B09L3WXJ96` | 旧码是 **RETIRED 死档**,新码是**新建**的 item(wpid 不同) |
+
+**A171罗尹鸿:改码定案后摘要点名「旧码名下还有 executing 的 `price`,不迁,由
+`expire_executing` 判成 ineffective 收尾」。** 所有者查证:处置 691466
+(`price`,建议 15.71 → 16.78,`executed_at` 2026-09-07 14:00)仍是 `executing`;
+而新码 `AJ5K52FK5SME` 在 2026-09-08 06:41 的观测里 `price=16.78`,旧码同一轮记了
+缺席,沃尔玛后台只有新码。⇒ **改价早就生效了,只是这条账拿旧码那一行比,而那一行
+已经不在观测面上**(`_MAINT_OPEN_SQL` 是 `JOIN catalog.walmart_items`,旧码缺席就
+JOIN 不上)。后果:要等 3 天 `expire_executing` 超期放行才落定(还落成
+`ineffective` —— 与事实相反),而且**每一次改码定案都把它点名一遍**。
+
+#### 二、改动 A:影子双挂按「同 wpid + 旧码单查 404」定案 `confirmed`
+
+`workflows/sku_migrate.py`:
+
+1. `_SQL_OBSERVE` 增选 `nw.wpid AS new_wpid, ow.wpid AS old_wpid`。
+2. `_settle` 对 **同 wpid 的双挂行**(`_shadow_candidates`:新码在架 ∧ 旧码没缺席 ∧
+   两码 wpid 相同且非空;**含状态已经是 `double` 的行** —— `_SQL_OBSERVE` 本来就取
+   pending ∪ double)**逐条单查旧码** `api.items.get_item(store, old_sku)`:
+   404 ⇒ 行上挂 `old_probe=404`,200 ⇒ `old_probe=200`。
+   走 api/items → api/_client 的**每店固定出口代理**与 `items.get` 桶(900/min),
+   **严禁直连**;店铺凭证 `services/stores.load_stores([store])` **按需加载、一轮一次**
+   —— 一条影子候选都没有就**一次凭证都不读、一次沃尔玛都不调**。
+3. `_verdict` 在规则 (b) 之前插一条 **(a′)**:
+   `new_present ∧ ¬old_gone ∧ old_probe == 404 ∧ old_wpid == new_wpid ⇒ confirmed`,
+   理由「新码在架,旧码与新码同 wpid 且单查 404 —— 列表接口的影子,改码已生效」。
+   `_verdict` **仍是纯函数**(探测结果由 `_settle` 喂进来)。
+4. 定案后走**现有** `_confirm` 路径(弃旧码 `sku_update` / UPC 改标 / 处置迁键 /
+   清节点行 / 台账 confirmed),**不新增任何写动作**。
+5. 摘要:首行新增「**影子改码 N**」,与「⚠ 同店双挂 N」**分开报** —— 前者是本轮
+   自救掉的,后者是仍要所有者回头处理的待办;明细里每条影子定案各一行。
+   dry-run **照样探测**(只读)并报 `[DRY-RUN] 将定案 … = confirmed(…同 wpid…
+   单查 404…影子…)` —— 空跑正是人眼确认"这批到底是影子还是真双挂"的那一步。
+
+**为什么证据必须是两条**(缺一不可,这是本节最容易被下一个人"简化"掉的地方):
+
+- **只有 wpid 相同**:只说明"曾经是同一条 listing",不说明旧码现在没了。
+  真双挂里 `B08DR3TKQK` 的两个 wpid 不同,但一个 wpid 相同却旧码真在架的组合
+  (改码 feed 发过、后台又被人手工建回旧码)不是不可能 —— 单查 200 就是它的样子。
+- **只有单查 404**:不说明"新码是由这个旧 item 换来的"。`B09L3WXJ96` 就是反例:
+  旧码是 RETIRED 死档(单查很可能 404),而新码是**新建**的另一条 item ——
+  按 404 一条就定案,等于把一条从未生效的改码记成成功,旧码从此弃用、UPC 改标,
+  **而且不报错**。
+- **单查是"读",不违反"定案只信观测"**:它本身就是一次逐条观测,而且比列表那一轮
+  更新更准。这条纪律防的是"拿回执当判据",与逐条 GET 是两回事。
+
+**fail-closed 的三条分支**(探不出来一律**不猜**,那些行照旧判 `double`,
+并在摘要里**点名一次**「影子探测失败(异常类名),N 条按 double 处理」):
+
+| 分支 | 处置 |
+|---|---|
+| `load_stores` 抛(飞书抖 / 快照也没有) | 整批不探测,点名 |
+| 店不在可调用列表(未启用 / 没配代理 / 没凭证) | 整批不探测,点名 |
+| 单条 GET 抛(429 / 超时 / 代理波动) | **只有那一条**不挂探测结果,其余照常定案;按异常类名归并计数点名 |
+
+反过来(探不出来就当 404)会拿一次网络抖动去弃码、改 UPC、迁处置键,而且全程
+不报错 —— 那是**不可逆**的一侧。判不准就判活(conventions §五)。
+
+**旧码那一行 `catalog.walmart_items` 怎么办:本次什么都不做**(结论,别顺手加)。
+查过 `services/walmart_catalog`:`_UPSERT_SQL` 的 `ON CONFLICT DO UPDATE` 里写死
+`missing_since = NULL` —— 只要下一轮 catalog_sync 在**列表**里还看得见旧码
+(僵尸列表正是这样),我们标的 `missing_since` **当轮就会被翻回 NULL**。
+所以本次**不标** `missing_since`:标了也留不住,徒增抖动(还会让
+`product_events` 的缺席/复现事件来回刷)。如实记下代价:
+
+- 影子行仍留在维护面与问题面上(`maintenance_intents` / `problem_scan` 的取数只看
+  `missing_since IS NULL` + `published_status`,**不看登记簿的 `abandoned_at`**),
+  于是维护 feed 对它仍会失败、problem_scan 仍会对它建议删除;
+- 那批失败正是 `docs/backlog.md` §十三(僵尸列表与破坏类处置卡死)的病灶,
+  **根治归那一条**(建议修法已经写在那里:对可疑行逐条单查,404 ⇒ 当观测缺席)。
+  本节只做改码链自己的自救,不越界去动 catalog_sync / problem_scan 的取数。
+
+#### 三、改动 B:旧码名下**维护类** `executing` 行迁到新码
+
+`services/dispositions.py`:`rekey_suggested` **改名 `rekey_open`**(函数名再叫
+suggested 就与它做的事对不上;**不留别名、不留两个函数** —— 一个能力一条实现路径,
+§六。全仓调用点与测试一起改)。
+
+- 迁的面:**全部 `suggested` + 维护组(`MAINT_ACTIONS`:price/inventory/title)的
+  `executing`**。条件与 suggested 那半完全一样:新码名下同 `(store, sku, action)`
+  已有未落定行(`_REKEY_TAKEN_SQL`)⇒ **不迁不删、点名人工**;`asin` 列 coalesce 补;
+  迁过的行 `detail` 留 `rekeyed_from` / `rekeyed_at`(回头查"这条账当初打在哪个码上"
+  必须有答案)。
+- **`executed_at` 一个字不改**:宽限期(`MAINT_SETTLE_GRACE_HOURS` = 2h)照旧从
+  **原提交时刻**算 —— 刷新它等于把"提交多久了"重新计时,而那条 feed 早就发出去了。
+- **破坏组(`DESTRUCTIVE_ACTIONS`)的 `executing` 照旧不迁**:它们的判据是
+  `product_events` 的 `delete_verified`(「这个 SKU 不见了」),改码后旧码正好消失,
+  搬到新码上就是拿另一个身份去等一个已经被污染的判决。它们本不该出现(候选判据
+  「无未了结破坏建议」挑选时就剔掉了),真出现了由 `executing_actions_on` 点名人工。
+- **迁过去之后不加任何新的落定代码**:`settle_maintenance` 的现有规则(新码
+  `last_seen_at > executed_at + 2h` 之后按现值比 `detail->>'new'`)自然收尾 ——
+  A171 那条 691466 会在下一次 maintenance 的落定里判成 `confirmed`(16.78 == 16.78)。
+  `expire_executing` **不动**,仍是最终兜底。
+- `workflows/sku_migrate._confirm`:先取 `executing_actions_on`(**必须在迁键之前**,
+  之后就读不到了),再调 `rekey_open`;摘要按组分开说 —— 维护组「旧码名下 executing
+  的 {actions} **已迁到新码**,由维护链按新码观测落定」,破坏组的告警**原样保留**,
+  撞车的仍走「请人工处置」那一句。
+
+**边界①为什么可以改**:原口径「executing 一律不碰,搬键等于把判决对象换掉」的
+**前提**是"新码与旧码是两个不同的 item"。在 MP_ITEM_MATCH 的原地换码下这个前提
+不成立:同一个 wpid,**新码的现值就是那条 feed 作用的对象**。所以搬过去不是换判决
+对象,而是把账挪到唯一还比得了的那一行。破坏组的前提没变(它比的是"消失没消失",
+而消失这件事被改码本身污染了),所以那一半一个字不改。
+
+#### 四、纪律与不变量(别顺手改掉)
+
+- 依赖方向仍是 workflows → services → api:**"是不是影子"这个业务判断在 `_verdict`**,
+  api 层只回 `None`(404)/ `dict`(200)(铁律 2)。
+- 写库函数**不设 `dry_run` 形参**;探测是读,所以 dry-run 可做、也**必须**做。
+- **不加任何对影子行的自动删除**(写操作永不自动兜底);真双挂仍留 `double` 人工处置。
+- 不动 catalog_sync / problem_scan / 维护链的取数 SQL。
+- `_verdict` 的其余六条规则与优先级一字未改(顺序即语义)。
+
+#### 五、死档不改码(2026-09-09 追加)
+
+上面第三节说的是"改码**之后**那本账怎么收";这一节说的是"这一条**根本不该**改码"。
+
+沃尔玛侧已不存在的 item(最近一次 DELETE/RETIRE 回执码 ∈
+`registry.resources.WALMART_ERR_ITEM_GONE`:Invalid Item ID / deleted-retired /
+already de-activated / QARTH「No matching record」)发 MP_ITEM_MATCH **不是改码,
+是新建一条 listing** —— 它匹配不到任何现存 item,于是照着载荷建了个新的。
+
+实证:**A131吕灿荣 B09L3WXJ96** 的那条**真双挂**(与本节第一段讲的"影子双挂"
+不是一回事,两码 wpid **不同**):旧码是 RETIRED 死档、新码是这样新建出来的 item,
+两条同时挂在店里。回执全绿、摘要正常,没有任何东西会说它建了个新品。
+
+落地:`workflows/sku_migrate._candidates` 的**第三道后置闸**(与在途闸、撞号闸并列,
+`_pick_report` 里是第七类落选理由:「沃尔玛回执说该 SKU 已经不在了(死档),改码会
+新建 listing —— 不迁」),摘要首行单独报「死档 N」。判据经
+`services/feed_track.receipt_blocked`,与 `problem_scan` 的死档闸**同一个函数、同一份
+SQL**;dry-run 同样生效(三道后置闸全是只读判据)。
+
+**不进 `_CONDS`** 是有意的:那份判据文本是"目录 × 登记簿"的行判据,而这一条读的是
+`ops.feed_items` 的回执历史(还要经 `catalog.sku_aliases` 继承一跳)—— 塞进候选 SQL
+等于在判据文本里再嵌一段两层子查询,而它的唯一出处已经在 services 里。
+
+目录里那些死档行**本身**仍未根治(`walmart_items.missing_since` 仍是 NULL,维护链
+对它们照旧发 feed 照旧失败),归 `docs/backlog.md` §十三的后半段。
+
+#### 六、后置闸不占本轮名额(2026-09-09 追加)
+
+A131吕灿荣 实证:`-p limit=500` 只发出 45 条 —— 候选 SQL 先按 `LIMIT 500` 截断,
+在途闸再从这 500 里剔掉 455,被剔的行**白占了本轮名额**,候选面上还有几百条合格的
+一条没轮到。改法:候选 SQL 按 `CANDIDATE_FETCH_CAP`(20000,远大于任何一家店的
+在架行)整店取回,三道后置闸(在途 feed / 死档 / Product ID 撞号)过完**再**按
+`-p limit` 截,截掉的在摘要里说出口(「合格候选 N 个,只发前 M 个,其余下一轮」)。
+上限 0 的早退不变,`_pick_report` 的「没轮到」理由不变。

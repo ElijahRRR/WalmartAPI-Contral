@@ -1576,17 +1576,32 @@ CREATE TABLE IF NOT EXISTS ops.dedupe (
 --
 -- 状态机 suggested → executing → confirmed / ineffective:
 --   suggested    扫描件给出的建议,还没动手
---   executing    执行件已提交 feed(feed_id 落在本行),等观测
---   confirmed    观测确认生效(delete_verified / 反补后重新 PUBLISHED)
---   ineffective  观测确认**没**生效(delete_not_effective:回执说成了但商品还在架
---                ——所有者实证过的真实故障模式),下轮重新建议
+--   executing    执行件已提交 feed(feed_id 落在本行),等观测/等回执
+--   confirmed    生效(delete_verified / 反补后重新 PUBLISHED / 回执说该 SKU 已不存在)
+--   ineffective  没生效(delete_not_effective:回执说成了但商品还在架 —— 所有者
+--                实证过的真实故障模式;或回执 failed/missing),下轮重新建议
 --   withdrawn    扫描件本轮**不再建议**它了(问题自己好了 / 不再命中闸)。
 --                建议是有时效的:昨天建议删 A、今天 A 恢复正常,那条 suggested
 --                还挂着的话执行件照样会删。撤销只动 suggested,executing 不碰
---                (feed 已经在沃尔玛队列里,撤销无意义,归 settle 按观测判)
+--                (feed 已经在沃尔玛队列里,撤销无意义,归 settle 按观测/回执判)
 -- 生效判定**不自己实现**:直接读 catalog.product_events 里 catalog_sync 经
 -- services/product_events.verify_deletions 落的 delete_verified /
 -- delete_not_effective ——"不信回执信观测"那套已经在跑,再写一份只会两份漂移。
+--
+-- detail->>'settled_by' 记**是谁判的**(2026-09-09 起破坏类有三种来源):
+--   delete_verified / delete_not_effective  观测判(catalog_sync 核验)
+--   receipt_gone     回执码 ∈ registry.resources.WALMART_ERR_ITEM_GONE ——
+--                    沃尔玛说这个 SKU 已经不在了(删了/退役了/停用了/匹配库里
+--                    查无),破坏动作的目的已达成 ⇒ confirmed。**不论回执 status**
+--                    (QARTH「No matching record」那个码是 status=success 带回来的)
+--   receipt_failed   回执 failed/missing(含 WFS 不许删等永久拒)⇒ ineffective
+--   value_unchanged / observed   维护三类按现值比对(settle_maintenance)
+--   expired          超期放行(expire_executing,只对维护三类)
+-- 补 receipt_* 之前**回执失败没有任何落定路径**:观测流的起点是成功回执,
+-- 失败的回执一条都进不去 —— 全船队约 800 条 delete/retire 停在 executing 数周,
+-- 而下面那条部分唯一索引挡住同 SKU 再建议 ⇒ 永不重删(docs/backlog.md §十三)。
+-- ⚠ receipt_gone 是**处置账的收尾,不是身份层的结论**:落它的那条 SQL 不弃码、
+-- 不改 catalog.walmart_items、不记 product_events。
 CREATE TABLE IF NOT EXISTS ops.dispositions (
     id           bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
     store        text NOT NULL,

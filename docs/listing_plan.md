@@ -214,7 +214,7 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
 - [x] 跟卖库存:`maintenance_intents.match_inventory_intents`(唯一路径,
       默认铺 10;stockzero 解除自动回补)
 - [x] 配额切片后置(淘汰放切片前,配额以成功提交为准)
-- [x] 缺数据自动推采集(`list_new._push_scrape`,日界批次名防重)
+- [x] 缺数据自动推采集(`list_new._push_scrape`;2026-09-10 起只推 12 小时内没快照的候选、批次名按时间戳,判据与审核链共用 `amz_source.latest_seen`)
 - [x] manufacturer 提顶层 + risk_gate 双字段
 - [x] 闸门前淘汰计次:**否决不做**(所有者:数据每轮会变,不该永久淘汰;
       贵步骤已在切片后,无浪费)

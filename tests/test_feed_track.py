@@ -620,3 +620,48 @@ def test_sku_migrate_receipt_writes_no_product_event(monkeypatch):
     feed_track.poll_feed(STORE, "F11")
     assert [(r["sku"], r["event"]) for r in written] == \
         [("B0LIST01", "list_feed_success")]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  receipt_blocked:破坏类回执闸的**唯一一份 SQL**(2026-09-09 上移到 services)
+#
+#  两个消费方:problem_scan(死档 / 永久拒不再重建议)与 sku_migrate(死档不
+#  改码)。各写一份的表现是两条链对"这个 SKU 还在不在"给出不同答案,而且不报错。
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_receipt_blocked_sql_shape():
+    """SQL 的四个形状要件,每个都对应一种"错了不报错"的失效方式。"""
+    q = feed_track._RECEIPT_BLOCKED_SQL
+    # ① 最近一次尝试,不是"历史上出现过就永久拉黑"(转出 WFS 之后要能放出来)
+    assert "DISTINCT ON (store, sku)" in q
+    assert "ORDER BY store, sku, submitted_at DESC" in q
+    # ② 先取最近一次、**再**比码集:内层就按码过滤会拿更早那次失败当结论
+    assert q.index("DISTINCT ON") < q.index("t.error_code = ANY(%(codes)s::text[])")
+    # ③ 删与停都算(顽固件双发的另一半不能漏)
+    assert "f.feed_type = ANY(%(feeds)s::text[])" in q
+    assert feed_track.DESTRUCTIVE_FEED_TYPES == ("DELETE_ITEM", "RETIRE_ITEM")
+    # ④ 改码链继承一跳(新码在 feed_items 里一条历史都没有,不继承就整个失明)
+    assert "catalog.sku_aliases a" in q and q.count("UNION ALL") == 1
+    assert "f.sku = a.alias_sku" in q
+    assert "listing_sources" not in q          # 代际继承只准经视图
+    # 每个参数带显式 ::类型(本仓 SQL 因 PG 推不出参数类型连炸三次的老教训)
+    import re
+    assert not re.findall(r"%\((\w+)\)s(?!\s*::)", q)
+
+
+def test_receipt_blocked_asks_nothing_when_the_code_set_is_empty():
+    """空码集 ⇒ 一条 SQL 都不发(`= ANY('{}')` 恒假,查了也是白查)。"""
+    conn = _Conn()
+    assert feed_track.receipt_blocked(conn, []) == set()
+    assert conn.sqls == []
+
+
+def test_receipt_blocked_passes_the_codes_and_the_store_through():
+    """码集由调用方从 registry 传进来,本函数**不认识任何具体的码**(铁律 3);
+    store 为 None = 全船队(SQL 里那半条 `IS NULL OR` 恒真)。"""
+    conn = _Conn()
+    feed_track.receipt_blocked(conn, {"B", "A", "A"}, store="T1")
+    sql, args = conn.sqls[0]
+    assert sql is feed_track._RECEIPT_BLOCKED_SQL
+    assert args["codes"] == ["A", "B"] and args["store"] == "T1"
+    assert args["feeds"] == list(feed_track.DESTRUCTIVE_FEED_TYPES)

@@ -54,8 +54,8 @@
 | perf_problems | ✅ 明细已映射飞书(运营在用) | 挂独立调度 |
 | maintenance | 🟡 三 provider 实跑过;**清零链路未生产验证** | 清零验证(⚠ FEISHU_LIMITS_* 已于 2026-08-17 配好,前置解除,可以验了);涨跌幅闸暂不做;~~挂调度~~✅ |
 | product_clear | ✅ 2026-08-07 | RETIRE_ITEM 动作实测;切旧 15:00 cron;挂调度 |
-| problem_scan | ✅ 2026-08-14(批次 E 拆出) | 只读定性,产 ops.dispositions 建议行 |
-| problem_product_cleanup | ✅ 2026-08-07(21 店真跑) | 停旧每 6h cron;挂调度。⚠ 批次 E 后改为**纯执行件**:只消费建议行,自己不做决策 |
+| problem_scan | ✅ 2026-08-14(批次 E 拆出) | 只读定性,产 ops.dispositions 建议行。**2026-09-09 加两道回执闸**:最近一次 DELETE/RETIRE 回执码命中「已死档」(沃尔玛说这个 SKU 已不在了)或「永久拒」(WFS 不许删 / RETIRE 通用异常)的 (店,SKU) 不再建议,两桶分开计数并在摘要点名(判据 registry 两个码集 + `services/feed_track.receipt_blocked`,原散落的 `_WFS_BLOCKED_CODE` 字面量已删) |
+| problem_product_cleanup | ✅ 2026-08-07(21 店真跑) | 停旧每 6h cron;挂调度。⚠ 批次 E 后改为**纯执行件**:只消费建议行,自己不做决策。**2026-09-09 起 `settle` 多两种落定来源**:回执码说「该 SKU 已不存在」⇒ confirmed(`settled_by=receipt_gone`)、回执 failed/missing ⇒ ineffective(`receipt_failed`),摘要单独一行报。补它之前失败回执**没有任何落定路径**,全船队约 800 条 delete/retire 卡在 executing 数周、同 SKU 永不重删(docs/backlog.md §十三) |
 | catalog_sync | ✅ 47 店全量 | 每日并跑对拍;挂调度 |
 | product_ingest / product_refresh | ✅ 生产实跑(2026-08-13 所有者确认) | VPS 后配 EXPORT_TOKEN;挂调度 |
 | settlement_sync | ✅ 首跑 | 挂调度(双周账期) |

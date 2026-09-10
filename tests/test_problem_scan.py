@@ -13,6 +13,8 @@ import socket
 
 import pytest
 
+from registry import resources
+from services import feed_track
 from services import problem_products as pp
 from workflows import problem_scan as scan
 
@@ -215,12 +217,12 @@ def test_preview_writes_nothing(monkeypatch):
     """preview=1 只打印:一条建议行都不许落(与危险工作流的 dry-run 同精神)。"""
     monkeypatch.setattr(scan, "_load_state", lambda: (
         [_item("T1", "S_B", "prohibited product policy")],
-        set(), set(), {}, set(), set(), set()))
+        set(), set(), {}, set(), set(), set(), set()))
     monkeypatch.setattr(scan.dispositions, "suggest_many",
                         lambda conn, rows: (_ for _ in ()).throw(
                             AssertionError("preview 不许写建议行")))
     monkeypatch.setattr(scan, "_audit_rejected_rows",
-                        lambda conn, inflight, inactive, only, wfs=None: [])
+                        lambda conn, inflight, inactive, only, gone=None, perm=None: [])
 
     import contextlib
     from registry import db as _db
@@ -244,9 +246,9 @@ def test_absence_probe_failure_does_not_stop_the_scan(monkeypatch):
     """
     monkeypatch.setattr(scan, "_load_state", lambda: (
         [_item("T1", "S_B", "prohibited product policy")],
-        set(), set(), {}, set(), set(), set()))
+        set(), set(), {}, set(), set(), set(), set()))
     monkeypatch.setattr(scan, "_audit_rejected_rows",
-                        lambda conn, inflight, inactive, only, wfs=None: [])
+                        lambda conn, inflight, inactive, only, gone=None, perm=None: [])
 
     import contextlib
     from registry import db as _db
@@ -476,7 +478,7 @@ def test_summarize_counts_the_rows_that_actually_land():
     ]
     audit_rows = [allrows[1]]
     n = {"inflight": 2, "inflight_listing": 0, "inactive": 3, "delete": 1,
-         "wfs": 0}
+         "gone": 0, "permanent": 0}
     head = _summ(allrows, audit_rows, n, 99)
     # 删除报 2(retire 之外的全部 delete 行),不是 n['delete'] 的 1
     assert "删除 2" in head[0]
@@ -531,7 +533,7 @@ def test_summarize_dedupes_like_the_unique_index():
          "category": "B", "source": "scan"},
     ]
     n = {"fallback": 0, "stage": 0, "inflight": 0, "inflight_listing": 0,
-         "wfs": 0,
+         "gone": 0, "permanent": 0,
          "inactive": 0}
     head = scan._summarize(allrows, [allrows[1]], n, 3)
     assert "删除 2" in head[0]          # 不是 3
@@ -601,54 +603,118 @@ def test_policy_gap_note_reports_unknown_policy_names():
     assert scan._policy_gap_note(_ConnAll(), items) == ""
 
 
-# ── WFS 删不掉的闸(多仓批次 0)──────────────────────────────────────────────
+# ── 破坏类回执的两道闸:死档 / 永久拒(2026-09-09 由 WFS 那一道泛化)─────────
 
-def test_wfs_blocked_skus_are_skipped_not_re_deleted_every_round():
-    """WFS 件删不掉 → 跳过并计数,**不再每天空发一次注定被拒的 DELETE_ITEM**。
+def test_dead_listing_skus_are_skipped_not_re_deleted_every_round():
+    """死档 SKU 跳过并计数,**不再每天空发一次注定失败的 DELETE_ITEM**。
 
-    生产实证 11 条(L001/A152/A154/A170)连着几轮同一个 ERR_EXT_DATA_0101218。
-    ⚠ 只拦破坏动作:反补走 MP_MAINTENANCE,对 WFS 件照常可用。
+    2026-09-09 全船队实证:约 800 条 delete/retire 卡在 executing,回执里
+    ~450 条「Incoming Itemid does not exist in Matching」、~200 条「This SKU has
+    been deleted/retired」、数百条 QARTH「No matching record found」——
+    沃尔玛侧这些 SKU 早就不在了,破坏动作的目的已达成,再发只是烧配额。
     """
-    items = [_item("T1", "S_DEL", "prohibited product policy"),   # → 删除
+    items = [_item("T1", "S_DEL", "prohibited product policy"),
              _item("T1", "S_OK", "prohibited product policy")]
     plans, n = scan.plan(items, set(), {}, set(),
-                         wfs_blocked={("T1", "S_DEL")})
-    assert n["wfs"] == 1
+                         gone_blocked={("T1", "S_DEL")})
+    assert n["gone"] == 1 and n["permanent"] == 0
     assert [r["sku"] for r in plans["T1"]["delete"]] == ["S_OK"]
 
 
-def test_wfs_gate_blocks_the_delete_and_counts_it():
-    """WFS 件在「一律删除」口径下(2026-08-28 反补退役)一条都发不出去:
-    跳过并报数,把"要不要转出 WFS"交回给人 —— 不跳的话每天空发一次注定
-    被拒的 DELETE_ITEM(生产实见 11 条连烧多轮)。"""
+def test_permanent_refusal_skus_are_skipped_and_counted_separately():
+    """永久拒(WFS 不许删 / RETIRE 的 ERR_PDI_0004)与死档**分开计数**。
+
+    两件事的下一步不同:死档是"事情已经成了,不用再管";永久拒是"要人去
+    Seller Center 处理(转出 WFS)"。合成一个数就等于把待办混进已完成。
+    ⚠ 拦掉不等于改判 retire:RETIRE_ITEM 对 WFS 件行不行官方没有明文,
+    按本仓纪律不许按推断编码 —— 只跳过并响亮报数。
+    """
     it = _item("T1", "S_EXP", "end date has passed")
-    plans, n = scan.plan([it], set(), set(), wfs_blocked={("T1", "S_EXP")})
-    assert n["wfs"] == 1 and n["delete"] == 0
+    plans, n = scan.plan([it], set(), set(), perm_blocked={("T1", "S_EXP")})
+    assert n["permanent"] == 1 and n["gone"] == 0 and n["delete"] == 0
     assert plans.get("T1", {"delete": []})["delete"] == []
 
 
-def test_wfs_gate_also_blocks_stubborn_double_feed():
-    """顽固件的 retire+delete 双发同样拦:delete 注定被拒,而 retire 对 WFS
-    件行不行官方没有明文 —— 按本仓纪律不按推断编码,整条跳过并报数。"""
-    items = [_item("T1", "S_Z", "prohibited product policy")]
-    plans, n = scan.plan(items, set(), set(), stubborn={("T1", "S_Z")},
-                         wfs_blocked={("T1", "S_Z")})
-    assert n["wfs"] == 1 and n["stubborn"] == 0
-    assert plans.get("T1", {"delete": [], "retire": []})["delete"] == []
+def test_both_receipt_gates_also_block_the_stubborn_double_feed():
+    """顽固件的 retire+delete 双发同样拦(两桶都拦)。
 
-
-def test_wfs_blocked_sql_reads_only_the_latest_attempt():
-    """口径是**最近一次**删除回执,不是"历史上出现过就永久拉黑"。
-
-    商品转出 WFS 之后就该能删了 —— 下一次尝试的回执会把它放出来。
-    写成 EXISTS(任意一轮命中过)的话,转出 WFS 的件永远删不了,而且没人
-    看得出来是被自己的闸拦着。
+    死档:delete 与 retire 都会拿到同一句「这个 SKU 不在了」;
+    永久拒:delete 注定被拒,而 retire 对 WFS 件行不行官方没有明文。
+    两种情形都整条跳过并报数,不按推断编码。
     """
-    q = scan._SQL_WFS_BLOCKED
+    for bucket, key in (("gone_blocked", "gone"),
+                        ("perm_blocked", "permanent")):
+        items = [_item("T1", "S_Z", "prohibited product policy")]
+        plans, n = scan.plan(items, set(), set(), stubborn={("T1", "S_Z")},
+                             **{bucket: {("T1", "S_Z")}})
+        assert n[key] == 1 and n["stubborn"] == 0, bucket
+        assert plans.get("T1", {"delete": [], "retire": []})["delete"] == []
+        assert plans.get("T1", {"delete": [], "retire": []})["retire"] == []
+
+
+def test_the_named_samples_match_the_counts_in_the_headline():
+    """摘要两处的数必须对得上:总览那行的 `n['gone']`/`n['permanent']` 与
+    明细里点名的条数,排除顺序都是「非 ACTIVE → 在途 → 死档 → 永久拒」。
+
+    对不齐的老坑(2026-08-14 生产实遇):两个数都"看起来对",人拿其中一个去
+    对账才发现少了一截,而两边都不报错。
+    """
+    items = [_item("T1", "S_GONE", "x"), _item("T1", "S_PERM", "x"),
+             _item("T1", "S_INFLIGHT", "x"), _item("T2", "S_DEAD_STORE", "x")]
+    inflight = {("T1", "S_INFLIGHT")}
+    gone = {("T1", "S_GONE"), ("T1", "S_INFLIGHT"), ("T2", "S_DEAD_STORE")}
+    perm = {("T1", "S_PERM")}
+    _plans, n = scan.plan(items, inflight, {"T2"}, set(), inflight, gone, perm)
+    # 在途的与非 ACTIVE 店的**先被别的闸拦走**,不算进这两桶
+    assert (n["gone"], n["permanent"], n["inflight"], n["inactive"]) \
+        == (1, 1, 1, 1)
+
+
+def test_receipt_blocked_sql_reads_only_the_latest_attempt_of_both_feeds():
+    """口径三条,一条都不能少(SQL 的唯一出处已在 services/feed_track):
+
+    ① **最近一次**尝试,不是"历史上出现过就永久拉黑" —— 商品转出 WFS 之后
+       就该能删了,下一次尝试的回执会把它放出来;写成 EXISTS 的话它永远删不了
+       而且没人看得出是被自己的闸拦着;
+    ② **DELETE_ITEM 与 RETIRE_ITEM 都算**:只看删不看停,顽固件的 retire
+       那一半会继续每天空烧配额;
+    ③ **不限定 status**:死档码 EXT_DATA_ERROR_60745664660159(QARTH)是
+       `status=success` 带回来的,只收 failed/missing 就永远收不到那几百条。
+    """
+    q = feed_track._RECEIPT_BLOCKED_SQL
     assert "DISTINCT ON (store, sku)" in q
     assert "ORDER BY store, sku, submitted_at DESC" in q
-    assert "feed_type = 'DELETE_ITEM'" in q
-    assert scan._WFS_BLOCKED_CODE == "ERR_EXT_DATA_0101218"
+    assert "f.feed_type = ANY(%(feeds)s::text[])" in q
+    assert feed_track.DESTRUCTIVE_FEED_TYPES == ("DELETE_ITEM", "RETIRE_ITEM")
+    assert "error_code = ANY(%(codes)s::text[])" in q
+    assert "status IN ('failed', 'missing')" not in q      # 旧口径不许回来
+
+
+def test_the_error_codes_live_only_in_the_registry():
+    """码集的**唯一出处**是 registry(铁律 3:业务代码禁止散落错误码字面量)。
+
+    原来 `problem_scan._WFS_BLOCKED_CODE` 就是一个散落的字面量;泛化成七个码
+    之后再散落一次,后果是改一处另一处静默按旧清单办 —— 闸看起来还在,
+    实际漏掉了新登记的码,而且不报错。
+    """
+    assert not hasattr(scan, "_WFS_BLOCKED_CODE")
+    assert not hasattr(scan, "_SQL_WFS_BLOCKED")
+    # 两集合不相交:同一条回执的同一个码不可能既是"已经不在了"又是"不许删"
+    assert not (resources.WALMART_ERR_ITEM_GONE
+                & resources.WALMART_ERR_DESTRUCTIVE_PERMANENT)
+    codes = (resources.WALMART_ERR_ITEM_GONE
+             | resources.WALMART_ERR_DESTRUCTIVE_PERMANENT)
+    root = pathlib.Path(__file__).resolve().parents[1]
+    offenders = []
+    for d in ("services", "workflows", "registry", "api"):
+        for f in sorted((root / d).rglob("*.py")):
+            if "__pycache__" in f.parts or f.name == "resources.py":
+                continue
+            text = f.read_text(encoding="utf-8")
+            offenders += [f"{f.relative_to(root)}:{c}"
+                          for c in codes if c in text]
+    assert not offenders, ("错误码字面量散落到业务代码里了,改引用 "
+                           "registry.resources 的两个 frozenset:" + str(offenders))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -696,9 +762,10 @@ def test_three_history_sqls_and_inflight_go_through_sku_aliases_only():
     各自现写一遍登记簿指针的 JOIN 就是四份会各自漂移的实现,而漂了不报错:
     只是某一处从此看不见历史(守门 test_sku_guard 那条从源码层面钉同一件事)。
     """
-    for name in ("_SQL_STUBBORN", "_SQL_LAST_CAT", "_SQL_WFS_BLOCKED",
-                 "_SQL_INFLIGHT"):
-        q = getattr(scan, name)
+    for name, mod in (("_SQL_STUBBORN", scan), ("_SQL_LAST_CAT", scan),
+                      ("_RECEIPT_BLOCKED_SQL", feed_track),
+                      ("_SQL_INFLIGHT", scan)):
+        q = getattr(mod, name)
         assert "catalog.sku_aliases a" in q, name
         assert q.count("UNION ALL") == 1, name          # 只继承一跳
         assert "f.sku = a.alias_sku" in q or "e.sku = a.alias_sku" in q, name
@@ -712,11 +779,11 @@ def test_history_sql_placeholders_are_named_not_positional():
     漏的一处,而它当场炸(这条测试只是让它在 pytest 里炸,不在生产里炸)。
     """
     assert "%(ev)s" in scan._SQL_LAST_CAT and "%s" not in scan._SQL_LAST_CAT
-    assert "%(code)s" in scan._SQL_WFS_BLOCKED
-    assert "%s" not in scan._SQL_WFS_BLOCKED
+    assert "%(codes)s" in feed_track._RECEIPT_BLOCKED_SQL
+    assert "%s" not in feed_track._RECEIPT_BLOCKED_SQL
     src = pathlib.Path("workflows/problem_scan.py").read_text(encoding="utf-8")
     assert '_SQL_LAST_CAT, {"ev": product_events.PROBLEM_CATEGORIZED}' in src
-    assert '_SQL_WFS_BLOCKED, {"code": _WFS_BLOCKED_CODE}' in src
+    assert "feed_track.receipt_blocked(" in src
 
 
 # ── 沙箱 PG 集成:四段 SQL 的真实语义 ────────────────────────────────────────
@@ -743,6 +810,9 @@ needs_pg = pytest.mark.skipif(not _pg_up(),
                               reason=f"沙箱 PG {_PG_HOST}:{_PG_PORT} 未启动")
 
 _STORE = "PSCAN_T1"
+#: 夹具用的永久拒码(WFS 件不许删)。取自 registry —— 测试里也不写字面量,
+#: 否则码表一改,夹具与生产代码就对不上,而用例照绿。
+_PERM_CODE = sorted(resources.WALMART_ERR_DESTRUCTIVE_PERMANENT)[0]
 _OLD, _NEW = "B0PSCANOLD1", "APSCAN234567"      # 旧码 = 裸 ASIN 形态;新码 = 不透明码
 
 
@@ -795,11 +865,15 @@ def _seed_pair(conn, *, replaced: bool):
             "('F_WFS', %s, 'problem_product_cleanup', %s, 'DELETE_ITEM',"
             " 'failed', %s, now() - interval '3 days'),"
             "('F_INF', %s, 'list_new', %s, 'MP_ITEM', 'submitted', NULL, now())",
-            (_OLD, _STORE, scan._WFS_BLOCKED_CODE, _OLD, _STORE))
+            (_OLD, _STORE, _PERM_CODE, _OLD, _STORE))
 
 
 def _read(conn):
-    """输入:连接 → 输出:四段判据对 (店, 新码) 的结论 + 扫描面里的 SKU 集合。"""
+    """输入:连接 → 输出:四段判据对 (店, 新码) 的结论 + 扫描面里的 SKU 集合。
+
+    第四段(原「WFS 拦截」)2026-09-09 泛化成 `feed_track.receipt_blocked`,
+    这里读的是**永久拒**那一桶(夹具造的正是一条 WFS 回执)。
+    """
     from services import product_events
     with conn.cursor() as cur:
         cur.execute(scan._SQL_ITEMS)
@@ -809,11 +883,11 @@ def _read(conn):
                     if ev == 'delete_not_effective'}
         cur.execute(scan._SQL_LAST_CAT, {"ev": product_events.PROBLEM_CATEGORIZED})
         last_cat = {(s, k): c for s, k, c in cur.fetchall()}
-        cur.execute(scan._SQL_WFS_BLOCKED, {"code": scan._WFS_BLOCKED_CODE})
-        wfs = {(st, k) for st, k in cur.fetchall()}
+        perm = feed_track.receipt_blocked(
+            conn, resources.WALMART_ERR_DESTRUCTIVE_PERMANENT)
         cur.execute(scan._SQL_INFLIGHT, {"disposal": list(scan._DISPOSAL_FEEDS)})
         inflight = {(st, k): d for st, k, d in cur.fetchall()}
-    return surface, stubborn, last_cat, wfs, inflight
+    return surface, stubborn, last_cat, perm, inflight
 
 
 @needs_pg
@@ -862,12 +936,12 @@ def test_last_category_follows_the_replacement_chain(pg):
 
 
 @needs_pg
-def test_wfs_block_follows_the_replacement_chain(pg):
-    """WFS 删不掉的拦截继承一跳:不继承就每天重建议、重发、同一个错、白烧
-    DELETE_ITEM 的 6/hour 桶(生产实见 11 条)。"""
+def test_receipt_block_follows_the_replacement_chain(pg):
+    """回执闸继承一跳:不继承就每天重建议、重发、同一个错、白烧
+    DELETE_ITEM 的 6/hour 桶(生产实见 11 条 WFS 件)。"""
     _seed_pair(pg, replaced=True)
-    _, _, _, wfs, _ = _read(pg)
-    assert (_STORE, _NEW) in wfs
+    _, _, _, perm, _ = _read(pg)
+    assert (_STORE, _NEW) in perm
 
 
 @needs_pg
@@ -895,11 +969,11 @@ def test_four_history_sqls_are_unchanged_when_sku_aliases_is_empty(pg):
     with pg.cursor() as cur:
         cur.execute("SELECT count(*) FROM catalog.sku_aliases")
         assert cur.fetchone()[0] == 0              # 改码前恒空集
-    surface, stubborn, last_cat, wfs, inflight = _read(pg)
+    surface, stubborn, last_cat, perm, inflight = _read(pg)
     assert surface == {_OLD}
     assert stubborn == {(_STORE, _OLD)}
     assert last_cat == {(_STORE, _OLD): "L"}
-    assert wfs == {(_STORE, _OLD)}
+    assert perm == {(_STORE, _OLD)}
     assert inflight == {(_STORE, _OLD): False}     # 新码一条都没继承到
 
 
@@ -924,7 +998,8 @@ def test_item_appeared_on_the_new_code_would_clear_the_generation(pg):
 @needs_pg
 def test_load_state_runs_every_sql_and_never_surfaces_a_replaced_row(pg,
                                                                     monkeypatch):
-    """整段 `_load_state` 打在真库上跑一遍:五条 SQL + **实参形状**都对。
+    """整段 `_load_state` 打在真库上跑一遍:五条 SQL + 两次回执闸查询 +
+    **实参形状**都对。
 
     O5 把两条 SQL 的占位符从 `%s` 改成命名式,消费点的实参必须同步改成 dict ——
     只改 SQL 不改调用点会 ProgrammingError,而纯文本断言看不出来。这条用例让它
@@ -935,12 +1010,13 @@ def test_load_state_runs_every_sql_and_never_surfaces_a_replaced_row(pg,
     monkeypatch.setattr(scan.db, "pg_conn",
                         lambda *a, **kw: contextlib.nullcontext(pg))
     (items, inflight, inflight_disposal, last_cat,
-     inactive, stubborn, wfs_blocked) = scan._load_state()
+     inactive, stubborn, gone_blocked, perm_blocked) = scan._load_state()
     ours = [i for i in items if i["store"] == _STORE]
     assert ours == []                                   # 旧码不在扫描面,新码 PUBLISHED
     assert (_STORE, _NEW) in stubborn                   # 顽固代际继承到位
     assert last_cat[(_STORE, _NEW)] == "L"
-    assert (_STORE, _NEW) in wfs_blocked
+    assert (_STORE, _NEW) in perm_blocked      # 夹具造的是一条 WFS 回执
+    assert (_STORE, _NEW) not in gone_blocked  # 两桶不相交,码只落一边
     assert (_STORE, _NEW) in inflight
     assert (_STORE, _NEW) not in inflight_disposal      # 继承来的是上架 feed
 

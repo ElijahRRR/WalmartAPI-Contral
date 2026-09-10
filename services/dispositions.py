@@ -14,15 +14,27 @@
     withdraw_stale()    本轮不再建议的 suggested 行置 withdrawn
     claim()             执行件领取待执行建议(只读,不改状态——提交成功才改)
     mark_executing()    提交成功后落 feed_id 并转 executing
-    settle()            按观测事件把 executing 判成 confirmed / ineffective
+    settle()            把 executing 判成 confirmed / ineffective(见下三种来源)
     settle_maintenance() 同上,但判的是"值改过来了没有"(标题/价格/库存)
     expire_executing()  超期没等到观测的 executing 行放行,免得永久堵住同一 SKU
+
+破坏类落定的**三种来源**(2026-09-09 补后两种),`detail.settled_by` 区分:
+  · 观测      —— delete_verified / delete_not_effective(不信回执信观测);
+  · receipt_gone   —— 回执码 ∈ `resources.WALMART_ERR_ITEM_GONE`:沃尔玛说这个
+                      SKU 已经不在了(删了/退役了/停用了/匹配库里查无)⇒ confirmed;
+  · receipt_failed —— 回执 failed/missing ⇒ ineffective,下轮重新建议。
+补前两种之前**回执失败没有任何落定路径**:全船队约 800 条 delete/retire 停在
+executing 数周,部分唯一索引挡住同 SKU 再建议 ⇒ 永不重删(见 _SETTLE_RECEIPT_SQL)。
+⚠ `receipt_gone` 是**处置账的收尾,不是身份层的结论**:本模块不弃码、不改
+catalog.walmart_items、不记 product_events。弃码点仍是四个(conventions §九),
+目录里死档行本身的根治归 docs/backlog.md §十三。
 
 ⚠ **生效判定不在本模块实现**。settle() 读的是 catalog.product_events 里
 catalog_sync 经 services/product_events.verify_deletions 落的
 delete_verified / delete_not_effective ——"不信回执信观测"那套规则(含 48h
 宽限期、RETIRED/缺席算 gone)已经在跑,这里再写一份判定只会产生两份会漂移的
-真相。本模块只做"把已有判决登记到建议行上"。
+真相。本模块只做"把已有判决登记到建议行上";回执那一档同理,判据(哪些码算
+"已经不在了")的唯一出处是 registry/resources.py 的两个码集。
 
 ⚠ **两条链共用一张表,交界处五条纪律**(2026-08-16 定,2026-08-24 大修)。
 起因是所有者在 08-19 的维护记录里翻到一行「删除 | 审核判拒仍在架:(理由未留存)」
@@ -56,6 +68,8 @@ delete_verified / delete_not_effective ——"不信回执信观测"那套规则
 """
 
 import logging
+
+from registry import resources
 
 logger = logging.getLogger("services.dispositions")
 
@@ -184,6 +198,69 @@ WHERE d.status = 'executing' AND d.action = 'relist'
   AND w.last_seen_at > d.executed_at
 RETURNING d.status
 """
+
+
+# ── 回执落定(2026-09-09,所有者实证「动手做」)────────────────────────────────
+# 病根:破坏类处置**只有观测一条落定路径**。feed_poll 把 ops.feed_items 落成
+# failed/missing、product_events 也记了失败回执事件,而上面那条
+# _SETTLE_DELETE_SQL 只认 delete_verified / delete_not_effective —— 那两个事件
+# 的起点是**成功**回执那条事件(见 product_events._VERIFY_SQL),**失败的回执
+# 一条都进不去**。于是全船队约 800 条 delete/retire 停在 executing 数周,
+# 部分唯一索引 dispositions_open_uidx 挡住同 SKU 再建议 ⇒ 永不重删,而
+# sku_migrate 的「无未了结破坏建议」判据又把它们剔出改码面(A085朱丽霖 8 条)。
+#
+# 判据(码集的唯一出处是 registry.resources,本模块不认识任何具体的码):
+#   · `error_code ∈ ITEM_GONE`(**不论 status**)⇒ confirmed / receipt_gone
+#     —— 沃尔玛说这个 SKU 已经不在了,破坏动作的目的已达成。不看 status 是因为
+#     QARTH 那个死档码是 `status=success` 带回来的;
+#   · 否则 status ∈ (failed, missing) ⇒ ineffective / receipt_failed
+#     —— 永久拒(WFS/PDI_0004)与临时失败**都落这一档**:处置账先收掉,该不该
+#     再建议由 problem_scan 的死档/永久拒闸按最近一次回执码判,两件事分开;
+#   · `submitted`(还没轮询到)⇒ 不动,那是 feed_poll 的活;
+#   · success 且不带死档码 ⇒ 不动,那是观测核验的活(48h 宽限期内等着)。
+#
+# ⚠ **本条只动处置账,不动身份层**:不弃码、不改 catalog.walmart_items、不记
+# product_events。弃码点仍是四个(conventions §九),`receipt_gone` 是**处置账
+# 的收尾,不是身份层的结论** —— 目录里那些死档行(walmart_items 仍
+# missing_since IS NULL)的根治另有其事,归 docs/backlog.md §十三。
+#
+# ⚠ **顺序是语义**:settle() 先跑两条观测 SQL 再跑这条。观测判决优先,本条只
+# 收观测收不到的那些;反过来跑的话,一条回执 failed 但商品其实已经消失的行会
+# 被记成 ineffective(下轮重新建议、重发),而观测本来能给出 confirmed。
+#
+# ⚠ **回执行按主键取,不加 DISTINCT ON、更不用 LATERAL**,两条都是实测出来的:
+#   ① `FROM LATERAL (… WHERE fi.feed_id = d.feed_id … LIMIT 1)` —— PG **不允许**
+#      UPDATE 的 FROM 子句里的 LATERAL 反向引用目标表,实测报
+#      `invalid reference to FROM-clause entry for table "d"`(写成这样连不上库
+#      的单测照绿,只在生产上炸 —— 与本模块头注那三次 cast 事故同一个坑);
+#   ② `(SELECT DISTINCT ON (feed_id, sku) … ORDER BY feed_id, sku, submitted_at
+#      DESC)` 虽然能跑,但 `ops.feed_items` 的主键**就是** (feed_id, sku) ——
+#      一个 (feed, SKU) 天生只有一行,"取最近一次"是句空话,代价却是每轮把这张
+#      几百万行的流水表整个排一遍。直接按主键 JOIN 走 PK 索引。
+_SETTLE_RECEIPT_SQL = """
+UPDATE ops.dispositions d
+SET status = CASE WHEN r.error_code = ANY(%(gone)s::text[])
+                  THEN 'confirmed' ELSE 'ineffective' END,
+    settled_at = now(),
+    detail = d.detail || jsonb_build_object(
+        'settled_by', CASE WHEN r.error_code = ANY(%(gone)s::text[])
+                           THEN 'receipt_gone' ELSE 'receipt_failed' END,
+        'receipt_status', r.status,
+        'error_code', r.error_code,
+        'error_desc', left(r.error_desc, 300))
+FROM ops.feed_items r
+WHERE d.status = 'executing'
+  AND d.action = ANY(%(actions)s::text[])
+  AND d.feed_id IS NOT NULL
+  AND r.feed_id = d.feed_id AND r.sku = d.sku
+  AND (r.status = ANY(%(settling)s::text[])
+       OR r.error_code = ANY(%(gone)s::text[]))
+RETURNING d.status, d.detail->>'settled_by' AS settled_by
+"""
+
+#: 「回执已经是终局」的两个台账状态。success 不在里面:那一档归观测核验
+#: (48h 宽限);submitted 也不在:那一档还没轮询到,归 feed_poll。
+_RECEIPT_SETTLING = ("failed", "missing")
 
 
 def suggest_many(conn, rows: list[dict]) -> int:
@@ -602,21 +679,47 @@ def mark_executing(conn, ids: list[int], feed_id, by: str = "") -> int:
 
 
 def settle(conn) -> dict:
-    """输入:连接 → 输出:{confirmed: n, ineffective: n}(本轮落定的建议行)。
+    """输入:连接 → 输出:{confirmed, ineffective, receipt_gone, receipt_failed}。
 
-    只登记**已有**的观测判决,不自己判生效(见模块头注)。还没等到
-    catalog_sync 重新观测的行保持 executing,不落判 —— 与
-    product_events.verify_deletions 的 'wait' 语义对齐。
+    落定有**三种来源**(2026-09-09 补第二、三种),`detail.settled_by` 区分:
+      · `observed`(实际写的是事件名 delete_verified / delete_not_effective)
+        —— 观测判决,catalog_sync 经 product_events.verify_deletions 落的;
+      · `receipt_gone`   —— 回执说这个 SKU 已经不在了 ⇒ confirmed;
+      · `receipt_failed` —— 回执失败(含永久拒与临时失败)⇒ ineffective。
+    confirmed / ineffective 两个计数是**总数**(含回执来源),后两个是其中
+    回执判的那部分 —— 摘要两行都要报,别只报总数。
+
+    ⚠ **观测优先**:两条观测 SQL 先跑,回执那条只收观测收不到的
+    (见 _SETTLE_RECEIPT_SQL 头注)。还没等到 catalog_sync 重新观测、回执也还
+    没落终态的行保持 executing,不落判 —— 与 verify_deletions 的 'wait' 同义。
+
+    本函数**只动处置账**:不弃码、不改 walmart_items、不记 product_events。
     """
-    out = {"confirmed": 0, "ineffective": 0}
+    out = {"confirmed": 0, "ineffective": 0,
+           "receipt_gone": 0, "receipt_failed": 0}
     with conn.cursor() as cur:
         for sql in (_SETTLE_DELETE_SQL, _SETTLE_RELIST_SQL):
             cur.execute(sql)
             for (st,) in cur.fetchall():
                 out[st] = out.get(st, 0) + 1
-    if out["ineffective"]:
+        observed_bad = out["ineffective"]
+        cur.execute(_SETTLE_RECEIPT_SQL, {
+            "gone": sorted(resources.WALMART_ERR_ITEM_GONE),
+            "actions": list(DESTRUCTIVE_ACTIONS),
+            "settling": list(_RECEIPT_SETTLING)})
+        for st, by in cur.fetchall():
+            out[st] = out.get(st, 0) + 1
+            out[by] = out.get(by, 0) + 1
+    if observed_bad:
         logger.warning("处置建议落定:%d 条**未生效**(回执成功但观测显示没动)"
-                       "——下轮扫描会重新建议", out["ineffective"])
+                       "——下轮扫描会重新建议", observed_bad)
+    if out["receipt_gone"] or out["receipt_failed"]:
+        # 必须见人:这两档以前**根本没有落定路径**,行一路卡在 executing,
+        # 而部分唯一索引挡着同 SKU 再建议(全船队实测卡了约 800 条数周)
+        logger.warning("处置建议按回执落定:已不存在 %d 条(沃尔玛说这个 SKU "
+                       "已经删了/退役了/查无,破坏动作目的已达成),回执失败 "
+                       "%d 条(下轮按最近一次回执码决定还建不建议)",
+                       out["receipt_gone"], out["receipt_failed"])
     return out
 
 
@@ -864,11 +967,25 @@ WHERE store = %(store)s::text AND sku = %(new_sku)s::text
   AND status IN ('suggested', 'executing')
 """
 
+#: 迁键的写(2026-09-08 扩面:**维护组的 executing 行一并迁**,见 `rekey_open`
+#: 边界①)。破坏组的 executing 行**仍然不迁** —— 它们等的是「这个 SKU 不见了」
+#: 那条观测判据,搬键就是把判决对象换掉。所以状态条件写成
+#: 「suggested,或 executing 且动作在维护组里」,而不是一句 `status <> 'settled'`:
+#: 后者会把破坏组一起卷进来,而且不报错。
+#: `detail` 留痕(`rekeyed_from` / `rekeyed_at`):一条 executing 行换了 sku 之后,
+#: 「它当初是打在哪个码上的」在库里必须有答案 —— 没有它,回头查 A171 那条
+#: 691466 就只能靠人记性(08-19 那次「谁也说不清是哪条链干的」同款)。
+#: ⚠ `executed_at` **一个字不改**:宽限期(MAINT_SETTLE_GRACE_HOURS)照旧从
+#: 原提交时刻算 —— 刷新它等于把"提交多久了"重新计时,那条 feed 早就发出去了。
 _REKEY_SQL = """
 UPDATE ops.dispositions
-   SET sku = %(new_sku)s::text, asin = coalesce(asin, %(asin)s::text)
+   SET sku = %(new_sku)s::text, asin = coalesce(asin, %(asin)s::text),
+       detail = detail || jsonb_build_object(
+           'rekeyed_from', %(old_sku)s::text, 'rekeyed_at', now())
  WHERE store = %(store)s::text AND sku = %(old_sku)s::text
-   AND status = 'suggested'
+   AND settled_at IS NULL
+   AND (status = 'suggested'
+        OR (status = 'executing' AND action = ANY(%(maint)s::text[])))
    AND action <> ALL(%(taken)s::text[])
 """
 
@@ -884,51 +1001,72 @@ ORDER BY action
 def executing_actions_on(conn, store: str, sku: str) -> list[str]:
     """输入:连接 + (店, SKU) → 输出:该行名下**未落定的 executing** 动作列表。
 
-    只读。给改码定案时的**点名**用:`rekey_suggested` 故意不搬 executing 行
-    (搬键 = 把判决对象换掉),于是改码之后这些行滞留在旧码上,等
-    `expire_executing` 把它们判成 ineffective 收尾 —— 自愈,不是事故。
-    但**不许静默**:滞留几条、是哪些动作,要进摘要让人看见。
-    ⚠ 破坏组(delete/retire)不该出现在这里 —— 改码候选判据「无未了结破坏建议」
-    在挑选时就把它们剔掉了。真出现了说明中间窗口里长出了新的破坏建议
-    (problem_scan 的 `_SQL_ITEMS` 那条 NOT EXISTS 本该挡住),要当异常看。
+    只读。给改码定案时的**点名**用,**必须在 `rekey_open` 之前调**:迁键之后
+    维护组的 executing 行已经挂到新码上了,再读就读不到。
+
+    两组的去向从 2026-09-08 起**不一样**,摘要要分开说(见 `rekey_open` 边界①):
+      · **维护组**(title/price/inventory)的 executing 行**已迁到新码**,由维护链
+        按新码的观测落定(同一个 wpid,新码的现值就是那条 feed 作用的对象);
+      · **破坏组**(delete/retire)**不迁**,滞留在旧码上等 `expire_executing`
+        判成 ineffective 收尾。
+    ⚠ 破坏组不该出现在这里 —— 改码候选判据「无未了结破坏建议」在挑选时就把
+    它们剔掉了。真出现了说明中间窗口里长出了新的破坏建议(problem_scan 的
+    `_SQL_ITEMS` 那条 NOT EXISTS 本该挡住),要当异常看,**不许静默**。
     """
     with conn.cursor() as cur:
         cur.execute(_STRANDED_SQL, {"store": store, "sku": sku})
         return [r[0] for r in cur.fetchall()]
 
 
-def rekey_suggested(conn, store: str, old_sku: str, new_sku: str,
-                    asin: str | None = None) -> tuple[int, list[str]]:
+def rekey_open(conn, store: str, old_sku: str, new_sku: str,
+               asin: str | None = None) -> tuple[int, list[str]]:
     """输入:连接 + 店 + 新旧码(+ 出身 ASIN)→ 输出:(迁走的建议行数,
     因唯一索引冲突未迁的 action 列表)。
 
-    改码定案时把**未落定的建议**(status='suggested')从旧码搬到新码:建议是
-    "这个 item 该怎么处置",item 没变、只是身份列换了,不搬的话下一轮扫描件
-    对新码重新建一遍(旧码那条则永远撤不掉,因为它已经不在扫描面里)。
+    改码定案时把**未落定的建议**从旧码搬到新码:建议是"这个 item 该怎么处置",
+    item 没变、只是身份列换了,不搬的话下一轮扫描件对新码重新建一遍(旧码那条
+    则永远撤不掉,因为它已经不在扫描面里)。
+
+    迁的面 = **全部 suggested + 维护组(MAINT_ACTIONS)的 executing**
+    (2026-09-08 扩面,原名 `rekey_suggested`;改名是因为函数名再叫 suggested
+    就与它做的事对不上,而**不许留两个函数**:一个能力一条实现路径,§六)。
 
     三条边界,每条都有理由:
-      ① **executing 行本函数不碰**:它已经提交了 feed、正等观测判决,搬键
-         等于把判决对象换掉。
-         ⚠ 2026-09-04 起这里的前提变了:原来靠 `open_executing_count` 那条
-         **整店**前置闸保证"这一刻该店没有 executing 行",所有者复议后那条闸
-         只报数不拦(13:00 三条链齐发,整店 executing 是常态,拦它等于改码永远
-         开不了工)。现在的保证是**逐候选**的:改码候选判据「无未了结破坏建议」
-         剔掉了旧码名下有未落定 delete/retire 的行,所以本函数遇不到破坏组的
-         executing。**维护组(title/price/inventory)的 executing 行则可能存在**,
-         照旧不碰 —— 它们滞留在旧码上,由 `expire_executing` 判成 ineffective
-         收尾(自愈)。调用方用 `executing_actions_on` 把它们点名进摘要,不静默。
+      ① **维护组的 executing 行一并迁,破坏组的 executing 行绝不迁**
+         (2026-09-08 所有者实证改口)。原口径是"executing 一律不碰,搬键等于
+         把判决对象换掉",那句话的前提是"新码与旧码是两个不同的 item"。
+         MP_ITEM_MATCH 的改码是**同一个 item 上原地换码**(同 wpid,
+         docs/sku_plan.md §9.12 实测),所以对维护三类(title/price/inventory)
+         而言,**新码的现值就是那条 feed 作用的对象** —— 搬过去不是换判决对象,
+         而是把账挪到唯一还能比得了的那一行。不搬的表现(A171罗尹鸿 691466:
+         改价 15.71→16.78 已生效,新码观测 price=16.78、旧码同时记缺席):
+         那条 executing 拿旧码那一行比,而旧码在 `catalog.walmart_items` 里已经
+         缺席、`_MAINT_OPEN_SQL` 的 JOIN 根本取不到它 ⇒ 一路挂到
+         `expire_executing` 3 天超期才放行,期间每一次改码定案还要把它点名一遍。
+         迁过去之后**不加任何新的落定代码**:`settle_maintenance` 的现有规则
+         (新码 `last_seen_at > executed_at + MAINT_SETTLE_GRACE_HOURS` 后按现值
+         比 want)自然把它判成 confirmed。**`executed_at` 不改** —— 宽限期照旧
+         从原提交时刻算。
+         **破坏组(DESTRUCTIVE_ACTIONS)的 executing 行仍旧不碰**:它们的判据是
+         `product_events` 的 delete_verified(「这个 SKU 不见了」),改码后旧码
+         正好消失 —— 搬到新码上就是拿另一个身份去等一个已经被污染的判决。
+         它们本来就不该出现(候选判据「无未了结破坏建议」在挑选时剔掉了),
+         真出现了由调用方用 `executing_actions_on` 点名人工。
       ② **动作撞车不迁、不删、不合并**,返回 action 列表让调用方点名人工:
          新码名下已有同动作的未落定行时,两条同动作的建议合成一条会让其中
          一个的落定结果覆盖另一个(schema.sql 的索引注释明写这条设计)。
-         判不准就判活(conventions §五)。
+         判不准就判活(conventions §五)。撞车集按 (suggested ∪ executing) 算
+         —— 部分唯一索引 dispositions_open_uidx 管的正是这两个状态。
       ③ asin 列跟着补(coalesce,只填不覆盖):不透明码在 sku 列里提不出 ASIN,
-         这一列是它与产品中心/黑名单对齐的唯一线索。
+         这一列是它与产品中心/黑名单对齐的唯一线索。迁过的行 `detail` 里留
+         `rekeyed_from` / `rekeyed_at`,查账时能答"它当初打在哪个码上"。
     """
     with conn.cursor() as cur:
         cur.execute(_REKEY_TAKEN_SQL, {"store": store, "new_sku": new_sku})
         taken = sorted({r[0] for r in cur.fetchall()})
         cur.execute(_REKEY_SQL, {"store": store, "old_sku": old_sku,
                                  "new_sku": new_sku, "asin": asin,
+                                 "maint": list(MAINT_ACTIONS),
                                  "taken": taken})
         moved = cur.rowcount
     if taken:

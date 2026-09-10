@@ -125,6 +125,72 @@ def _progress(head: dict) -> str:
     return f"已收 {recv},成功 {ok},失败 {bad},待处理 {pending}"
 
 
+#: 破坏类 feed 的两个类型 —— **唯一出处**(2026-09-09 归一)。
+#: 它是 `dispositions.DESTRUCTIVE_ACTIONS`(delete/retire)的 feed 面,
+#: workflows/problem_scan 的在途分档与下面的 `receipt_blocked` 共用这一份:
+#: 各写一份的表现是有人加了第三种破坏 feed,另一处静默漏判(不报错)。
+DESTRUCTIVE_FEED_TYPES = ("DELETE_ITEM", "RETIRE_ITEM")
+
+#: 「这个 (店, SKU) **最近一次**破坏类尝试的回执码命中给定码集了吗」。
+#: 三个形状上的决定,每个都有理由:
+#:   ① **DISTINCT ON 最近一次**,不是 EXISTS(历史上出现过就永久拉黑):WFS 件
+#:      转出 WFS 之后就该能删了,下一次尝试的回执会把它自己放出来。写成 EXISTS
+#:      的话它永远删不了,而且没人看得出是被自己的闸拦着。
+#:   ② **不限定 status**(2026-09-09 放宽):死档码里的 QARTH「No matching
+#:      record found for the SKU」那一条是 `status=success` 带回来的,只收
+#:      failed/missing 就永远收不到那几百条(backlog §十三 A085 611 条)。
+#:      码集本身是判据,status 不是。
+#:   ③ **DELETE_ITEM 与 RETIRE_ITEM 都算**:两种破坏动作对同一个死档 SKU 得到
+#:      的是同一句话,只看删不看停会让顽固件的 retire 那一半继续每天空烧配额。
+#: 别名一律经 `catalog.sku_aliases` 继承**一跳**(代际继承的唯一出处):改码后
+#: 新码在 ops.feed_items 里一条历史都没有,不继承这道闸对它整个失明。
+#: ⚠ 先取最近一次、**再**比码集(不是在内层就按码过滤):内层过滤会把"最近一次
+#: 其实成功了"的行跳过去、拿更早那次失败当结论 —— 闸永远放不开人。
+_RECEIPT_BLOCKED_SQL = """
+SELECT store, sku FROM (
+    SELECT DISTINCT ON (store, sku) store, sku, error_code FROM (
+        SELECT f.store, f.sku, f.error_code, f.submitted_at
+        FROM ops.feed_items f
+        WHERE f.feed_type = ANY(%(feeds)s::text[])
+          AND (%(store)s::text IS NULL OR f.store = %(store)s::text)
+        UNION ALL
+        SELECT a.store, a.sku, f.error_code, f.submitted_at
+        FROM catalog.sku_aliases a
+        JOIN ops.feed_items f
+          ON f.store = a.store AND f.sku = a.alias_sku
+        WHERE f.feed_type = ANY(%(feeds)s::text[])
+          AND (%(store)s::text IS NULL OR a.store = %(store)s::text)
+    ) u ORDER BY store, sku, submitted_at DESC
+) t WHERE t.error_code = ANY(%(codes)s::text[])
+"""
+
+
+def receipt_blocked(conn, codes, store: str | None = None
+                    ) -> set[tuple[str, str]]:
+    """输入:连接 + 错误码集合(+ 限定店铺)→ 输出:{(店铺, SKU)} —— 最近一次
+    破坏类尝试的回执码落在该集合里的行。只读。
+
+    **两个消费方共用这一份 SQL**(2026-09-09 上移到 services):
+      · workflows/problem_scan —— 死档 / 永久拒的行不再每天重建议、重发;
+      · workflows/sku_migrate  —— 死档的旧码不改码(发 MP_ITEM_MATCH 会**新建**
+        一条 listing,不是改码,A131吕灿荣 B09L3WXJ96 真双挂实证)。
+    码集由调用方从 `registry.resources` 传进来(`WALMART_ERR_ITEM_GONE` /
+    `WALMART_ERR_DESTRUCTIVE_PERMANENT`),本函数**不认识任何具体的码** ——
+    清单只在 registry 出生一次(铁律 3)。
+
+    ⚠ 判据是「**最近一次**尝试的回执」,**没有时间窗**:下一次尝试若回执变了
+    (人工把件转出 WFS 之后重删成功),它自然就从这个集合里出去了。
+    """
+    codes = sorted(set(codes))
+    if not codes:
+        return set()
+    with conn.cursor() as cur:
+        cur.execute(_RECEIPT_BLOCKED_SQL,
+                    {"feeds": list(DESTRUCTIVE_FEED_TYPES), "codes": codes,
+                     "store": store})
+        return {(st, sk) for st, sk in cur.fetchall()}
+
+
 def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
     """输入:店铺 + feed_id → 输出:(feed 汇总 head, SKU 结果)。
 

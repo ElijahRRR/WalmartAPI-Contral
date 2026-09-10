@@ -17,12 +17,14 @@
   problem_product_cleanup(DANGEROUS=True) 只消费建议行,自己不做任何决策
 
 两个来源(source 列):
-  scan   catalog.walmart_items 里 publishedStatus 非 PUBLISHED 且未缺席的行
-         —— **一律建议删除**(所有者定稿 2026-08-28:「不再修改 End Date 救
-         商品」,反补机制整体退役);归类(services/problem_products)保留,
-         但只进病历/黑名单/摘要,不再决定走向。
-         **lifecycle=RETIRED 全豁免**(所有者定稿 2026-09-06):实证删不掉、
-         后台一般不显示,见 _SQL_ITEMS 头注
+  scan   catalog.walmart_items 里**一切未缺席的行**(所有者定稿 2026-09-10:
+         「扫描面不再限制,按分类结果处置」)。删不删由归类的**原子集合**判:
+         原文只含可恢复原子(End Date 过期 / Stage 等上线,唯一出处
+         services/error_taxonomy.RECOVERABLE_CODES)→ 不删;其余一律删,
+         不看 published_status / lifecycle。无原因的行不是候选。
+         逐原子明细落 detail.atoms(事件与建议行都记),不再只留主码。
+         历史:2026-08-28「非 PUBLISHED 一律删除」、2026-09-06「RETIRED 全豁免」
+         两条状态口径同日退役,依据见 _SQL_ITEMS 头注。
   audit  审核链判 reject 但**还在架**的产品 —— 审核说不该卖、沃尔玛后台还挂着,
          这个缺口原来没有任何工作流盯着(批复 #8 要求补上)
 
@@ -32,12 +34,14 @@
 去重口径(2026-08-28 反补退役后剩两条,注释记的是生产事故的教训):
   ① 在途/待观测:feed_items 有 submitted 未落定(滚动 48h 封顶),或已落定
      success 但 catalog_sync 尚未重新观测 → 不建议
-  ② 归类事件:同 (店铺,SKU) 类别未变不重复记
+  ② 归类事件:同 (店铺,SKU) **原子码集合**未变不重复记(2026-09-10 前按主码)
 注:①在这里是**预筛**,不是最终闸门——真正的在途防重在 api/feeds.submit_feed
 的 ops.feed_log 里(提交时判,返回 outcome=dedup)。预筛只是省得把注定被拦下的
 行也建成建议。
 
-店铺闸:ops.store_kpi_daily 最新 store_status 非 ACTIVE 的店整体跳过。
+店铺状态**不设闸**(所有者定稿 2026-09-10:「非 ACTIVE 店也需要在扫描范围内」):
+ops.store_kpi_daily 里 store_status 非 ACTIVE 的店照扫照建议;此前整店跳过。
+状态只用来在摘要里按店点名,让人眼闸门看得见这批建议来自非 ACTIVE 店。
 
 调度顺序:catalog_sync → problem_scan → problem_product_cleanup(真跑)。
 """
@@ -65,18 +69,23 @@ SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重�
 # 就是防"一次删光",读不到表就退回不限等于闸不存在。
 logger = logging.getLogger("workflows.problem_scan")
 
-# 扫描面 = **一切非 PUBLISHED**(所有者定稿 2026-08-28:「publishedStatus
-# 不是 PUBLISHED 的,都进行删除,不再修改 End Date 救商品」)。三个边界:
-#   · 范围从 UNPUBLISHED/SYSTEM_PROBLEM 扩到含 STAGE/READY_TO_PUBLISH/
-#     IN_PROGRESS:刚上架的行在发布管道里有几小时~48h 的过渡态,靠既有的
-#     在途预筛护住(上架 feed 在 feed_items 挂 submitted/待观测即跳过,
-#     QARTH 复审同一机制,见下)——过了 48h 还卡在过渡态的就是真卡死,照删。
-#   · published_status IS NULL(状态没采到)**不进扫描**:删除不可逆,
-#     判不准就判活,不拿未知赌。
-#   · Stage 不再按行豁免(旧 is_stage_pending 已退役):所有者定稿——
-#     『stage status until you go live』一般只在店铺非 ACTIVE 时出现(那时
-#     全店皆然),而店铺闸(_SQL_STATUS 非 ACTIVE 整店跳过)已经挡住那种店;
-#     ACTIVE 店里的 Stage 行 = 翻出来的老档(2026-08-28 事件实证),照删。
+# 扫描面 = **一切未缺席的行**(所有者定稿 2026-09-10:「扫描面不再限制,按分类结果
+# 处置,所有状态的产品都需要扫描」)。published_status / lifecycle_status 都不再是
+# 筛选条件 —— 删不删由 plan() 按原子归类判(原子集合 ⊆ 可恢复码不删,其余删),
+# 状态列只带回来给摘要分档。此前两条**状态口径**同日退役,理由留档:
+#   · 2026-08-28「非 PUBLISHED 一律删除」:状态即判据,单独一条 End Date 过期也删,
+#     可恢复与不可恢复不分 —— 所有者 2026-09-10 要求分开。
+#   · 2026-09-06「RETIRED 全豁免」:当时依据是 08-28 可见性变更翻回来的死档
+#     (10,191 行)发 DELETE_ITEM 删不掉;2026-09-09 沃尔玛已把列表可见性改回去
+#     (A109 在册 6858 → 3371,3487 行当轮判缺席),死档随 missing_since 出了
+#     扫描面。RETIRED 行照扫:退市 = Site End Date 设成过去,通常只带「End Date
+#     过期」一个原子,按可恢复留;带政策原子的照删;删不掉的(回执「已停用」
+#     60706056565050 等死档码)由 2026-09-09 的死档/永久拒两道回执闸兜住,
+#     见 _load_state 的 receipt_blocked,不会每天重发。
+#   · published_status IS NULL 也进扫描面:判据是原文不是状态;没采到状态的行
+#     原文照样是当轮扫回来的(walmart_catalog 每轮整行覆盖)。
+# 保留的两条是**操作层**边界,不是判据:
+#   · missing_since IS NULL:缺席行不在目录里,无从处置(缺席 ≠ 恢复正常)。
 #   · **在途改码的旧码不进扫描面**(SKU 改造批次 3,O4):SkuUpdate 生效有
 #     15 分钟到 4 小时的窗口(官方),窗口内旧码可能被观测成非 PUBLISHED 且
 #     missing_since 仍为 NULL —— 正好落进上面这三条,当轮就被建议 DELETE_ITEM,
@@ -85,23 +94,12 @@ logger = logging.getLogger("workflows.problem_scan")
 #     这一层,不许靠"先跑谁后跑谁"(conventions §三:调度顺序不许承载判据)。
 #     登记簿那一跳走 NOT EXISTS 而不是 JOIN:扫描面的行数不许被它改变。
 #     改码前 replaced_by 全库为 NULL ⇒ NOT EXISTS 恒真,结果集逐行不变。
-#   ⚠ 三列的**位置顺序不许动**(_load_state 按位置解包成 store/sku/reasons)。
-# RETIRED 全豁免(所有者定稿 2026-09-06)。依据三条:
-#   ① 实证无法清理:RETIRED 行(2026-09-06 库内 10,191 行)发 DELETE_ITEM 反复
-#      回 "deleted/retired" 类失败,删不掉,只烧 MP_MAINTENANCE 配额;
-#   ② 来路是沃尔玛列表接口的可见性变更(2026-08-28 起 GET /v3/items 列表把
-#      已删/已退役的死档也吐回来,单条 GET 404),不是我们主动退役的品——
-#      docs/plan.md 2026-08-28 条与 docs/sku_plan.md §8 决策 A 有记;
-#   ③ 后台一般也不显示,运营看不到、不会误以为在卖。
-# lifecycle 为 NULL 的行**不豁免**:NULL = 没采到,不知道是不是 RETIRED,
-# 按"判不准就判活"照扫(扫的结果是"建议删除",由下游处置件消费)。
+#   ⚠ 四列的**位置顺序不许动**(_load_state 按位置解包成
+#     store/sku/reasons/published_status)。
 _SQL_ITEMS = """
-SELECT w.store, w.sku, w.unpublished_reasons
+SELECT w.store, w.sku, w.unpublished_reasons, w.published_status
 FROM catalog.walmart_items w
-WHERE w.published_status IS NOT NULL
-  AND w.published_status <> 'PUBLISHED'
-  AND w.missing_since IS NULL
-  AND (w.lifecycle_status IS NULL OR w.lifecycle_status <> 'RETIRED')
+WHERE w.missing_since IS NULL
   AND NOT EXISTS (SELECT 1 FROM catalog.listing_sources ls
                   WHERE ls.store = w.store AND ls.sku = w.sku
                     AND ls.replaced_by IS NOT NULL)
@@ -183,12 +181,28 @@ GROUP BY store, sku
 # **一条判据**,判据只能有一处出生(conventions §六),写几遍就是几份会各自
 # 漂移的实现,而漂了不报错、只是某一处从此看不见历史。
 # ⚠ 占位符改成命名式:UNION 之后同一个值要用两次,`%s` 位置参数给不了两遍。
+# 最近一次归类的**签名**(2026-09-10):有 atoms 的事件取原子码集合(去重、字典序、
+# 逗号拼),没有的(存量)退回 detail.category。单原子行的签名与主码相同,换判据
+# 不会让整库在第一轮重记一遍;复合行会补记一次 —— 那正是此前缺的账。
+# jsonb_typeof 护一层:atoms 不是数组(NULL/缺键/写坏)时不炸,退回主码。
 _SQL_LAST_CAT = """
 SELECT DISTINCT ON (store, sku) store, sku, cat FROM (
-    SELECT e.store, e.sku, e.detail->>'category' AS cat, e.occurred_at
+    SELECT e.store, e.sku,
+           coalesce((SELECT string_agg(DISTINCT x->>'code', ',' ORDER BY x->>'code')
+                     FROM jsonb_array_elements(
+                          CASE WHEN jsonb_typeof(e.detail->'atoms') = 'array'
+                               THEN e.detail->'atoms' END) x),
+                    e.detail->>'category') AS cat,
+           e.occurred_at
     FROM catalog.product_events e WHERE e.event = %(ev)s::text
     UNION ALL
-    SELECT a.store, a.sku, e.detail->>'category', e.occurred_at
+    SELECT a.store, a.sku,
+           coalesce((SELECT string_agg(DISTINCT x->>'code', ',' ORDER BY x->>'code')
+                     FROM jsonb_array_elements(
+                          CASE WHEN jsonb_typeof(e.detail->'atoms') = 'array'
+                               THEN e.detail->'atoms' END) x),
+                    e.detail->>'category'),
+           e.occurred_at
     FROM catalog.sku_aliases a
     JOIN catalog.product_events e
       ON e.store = a.store AND e.sku = a.alias_sku
@@ -217,6 +231,9 @@ ORDER BY store, sku, occurred_at DESC
 # delete_not_effective 属上一代刊登,不再顽固——按正常归类路径走
 # (否则重上架的同 ASIN 首次出问题就被双 feed 直删——顽固加压只该给
 # 本代际已实证「删除未生效」的行)。
+# 店铺状态**只做摘要标注,不做闸**(所有者定稿 2026-09-10:「非 ACTIVE 店也需要在
+# 扫描范围内」)。此前非 ACTIVE 店整店跳过;现在 plan() / _audit_rejected_rows
+# 都不读它,run() 只拿它给建议行按店点名(_inactive_note)。
 _SQL_STATUS = """
 SELECT DISTINCT ON (store) store, store_status FROM ops.store_kpi_daily
 ORDER BY store, data_date DESC
@@ -243,7 +260,7 @@ WHERE rejected_still_listed
 def _load_state():
     with db.pg_conn() as conn, conn.cursor() as cur:
         cur.execute(_SQL_ITEMS)
-        items = [dict(zip(("store", "sku", "reasons"), r))
+        items = [dict(zip(("store", "sku", "reasons", "published_status"), r))
                  for r in cur.fetchall()]
         cur.execute(_SQL_INFLIGHT, {"disposal": list(_DISPOSAL_FEEDS)})
         rows_if = cur.fetchall()
@@ -267,28 +284,37 @@ def _load_state():
             inactive, stubborn, gone_blocked, perm_blocked)
 
 
-def plan(items, inflight, inactive, stubborn=frozenset(),
+def plan(items, inflight, stubborn=frozenset(),
          inflight_disposal=frozenset(), gone_blocked=frozenset(),
          perm_blocked=frozenset()):
-    """输入:问题商品与去重状态 → 输出:(计划 dict, 计数 dict)。纯函数,可测。
+    """输入:扫描面全部行与去重状态 → 输出:(计划 dict, 计数 dict)。纯函数,可测。
 
     计划形如 {店铺: {"delete": [item行], "retire": [item行]}},每行附
-    category/cat_name(归类只进病历/黑名单/摘要,不再决定走向)。
+    category/cat_name/atoms/cat_sig/recoverable(归类进病历/黑名单/摘要,
+    **也决定走向**)。
 
-    **一律删除**(所有者定稿 2026-08-28:「publishedStatus 不是 PUBLISHED 的,
-    都进行删除,不再修改 End Date 救商品」)。此前的 A/L 类反补通道、反补计数
-    30 天窗、Stage 按行豁免全部退役 —— A 类的语病见 problem_products 头注:
-    「end date has passed」本身就是退市标记,反补它 = 对退市档案走官方复活
-    通道。顽固双击(retire+delete 齐发)保留:那是对「删除未生效」的加压,
-    方向与本定稿一致。
+    **按原子归类处置**(所有者定稿 2026-09-10,取代 2026-08-28「非 PUBLISHED
+    一律删除」与 2026-09-06「RETIRED 全豁免」):
+      · 无原因(unpublished_reasons 空)→ 不是候选(clean 桶):在售行的常态;
+        非 PUBLISHED 而无原因的行也不删 —— 没有原文就没有判据,判不准就判活。
+        这一档排在在途闸**之前**:在途计数只该数真正的问题行。
+      · 原子集合 ⊆ RECOVERABLE_CODES(`error_taxonomy.is_recoverable_only`)
+        → 不删(recoverable 桶),归类照记进病历。
+      · 其余一律删除,**不看 published_status / lifecycle**:复合原文里哪怕只有
+        一个非可恢复原子(「End Date 过期; 禁售政策」)也删;OTHER 未识别的也删
+        (所有者:「其他的都删除」),但逐条进摘要告警(_unknown_note)。
+    顽固双击(retire+delete 齐发)与死档/永久拒回执闸、在途预筛不变 —— 那些是
+    操作层防重,不是"该不该删"的判据。**店铺状态不再是闸**(所有者同日追加:
+    「非 ACTIVE 店也需要在扫描范围内」),非 ACTIVE 店的行与别的店一视同仁。
     """
     out: dict[str, dict] = {}
-    n = {"inflight": 0, "inflight_listing": 0, "inactive": 0,
-         "delete": 0, "stubborn": 0, "gone": 0, "permanent": 0}
+    n = {"inflight": 0, "inflight_listing": 0,
+         "delete": 0, "stubborn": 0, "gone": 0, "permanent": 0,
+         "clean": 0, "recoverable": 0, "unknown": 0}
     for it in items:
         key = (it["store"], it["sku"])
-        if it["store"] in inactive:
-            n["inactive"] += 1
+        if not (it.get("reasons") or "").strip():
+            n["clean"] += 1             # 无原因 = 无判据,不是候选
             continue
         if key in inflight:
             # 分开数:处置在途(我们的删/停还没落定)vs 上架/维护在途
@@ -299,16 +325,26 @@ def plan(items, inflight, inactive, stubborn=frozenset(),
             else:
                 n["inflight_listing"] += 1
             continue
-        # 2026-09-03 换轨:归类改吃新 16 码(services/error_taxonomy),
-        # 不再是 problem_products 的 A-L 单字母码。入选黑名单的判据随之变成
-        # `blacklist.PERMANENT`(所有者逐码裁决的七个 + OTHER 两个显式词条)。
-        # `unlisted_term` 一并带上:`OTHER` 是混装桶,只有 business decision /
-        # trust & safety 算永久拉黑,判据在引擎里(is_permanent)。
+        # 归类吃新 16 码(services/error_taxonomy,2026-09-03 换轨);入选黑名单
+        # 的判据是 `blacklist.PERMANENT`(所有者逐码裁决的七个 + OTHER 两个显式
+        # 词条),`unlisted_term` 一并带上(is_permanent 读它)。
+        # 2026-09-10 起逐原子明细也带上:atoms 落事件与建议行的 detail,
+        # cat_sig(原子码集合签名)是归类事件"变没变"的判据,recoverable 是走向。
         res = error_taxonomy.classify_reasons(
             error_taxonomy.split_reasons(it["reasons"]))
         it["category"], it["cat_name"] = res.code, res.name
         it["unlisted_term"] = res.unlisted_term
         it["policy_name"] = res.policy_name
+        it["atoms"] = [{"code": c, "policy_name": pn, "text": t}
+                       for c, pn, t in res.atoms]
+        it["cat_sig"] = ",".join(sorted({c for c, _ in res.atom_codes}))
+        it["unknown"] = list(res.unknown)
+        it["recoverable"] = error_taxonomy.is_recoverable_only(res)
+        if res.unknown:
+            n["unknown"] += 1
+        if it["recoverable"]:
+            n["recoverable"] += 1       # 只含可恢复原子:不删,等它自己/运营恢复
+            continue
         bucket = out.setdefault(it["store"], {"delete": [], "retire": []})
         # 两道回执闸(见上面 receipt_blocked 那段注释)。**死档优先于永久拒**:
         # 一个 SKU 只可能命中其中之一(判据是同一次回执的同一个码,两个码集
@@ -350,7 +386,9 @@ def to_dispositions(plans: dict) -> list[dict]:
                     "store": store, "sku": it["sku"], "source": "scan",
                     "action": action, "category": it.get("category"),
                     "reason": it.get("reasons") or "",
-                    "detail": {"cat_name": it.get("cat_name")},
+                    # atoms:逐原子 (码/政策名/原文),2026-09-10 起与事件同款落库
+                    "detail": {"cat_name": it.get("cat_name"),
+                               "atoms": it.get("atoms") or []},
                 })
     return rows
 
@@ -382,7 +420,9 @@ def _summarize(allrows: list[dict], audit_rows: list[dict], n: dict,
     by_act: dict[str, int] = {}
     for r in allrows:
         by_act[r["action"]] = by_act.get(r["action"], 0) + 1
-    out = [f"problem_scan:非 PUBLISHED 商品 {n_items} 行 → 建议 删除 "
+    # 首行(链通知只发这一行):扫描面现在是目录全量,先报三档分流再报建议数
+    out = [f"problem_scan:扫描 {n_items} 行(无原因 {n.get('clean', 0)},"
+           f"仅可恢复原子不删 {n.get('recoverable', 0)})→ 建议 删除 "
            f"{by_act.get('delete', 0)}"
            f"(其中审核判拒 {sum(1 for r in allrows if r.get('source') == 'audit')}),"
            f"顽固停用 {by_act.get('retire', 0)};"
@@ -390,8 +430,7 @@ def _summarize(allrows: list[dict], audit_rows: list[dict], n: dict,
            f"永久拒跳过 {n['permanent']},"
            f"处置在途/待观测跳过 {n['inflight']},"
            f"上架/维护在途跳过 {n['inflight_listing']}"
-           f"(多为新品合规复审,复审完自动进扫描),"
-           f"非 ACTIVE 店跳过 {n['inactive']}"]
+           f"(多为新品合规复审,复审完自动进扫描)"]
     per_store: dict[str, dict] = {}
     for r in allrows:
         b = per_store.setdefault(r["store"], {"delete": [], "retire": []})
@@ -434,10 +473,33 @@ def _blocked_notes(gone_skipped: list, perm_skipped: list) -> list[str]:
     return out
 
 
+def _inactive_note(allrows: list[dict], inactive: set) -> str:
+    """输入:最终建议行 + 非 ACTIVE 店集合 → 输出:按店点名行(无则空串)。
+
+    所有者 2026-09-10:「非 ACTIVE 店也需要在扫描范围内」—— 这批店此前整店跳过,
+    现在照常建议。建议本身不区别对待,但人眼闸门要看得见"这几条来自一家
+    沃尔玛标成非 ACTIVE 的店"(店被停时后台的品往往整批异常,删除面会突然变大)。
+    """
+    by_store: dict[str, int] = {}
+    for r in allrows:
+        if r["store"] in inactive:
+            by_store[r["store"]] = by_store.get(r["store"], 0) + 1
+    if not by_store:
+        return ""
+    return ("  ⚠ 非 ACTIVE 店照常建议(店铺状态不设闸,2026-09-10):"
+            + ",".join(f"{st}×{c}" for st, c in
+                        sorted(by_store.items(), key=lambda kv: -kv[1])))
+
+
 def _record_categories(conn, items: list[dict], last_cat: dict) -> int:
-    """归类事件:仅 (店铺,SKU) 类别变化时落账(病历不灌水)。"""
+    """归类事件:仅 (店铺,SKU) **原子码集合**变化时落账(病历不灌水)。
+
+    判据 2026-09-10 从主码换成原子码集合(`cat_sig`,_SQL_LAST_CAT 同一口径):
+    主码没变、原子多了一个(「禁售」→「End Date 过期; 禁售」)也是一次变化,
+    此前这种变化不留任何痕迹(所有者:「次要原子要落库」)。
+    """
     fresh = [it for it in items if "category" in it
-             and last_cat.get((it["store"], it["sku"])) != it["category"]]
+             and last_cat.get((it["store"], it["sku"])) != it["cat_sig"]]
     product_events.record_many(conn, [
         {"sku": it["sku"], "store": it["store"],
          "event": product_events.PROBLEM_CATEGORIZED,
@@ -448,8 +510,12 @@ def _record_categories(conn, items: list[dict], last_cat: dict) -> int:
          #   make sure you have the appropriate product type selected.」),
          #   于是 PT_WRONG 被判成 POLICY、可修复的品被永久拉黑。
          #   截断属于展示层,不属于账本(同 services/blacklist 头注的考古结论)。
+         # atoms / recoverable(2026-09-10):逐原子 (码/政策名/原文) 与走向,
+         #   读侧不必再拆原文重判;_SQL_LAST_CAT 拿 atoms 的码集合当签名。
          "detail": {"category": it["category"], "name": it["cat_name"],
-                    "reason": it["reasons"] or None}}
+                    "reason": it["reasons"] or None,
+                    "atoms": it["atoms"],
+                    "recoverable": it["recoverable"]}}
         for it in fresh])
     return len(fresh)
 
@@ -509,6 +575,49 @@ def _k_cluster_note(items: list[dict]) -> str:
             % _K_CLUSTER_WARN
             + ",".join(f"{st}×{n}" for st, n in
                         sorted(hot.items(), key=lambda kv: -kv[1])))
+
+
+
+def _recoverable_note(items: list[dict]) -> str:
+    """输入:已归类 item → 输出:「仅可恢复原子不删」按店计数行(无则空串)。
+
+    这批行以前一律删,现在留着 —— 人眼闸门要看得见每店留了多少、留的是什么
+    (EXPIRED 还是 STAGE),否则"删除数骤降"读不出原因。
+    """
+    by_store: dict[str, dict[str, int]] = {}
+    for it in items:
+        if not it.get("recoverable"):
+            continue
+        d = by_store.setdefault(it["store"], {})
+        d[it["cat_sig"]] = d.get(it["cat_sig"], 0) + 1
+    if not by_store:
+        return ""
+    return ("  仅可恢复原子不删(按店):"
+            + ",".join(f"{st}×{sum(d.values())}"
+                        + "{" + ",".join(f"{k}:{v}" for k, v in sorted(d.items())) + "}"
+                        for st, d in sorted(by_store.items(),
+                                            key=lambda kv: -sum(kv[1].values()))))
+
+
+def _unknown_note(items: list[dict]) -> str:
+    """输入:已归类 item → 输出:未识别原子告警行(无则空串)。
+
+    `classify_reasons` 的契约是"unknown 引擎不吞,调用方必须告警"—— 本工作流
+    此前没接。2026-09-10 起未识别原子的行照删(所有者:「其他的都删除」),
+    所以更要喊:沃尔玛换一种措辞说"等一等"(比如新的审查中文案),这里是唯一
+    能看见的地方;看见了就去 error_taxonomy 加规则或加进 RECOVERABLE_CODES。
+    """
+    seen: dict[str, int] = {}
+    for it in items:
+        for atom in it.get("unknown") or ():
+            seen[atom] = seen.get(atom, 0) + 1
+    if not seen:
+        return ""
+    top = sorted(seen.items(), key=lambda kv: -kv[1])[:5]
+    return (f"  ⚠ 未识别原子 {sum(seen.values())} 条(这些行按「其他」删除;"
+            f"措辞样本:"
+            + " | ".join(f"{a[:90]}…×{c}" if len(a) > 90 else f"{a}×{c}"
+                         for a, c in top) + ")")
 
 
 # 政策名提取(2026-08-24,审核反哺):沃尔玛下架原因里带政策名的两种写法
@@ -581,13 +690,12 @@ def _push_sheets() -> str:
     return blacklist_sheet.push_after()
 
 
-def _audit_rejected_rows(conn, inflight: set, inactive: set,
-                         only: str | None,
+def _audit_rejected_rows(conn, inflight: set, only: str | None,
                          gone_blocked: set = frozenset(),
                          perm_blocked: set = frozenset()) -> list[dict]:
     """输入:连接 + 去重状态 → 输出:判拒仍在架的建议行。
 
-    与 scan 来源共用同一套闸(非 ACTIVE 店跳过、在途不建议),但**不走归类**
+    与 scan 来源共用同一套闸(在途不建议、两道回执闸;店铺状态不设闸),但**不走归类**
     ——审核已经给出结论了,这里不需要再猜沃尔玛为什么不高兴。
 
     ⚠ **本函数不再截单店上限**(2026-08-24 归一):限额表「下架限制」由执行件
@@ -604,7 +712,7 @@ def _audit_rejected_rows(conn, inflight: set, inactive: set,
             rows, key=lambda r: (str(r[0]), str(r[1]))):
         if only and store != only:
             continue
-        if store in inactive or (store, sku) in inflight:
+        if (store, sku) in inflight:
             continue
         if (store, sku) in gone_blocked or (store, sku) in perm_blocked:
             # 审核说该删,但沃尔玛最近一次回执说"这个 SKU 已经不在了"(死档)
@@ -651,22 +759,24 @@ def run(params: dict) -> str:
     if absent:
         items = [i for i in items if i["store"] not in absent]
 
-    plans, n = plan(items, inflight, inactive, stubborn,
+    plans, n = plan(items, inflight, stubborn,
                     inflight_disposal, gone_blocked, perm_blocked)
     rows = to_dispositions(plans)
     # 被两道回执闸挡下的**本轮候选**(不是库里全部命中码的行):摘要要点名,
     # 而点名的对象必须是"今天本来会被建议删的那些",否则数字与总览那行对不上。
-    # ⚠ 排除顺序必须与 `plan()` 里那几支 continue **逐条对齐**(非 ACTIVE 店 →
-    # 在途 → 死档 → 永久拒):对不齐的话总览那行报 n['gone'],这里报另一个数,
-    # 而两个数都"看起来对" —— 本仓 2026-08-14 摘要对不上账的老坑同款。
+    # ⚠ 排除顺序必须与 `plan()` 里那几支 continue **逐条对齐**(无原因 → 在途 →
+    # 归类 → 仅可恢复 → 死档 → 永久拒):对不齐的话总览那行报 n['gone'],这里报
+    # 另一个数,而两个数都"看起来对" —— 本仓 2026-08-14 摘要对不上账的老坑同款。
+    # 到得了回执闸的行 = 归了类(有 category ⇔ 有原因且不在途)且不是仅可恢复原子。
+    # 直接读 plan() 留在行上的标记,不在这里再抄一遍它的分流顺序。
     keys = {(i["store"], i["sku"]) for i in items
-            if i["store"] not in inactive and (i["store"], i["sku"]) not in inflight}
+            if "category" in i and not i.get("recoverable")}
     gone_skipped = sorted(keys & set(gone_blocked))
     perm_skipped = sorted((keys & set(perm_blocked)) - set(gone_blocked))
     lines: list[str] = []
 
     with db.pg_conn() as conn:
-        audit_rows = _audit_rejected_rows(conn, inflight, inactive, only,
+        audit_rows = _audit_rejected_rows(conn, inflight, only,
                                           gone_blocked, perm_blocked)
         if absent:
             n_audit_avoided = sum(1 for r in audit_rows
@@ -699,8 +809,11 @@ def run(params: dict) -> str:
         lines[:0] = head        # 总览 + 分店明细排在最前,审核/剔除说明跟其后
         # 两道回执闸的点名紧跟总览:它们是"今天为什么少了这么多建议"的答案
         lines[len(head):len(head)] = _blocked_notes(gone_skipped, perm_skipped)
+        if (note := _inactive_note(allrows, inactive)):
+            lines.append(note)
         # 观察面用 items_all(缺席不连坐,见上)
-        for note in (_k_cluster_note(items_all), _policy_gap_note(conn, items_all)):
+        for note in (_recoverable_note(items_all), _unknown_note(items_all),
+                     _k_cluster_note(items_all), _policy_gap_note(conn, items_all)):
             if note:
                 lines.append(note)
         if preview:

@@ -43,18 +43,17 @@ def test_relist_machinery_is_retired_for_good():
     assert "relist" not in inspect.getsource(scan.plan)
 
 
-def test_scan_sql_covers_everything_not_published():
-    """扫描面 = 一切非 PUBLISHED(所有者定稿 2026-08-28),两个边界一起钉:
-    NULL(状态未采到)不进——删除不可逆,不拿未知赌;Stage 不再按行豁免
-    (店铺闸挡非 ACTIVE 店;ACTIVE 店里的 Stage = 翻出来的老档,照删)。"""
-    assert "published_status IS NOT NULL" in scan._SQL_ITEMS
-    assert "published_status <> 'PUBLISHED'" in scan._SQL_ITEMS
-    assert "missing_since IS NULL" in scan._SQL_ITEMS
-    assert "IN ('UNPUBLISHED'" not in scan._SQL_ITEMS   # 旧白名单口径不许回来
-    # RETIRED 全豁免(所有者定稿 2026-09-06):实证无法清理、后台一般不显示;
-    # NULL lifecycle 不豁免 —— 判不准就判活,但"活"在这里是"照扫",别把未知当 RETIRED。
-    assert "lifecycle_status <> 'RETIRED'" in scan._SQL_ITEMS
-    assert "lifecycle_status IS NULL OR" in scan._SQL_ITEMS
+def test_scan_surface_is_every_present_row():
+    """扫描面 = 一切未缺席的行(所有者定稿 2026-09-10:「扫描面不再限制,按分类
+    结果处置,所有状态的产品都需要扫描」)。状态列不再是筛选条件:
+    2026-08-28 的「非 PUBLISHED」与 2026-09-06 的「RETIRED 全豁免」两条同日退役;
+    只剩两条**操作层**边界(缺席行、在途改码的旧码)。"""
+    q = scan._SQL_ITEMS
+    assert "published_status <>" not in q and "published_status IS NOT NULL" not in q
+    assert "lifecycle_status" not in q                       # RETIRED 豁免退役
+    assert "IN ('UNPUBLISHED'" not in q                      # 旧白名单口径不许回来
+    assert "missing_since IS NULL" in q
+    assert "ls.replaced_by IS NOT NULL" in q
     import inspect
     assert "is_stage_pending" not in inspect.getsource(scan.plan)
 
@@ -64,43 +63,46 @@ def _item(store, sku, reasons):
 
 
 def test_plan_routing_and_dedup():
-    """一律删除(2026-08-28 定稿):A 类过期、Stage、其他类别全部进删除桶;
-    在途/非 ACTIVE 店照旧跳过;顽固双击照旧。"""
+    """按原子归类处置(2026-09-10 定稿):单独的 End Date 过期 / Stage 不删,
+    其余进删除桶;在途照旧跳过;非 ACTIVE 店照常建议;顽固双击照旧。"""
     items = [
-        _item("T1", "S_A", "end date has passed"),            # 过期 → 删除
+        _item("T1", "S_A", "end date has passed"),            # 仅可恢复原子 → 留
         _item("T1", "S_B", "prohibited product policy"),      # → 删除
-        _item("T1", "S_STAGE", "stage status until you go live"),  # → 删除(不再豁免)
+        _item("T1", "S_STAGE", "stage status until you go live"),  # 仅可恢复原子 → 留
         _item("T1", "S_FLY", "intellectual property"),        # 处置在途 → 跳过
         _item("T1", "S_NEW", "prohibited product policy"),    # 上架在途 → 跳过
-        _item("T_OFF", "S_X", "prohibited product policy"),   # 非 ACTIVE 店 → 跳过
+        _item("T_OFF", "S_X", "prohibited product policy"),   # 非 ACTIVE 店 → 照常删(2026-09-10)
         _item("T1", "S_ZOMBIE", "prohibited product policy"),  # 删除未生效 → 双击
     ]
     # 2026-08-24 起在途计数拆两桶(跳过行为不变):处置在途 vs 上架/维护在途
     plans, n = scan.plan(items,
                          inflight={("T1", "S_FLY"), ("T1", "S_NEW")},
-                         inactive={"T_OFF"},
                          stubborn={("T1", "S_ZOMBIE")},
                          inflight_disposal={("T1", "S_FLY")})
-    # 顽固 SKU 停用+删除双 feed;其余(含过期与 Stage)全进删除桶
-    assert {r["sku"] for r in plans["T1"]["delete"]} == \
-        {"S_A", "S_B", "S_STAGE", "S_ZOMBIE"}
+    # 顽固 SKU 停用+删除双 feed;过期与 Stage 留下,其余进删除桶
+    assert {r["sku"] for r in plans["T1"]["delete"]} == {"S_B", "S_ZOMBIE"}
     assert [r["sku"] for r in plans["T1"]["retire"]] == ["S_ZOMBIE"]
     assert "relist" not in plans["T1"]          # 反补桶不存在了
     assert n["stubborn"] == 1
-    assert "T_OFF" not in plans
-    assert (n["inflight"], n["inactive"]) == (1, 1)
+    # 非 ACTIVE 店不再整店跳过(所有者 2026-09-10:「非 ACTIVE 店也需要在扫描范围内」)
+    assert [r["sku"] for r in plans["T_OFF"]["delete"]] == ["S_X"]
+    assert "inactive" not in n
+    assert n["inflight"] == 1
     assert n["inflight_listing"] == 1        # S_NEW:上架 feed 在途,单列一桶
-    assert n["delete"] == 3                  # 双击那条不计在 delete(摘要按行重算)
-    # Stage 行照常归类(J 类进病历/摘要),只是不再改变走向
-    stage_row = [r for r in plans["T1"]["delete"] if r["sku"] == "S_STAGE"][0]
-    assert stage_row["category"] == "STAGE"        # 换轨前是旧码 J(特殊)
+    assert n["delete"] == 2                  # S_B + S_X;双击那条不计在 delete(摘要按行重算)
+    assert n["recoverable"] == 2             # S_A / S_STAGE
+    # 留下的行照常归类(进病历/摘要),走向由 recoverable 标出
+    for it in items:
+        if it["sku"] in ("S_A", "S_STAGE"):
+            assert it["recoverable"] is True and it["category"] in ("EXPIRED", "STAGE")
+    assert items[1]["recoverable"] is False
 
 
 def test_to_dispositions_splits_double_hit():
     """顽固双击 = **两条**建议行,不是一条。它们是两个 feed、两次独立的生效
     判定,合成一行会让其中一个的落定结果覆盖另一个。"""
     plans, _ = scan.plan([_item("T1", "S_Z", "prohibited product policy")],
-                         inflight=set(), inactive=set(),
+                         inflight=set(),
                          stubborn={("T1", "S_Z")})
     rows = scan.to_dispositions(plans)
     assert sorted(r["action"] for r in rows) == ["delete", "retire"]
@@ -110,7 +112,7 @@ def test_to_dispositions_splits_double_hit():
 
 def test_to_dispositions_carries_category_and_reason():
     plans, _ = scan.plan([_item("T1", "S_B", "violates Prohibited Product Policy")],
-                         inflight=set(), inactive=set())
+                         inflight=set())
     (row,) = scan.to_dispositions(plans)
     assert (row["action"], row["category"]) == ("delete", "POLICY")
     assert "Prohibited" in row["reason"]
@@ -153,7 +155,8 @@ def test_audit_rejected_reads_the_view_not_its_own_join():
 
 
 def test_audit_rejected_respects_the_same_gates(monkeypatch):
-    """审核来源与 scan 来源共用同一套闸:非 ACTIVE 店与在途都不建议。"""
+    """审核来源与 scan 来源共用同一套闸:在途不建议;非 ACTIVE 店照常建议
+    (所有者 2026-09-10:「非 ACTIVE 店也需要在扫描范围内」,此前整店跳过)。"""
     class _Cur:
         def __enter__(self): return self
         def __exit__(self, *a): return False
@@ -168,8 +171,8 @@ def test_audit_rejected_respects_the_same_gates(monkeypatch):
         def cursor(self): return _Cur()
 
     rows = scan._audit_rejected_rows(
-        _Conn(), inflight={("T1", "S_FLY")}, inactive={"T_OFF"}, only=None)
-    assert [r["sku"] for r in rows] == ["S1"]
+        _Conn(), inflight={("T1", "S_FLY")}, only=None)
+    assert [r["sku"] for r in rows] == ["S1", "S2"]      # S2 在非 ACTIVE 店,照建议
     assert rows[0]["source"] == "audit" and rows[0]["action"] == "delete"
     assert rows[0]["asin"] == "B01" and "知产" in rows[0]["reason"]
     # 先上架后被判拒的标记随建议行带走:它是审核链漏拦的线索,
@@ -203,8 +206,7 @@ def test_audit_scan_no_longer_caps_but_stays_ordered():
     class _Conn:
         def cursor(self): return _Cur()
 
-    rows = scan._audit_rejected_rows(_Conn(), inflight=set(), inactive=set(),
-                                     only=None)
+    rows = scan._audit_rejected_rows(_Conn(), inflight=set(), only=None)
     assert len(rows) == 8                       # 一条都不截
     assert [r["sku"] for r in rows if r["store"] == "T1"] == [
         "S000", "S001", "S002", "S003", "S004"]
@@ -331,7 +333,7 @@ def test_scan_and_audit_can_only_agree_on_delete():
     段随之删除)。这里钉的是 scan 侧产出的动作面。"""
     plans, _ = scan.plan([_item("T1", "S_A", "end date has passed"),
                           _item("T1", "S_Z", "prohibited product policy")],
-                         inflight=set(), inactive=set(),
+                         inflight=set(),
                          stubborn={("T1", "S_Z")})
     actions = {r["action"] for r in scan.to_dispositions(plans)}
     assert actions <= {"delete", "retire"}
@@ -482,7 +484,7 @@ def test_summarize_counts_the_rows_that_actually_land():
     head = _summ(allrows, audit_rows, n, 99)
     # 删除报 2(retire 之外的全部 delete 行),不是 n['delete'] 的 1
     assert "删除 2" in head[0]
-    assert "非 PUBLISHED 商品 99 行" in head[0]
+    assert "扫描 99 行" in head[0]          # 2026-09-10 起扫描面是目录全量
     assert "顽固停用 1" in head[0]
     assert "其中审核判拒 1" in head[0]
     # 分店明细按建议行重建,audit 来源没有 category → 显示 '-'
@@ -547,13 +549,13 @@ def test_summarize_dedupes_like_the_unique_index():
 
 def test_l_system_error_now_deletes_like_everything_else():
     """L 类(internal error)2026-08-24 曾走反补(沃尔玛原话 Resubmit);
-    2026-08-28 所有者定稿推翻:非 PUBLISHED 一律删除,L 类不再例外。
-    归类仍是 L(病历/摘要照记),只是走向统一成删除。"""
+    2026-08-28 所有者定稿推翻;2026-09-10「按原子归类」口径下 SYSTEM 不在
+    可恢复码里(只有 EXPIRED/STAGE),仍然删除。归类仍是 SYSTEM(病历/摘要照记)。"""
     items = [
         _item("T1", "S_L1", "an internal error occurred while publishing"),
         _item("T1", "S_L2", "an internal error occurred"),
     ]
-    plans, n = scan.plan(items, inflight=set(), inactive=set())
+    plans, n = scan.plan(items, inflight=set())
     assert {r["sku"] for r in plans["T1"]["delete"]} == {"S_L1", "S_L2"}
     assert all(r["category"] == "SYSTEM" for r in plans["T1"]["delete"])
     assert n["delete"] == 2
@@ -615,7 +617,7 @@ def test_dead_listing_skus_are_skipped_not_re_deleted_every_round():
     """
     items = [_item("T1", "S_DEL", "prohibited product policy"),
              _item("T1", "S_OK", "prohibited product policy")]
-    plans, n = scan.plan(items, set(), {}, set(),
+    plans, n = scan.plan(items, set(), set(),
                          gone_blocked={("T1", "S_DEL")})
     assert n["gone"] == 1 and n["permanent"] == 0
     assert [r["sku"] for r in plans["T1"]["delete"]] == ["S_OK"]
@@ -628,9 +630,11 @@ def test_permanent_refusal_skus_are_skipped_and_counted_separately():
     Seller Center 处理(转出 WFS)"。合成一个数就等于把待办混进已完成。
     ⚠ 拦掉不等于改判 retire:RETIRE_ITEM 对 WFS 件行不行官方没有明文,
     按本仓纪律不许按推断编码 —— 只跳过并响亮报数。
+    (2026-09-10 起单独的「End Date 过期」按可恢复留、到不了回执闸,
+    夹具用政策原因。)
     """
-    it = _item("T1", "S_EXP", "end date has passed")
-    plans, n = scan.plan([it], set(), set(), perm_blocked={("T1", "S_EXP")})
+    it = _item("T1", "S_POL", "prohibited product policy")
+    plans, n = scan.plan([it], set(), set(), perm_blocked={("T1", "S_POL")})
     assert n["permanent"] == 1 and n["gone"] == 0 and n["delete"] == 0
     assert plans.get("T1", {"delete": []})["delete"] == []
 
@@ -645,7 +649,7 @@ def test_both_receipt_gates_also_block_the_stubborn_double_feed():
     for bucket, key in (("gone_blocked", "gone"),
                         ("perm_blocked", "permanent")):
         items = [_item("T1", "S_Z", "prohibited product policy")]
-        plans, n = scan.plan(items, set(), set(), stubborn={("T1", "S_Z")},
+        plans, n = scan.plan(items, set(), stubborn={("T1", "S_Z")},
                              **{bucket: {("T1", "S_Z")}})
         assert n[key] == 1 and n["stubborn"] == 0, bucket
         assert plans.get("T1", {"delete": [], "retire": []})["delete"] == []
@@ -654,7 +658,7 @@ def test_both_receipt_gates_also_block_the_stubborn_double_feed():
 
 def test_the_named_samples_match_the_counts_in_the_headline():
     """摘要两处的数必须对得上:总览那行的 `n['gone']`/`n['permanent']` 与
-    明细里点名的条数,排除顺序都是「非 ACTIVE → 在途 → 死档 → 永久拒」。
+    明细里点名的条数,排除顺序都是「在途 → 死档 → 永久拒」(店铺状态不设闸)。
 
     对不齐的老坑(2026-08-14 生产实遇):两个数都"看起来对",人拿其中一个去
     对账才发现少了一截,而两边都不报错。
@@ -664,10 +668,10 @@ def test_the_named_samples_match_the_counts_in_the_headline():
     inflight = {("T1", "S_INFLIGHT")}
     gone = {("T1", "S_GONE"), ("T1", "S_INFLIGHT"), ("T2", "S_DEAD_STORE")}
     perm = {("T1", "S_PERM")}
-    _plans, n = scan.plan(items, inflight, {"T2"}, set(), inflight, gone, perm)
-    # 在途的与非 ACTIVE 店的**先被别的闸拦走**,不算进这两桶
-    assert (n["gone"], n["permanent"], n["inflight"], n["inactive"]) \
-        == (1, 1, 1, 1)
+    _plans, n = scan.plan(items, inflight, set(), inflight, gone, perm)
+    # 在途的**先被在途闸拦走**,不算进这两桶;非 ACTIVE 店的行照常走到回执闸
+    # (2026-09-10 店铺状态不设闸),S_DEAD_STORE 算进死档桶
+    assert (n["gone"], n["permanent"], n["inflight"]) == (2, 1, 1)
 
 
 def test_receipt_blocked_sql_reads_only_the_latest_attempt_of_both_feeds():
@@ -729,15 +733,16 @@ def test_the_error_codes_live_only_in_the_registry():
 # ══════════════════════════════════════════════════════════════════════════════
 
 def test_items_sql_column_order_is_unchanged():
-    """三列的**位置顺序**是契约:_load_state 按位置解包成 store/sku/reasons。
+    """四列的**位置顺序**是契约:_load_state 按位置解包成
+    store/sku/reasons/published_status。
 
     加表别名时把列序动了,不报错 —— 只是从此每一行的 sku 里装着
     unpublished_reasons,归类全错、建议全错。
     """
     head = scan._SQL_ITEMS.strip().splitlines()[0]
-    assert head == "SELECT w.store, w.sku, w.unpublished_reasons"
+    assert head == "SELECT w.store, w.sku, w.unpublished_reasons, w.published_status"
     src = pathlib.Path("workflows/problem_scan.py").read_text(encoding="utf-8")
-    assert '("store", "sku", "reasons")' in src
+    assert '("store", "sku", "reasons", "published_status")' in src
 
 
 def test_replaced_rows_are_excluded_by_a_not_exists_not_a_join():
@@ -750,9 +755,8 @@ def test_replaced_rows_are_excluded_by_a_not_exists_not_a_join():
     assert "NOT EXISTS (SELECT 1 FROM catalog.listing_sources ls" in q
     assert "ls.replaced_by IS NOT NULL" in q
     assert "JOIN catalog.listing_sources" not in q
-    # 改码前 replaced_by 全库为 NULL ⇒ NOT EXISTS 恒真,三条既有条件一字未动
-    assert "w.published_status IS NOT NULL" in q
-    assert "w.published_status <> 'PUBLISHED'" in q
+    # 改码前 replaced_by 全库为 NULL ⇒ NOT EXISTS 恒真,既有的缺席条件一字未动
+    # (状态条件 2026-09-10 退役,见 test_scan_surface_is_every_present_row)
     assert "w.missing_since IS NULL" in q
 
 
@@ -877,7 +881,7 @@ def _read(conn):
     from services import product_events
     with conn.cursor() as cur:
         cur.execute(scan._SQL_ITEMS)
-        surface = {sku for st, sku, _ in cur.fetchall() if st == _STORE}
+        surface = {sku for st, sku, *_ in cur.fetchall() if st == _STORE}
         cur.execute(scan._SQL_STUBBORN)
         stubborn = {(st, k) for st, k, ev in cur.fetchall()
                     if ev == 'delete_not_effective'}
@@ -901,8 +905,9 @@ def test_rows_being_replaced_are_out_of_the_scan_surface(pg):
     _seed_pair(pg, replaced=True)
     surface, *_ = _read(pg)
     assert _OLD not in surface
-    # 新码在架且 PUBLISHED,本来就不该在扫描面里(排除的是旧码,不是整对)
-    assert _NEW not in surface
+    # 新码在架且 PUBLISHED:2026-09-10 起扫描面不按状态筛,它**在**扫描面里
+    # (无原因 ⇒ plan() 分进 clean 桶,不是候选);排除的只是旧码,不是整对
+    assert _NEW in surface
 
 
 @needs_pg
@@ -1012,13 +1017,172 @@ def test_load_state_runs_every_sql_and_never_surfaces_a_replaced_row(pg,
     (items, inflight, inflight_disposal, last_cat,
      inactive, stubborn, gone_blocked, perm_blocked) = scan._load_state()
     ours = [i for i in items if i["store"] == _STORE]
-    assert ours == []                                   # 旧码不在扫描面,新码 PUBLISHED
+    # 旧码不在扫描面;新码 PUBLISHED 也在(状态不再筛),四列按位置解包
+    assert [(i["sku"], i["published_status"]) for i in ours] == [(_NEW, "PUBLISHED")]
     assert (_STORE, _NEW) in stubborn                   # 顽固代际继承到位
     assert last_cat[(_STORE, _NEW)] == "L"
     assert (_STORE, _NEW) in perm_blocked      # 夹具造的是一条 WFS 回执
     assert (_STORE, _NEW) not in gone_blocked  # 两桶不相交,码只落一边
     assert (_STORE, _NEW) in inflight
     assert (_STORE, _NEW) not in inflight_disposal      # 继承来的是上架 feed
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  按原子归类处置 + 次要原子落库(所有者定稿 2026-09-10)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_recoverable_only_rows_are_kept_but_still_categorized():
+    """原子集合 ⊆ {EXPIRED, STAGE} 的行不删:单独过期、单独 Stage、两者相加都留。
+    留下的行照常归类(进病历),cat_sig 是原子码集合签名。"""
+    items = [
+        _item("T1", "S_EXP", "This item is unpublished because the End Date has passed."),
+        _item("T1", "S_STG", "Item is in stage status until you go live."),
+        _item("T1", "S_BOTH", "the End Date has passed.; stage status until you go live"),
+    ]
+    plans, n = scan.plan(items, inflight=set())
+    assert plans == {} and n["delete"] == 0 and n["recoverable"] == 3
+    assert [it["cat_sig"] for it in items] == ["EXPIRED", "STAGE", "EXPIRED,STAGE"]
+    assert all(it["recoverable"] for it in items)
+    assert [a["code"] for a in items[2]["atoms"]] == ["EXPIRED", "STAGE"]
+
+
+def test_compound_with_a_non_recoverable_atom_deletes():
+    """「End Date 过期; 禁售政策」:主码 POLICY,原子集合含非可恢复原子 → 删。
+    这就是 B08HJ382VJ 08-29 那条原文的形状。"""
+    text = ("This item is unpublished because the End Date has passed.; "
+            "This item has been unpublished for violating Walmart's Marketplace "
+            "Prohibited Product Policy: Plants & Seeds")
+    it = _item("T1", "S_MIX", text)
+    plans, n = scan.plan([it], inflight=set())
+    assert [r["sku"] for r in plans["T1"]["delete"]] == ["S_MIX"]
+    assert it["category"] == "POLICY" and it["recoverable"] is False
+    assert it["cat_sig"] == "EXPIRED,POLICY"
+    assert [(a["code"], a["policy_name"]) for a in it["atoms"]] == \
+        [("EXPIRED", None), ("POLICY", "Plants & Seeds")]
+    assert it["atoms"][0]["text"].startswith("This item is unpublished because the End Date")
+
+
+def test_rows_without_reasons_are_not_candidates_whatever_the_status():
+    """无原因 = 无判据:PUBLISHED 行的常态;非 PUBLISHED 而无原因的也不删
+    (判不准就判活)。这一档在在途闸之前分流,在途计数只数问题行。"""
+    items = [
+        {"store": "T1", "sku": "S_LIVE", "reasons": "", "published_status": "PUBLISHED"},
+        {"store": "T1", "sku": "S_NULL", "reasons": None, "published_status": "UNPUBLISHED"},
+        {"store": "T_OFF", "sku": "S_OFF", "reasons": "  ", "published_status": "STAGE"},
+    ]
+    plans, n = scan.plan(items, inflight={("T1", "S_LIVE")})
+    assert plans == {}
+    assert n["clean"] == 3 and n["delete"] == 0
+    assert n["inflight"] == n["inflight_listing"] == 0
+    assert all("category" not in it for it in items)      # 没归类 ⇒ 不记事件
+
+
+def test_published_row_with_a_policy_reason_follows_the_same_rule():
+    """状态不再是判据:PUBLISHED 行若带非可恢复原子,与 UNPUBLISHED 行同样删。
+    (walmart_catalog 每轮整行覆盖 unpublished_reasons,在售行带原因几乎不可能;
+    真出现了就是沃尔玛说它有问题,按原文处置。)"""
+    it = {"store": "T1", "sku": "S_PUB", "published_status": "PUBLISHED",
+          "reasons": "violates Prohibited Product Policy"}
+    plans, n = scan.plan([it], inflight=set())
+    assert [r["sku"] for r in plans["T1"]["delete"]] == ["S_PUB"]
+
+
+def test_unknown_atoms_still_delete_but_are_reported():
+    """未识别原子照删(所有者:「其他的都删除」),但必须进摘要告警 ——
+    classify_reasons 的契约是"unknown 引擎不吞,调用方必须告警"。"""
+    it = _item("T1", "S_UNK", "Some brand-new Walmart wording nobody has seen")
+    plans, n = scan.plan([it], inflight=set())
+    assert [r["sku"] for r in plans["T1"]["delete"]] == ["S_UNK"]
+    assert n["unknown"] == 1 and it["category"] == "OTHER"
+    note = scan._unknown_note([it])
+    assert "未识别原子 1 条" in note and "brand-new Walmart wording" in note
+    assert scan._unknown_note([_item("T1", "S", "end date has passed")]) == ""
+
+
+def test_inactive_store_note_names_stores_but_never_gates():
+    """店铺状态不设闸(所有者 2026-09-10):plan() 与审核行都不再读非 ACTIVE 集合;
+    run() 只拿它给最终建议行按店点名,让人眼闸门看得见。"""
+    import inspect
+    assert "inactive" not in inspect.signature(scan.plan).parameters
+    assert "inactive" not in inspect.signature(scan._audit_rejected_rows).parameters
+    rows = [{"store": "T_OFF", "sku": "A", "action": "delete"},
+            {"store": "T_OFF", "sku": "B", "action": "delete"},
+            {"store": "T1", "sku": "C", "action": "delete"}]
+    note = scan._inactive_note(rows, {"T_OFF"})
+    assert "非 ACTIVE 店照常建议" in note and "T_OFF×2" in note and "T1" not in note
+    assert scan._inactive_note(rows, set()) == ""
+
+
+def test_recoverable_note_counts_per_store_and_kind():
+    items = [_item("T1", "A", "end date has passed"),
+             _item("T1", "B", "stage status until you go live"),
+             _item("T2", "C", "end date has passed"),
+             _item("T2", "D", "prohibited product policy")]
+    scan.plan(items, inflight=set())
+    note = scan._recoverable_note(items)
+    assert "T1×2{EXPIRED:1,STAGE:1}" in note and "T2×1{EXPIRED:1}" in note
+    assert scan._recoverable_note([items[3]]) == ""
+
+
+def test_dispositions_carry_atoms():
+    """建议行 detail.atoms 与事件同款:逐原子 (码/政策名/原文)。"""
+    plans, _ = scan.plan([_item("T1", "S", "the End Date has passed.; "
+                                "violates Prohibited Product Policy: Hazardous Items")],
+                         inflight=set())
+    (row,) = scan.to_dispositions(plans)
+    assert row["category"] == "POLICY"
+    assert [a["code"] for a in row["detail"]["atoms"]] == ["EXPIRED", "POLICY"]
+    assert row["detail"]["atoms"][1]["policy_name"] == "Hazardous Items"
+    assert row["detail"]["cat_name"] == "违反禁售政策"
+
+
+def test_categorized_event_fires_on_atom_set_change_not_main_code(monkeypatch):
+    """归类事件的判据从主码换成原子码集合:主码不变、多了一个原子也记;
+    存量事件没有 atoms 时 _SQL_LAST_CAT 退回主码,单原子行的签名与主码相同。"""
+    from services import product_events
+    captured: list[list[dict]] = []
+    monkeypatch.setattr(product_events, "record_many",
+                        lambda conn, rows: captured.append(rows) or len(rows))
+    items = [
+        _item("T1", "S_SAME", "prohibited product policy"),                   # POLICY == POLICY
+        _item("T1", "S_GREW", "end date has passed; prohibited product policy"),  # POLICY → EXPIRED,POLICY
+        _item("T1", "S_KEPT", "end date has passed"),                         # 留下的行也记
+    ]
+    scan.plan(items, inflight=set())
+    last_cat = {("T1", "S_SAME"): "POLICY", ("T1", "S_GREW"): "POLICY"}
+    n = scan._record_categories(object(), items, last_cat)
+    assert n == 2
+    (rows,) = captured
+    assert [r["sku"] for r in rows] == ["S_GREW", "S_KEPT"]
+    grew = rows[0]["detail"]
+    assert grew["category"] == "POLICY"
+    assert [a["code"] for a in grew["atoms"]] == ["EXPIRED", "POLICY"]
+    assert grew["recoverable"] is False
+    assert rows[1]["detail"]["recoverable"] is True
+    assert all(r["event"] == product_events.PROBLEM_CATEGORIZED for r in rows)
+
+
+def test_last_cat_sql_signs_by_atoms_with_category_fallback():
+    """_SQL_LAST_CAT 与 cat_sig 同一口径:原子码去重、字典序、逗号拼;
+    没有 atoms 的存量事件退回 detail.category;atoms 不是数组时不炸。"""
+    q = scan._SQL_LAST_CAT
+    assert q.count("jsonb_array_elements(") == 2               # 两个 UNION 分支同款
+    assert q.count("string_agg(DISTINCT x->>'code', ',' ORDER BY x->>'code')") == 2
+    assert q.count("jsonb_typeof(e.detail->'atoms') = 'array'") == 2
+    assert q.count("e.detail->>'category'") == 2
+    # Python 侧签名生成器与 SQL 同一口径:去重 + 排序 + 逗号
+    it = _item("T1", "S", "prohibited product policy; end date has passed; prohibited product policy")
+    scan.plan([it], inflight=set())
+    assert it["cat_sig"] == "EXPIRED,POLICY"
+
+
+def test_recoverable_codes_are_the_single_source():
+    """可恢复码只在 error_taxonomy 出生;problem_scan 不自带一份。"""
+    from services import error_taxonomy as et
+    assert et.RECOVERABLE_CODES == ("EXPIRED", "STAGE")
+    src = pathlib.Path("workflows/problem_scan.py").read_text(encoding="utf-8")
+    assert "is_recoverable_only" in src
+    assert '"EXPIRED"' not in src and "'EXPIRED'" not in src
 
 
 # ══════════════════════════════════════════════════════════════════════════════

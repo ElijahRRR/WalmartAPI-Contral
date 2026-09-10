@@ -230,6 +230,17 @@ PERMANENT_UNLISTED_TERMS = ("business decision", "trust & safety")
 NOT_A_PRODUCT_BAN = ("PT_WRONG", "GATED", "CONTENT", "INFO",
                      "PRICE", "SYSTEM", "STAGE", "EXPIRED")
 
+#: **可恢复原子码**(所有者定稿 2026-09-10,唯一出处):问题商品链的处置判据
+#: 从「状态非 PUBLISHED 一律删」换成「按原子归类」—— 原文**只**由这两种原子组成
+#: 的行不删(End Date 过期等运营改日期、Stage 等沃尔玛放行),混进任何别的原子
+#: 即删。⚠ 判据看的是**原子集合**不是主码:主码序里 EXPIRED/STAGE 排最末,
+#: 复合原文里它们永远赢不了主码,拿主码判等于"复合行全删、单独行全留",
+#: 这正是所有者要的;但反过来"主码是 POLICY 就删"看不出还有哪些原子 ——
+#: 所以逐原子落库(`Result.atoms` → 事件/建议行 detail.atoms),不再只留主码。
+#: ⚠ `currently under review`(序 16 显式 OTHER,自愈态)**不在此列**:所有者
+#:   2026-09-10 只点了 End Date 与 Stage 两种;要加先改这里再改测试。
+RECOVERABLE_CODES = ("EXPIRED", "STAGE")
+
 _RULE_UNKNOWN = RULES[-1]
 _RULE_UNLISTED = RULES[-2]
 # feed 政策族只过序 1-15(方案 §3.6 通道 2):序 0 是 AI 通道自己的事,
@@ -457,6 +468,10 @@ class Result(NamedTuple):
     #: `is_permanent` 判 `OTHER` 该不该拉黑读的就是它,拿聚合去判会把
     #: "另一个原子提到过 business decision" 也算成主码的理由。
     unlisted_term: str | None = None
+    #: 逐原子明细 (码, 政策名, **原文**),与 atom_codes 同序(2026-09-10,所有者:
+    #: 「次要原子要落库」)。atom_codes 只有码,查"这条还带哪些原子"要重判原文;
+    #: 这里把原文一起带回,写入方原样落 detail.atoms,读侧不必再拆。
+    atoms: tuple[tuple[str, str | None, str], ...] = ()
 
 
 class FeedResult(NamedTuple):
@@ -523,7 +538,19 @@ def classify_reasons(atoms: Iterable[str] | None,
                       if r.rule_order == _RULE_UNKNOWN.order),
         unlisted=tuple(sorted(unlisted.items())),
         unlisted_term=win.unlisted_term,
+        atoms=tuple((r.code, r.policy_name, r.atom) for r in results),
     )
+
+
+def is_recoverable_only(result: Result) -> bool:
+    """输入:记录级 Result → 输出:原文是否**只**由可恢复原子组成(空原文 False)。
+
+    问题商品链"删不删"的唯一判据(所有者定稿 2026-09-10):看原子集合不看主码。
+    空原文返回 False 只是"没有可恢复原子",**不是"该删"** —— 无原因的行根本
+    不是候选,由调用方在归类之前就分流(problem_scan.plan 的 clean 桶)。
+    """
+    codes = {c for c, _ in result.atom_codes}
+    return bool(codes) and codes <= set(RECOVERABLE_CODES)
 
 
 def classify_feed_error(code: str | None, field: str | None,

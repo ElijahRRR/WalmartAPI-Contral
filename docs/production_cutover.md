@@ -160,14 +160,18 @@ warning 计数 —— 它不许混进"标题 N 条"里无声发生。
 那是采集问题;拿它当删除依据 = 采集抖动一次就删一批在架商品,而且不报错。
 `0.0` 才是明确的不像。
 
-### 5.2 problem_scan 对 RETIRED 全豁免(2026-09-06 起,所有者定稿)
+### 5.2 problem_scan 扫描面与走向(2026-09-10 起,所有者定稿;取代 09-06 的 RETIRED 全豁免)
 
-`workflows/problem_scan._SQL_ITEMS` 扫描面 = 非 PUBLISHED ∧ 未缺席 ∧ **lifecycle ≠ RETIRED**
-(NULL 照扫)。依据:08-28 可见性变更翻回来的 RETIRED 死档(10,191 行)对 DELETE_ITEM
-**实证删不掉**、后台一般不显示,建议删除只烧 MP_MAINTENANCE 配额。副作用:product_clear
-停用(RETIRE_ITEM)的品从此长期可恢复,不再被下一轮 problem_scan 建议删除。
-「僵尸列表」(列表接口仍返回已删品为 PUBLISHED/ACTIVE、单条 GET 404)所有者定为
-**暂不处理**。全文见 docs/sku_plan.md §9.11。
+`workflows/problem_scan._SQL_ITEMS` 扫描面 = 目录里**一切未缺席**的行,不看
+published_status / lifecycle(在途改码的旧码仍排除)。走向由归类的**原子集合**判
+(`services/error_taxonomy.is_recoverable_only`):只含 EXPIRED / STAGE → 不删;无原因
+→ 不是候选;其余一律删(含未识别,摘要告警)。**店铺状态不设闸**(所有者同日追加:
+「非 ACTIVE 店也需要在扫描范围内」),非 ACTIVE 店照扫照建议,摘要按店点名。逐原子明细落
+`product_events.detail.atoms` / `ops.dispositions.detail.atoms`。摘要首行报
+「扫描 N 行(无原因 / 仅可恢复原子不删)→ 建议删除 …」,并按店列「仅可恢复原子不删」。
+09-06 那条 RETIRED 全豁免的依据(08-28 可见性变更翻回来的死档删不掉)已随 09-09
+沃尔玛改回列表可见性而消失(A109 在册 6858 → 3371);RETIRED 行照扫,通常只带
+「End Date 过期」一个原子,按可恢复留。全文见 docs/plan.md 2026-09-10 条。
 
 ## 六、维护记录表 11 列(已落地)
 

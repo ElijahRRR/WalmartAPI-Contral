@@ -1962,21 +1962,49 @@ def test_price_tier_peaks_only_on_beijing_weekdays():
         dt.datetime(2026, 9, thu, 3, tzinfo=dt.timezone.utc)) == "peak"   # 北京 11:00
 
 
-def test_v4_pro_is_priced_as_flash_during_official_routing():
-    """官方 2026-09-10 公告:V4.1 Flash 上线后、V4.1 Pro 上线前,对 V4 Pro 的
-    请求全部路由到 V4.1 Flash 并**按 V4.1 Flash 单价计费**。
+def test_v4_pro_keeps_its_own_price_until_the_official_routing_date():
+    """官方定价页注(2):**北京时间 2026-09-14 12:00 之后**,访问 deepseek-v4-pro
+    的请求才全部路由到 V4.1 Flash 并按 Flash 计费 —— 在那之前它是真 Pro 价扣钱。
 
-    ⚠ V4.1 Pro 上线时要撤掉 LLM_MODEL_ALIASES 里那一行并恢复 Pro 自己的价,
-    否则 Pro 的账会按 Flash 少算四倍多。这条用例是那个动作的提醒。
+    2026-09-10 实错:只看了调价公告那句"会把对 V4 Pro 的请求全部路由到 V4.1
+    Flash 并按 V4.1 Flash 单价计费",就把 v4-pro 无条件折进 LLM_MODEL_ALIASES,
+    漏了定价页注(2)写着的生效日期 —— 那几天里账会少算四倍多(未命中 4.5 倍、
+    输出 3.4 倍),而钱是真按 Pro 扣的。所以折价按**时刻**判、日期落在 registry,
+    到点自己换算:"以后记得回来改一行"从没有人真的回来改。
     """
+    import datetime as dt
     from registry import resources
     from services import llm_cost
 
-    assert resources.llm_priced_model("deepseek-v4-pro") == "deepseek-flash"
+    starts = resources.LLM_PRO_ROUTING_STARTS
+    assert (starts.year, starts.month, starts.day, starts.hour) == (2026, 9, 14, 12)
+    assert starts.utcoffset() == dt.timedelta(hours=8)          # 北京时间,不是 UTC
     row = {"calls": 1, "prompt": 0, "completion": 1_000_000,
            "cache_hit": 0, "cache_miss": 0}
-    assert (llm_cost.cost_of("deepseek-v4-pro", "offpeak", row)
-            == llm_cost.cost_of("deepseek-flash", "offpeak", row))
+    before, after = starts - dt.timedelta(seconds=1), starts
+    # 生效前:按 Pro 自己的价(空闲输出 13.5 元 / 百万 token)
+    assert resources.llm_priced_model("deepseek-v4-pro", before) == "deepseek-v4-pro"
+    assert llm_cost.cost_of("deepseek-v4-pro", "offpeak", row, before) == 13.5
+    # 到点那一刻(含)起:折到 flash 行,与直接发 flash 一分不差
+    assert resources.llm_priced_model("deepseek-v4-pro", after) == "deepseek-flash"
+    assert (llm_cost.cost_of("deepseek-v4-pro", "offpeak", row, after)
+            == llm_cost.cost_of("deepseek-flash", "offpeak", row, after) == 4.0)
+    # 永久别名表**不许**装它:那张表是无条件折,混进来等于把生效日期抹掉
+    assert "deepseek-v4-pro" not in resources.LLM_MODEL_ALIASES
+
+
+def test_official_prices_are_pinned_cell_by_cell():
+    """两个可调模型的单价逐格钉住官方定价页(2026-09-10 15:21 北京复核)。
+
+    单价**没有任何端点可查**(DeepSeek 不提供,只能落本地),抄错一格不会报错,
+    要到对账对不上那天才发现。所以把官方那张表原样钉在这里当守门人。
+    """
+    from registry import resources
+
+    assert resources.LLM_PRICING["deepseek-flash"] == {
+        "offpeak": (0.02, 1.0, 4.0), "peak": (0.04, 2.0, 8.0)}
+    assert resources.LLM_PRICING["deepseek-v4-pro"] == {
+        "offpeak": (0.15, 4.5, 13.5), "peak": (0.30, 9.0, 27.0)}
 
 
 def test_pricing_table_is_cny_and_offpeak_is_half():

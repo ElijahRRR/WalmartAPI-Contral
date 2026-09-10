@@ -226,22 +226,28 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 ⚠ **峰谷价差一倍** —— 高峰 = 北京时间**周一至周五** 09:00–12:00 与
 14:00–18:00,其余半价,**周末全天谷价**。大批量重审排在北京时间
 **晚 18:00 至次日早 08:00** 或周末跑,直接省一半。
-⚠ **`deepseek-v4-pro` 现在按 Flash 单价计费**(官方 2026-09-10 公告:
-V4.1 Flash 上线后、V4.1 Pro 上线前,对 V4 Pro 的请求全部路由到 V4.1 Flash);
-V4.1 Pro 上线时要撤掉 `registry.LLM_MODEL_ALIASES` 里那一行。
+⚠ **`deepseek-v4-pro` 在北京时间 2026-09-14 12:00 之前仍是真 Pro 价**(未命中
+4.5 倍、输出 3.4 倍于 Flash):官方定价页注(2)说的是那一刻**之后**才把对 V4 Pro
+的请求全部路由到 V4.1 Flash 并按 Flash 计费 —— 只看调价公告很容易漏掉这个日期,
+把账少算四倍多。折价按时刻自动判(日期在 `registry.LLM_PRO_ROUTING_STARTS`),
+摘要每轮报当下这一段;V4.1 Pro 上线时官方撤路由,那时才要动
+`registry.LLM_ROUTED_MODELS`。
 不认识的模型**只报 token 不报钱**并点名 —— 按 0 计价 = 假账。
 **模型统一 `deepseek-flash`**(= V4.1 Flash 的正式 id;审核与上架同一个,
 所有者定稿 2026-09-10),不填 `.env` 也是它。
 ⚠ **模型名的唯一判据是 `GET /models` 的返回,不是定价页**:2026-09-10 实测只回
-`deepseek-flash` 与 `deepseek-v4-pro` 两个,而同一天的定价页还列着
-`deepseek-v4-flash` / `-vision-exp`、更新日志最新一条还是 8/21 —— **文档站滞后
-于线上**。`deepseek-flash` 去掉了版本号、原生多模态,所以 vision-exp 一并退役。
+`deepseek-flash` 与 `deepseek-v4-pro` 两个,而同一天上午的定价页还列着
+`deepseek-v4-flash` / `-vision-exp`、更新日志最新一条还是 8/21 —— **文档站会滞后
+于线上**(当天 15:21 复核时页面才追上,也只剩这两列;判据仍是 /models)。
+`deepseek-flash` 去掉了版本号、原生多模态,所以 vision-exp 一并退役。
 ⚠ 切换当轮 `catalog.llm_cache` **全量作废**(V4.1 与 V4 是两个模型、两套答案,
 名字只差一个版本号,键空间故意分开),下一轮审核/上架全额重付,大批重审排谷
 时段或周末。**别填已退役的名字**(`deepseek-chat` / `deepseek-reasoner` /
-`deepseek-v4-flash`):真的切断那天**全仓 LLM 调用一起失败**;用了摘要会点名。
-`deepseek-v4-pro` 仍可用,但官方路由期一结束(V4.1 Pro 上线)它会变回真 Pro、
-单价跳四倍多,所以不拿它当缺省。
+`deepseek-v4-flash`):官方注(1)说它们**仍可调用但对应模型已下线**,请求由
+V4.1 Flash 顶替、按 Flash 计费 —— 也就是今天不报错,但拿回来的答案已经不是你
+以为的那个模型;而宽限期一断,**全仓 LLM 调用一起失败**;用了摘要会点名。
+`deepseek-v4-pro` 仍可用,但 9/14 12:00 之前它本来就是真 Pro 价、路由期一结束
+(V4.1 Pro 上线)又会变回去,所以不拿它当缺省。
 `thinking 必须显式 disabled` 那道闸按 **`registry.LLM_THINKING` 登记表**门控
 (2026-09-10 由 `"flash" in model` 子串匹配改来 —— 缺省模型切成 v4-pro 的那一刻
 子串门控整条失效,而那正是它最该生效的时候);表里没有的模型不下发该字段并

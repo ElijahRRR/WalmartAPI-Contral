@@ -105,6 +105,15 @@ def summarize(usage_stats: dict, items: int = 0) -> list[str]:
                  f"(现路由到 {sorted({resources.llm_priced_model(m) for m in legacy})}),"
                  f"生产请在 .env 写死 DEEPSEEK_MODEL=<正式模型名> —— "
                  f"别名一旦切断,全仓 LLM 调用同时失败")
+    routed = {m: resources.LLM_ROUTED_MODELS[m] for (m, _, _) in usage_stats
+              if m in resources.LLM_ROUTED_MODELS}
+    if routed:
+        # 路由期结束(V4.1 Pro 上线)单价与实际模型都会变,官方不来通知 ——
+        # 每轮点名比"记得几个月后复核"靠得住
+        head += (";ℹ 官方路由期:" + "、".join(
+            f"{m} 的请求实际跑 {tgt}、按 {tgt} 单价计费" for m, tgt in sorted(routed.items()))
+            + "(V4.1 Pro 上线后单价与实际模型都会变,复核 "
+              "registry.LLM_MODEL_ALIASES)")
     if unpriced:
         # 静默按 0 计价 = 假账。点名说哪个模型没价,让人知道这个数字不全
         head += (f";⚠ 未计价模型 {sorted(unpriced)} —— 在 "

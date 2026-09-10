@@ -230,11 +230,18 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 V4.1 Flash 上线后、V4.1 Pro 上线前,对 V4 Pro 的请求全部路由到 V4.1 Flash);
 V4.1 Pro 上线时要撤掉 `registry.LLM_MODEL_ALIASES` 里那一行。
 不认识的模型**只报 token 不报钱**并点名 —— 按 0 计价 = 假账。
-**模型统一 `deepseek-v4-flash`**(审核与上架同一个,2026-08-21 定稿),
-不填 `.env` 也是它。**别填 `deepseek-chat` / `deepseek-reasoner`** —— 官方
-已宣布停用的旧别名(公告停用日 2026-07-24 已过,还能用是宽限期):切断当天
-**全仓 LLM 调用一起失败**,而且 `thinking 必须显式 disabled` 那道闸按
-`"flash" in model` 门控,别名下**整条失效**。用了别名摘要会点名警告。
+**模型统一 `deepseek-v4-pro`**(审核与上架同一个,所有者定稿 2026-09-10),
+不填 `.env` 也是它 —— 官方路由期里**它实际跑的是 V4.1 Flash、按 Flash 单价
+计费**,所以拿文档里已有的 id 就能用上 V4.1 Flash,不必猜官方尚未公布的
+V4.1 id。⚠ 切换当轮 `catalog.llm_cache` **全量作废**(v4-pro 与 v4-flash 背后
+是两个模型、两套答案,故意不共用键空间),下一轮审核/上架全额重付,大批重审
+排谷时段或周末。**别填 `deepseek-chat` / `deepseek-reasoner`** —— 官方已宣布
+停用的旧别名(公告停用日 2026-07-24 已过,还能用是宽限期),切断当天**全仓
+LLM 调用一起失败**;用了别名摘要会点名警告。
+`thinking 必须显式 disabled` 那道闸按 **`registry.LLM_THINKING` 登记表**门控
+(2026-09-10 由 `"flash" in model` 子串匹配改来 —— 缺省模型切成 v4-pro 的那一刻
+子串门控整条失效,而那正是它最该生效的时候);表里没有的模型不下发该字段并
+点名警告一次。
 | **影刀 RPA** | 日报的店铺状态抓取 | 仅生产 macOS 有效;文件交接(`input.json` / `latest.json`)。⚠ 启动**必须经 launchd 代理**(`com.walmartapi.yingdao`,`launchd_install` 落盘后在图形会话里 `launchctl load -w`):日报链跑在智能体上下文里,没有 Aqua GUI session,直接 spawn 会在 `_RegisterApplication` 崩溃(2026-09-01 实证) |
 | **USPTO 商标库** | **本仓当前无消费方**(2026-09-03 C 批删了 L2 R5 商标反查;连接登记 `registry/db.uspto_conn` 保留待重建) | 跨库只读 |
 

@@ -810,17 +810,49 @@ LLM_PRICING = {
 #   全仓 LLM 调用会同时失败(L1 rerank / L3 / 上架属性映射 / variant_remap)。
 #   生产应在 .env 显式写 `DEEPSEEK_MODEL=deepseek-v4-flash`。
 LLM_LEGACY_ALIASES = {"deepseek-chat", "deepseek-reasoner"}
+
+# 官方"路由期"模型:请求发的是键,实际跑的是值,计价按 LLM_MODEL_ALIASES 折。
+# 摘要每轮点名 —— 路由期一结束(V4.1 Pro 上线)单价与实际模型都会变,而官方
+# 不会来通知我们;靠人记住"几个月后要复核"是记不住的。
+LLM_ROUTED_MODELS = {"deepseek-v4-pro": "V4.1 Flash"}
 LLM_MODEL_ALIASES = {
     "deepseek-chat": "deepseek-v4-flash",       # 非思考模式
     "deepseek-reasoner": "deepseek-v4-flash",   # 思考模式,同一张价表
     # 官方 2026-09-10 公告:V4.1 Flash 上线后、V4.1 Pro 上线前,**对 V4 Pro 的
     # 请求全部路由到 V4.1 Flash 并按 V4.1 Flash 单价计费** ⇒ 计价走 flash 行。
+    # ⚠ **这一行现在承重**:所有者 2026-09-10 定稿把缺省模型切成 deepseek-v4-pro
+    #   (拿官方文档里有的 id 换到 V4.1 Flash,不必猜未公布的 V4.1 id),于是
+    #   全仓的账都从这一行出。
     # ⚠ **V4.1 Pro 上线时必须撤掉这一行**并给 Pro 恢复自己的价(定价页
-    #   2026-09-10 值:空闲 0.15 / 4.5 / 13.5,高峰翻倍)—— 不撤就把 Pro 的账
-    #   按 Flash 少算四倍多。本仓缺省不用 Pro(缺省 deepseek-v4-flash),
-    #   这一行是给 .env 显式设了 Pro 的情况兜底。
+    #   2026-09-10 值:空闲 0.15 / 4.5 / 13.5,高峰翻倍)—— 不撤,Pro 的账会按
+    #   Flash 少算(未命中 4.5 倍、输出 3.4 倍),而且那天起真的在花 Pro 的钱。
+    #   路由期本身也会在摘要里每轮点名(LLM_ROUTED_MODELS),不靠人记。
     "deepseek-v4-pro": "deepseek-v4-flash",
 }
+
+
+# 思考模式开关:本仓全链要的是**非思考的 JSON 出参**,所以必须**显式下发**
+# disabled(旧仓铁律 llm_routes.py:91-93/701)。
+# ⚠ 2026-09-10 从 `"flash" in model` 子串匹配改成登记表:缺省模型切成
+#   `deepseek-v4-pro` 的那一刻,子串门控**整条失效**(名字里没有 flash),
+#   而这正是它最需要生效的时候。官方 first_api_call 的示例对
+#   `deepseek-v4-pro` 下发的就是 `"thinking": {"type": "enabled"}`,可见该
+#   字段对 Pro 合法 —— 我们下发 disabled 是同一个字段的另一个取值。
+# 值 = 要下发的 thinking 值;**表里没有的模型不下发该字段**(未知模型可能拒
+#   未知字段),api 层会点名警告一次,同时它也必然落进"未计价模型"那条提醒。
+# ⚠ **只登记官方文档里有的正式产品名**。两个旧别名(deepseek-chat /
+#   deepseek-reasoner)故意**不登记**:官方从未记过它们认不认 `thinking` 字段,
+#   给它们下发就是拿"未知字段可能被拒"去赌;而它们今天的行为(不下发)已经在
+#   生产验证过。别名本就该弃用,摘要每轮点名催换,不在这里替它们做假设。
+LLM_THINKING = {
+    "deepseek-v4-flash": {"type": "disabled"},
+    "deepseek-v4-pro": {"type": "disabled"},
+}
+
+
+def llm_thinking(model: str) -> dict | None:
+    """输入:请求里发的 model → 输出:要下发的 thinking 值,或 None(不下发)。"""
+    return LLM_THINKING.get(model)
 
 
 def llm_priced_model(model: str) -> str:
@@ -842,6 +874,10 @@ def llm_priced_model(model: str) -> str:
 # ⚠ `deepseek-reasoner` **不在这里** —— 它是 v4-flash 的**思考模式**,
 #   与非思考模式是两种输出行为,共用键空间就是拿思考模式的答案冒充非思考的。
 #   计价可以合并(同一张价表),缓存身份不行。
+# ⚠ `deepseek-v4-pro` **故意不进这张表**:官方路由期它跑的是 V4.1 Flash,
+#   与 V4-Flash 是**两个模型、两套答案**,共用键空间就是拿 V4.1 的答案冒充
+#   V4 的(或反之)。所以 2026-09-10 切缺省模型 = llm_cache 存量**全量作废**,
+#   下一轮审核/上架全额重付 —— 这是对的,不是缺陷;大批重审排谷时段或周末。
 LLM_CACHE_ANCHOR = {"deepseek-v4-flash": "deepseek-chat"}
 
 

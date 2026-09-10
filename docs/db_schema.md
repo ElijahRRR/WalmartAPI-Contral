@@ -500,6 +500,13 @@ CREATE TABLE catalog.product_events (
 --   taxonomy_version       增量谓词(同 audit_runs.audit_version 的套路)
 --   taxonomy_src           这一行的码是拿哪一级原文判的:records / items /
 --                          self(事件自己那份)/ keep(**没重判,原样留着**)
+--   atoms                  逐原子 [{code, policy_name, text}](2026-09-10,所有者:
+--                          「次要原子要落库」);主码只答"最重的是哪个",复合原文还带
+--                          哪些原子看这里。problem_scan._SQL_LAST_CAT 拿它的码集合
+--                          (去重、字典序、逗号拼)当归类事件"变没变"的签名,存量没
+--                          atoms 的事件退回 category
+--   recoverable            走向:原子集合 ⊆ error_taxonomy.RECOVERABLE_CODES ⇒ true
+--                          (不删,等它自己/运营恢复);2026-09-10 起
 -- ⚠ `detail.reason` 到 2026-09-04 为止被 `[:200]` 截过(判用全文、存留残文),
 --   所以回填**不许**拿它简单重判 —— 那次把 2,595 条判对的 PT_WRONG 改成了
 --   POLICY(可放 → 永久禁)。改法是 `error_source.restore`(候选须以事件自己
@@ -1088,6 +1095,7 @@ CREATE INDEX report_requests_open_idx ON ops.report_requests (store, report_type
 | `action` | **该谁干**:delete/retire/relist → `problem_product_cleanup`;title/price/inventory → `maintenance` | 执行件按它领取(`claim(actions=…)`),与 source 无关 |
 | `executed_by` | 最终**是谁**提交的 feed | 2026-08-24 新增;此前只能靠 source 猜 |
 | `detail->>'ship_node'` | 这条建议要写**哪个发货节点**(多仓批次 2) | 未配置「维护仓库」的店**不带这个键**(建议行与改造前逐字节一致,执行件走 legacy 路径)。带了就决定两件事:写通道(分节点 PUT / MP_INVENTORY feed)与落定判据(按 `catalog.item_node_inventory` 而非 `walmart_items.avail_qty`) |
+| `detail->'atoms'` | 这条建议的逐原子归类 `[{code, policy_name, text}]`(2026-09-10,problem_scan 写) | 与 `problem_categorized` 事件同款;`category` 列只是主码,复合原文还带哪些原子(「End Date 过期; 禁售」)看这里。维护链的建议行不带这个键 |
 | `sources` | 每个支撑来源各一格:`{来源: {action, code, reason, at}}` | 展示用的 reason/category 由 `claim()` 按它现算(单来源逐字不变,多来源拼成「维护:… \| 审核:…」);`reason`/`category` 两列是**首次建议**的病历,不再被后写方覆盖 |
 
 改码(批次 3)只准经两个积木碰这张表:`dispositions.open_executing_count`

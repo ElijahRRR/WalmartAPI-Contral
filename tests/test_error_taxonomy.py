@@ -432,6 +432,43 @@ def test_extract_policy_splits_the_politics_subcategory():
 def test_classify_reasons_on_nothing_does_not_explode():
     res = et.classify_reasons([])
     assert (res.code, res.atom_codes, res.unknown) == ("OTHER", (), ())
+    assert res.atoms == ()
+    assert et.is_recoverable_only(res) is False     # 空原文不是"可恢复",是"没判据"
+
+
+def test_result_atoms_carry_code_policy_and_verbatim_text():
+    """`Result.atoms`(2026-09-10,所有者:「次要原子要落库」):与 atom_codes 同序,
+    每项 (码, 政策名, **原文**) —— 写入方原样落 detail.atoms,读侧不必再拆原文重判。"""
+    a1 = "This item is unpublished because the End Date has passed."
+    a2 = ("This item has been unpublished for violating Walmart's Marketplace "
+          "Prohibited Product Policy: Plants & Seeds")
+    res = et.classify_reasons([a1, a2])
+    assert res.code == "POLICY"
+    assert res.atoms == (("EXPIRED", None, a1), ("POLICY", "Plants & Seeds", a2))
+    assert [c for c, _ in res.atom_codes] == [c for c, _, _ in res.atoms]
+
+
+@pytest.mark.parametrize("atoms, expect", [
+    (["the End Date has passed"], True),
+    (["stage status until you go live"], True),
+    (["the End Date has passed", "stage status until you go live"], True),
+    (["the End Date has passed", "violates Prohibited Product Policy"], False),
+    (["an internal error occurred"], False),             # SYSTEM 不算可恢复
+    (["currently under review"], False),                # 自愈态,所有者未列入
+    ([], False),
+])
+def test_is_recoverable_only_looks_at_the_atom_set(atoms, expect):
+    """问题商品链"删不删"的唯一判据(所有者定稿 2026-09-10):原子集合 ⊆
+    {EXPIRED, STAGE} 才留;看集合不看主码 —— 复合原文里 EXPIRED/STAGE 永远赢不了
+    主码,拿主码判等于"复合全删、单独全留",而这正是要的,但只有集合能表达它。"""
+    assert et.is_recoverable_only(et.classify_reasons(atoms)) is expect
+
+
+def test_recoverable_codes_are_neutral_and_never_permanent():
+    assert et.RECOVERABLE_CODES == ("EXPIRED", "STAGE")
+    assert set(et.RECOVERABLE_CODES) <= set(resources.ERROR_CATEGORY_CODES)
+    assert not set(et.RECOVERABLE_CODES) & set(et.PERMANENT_CODES)
+    assert set(et.RECOVERABLE_CODES) <= set(et.NOT_A_PRODUCT_BAN)
 
 
 def test_unknown_atoms_come_back_verbatim_for_the_alarm_list():

@@ -1904,3 +1904,26 @@ in suspect.items()}` 同一个新码来自不同旧类别时**互相覆盖**而�
 ⚠ `DROP VIEW … CREATE VIEW`,拉代码后要 `python cli.py db_init`。
 证据:视图那行最后改动是 #33(8 月 14 日),#109 对 `dispositions.py` 零改动 ——
 与报错新规那两天无关。
+
+### 19.6 按原子处置与次要原子落库(2026-09-10,所有者定稿)
+
+所有者两句话:「扫描面不再限制,按分类结果处置……单独的 End Date 或者 Stage 等待
+alive 的不删除,其他的都删除」;「次要原子要落库」。此前(§十六)记录级只留**主码**,
+复合原文「End Date 过期; 禁售」在库里与单条「禁售」无法区分,而且主码不变时归类事件
+不再记 —— B08HJ382VJ 08-27 → 08-29 多出一个过期原子,病历里零痕迹。落地:
+
+- `Result.atoms`:与 `atom_codes` 同序的 (码, 政策名, **原文**) 三元组,`classify_reasons`
+  填;`atom_codes` 形状不动(消费方不变)。
+- `RECOVERABLE_CODES = ("EXPIRED", "STAGE")` + `is_recoverable_only(result)`(唯一出处):
+  看**原子集合**不看主码 —— 主码序里两者垫底,复合原文永远赢不了主码,只有集合能表达
+  「单独才留」。空原文返回 False 但**不是"该删"**:无原因的行在归类之前就分流。
+- 写侧 `problem_scan`:事件 detail 加 `atoms` / `recoverable`,建议行 detail 加 `atoms`;
+  扫描面放开到目录全量;归类事件"变没变"从主码改为原子码集合签名(`_SQL_LAST_CAT`
+  对存量无 atoms 的事件退回 `category`,单原子行签名 = 主码,不会整库重记)。
+- 未识别原子照删(所有者:「其他的都删除」)但进摘要告警(`_unknown_note`)——
+  §一「unknown 引擎不吞,调用方必须告警」终于有了调用方。
+- `currently under review`(序 16 显式 OTHER,自愈态)**不在**可恢复码里:所有者只点了
+  两种;要加,改常量并补 `test_is_recoverable_only_looks_at_the_atom_set` 的用例。
+- `GATED` 同时在 `PERMANENT_CODES`(运营语义:我们拿不到资质,拉黑)与
+  `NOT_A_PRODUCT_BAN`(非官方禁售)—— 所有者 2026-09-10 确认这是两个问题,并存是有意的。
+  类目级封禁走飞书类目表 `access_state`(审核 L2 R1 闸),不走归类码。

@@ -1188,6 +1188,10 @@ dry-run 也不列候选(列了就是"将改码 N 个"的误导);定案留着,两
 转出项收口);plan.md 工作流 8 行、production_cutover §5 各记一句。
 `services/problem_products` 归类不动 —— RETIRED 行本来就不再进扫描面,归类无从发生。
 
+⚠ **2026-09-10 被取代**(所有者定稿,plan.md 当日条目):扫描面不再按状态筛、走向按
+原子集合判(只含 EXPIRED/STAGE 不删,其余删),RETIRED 全豁免退役 —— 其依据(死档
+删不掉)已随 09-09 沃尔玛改回列表可见性而消失。本节留作历史。
+
 ### 9.12 改码通道定案:MP_ITEM_MATCH(2026-09-06,所有者 Seller Center 实测)
 
 **事实**(所有者在 Seller Center 亲手做的一次改码,不是文档推断,以此为准):

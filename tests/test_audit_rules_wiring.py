@@ -1857,17 +1857,17 @@ def test_record_usage_buckets_by_model_purpose_and_tier():
     off = dt.datetime(2026, 8, 21, 20, tzinfo=dt.timezone.utc)
     u = {"prompt_tokens": 1000, "completion_tokens": 100,
          "prompt_cache_hit_tokens": 900, "prompt_cache_miss_tokens": 100}
-    _llm.record_usage("deepseek-v4-flash", "audit_l3", u, at=peak)
-    _llm.record_usage("deepseek-v4-flash", "audit_l3", u, at=peak)
-    _llm.record_usage("deepseek-v4-flash", "audit_l3", u, at=off)
-    assert _llm.USAGE_STATS[("deepseek-v4-flash", "audit_l3", "peak")] == {
+    _llm.record_usage("deepseek-flash", "audit_l3", u, at=peak)
+    _llm.record_usage("deepseek-flash", "audit_l3", u, at=peak)
+    _llm.record_usage("deepseek-flash", "audit_l3", u, at=off)
+    assert _llm.USAGE_STATS[("deepseek-flash", "audit_l3", "peak")] == {
         "calls": 2, "prompt": 2000, "completion": 200,
         "cache_hit": 1800, "cache_miss": 200}
-    assert _llm.USAGE_STATS[("deepseek-v4-flash", "audit_l3", "offpeak")
+    assert _llm.USAGE_STATS[("deepseek-flash", "audit_l3", "offpeak")
                             ]["calls"] == 1
     # 供应商不回 usage:只累加次数,其余留 0 —— 少算不瞎算
-    _llm.record_usage("deepseek-v4-flash", "audit_l1", None, at=off)
-    assert _llm.USAGE_STATS[("deepseek-v4-flash", "audit_l1", "offpeak")] == {
+    _llm.record_usage("deepseek-flash", "audit_l1", None, at=off)
+    assert _llm.USAGE_STATS[("deepseek-flash", "audit_l1", "offpeak")] == {
         "calls": 1, "prompt": 0, "completion": 0,
         "cache_hit": 0, "cache_miss": 0}
     _llm.reset_usage_stats()
@@ -1896,8 +1896,8 @@ def test_llm_cost_peak_is_exactly_double_offpeak():
 
     row = {"calls": 1, "prompt": 0, "completion": 1_000_000,
            "cache_hit": 500_000, "cache_miss": 500_000}
-    peak = llm_cost.cost_of("deepseek-v4-flash", "peak", row)
-    off = llm_cost.cost_of("deepseek-v4-flash", "offpeak", row)
+    peak = llm_cost.cost_of("deepseek-flash", "peak", row)
+    off = llm_cost.cost_of("deepseek-flash", "offpeak", row)
     assert abs(peak - 2 * off) < 1e-9
 
 
@@ -1910,8 +1910,8 @@ def test_llm_cost_falls_back_to_miss_price_when_split_absent():
              "cache_hit": 0, "cache_miss": 1_000_000}
     nosplit = {"calls": 1, "prompt": 1_000_000, "completion": 0,
                "cache_hit": 0, "cache_miss": 0}
-    assert (llm_cost.cost_of("deepseek-v4-flash", "peak", nosplit)
-            == llm_cost.cost_of("deepseek-v4-flash", "peak", split))
+    assert (llm_cost.cost_of("deepseek-flash", "peak", nosplit)
+            == llm_cost.cost_of("deepseek-flash", "peak", split))
 
 
 def test_llm_cost_small_amounts_keep_enough_digits():
@@ -1925,7 +1925,7 @@ def test_llm_cost_small_amounts_keep_enough_digits():
     row = {"calls": 9, "prompt": 70_000, "completion": 1_400,
            "cache_hit": 64_400, "cache_miss": 5_600}
     out = "\n".join(llm_cost.summarize(
-        {("deepseek-v4-flash", "audit_l3", "peak"): row}, items=200))
+        {("deepseek-flash", "audit_l3", "peak"): row}, items=200))
     import re as _re
     # 金额不能被四舍五入成正好 ¥0.00(后面还跟着位数的 ¥0.0052 才是要的)
     assert not _re.search(r"¥0\.00(?!\d)", out), out
@@ -1934,7 +1934,7 @@ def test_llm_cost_small_amounts_keep_enough_digits():
     big = {"calls": 1, "prompt": 0, "completion": 100_000_000,
            "cache_hit": 0, "cache_miss": 0}
     assert "¥800.00" in "\n".join(llm_cost.summarize(
-        {("deepseek-v4-flash", "audit_l3", "peak"): big}))
+        {("deepseek-flash", "audit_l3", "peak"): big}))
 
 
 def test_price_tier_peaks_only_on_beijing_weekdays():
@@ -1972,11 +1972,11 @@ def test_v4_pro_is_priced_as_flash_during_official_routing():
     from registry import resources
     from services import llm_cost
 
-    assert resources.llm_priced_model("deepseek-v4-pro") == "deepseek-v4-flash"
+    assert resources.llm_priced_model("deepseek-v4-pro") == "deepseek-flash"
     row = {"calls": 1, "prompt": 0, "completion": 1_000_000,
            "cache_hit": 0, "cache_miss": 0}
     assert (llm_cost.cost_of("deepseek-v4-pro", "offpeak", row)
-            == llm_cost.cost_of("deepseek-v4-flash", "offpeak", row))
+            == llm_cost.cost_of("deepseek-flash", "offpeak", row))
 
 
 def test_pricing_table_is_cny_and_offpeak_is_half():

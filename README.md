@@ -230,14 +230,18 @@ python cli.py order_sync order_audit -p order_audit:wait=0   # 串联 + 定向�
 V4.1 Flash 上线后、V4.1 Pro 上线前,对 V4 Pro 的请求全部路由到 V4.1 Flash);
 V4.1 Pro 上线时要撤掉 `registry.LLM_MODEL_ALIASES` 里那一行。
 不认识的模型**只报 token 不报钱**并点名 —— 按 0 计价 = 假账。
-**模型统一 `deepseek-v4-pro`**(审核与上架同一个,所有者定稿 2026-09-10),
-不填 `.env` 也是它 —— 官方路由期里**它实际跑的是 V4.1 Flash、按 Flash 单价
-计费**,所以拿文档里已有的 id 就能用上 V4.1 Flash,不必猜官方尚未公布的
-V4.1 id。⚠ 切换当轮 `catalog.llm_cache` **全量作废**(v4-pro 与 v4-flash 背后
-是两个模型、两套答案,故意不共用键空间),下一轮审核/上架全额重付,大批重审
-排谷时段或周末。**别填 `deepseek-chat` / `deepseek-reasoner`** —— 官方已宣布
-停用的旧别名(公告停用日 2026-07-24 已过,还能用是宽限期),切断当天**全仓
-LLM 调用一起失败**;用了别名摘要会点名警告。
+**模型统一 `deepseek-flash`**(= V4.1 Flash 的正式 id;审核与上架同一个,
+所有者定稿 2026-09-10),不填 `.env` 也是它。
+⚠ **模型名的唯一判据是 `GET /models` 的返回,不是定价页**:2026-09-10 实测只回
+`deepseek-flash` 与 `deepseek-v4-pro` 两个,而同一天的定价页还列着
+`deepseek-v4-flash` / `-vision-exp`、更新日志最新一条还是 8/21 —— **文档站滞后
+于线上**。`deepseek-flash` 去掉了版本号、原生多模态,所以 vision-exp 一并退役。
+⚠ 切换当轮 `catalog.llm_cache` **全量作废**(V4.1 与 V4 是两个模型、两套答案,
+名字只差一个版本号,键空间故意分开),下一轮审核/上架全额重付,大批重审排谷
+时段或周末。**别填已退役的名字**(`deepseek-chat` / `deepseek-reasoner` /
+`deepseek-v4-flash`):真的切断那天**全仓 LLM 调用一起失败**;用了摘要会点名。
+`deepseek-v4-pro` 仍可用,但官方路由期一结束(V4.1 Pro 上线)它会变回真 Pro、
+单价跳四倍多,所以不拿它当缺省。
 `thinking 必须显式 disabled` 那道闸按 **`registry.LLM_THINKING` 登记表**门控
 (2026-09-10 由 `"flash" in model` 子串匹配改来 —— 缺省模型切成 v4-pro 的那一刻
 子串门控整条失效,而那正是它最该生效的时候);表里没有的模型不下发该字段并

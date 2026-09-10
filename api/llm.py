@@ -20,17 +20,20 @@ import httpx
 logger = logging.getLogger("api.llm")
 
 _BASE_URL = "https://api.deepseek.com/chat/completions"
-# 全仓统一 **deepseek-v4-pro**(所有者定稿 2026-09-10:「把模型切换为 V4 Pro」),
-# 审核与上架同一个。模型名仍可经 .env 逐用途覆盖(registry.LLM_PURPOSE_ENV)。
+# 全仓统一 **deepseek-flash**(= V4.1 Flash 的正式 id),审核与上架同一个。
+# 模型名仍可经 .env 逐用途覆盖(registry.LLM_PURPOSE_ENV)。
 #
-# 为什么切 Pro 反而是切到 V4.1 Flash:官方 2026-09-10 公告「在 V4.1 Flash 正式
-# 上线之后、V4.1 Pro 上线之前,我们会将对 V4 Pro 的请求全部路由到 V4.1 Flash,
-# 并按 V4.1 Flash 单价计费」。于是拿**官方文档里已有的 id** 就能用上 V4.1 Flash,
-# 不必去猜官方尚未公布的 V4.1 id(9/10 当天定价页与更新日志都还没有它)。
+# 名字的**唯一判据是 `GET /models` 的返回**(所有者 2026-09-10 实测):
+#   HTTP 200 {"data":[{"id":"deepseek-flash"},{"id":"deepseek-v4-pro"}]}
+# 只有这两个可调 —— `deepseek-v4-flash` 已不在返回里(定价页当天却还列着它,
+# 更新日志最新一条还是 8/21:**文档站滞后于线上**,别拿文档当判据)。
+# `deepseek-flash` 版本号被去掉了,原生多模态,所以 vision-exp 一并退役。
 #
-# ⚠ **路由期结束就是一次涨价**:V4.1 Pro 上线后这个 id 会变回真 Pro
-#   (未命中 4.5 倍、输出 3.4 倍),而官方不会来通知。所以摘要每轮点名路由期
-#   (registry.LLM_ROUTED_MODELS),复核动作写在 LLM_MODEL_ALIASES 那一行。
+# 所有者定稿 2026-09-10 的原始要求是「模型切换为 V4.1 Flash」;当天正式 id 还
+# 没公布时先借道 `deepseek-v4-pro`(官方路由期:对 V4 Pro 的请求全部路由到
+# V4.1 Flash 并按其单价计费)。**现在拿到真名,直接用真名**,理由是去掉那个
+# 涨价悬崖 —— 借道 Pro 的话,V4.1 Pro 一上线这个 id 就变回真 Pro
+# (未命中 4.5 倍、输出 3.4 倍),而官方不会来通知。
 # ⚠ **换模型 = 换 llm_cache 键空间**:v4-pro 故意不与 v4-flash 共用键空间
 #   (背后是两个模型、两套答案),所以切换当轮存量缓存全量作废、全额重付。
 #   大批重审排北京时间 18:00–次日 08:00 或周末(谷价)。
@@ -39,7 +42,7 @@ _BASE_URL = "https://api.deepseek.com/chat/completions"
 #   L3 / 上架属性映射 / variant_remap **同时失败**。
 #   生产实见:.env 里 DEEPSEEK_MODEL 没设,一直在吃这个缺省值 —— 所以这一行
 #   就是生产的实际模型,改它才是真的切换。
-_DEFAULT_MODEL = "deepseek-v4-pro"
+_DEFAULT_MODEL = "deepseek-flash"
 
 
 def _default_model() -> str:
@@ -93,6 +96,11 @@ def _extract_json(text: str) -> dict:
 #: 已经为哪些模型抱怨过"thinking 未登记"(每个模型只吵一次,别刷满日志)
 _THINKING_WARNED: set = set()
 
+#: 哪些模型实测**拒收** thinking 字段(400 且报文提到它)。本进程内不再下发。
+#: `deepseek-flash` 认不认这个字段官方无文档、无法预先实测,这道降级就是为它
+#: 准备的:摘掉字段重发一次,而不是让整条 LLM 链因为一个字段全挂。
+_THINKING_REJECTED: set = set()
+
 
 def _request_body(messages: list[dict], temperature: float,
                   max_tokens: int, purpose: str) -> dict:
@@ -113,8 +121,10 @@ def _request_body(messages: list[dict], temperature: float,
             "temperature": temperature, "max_tokens": max_tokens,
             "response_format": {"type": "json_object"}}
     thinking = resources.llm_thinking(model)
-    if thinking is not None:
+    if thinking is not None and model not in _THINKING_REJECTED:
         body["thinking"] = thinking
+    elif thinking is not None:
+        pass                      # 实测被拒过,本进程内不再下发(已告警过)
     elif model not in _THINKING_WARNED:
         _THINKING_WARNED.add(model)
         logger.warning("模型 %s 未登记 thinking 开关(registry.LLM_THINKING),"
@@ -210,6 +220,19 @@ def chat_json(messages: list[dict], *, temperature: float = 0.2,
                 _bump_retry("http_429" if resp.status_code == 429
                             else "http_5xx")
                 raise RuntimeError(f"LLM HTTP {resp.status_code}")
+            # 降级(仅此一种,条件明确非 catch-all):**400 且报文提到 thinking**
+            # ⇒ 这个模型不认该字段。摘掉重发一次并告警,本进程内不再下发。
+            # 不这么做的话,一个官方还没写文档的字段能让全链 LLM 调用一起挂。
+            if (resp.status_code == 400 and "thinking" in body
+                    and "thinking" in resp.text.lower()
+                    and body["model"] not in _THINKING_REJECTED):
+                _THINKING_REJECTED.add(body["model"])
+                body.pop("thinking")
+                logger.warning(
+                    "模型 %s 拒收 thinking 字段(HTTP 400),已摘掉重发;"
+                    "本进程内不再下发 —— 请在 registry.LLM_THINKING 删掉它那一行,"
+                    "并留意它是否默认开思考模式(输出 token 会多花)", body["model"])
+                continue
             raise ValueError(f"LLM 请求被拒 HTTP {resp.status_code}: "
                              f"{resp.text[:200]}")
         except (httpx.HTTPError, RuntimeError, json.JSONDecodeError,

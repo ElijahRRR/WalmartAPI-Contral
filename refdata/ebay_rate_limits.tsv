@@ -1,0 +1,98 @@
+# eBay 官方限速/上限参考表 —— 2026-08-25 抓取(W4 五路调研)+ 同日四路对抗校验修订
+# 与沃尔玛侧 refdata/walmart_rate_limits.tsv 同一纪律:
+#   ① 本文件是**官方缺省值**的抄录(「默认配额」列),不是本仓实际写进令牌桶的值;
+#      **定稿桶值只在 docs/ebay_api_blueprint.md §3.1**(例:Trading 官方 5,000/day → 定稿 500/day;
+#      Developer Analytics 官方 5,000/day → 定稿 200/day;Sell Feed / Commerce Media / Commerce Identity
+#      定稿 0 = 显式禁用)。**写 registry 的人取蓝图的定稿列,不要抄本文件的默认列。**
+#   ② **两者不一致时以蓝图 §3.1 为准** —— tsv 是蓝图的来源之一,个别行已被官方核验修正(见下)。
+#   ③ 新增/修改任何一行,必须同步改蓝图 §3.1 或 §3.2/§3.3 对应行,反之亦然。
+# 列:api	resource	默认配额	周期	依据URL	核验状态
+# 「核验状态」只有三种写法:verified(本轮 fetch 到官方原文)/ ⚠ 未核验 / ⚠ 待复现(某一轮记 verified、另一轮未能复现)。
+#
+# 2026-08-25 校验轮的修订(逐条):
+#   · getOrders 时间窗:原记「⚠ 未核验」→ **2 years,verified**(三源交叉;90 天是 2023-02-16 作废的旧值)。
+#   · sell.feed(LMS) 全块:源页 data-file-limits.html 本轮未能复现(v2 试的 feed-limits.html 返 404)
+#     → 状态降为「⚠ 待复现」。**本项目明确不做 LMS**,不阻塞,但任何设计不得依赖这些数。
+#   · trading 超限错误 518:同上降为「⚠ 待复现」。
+#   · 补 sell.compliance 一行(官方配额页 NOT PRESENT,如实记录否定性结论)、错误码 30830 / 190204 与图片数量门槛四行。
+#   · commerce.notification / commerce.media(含 50 requests/5s 的 user-level 短窗)/ commerce.identity /
+#     sell.feed 四类桶本已在表内,现已同步进蓝图 §3.1 —— 漏登记会被「未登记 bucket 默认拒绝」当场拒掉。
+# 🔴 eBay 不是只有日配额:commerce.media 的 POST 是 50 requests / 5 seconds 且维度是 **user level**;
+#    trading 的 Revise Listing 类是 1200 calls / 30 seconds 且是 **卖家级(NOT an app limit)**。
+# ⚠ 「配额按 App/keyset 计还是按卖家账号计」官方无直述句(蓝图 §3.1 / §8.3 #2),本表不表态。
+api	resource	默认配额	周期	依据URL	核验状态
+sell.inventory	(整个 API,不分 resource)	2000000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+sell.account	(整个 API)	25000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+sell.fulfillment	order(all methods)	100000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+sell.fulfillment	getPaymentDispute	250000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+sell.fulfillment	getPaymentDisputeSummaries	250000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+sell.fulfillment	payment_dispute(其余方法,combined limit)	250000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+sell.finances	(整个 API)	15000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+sell.feed	(整个 API,按调用次数)	100000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+sell.metadata	(整个 API)	5000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+sell.marketing	Marketing Promotion	100000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+sell.marketing	Marketing Ads	10000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+sell.logistics	(整个 API)	2500000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+sell.negotiation	(整个 API)	1000000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+sell.recommendation	(整个 API)	5000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+sell.analytics	traffic_report	100	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+sell.analytics	seller_standards_profile	100	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+sell.analytics	customer_service_metric	400	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+sell.inventory_mapping	(整个 API)	20	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+commerce.taxonomy	(整个 API)	5000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+commerce.catalog	(整个 API)	10000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+commerce.identity	(整个 API)	5000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+commerce.notification	(整个 API)	10000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+commerce.media	image	1000000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+commerce.media	document	1000000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+commerce.media	video	5000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+commerce.media	image/video/document POST(user level)	50	5 seconds	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+developer.analytics	(整个 API,含 getRateLimits 自身)	5000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+post-order	Cancellation	5000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+post-order	Case Management	5000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+post-order	Inquiry	5000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+post-order	Return	5000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+trading	(整个 Trading API,应用级共享一个桶)	5000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+trading	Business Policies API(已弃用)	5000	day	https://developer.ebay.com/develop/get-started/api-call-limits	verified
+trading	Revise Listing 类(ReviseItem/ReviseFixedPriceItem/ReviseSellingManagerTemplate,卖家级非应用级)	1200	30 seconds	https://developer.ebay.com/support/kb-article?KBid=2137	verified
+oauth	POST /identity/v1/oauth2/token grant_type=client_credentials	1000	day	https://developer.ebay.com/api-docs/static/oauth-rate-limits.html	verified
+oauth	POST /identity/v1/oauth2/token grant_type=authorization_code	10000	day	https://developer.ebay.com/api-docs/static/oauth-rate-limits.html	verified
+oauth	POST /identity/v1/oauth2/token grant_type=refresh_token	50000	day	https://developer.ebay.com/api-docs/static/oauth-rate-limits.html	verified
+sell.feed(LMS)	data file 最大体积 15 MB(regular 或 compressed XML)	15 MB	per file	https://developer.ebay.com/api-docs/sell/static/feed/data-file-limits.html	verified(W4 抓 data-file-limits.html);⚠ v2 复核未复现(试的 feed-limits.html 为 404)
+sell.feed(LMS)	feedType=AddFixedPriceItem	500 feeds	24 hours	https://developer.ebay.com/api-docs/sell/static/feed/data-file-limits.html	verified(W4 抓 data-file-limits.html);⚠ v2 复核未复现(试的 feed-limits.html 为 404)
+sell.feed(LMS)	feedType=ReviseInventoryStatus	400 feeds	24 hours	https://developer.ebay.com/api-docs/sell/static/feed/data-file-limits.html	verified(W4 抓 data-file-limits.html);⚠ v2 复核未复现(试的 feed-limits.html 为 404)
+sell.feed(LMS)	feedType=OrderReport	300 feeds	24 hours	https://developer.ebay.com/api-docs/sell/static/feed/data-file-limits.html	verified(W4 抓 data-file-limits.html);⚠ v2 复核未复现(试的 feed-limits.html 为 404)
+sell.feed(LMS)	feedType=OrderAck	200 feeds	24 hours	https://developer.ebay.com/api-docs/sell/static/feed/data-file-limits.html	verified(W4 抓 data-file-limits.html);⚠ v2 复核未复现(试的 feed-limits.html 为 404)
+sell.feed(LMS)	feedType=RelistFixedPriceItem	200 feeds	24 hours	https://developer.ebay.com/api-docs/sell/static/feed/data-file-limits.html	verified(W4 抓 data-file-limits.html);⚠ v2 复核未复现(试的 feed-limits.html 为 404)
+sell.feed(LMS)	feedType=ReviseFixedPriceItem	150 feeds	24 hours	https://developer.ebay.com/api-docs/sell/static/feed/data-file-limits.html	verified(W4 抓 data-file-limits.html);⚠ v2 复核未复现(试的 feed-limits.html 为 404)
+sell.feed(LMS)	feedType=SetShipmentTrackingInfo	150 feeds	24 hours	https://developer.ebay.com/api-docs/sell/static/feed/data-file-limits.html	verified(W4 抓 data-file-limits.html);⚠ v2 复核未复现(试的 feed-limits.html 为 404)
+sell.feed(LMS)	feedType=AddItem/EndFixedPriceItem/EndItem/RelistItem/ReviseItem/VerifyAddItem/VerifyAddFixedPriceItem	100 feeds	24 hours	https://developer.ebay.com/api-docs/sell/static/feed/data-file-limits.html	verified(W4 抓 data-file-limits.html);⚠ v2 复核未复现(试的 feed-limits.html 为 404)
+sell.feed(LMS)	feedType=ActiveInventoryReport	25 feeds	24 hours	https://developer.ebay.com/api-docs/sell/static/feed/data-file-limits.html	verified(W4 抓 data-file-limits.html);⚠ v2 复核未复现(试的 feed-limits.html 为 404)
+sell.feed(LMS)	每卖家 per LMS feedType	400 requests	day	https://developer.ebay.com/api-docs/sell/static/feed/data-file-limits.html	verified(W4 抓 data-file-limits.html);⚠ v2 复核未复现(试的 feed-limits.html 为 404)
+sell.inventory	bulkCreateOrReplaceInventoryItem 单次批量上限	25 records	per call	https://developer.ebay.com/api-docs/master/sell/inventory/openapi/3/sell_inventory_v1_oas3.json	verified
+sell.inventory	bulkGetInventoryItem 单次批量上限	25 records	per call	https://developer.ebay.com/api-docs/master/sell/inventory/openapi/3/sell_inventory_v1_oas3.json	verified
+sell.inventory	bulkUpdatePriceQuantity 单次批量上限	25 offers	per call	https://developer.ebay.com/api-docs/master/sell/inventory/openapi/3/sell_inventory_v1_oas3.json	verified
+sell.inventory	bulkCreateOffer 单次批量上限	25 offers	per call	https://developer.ebay.com/api-docs/sell/inventory/static/release-notes-archive.html	verified
+sell.inventory	bulkPublishOffer 单次批量上限	25 offers	per call	https://developer.ebay.com/api-docs/sell/inventory/static/release-notes-archive.html	verified
+sell.inventory	bulkMigrateListing 单次批量上限	⚠ 未核验(疑为 5,勿写入代码)	per call	https://developer.ebay.com/api-docs/sell/inventory/static/release-notes-archive.html	⚠ 未核验
+sell.fulfillment	getOrders 分页 limit(Default 50)	200 max	per request	https://developer.ebay.com/api-docs/master/sell/fulfillment/openapi/3/sell_fulfillment_v1_oas3.json	verified
+sell.fulfillment	getOrders 分页 offset(Default 0)	无明示上限	per request	https://developer.ebay.com/api-docs/master/sell/fulfillment/openapi/3/sell_fulfillment_v1_oas3.json	verified
+sell.fulfillment	getOrders 时间窗深度(creationdate/lastmodifieddate filter 与 orderId 点取)	2 years	per request	https://developer.ebay.com/api-docs/sell/fulfillment/release-notes.html	verified(三源:OAS3 filter/orderIds 两句 + Release Notes v1.19.19 2023-02-16「from 90 days to two years」+ 错误码 30830 单位 years);⚠ lastmodifieddate 未被逐字覆盖
+commerce.taxonomy	类目树缓存策略(官方无"缓存 N 小时"说法,只给版本比对)	缓存全树 + 比对 categoryTreeVersion,变了才重拉	按需	https://developer.ebay.com/api-docs/sell/static/metadata/sell-categories.html	verified
+commerce.taxonomy	类目层级更新频率(Trading 用户指南口径)	monthly(可能更频繁)	month	https://developer.ebay.com/api-docs/user-guides/static/trading-user-guide/category-versioning.html	verified
+commerce.taxonomy	版本查询建议频率(官方口径)	至少每天 1 次	day	https://developer.ebay.com/api-docs/user-guides/static/trading-user-guide/category-versioning.html	verified
+所有 RESTful API	超限响应形态:HTTP 429 / errorId 2001 / domain ACCESS / category REQUEST	n/a	n/a	https://developer.ebay.com/api-docs/static/rest-response-components.html	verified
+所有 RESTful API	限流响应头(X-RateLimit-*/Retry-After)	官方 header 全集仅 Content-type/Content-Language/Location/Warning,无限流头	n/a	https://developer.ebay.com/api-docs/static/rest-request-components.html	verified
+所有 RESTful API	官方退避/重试建议	官方文档未给出任何 retry/backoff 指导,退避策略须自定	n/a	https://developer.ebay.com/api-docs/static/handling-error-messages.html	verified
+trading	超限错误 518	Call usage limit has been reached(建议调 GetApiAccessRules 自查)	n/a	https://developer.ebay.com/devzone/xml/docs/reference/ebay/errors/errormessages.htm	⚠ 待复现(W4 记 verified,v2 未取证;GetApiAccessRules 参考页已 404)
+trading	超限错误 21919144(卖家级 Add/Revise 类)	You have exceeded your maximum call limit of xxxx for item per day	day	https://developer.ebay.com/support/kb-article?KBid=2137	verified
+sell.feed(LMS)	超限错误 160025	If the limit is exceeded, error 160025 is returned	n/a	https://developer.ebay.com/api-docs/sell/static/feed/data-file-limits.html	verified(W4 抓 data-file-limits.html);⚠ v2 复核未复现(试的 feed-limits.html 为 404)
+developer.analytics	GET /developer/analytics/v1_beta/rate_limit/(getRateLimits,scope 仅需 api_scope,application token)	返回 count/limit/remaining/reset/timeWindow	当前时间窗	https://developer.ebay.com/api-docs/master/developer/analytics/openapi/3/developer_analytics_v1_beta_oas3.json	verified
+developer.analytics	GET /developer/analytics/v1_beta/user_rate_limit/(getUserRateLimits,需 user token)	按 application user 返回同结构	当前时间窗	https://developer.ebay.com/api-docs/master/developer/analytics/openapi/3/developer_analytics_v1_beta_oas3.json	verified
+全局	日配额计数器归零时刻(是否 PT 午夜)	⚠ 未核验(官方页无此表述,须实调 reset 字段)	day	https://developer.ebay.com/develop/get-started/api-call-limits	⚠ 未核验
+全局	getRateLimits 数据刷新延迟	⚠ 未核验(官方无声明)	n/a	https://developer.ebay.com/api-docs/developer/analytics/overview.html	⚠ 未核验
+全局	提额机制 Application Growth Check(免费,现行)	提额/开受限 API 生产权限/加 keyset	按申请	https://developer.ebay.com/api-docs/static/gs_request-an-application-growth.html	verified
+sell.compliance	(整个 API)	NOT PRESENT	n/a	https://developer.ebay.com/develop/get-started/api-call-limits	verified(否定性:官方配额页无此 API 的行,不是漏抄)
+sell.fulfillment	错误码 30830(getOrders 时间区间超限)	Time range between start date and end date must be within '{allowedTime}' years	n/a	https://developer.ebay.com/api-docs/master/sell/fulfillment/openapi/3/sell_fulfillment_v1_oas3.json	verified
+sell.inventory	错误码 190204(外链取图失败或图片平台非 HTTPS)	取图失败/非 HTTPS 即报 190204,Add/Revise/Relist 失败	n/a	https://developer.ebay.com/api-docs/sell/static/inventory/managing-image-media.html	verified
+sell.inventory	图片数量硬门槛(每 listing ≥1 图;多数类目 ≤24 图;多变体每变体 ≤12 图)	1 / 24 / 12	per listing	https://developer.ebay.com/api-docs/sell/static/inventory/managing-image-media.html	verified

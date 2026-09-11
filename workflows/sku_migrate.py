@@ -39,7 +39,14 @@
       │      说明这两个码是同一条 listing(原地换码已生效),两条证据缺一不可。
       │      定案后果与上一条**逐字相同**(不新增写动作);double 行也走这一条。
       ├──(回执 failed ∨ 观测反证且超 OBSERVE_HOURS)─────────▶ rolled_back
-      │                                                        (旧行复活,新码弃掉)
+      │                                                        (旧行复活,新码弃掉;
+      │                                                         有回执码就留档
+      │                                                         detail.receipt_code)
+      │      ⚠ 复活的旧码**下一轮照旧是候选** —— 除非那次是「Product ID 本身不合规」
+      │      (`resources.WALMART_ERR_MIGRATE_PERMANENT`,2026-09-10 A171罗尹鸿 实证):
+      │      同一个号重发必再拒,再选它就是每轮白烧一个码 + 一次 feed 而回执全绿。
+      │      这类旧码由候选判据第十一条「非改码永久拒」剔出候选面并点名;出路是
+      │      **换一个合规 UPC**(换号 ≠ 改码,不在本工作流范围),见 §9.15 七。
       ├──(超 STALE_HOURS 仍判不出)──────────────────────────▶ stalled(点名人工,不自动定案)
       └──(新码在架 ∧ 旧码也在架 ∧ **不是**影子)──▶ double(记台账;不拦节奏闸、
                                             不重复提交;旧码缺席后自动转 confirmed;
@@ -249,6 +256,10 @@ INFLIGHT_HOURS = 48
 CANDIDATE_FETCH_CAP = 20000
 #: dry-run 摘要里列几行样例(人眼确认用,不是上限)。
 PREVIEW_ROWS = 10
+#: 「维护账随码迁」那一行给几个样本(2026-09-10:归并成一行之后的可读性下限)。
+#: 取 5 是所有者读摘要的实际需要:看得出"迁的是哪几个品、形状对不对"即可,
+#: 再多就等于又把几百行搬回摘要里(那正是 A131 那一轮撑爆飞书 230025 的原因)。
+_MOVED_SAMPLES = 5
 
 _PENDING = "pending"
 _CONFIRMED = "confirmed"
@@ -273,9 +284,9 @@ _DOUBLE = "double"
 #  SQL
 # ══════════════════════════════════════════════════════════════════════════════
 
-#: 改码候选的**十条判据,每条只在这里出生一次**(短名 / 落选人话 / SQL 布尔式)。
-#: 下面两条 SQL 都由这一份拼出来:`_SQL_CANDIDATES` 把十条 AND 起来**选行**,
-#: `_SQL_WHY` 把同样这十条**逐条选成布尔列**,只为给点名落选的行出理由 —— 判据
+#: 改码候选的**十一条判据,每条只在这里出生一次**(短名 / 落选人话 / SQL 布尔式)。
+#: 下面两条 SQL 都由这一份拼出来:`_SQL_CANDIDATES` 把十一条 AND 起来**选行**,
+#: `_SQL_WHY` 把同样这十一条**逐条选成布尔列**,只为给点名落选的行出理由 —— 判据
 #: 文本共用一份,所以不可能"选取用一套、解释用另一套":那种漂移的表现是摘要说
 #: "它满足条件",而它就是不在候选面里,谁也不报错。
 #: 形态判据经 sku_codec.OPAQUE_SQL_PREDICATE 派生(**不在这里手打正则**:手打就是
@@ -366,6 +377,27 @@ _CONDS: tuple[tuple[str, str, str], ...] = (
      """NOT EXISTS (SELECT 1 FROM listing.sku_migrations m
                   WHERE m.store = w.store AND m.old_sku = w.sku
                     AND m.status IN ('pending', 'confirmed', 'stalled', 'double'))"""),
+    # ⚠ 第十一条(2026-09-10 A171罗尹鸿 实证,docs/sku_plan.md §9.15 七)。
+    # 回滚机制本身**是对的**(新码弃、旧码复活、不自动补交),坏就坏在回滚之后:
+    # 旧码复活 ⇒ 下一轮它又满足前十条 ⇒ 又进候选面、又 mint 一个新码、又发一条
+    # MP_ITEM_MATCH ⇒ 又被同一句话拒。**每轮白烧一个码和一次 feed**,而回执、
+    # 摘要、日志全都"正常"(那正是本仓最怕的那种坏法:错了不报错)。
+    # 判据源是**台账 detail 里的回执码**(`_roll_back` 落的),不是 error 文本:
+    # 文本会随沃尔玛措辞漂,码不会;码集的唯一出处在 registry
+    # (`resources.WALMART_ERR_MIGRATE_PERMANENT`,**本文件不写码字面量**)。
+    # ⚠ 只认 `rolled_back` 行:它是"这次改码确定没成"的那一档,而
+    # confirmed/pending/double 的行本来就被上一条判据挡着,不必也不该重复挡。
+    ("非改码永久拒",
+     "上次改码被沃尔玛以 Product ID 不合规拒收(码 "
+     + "、".join(sorted(resources.WALMART_ERR_MIGRATE_PERMANENT))
+     + "):被拒的是**那个号**不是我们的载荷,同一个 Product ID 重发必再拒;"
+       "要改码得先换一个合规 UPC —— 那是**换号**不是改码,不在本工作流范围"
+       "(得走 UPC 池 + 重上/改标那条路)—— 所以**不再选**它",
+     "NOT EXISTS (SELECT 1 FROM listing.sku_migrations m\n"
+     "                  WHERE m.store = w.store AND m.old_sku = w.sku\n"
+     "                    AND m.status = 'rolled_back'\n"
+     "                    AND m.detail->>'receipt_code' = "
+     "ANY(%(migrate_permanent)s::text[]))"),
 )
 
 #: 点名(`-p skus=` / `-p asins=`)与排除(`-p exclude_skus=` / `-p exclude_asins=`):
@@ -542,10 +574,23 @@ UPDATE listing.sku_migrations
  WHERE id = ANY(%(ids)s::bigint[])
 """
 
+#: 定案落终态。`receipt_code` 是 2026-09-10 加的(A171罗尹鸿 实证,§9.15 七):
+#: 回滚时把**沃尔玛回执码**留在 `detail` 里,给候选判据「非改码永久拒」当判据源。
+#: 为什么进 `detail` 而不是接着用 `error`:`error` 存的是**人话**(会随措辞改、
+#: 还带时间戳类文案),拿它 LIKE 匹配就是把判据挂在一句会漂的中文上;码是结构化
+#: 事实,单独一个键,判据 `detail->>'receipt_code' = ANY(...)` 一眼可读。
+#: **码为空就一个键都不写**(`%(receipt_code)s::text IS NULL` 那半句):观测反证
+#: 回滚(超观测期新码没出现)根本没有回执,写一个空键会让"没有码"看起来像"码是空"。
+#: `coalesce(detail, '{}'::jsonb)` 是因为老行的 detail 可能是 NULL,而 `NULL || x`
+#: 在 jsonb 里等于 NULL —— 那样这次写就悄悄丢了。
 _SQL_LEDGER_SETTLE = """
 UPDATE listing.sku_migrations
    SET status = %(status)s, settled_at = now(),
-       error = coalesce(%(error)s::text, error)
+       error = coalesce(%(error)s::text, error),
+       detail = CASE WHEN %(receipt_code)s::text IS NULL THEN detail
+                     ELSE coalesce(detail, '{}'::jsonb)
+                          || jsonb_build_object('receipt_code',
+                                                %(receipt_code)s::text) END
  WHERE id = %(id)s
 """
 
@@ -837,14 +882,21 @@ def _probe_shadows(store_name: str, rows: list[dict]) -> list[str]:
     return out
 
 
-def _confirm(store_name: str, row: dict) -> list[str]:
-    """输入:店 + 一条台账行 → 输出:告警行(无告警返回 [])。
+def _confirm(store_name: str, row: dict) -> tuple[list[str], list[str]]:
+    """输入:店 + 一条台账行 → 输出:(告警行, **随码迁走的维护动作**)。
 
     一个事务里把 confirmed 的全部后果做完:
     身份定案 → UPC 改标 → 处置迁键 → 节点库存清行 → 过程账落 confirmed。
     **上架表不在这张清单里**:改码不回写上架表 SKU 列(2026-09-06 所有者定稿,
     见模块头注「身份映射写在哪」)。**库存也不在这张清单里**:它随改码 feed 一起
     写完了,定案不再回写(所有者 2026-09-07 定稿,见安全约束⑦)。
+
+    ⚠ 第二个返回值是「维护账随码迁」的**原料,不是成品行**(2026-09-10 改口):
+    这件事是**信息不是告警** —— 它是设计好的后果,每条都对、没有一条要人动手。
+    A131吕灿荣 settle_only 一轮几百条各占一行,把 `taken`(撞车,要人处置)与
+    破坏组那两条真正要看的 ⚠ 冲得没影,整段摘要还撑爆了飞书的消息长度上限
+    (230025)。所以这里只把动作名交回去,由 `_settle` **汇总成一行**;
+    要人看的那两类(`taken` / 破坏组)**仍逐条**报,它们才是待办。
     """
     warns: list[str] = []
     old, new = row["old_sku"], row["new_sku"]
@@ -859,8 +911,11 @@ def _confirm(store_name: str, row: dict) -> list[str]:
         _moved, taken = dispositions.rekey_open(
             tx, store_name, old, new, asin=row["source_key"])
         walmart_catalog.drop_node_rows(tx, store_name, old)
+        # confirmed 没有"被拒的回执码"可写(它是成了的那一档)⇒ 显式 None,
+        # SQL 里那半句 CASE 就不动 detail
         tx.execute(_SQL_LEDGER_SETTLE,
-                   {"status": _CONFIRMED, "error": None, "id": row["id"]})
+                   {"status": _CONFIRMED, "error": None,
+                    "receipt_code": None, "id": row["id"]})
     if taken:
         warns.append(f"  ⚠ {old}→{new}:新码名下已有未落定建议 {','.join(taken)},"
                      f"这些动作的旧码建议**不迁不删**,请人工处置")
@@ -872,12 +927,6 @@ def _confirm(store_name: str, row: dict) -> list[str]:
     moved_exec = [a for a in stranded
                   if a in dispositions.MAINT_ACTIONS and a not in taken]
     bad = [a for a in stranded if a in dispositions.DESTRUCTIVE_ACTIONS]
-    if moved_exec:
-        warns.append(
-            f"  {old}→{new}:旧码名下 executing 的 {','.join(moved_exec)} "
-            f"**已迁到新码**,由维护链按新码观测落定(同 wpid = 同一条 listing,"
-            f"新码的现值就是那条 feed 作用的对象;executed_at 不改,宽限期照旧"
-            f"从原提交时刻算)")
     if bad:
         warns.append(
             f"  ⚠ {old}→{new}:旧码名下还有 executing 的**破坏组** "
@@ -885,16 +934,28 @@ def _confirm(store_name: str, row: dict) -> list[str]:
             f"「这个 SKU 不见了」,而改码后旧码正好消失)—— 滞留在旧码上由 "
             f"expire_executing 判成 ineffective 收尾;⛔ 候选判据本该把这行剔掉"
             f"(多半是中间窗口里新长出来的建议),**请人工核**")
-    return warns
+    return warns, moved_exec
 
 
-def _roll_back(store_name: str, row: dict, why: str) -> None:
-    """输入:店 + 台账行 + 理由 → 输出:无(旧行复活、新码弃掉、过程账落 rolled_back)。"""
+def _roll_back(store_name: str, row: dict, why: str,
+               receipt_code: str | None = None) -> None:
+    """输入:店 + 台账行 + 理由(+ 沃尔玛回执码)→ 输出:无
+    (旧行复活、新码弃掉、过程账落 rolled_back)。
+
+    `receipt_code` 是 2026-09-10 加的(A171罗尹鸿 实证,§9.15 七):**有码才写**,
+    落进台账 `detail.receipt_code`,给候选判据「非改码永久拒」当判据源 ——
+    有些拒是"那个 Product ID 本身不合规",重发必再拒,那条旧码不该再进候选面。
+    **观测反证的回滚没有回执**(超观测期新码始终没出现),这时码为空 ⇒
+    一个键都不写(见 `_SQL_LEDGER_SETTLE` 头注):不许把"没有码"写成"码是空"。
+    ⚠ 这里只**记事实**,不做任何判断 —— "这个码要不要挡下一轮"由候选判据说了算,
+    本函数照旧不自动补交、不换码重发(写操作永不自动兜底)。
+    """
     with db.pg_conn() as tx:
         sku_codec.settle_replacement(tx, store_name, row["old_sku"],
                                      row["new_sku"], _ROLLED_BACK, why)
         tx.execute(_SQL_LEDGER_SETTLE,
-                   {"status": _ROLLED_BACK, "error": why[:900], "id": row["id"]})
+                   {"status": _ROLLED_BACK, "error": why[:900],
+                    "receipt_code": (receipt_code or None), "id": row["id"]})
 
 
 def _settle(conn, store_name: str, execute: bool, *,
@@ -926,6 +987,12 @@ def _settle(conn, store_name: str, execute: bool, *,
               _DOUBLE: 0, "shadow": 0}
     lines: list[str] = []
     warns: list[str] = []
+    # 「维护账随码迁」的账本(2026-09-10):**汇总成一行**,不逐条 ——
+    # 它是信息不是告警(每条都对、没有一条要人动手),而逐条报的代价是
+    # A131吕灿荣 那一轮:几百行把真正要看的两类 ⚠ 冲没了,还撑爆飞书 230025。
+    # 计数按动作分档、样本留前几条:人要能答"迁了多少、都是什么、长什么样"。
+    moved_tally: dict[str, int] = {}
+    moved_samples: list[str] = []
     now = datetime.now(timezone.utc)
 
     with conn.cursor() as cur:
@@ -1020,7 +1087,12 @@ def _settle(conn, store_name: str, execute: bool, *,
         # 一条卡住的行会让**其余全部**改码永远定不了案。异常不吞:点名 + 记日志
         try:
             if verdict == _CONFIRMED:
-                warns += _confirm(store_name, row)
+                w, moved = _confirm(store_name, row)
+                warns += w
+                for act in moved:
+                    moved_tally[act] = moved_tally.get(act, 0) + 1
+                if moved:
+                    moved_samples.append(tag)
                 if shadow_hit:
                     lines.append(
                         f"  影子改码定案 {tag}:同 wpid {row['old_wpid']}、"
@@ -1028,7 +1100,10 @@ def _settle(conn, store_name: str, execute: bool, *,
                         f"节点库存清行全走现成路径,**不新增写动作**)")
                 logger.info("改码定案 confirmed %s %s:%s", store_name, tag, why)
             elif verdict == _ROLLED_BACK:
-                _roll_back(store_name, row, why)
+                # 回执码原样留档(有码才写):下一轮的「非改码永久拒」判据读它。
+                # 观测反证回滚时 receipt 是 None ⇒ 码为空 ⇒ 不写这个键。
+                _roll_back(store_name, row, why,
+                           receipt_code=(receipt or ("", ""))[1] or None)
                 logger.warning("改码回滚 %s %s:%s(**不自动补交**,"
                                "要重来请下一轮再跑,会抽一个新码)", store_name, tag, why)
                 warns.append(f"  ⚠ 回滚 {tag}:{why} —— 未自动补交(写操作永不自动兜底);"
@@ -1056,6 +1131,18 @@ def _settle(conn, store_name: str, execute: bool, *,
     # 身份映射在登记簿 + 在线产品总表「来源码」列,上架表 SKU 列只由上架链写。
     # 见模块头注「身份映射写在哪」——**不要把它加回来**(上架表会被清理,拿它
     # 当第二处身份映射就是双轨,§六)。
+    if moved_tally:
+        # 一行说全三件:多少条、都是哪些动作、长什么样(样本只给前
+        # _MOVED_SAMPLES 个 —— 再多就又回到"逐条"了)。
+        detail = "、".join(f"{a} {n}" for a, n in sorted(moved_tally.items()))
+        head = "、".join(moved_samples[:_MOVED_SAMPLES])
+        more = (f" 等 {len(moved_samples)} 个品"
+                if len(moved_samples) > _MOVED_SAMPLES else "")
+        lines.append(
+            f"  维护账随码迁 {sum(moved_tally.values())} 条({detail};"
+            f"样本 {head}{more}) —— 由维护链按新码观测落定,executed_at 不改"
+            f"(宽限期照旧从原提交时刻算);**这是信息不是告警**,"
+            f"撞车与破坏组那两类才逐条点名")
     lines.append(f"  定案:confirmed {counts[_CONFIRMED]}"
                  + (f"(其中影子改码 {counts['shadow']})" if counts["shadow"] else "")
                  + f"、rolled_back {counts[_ROLLED_BACK]}、"
@@ -1165,7 +1252,9 @@ def _pick_report(store_name: str, only_skus, only_keys, excl_skus, excl_keys,
     七类理由,来源各不相同:
 
       · 被 `-p exclude_*` 排除(排除优先于点名)—— 参数自己说了算;
-      · 不满足十条判据之一 —— 来自 `_SQL_WHY`,与候选 SQL **同一份判据文本**;
+      · 不满足十一条判据之一 —— 来自 `_SQL_WHY`,与候选 SQL **同一份判据文本**
+        (2026-09-10 起含第十一条「非改码永久拒」:Product ID 本身不合规,
+         回滚后**不再选**它,换号不是改码);
       · 旧码上有在途 feed;· 同批 Product ID 撞号;· 沃尔玛回执说它已经不在了
         (死档,改码会新建 listing)—— 三道后置闸;
       (**重量不再是落选理由**:2026-09-06 晚所有者定稿,解析不出或 > 11 磅
@@ -1253,8 +1342,8 @@ def _candidates(conn, store_name: str, limit: int, *,
 
     候选 = 在架 ∧ 已上架 ∧ 活码 ∧ 未在改 ∧ 出身在 SOURCE_TYPES ∧ **不是**不透明码
     ∧ 观测到的 gtin/upc 至少有一个 ∧ **有现挂价格** ∧ 该 (店, 旧码)
-    无未了结的破坏建议、无未了结的改码台账
-    (十条判据的唯一出处是 `_CONDS`,候选 SQL 与理由 SQL 共用同一份文本)。
+    无未了结的破坏建议、无未了结的改码台账、**上次不是被永久拒的改码**
+    (十一条判据的唯一出处是 `_CONDS`,候选 SQL 与理由 SQL 共用同一份文本)。
 
     `only_skus` / `only_keys`(`-p skus=` / `-p asins=`,取并集)与
     `exclude_skus` / `exclude_keys` 是**同一条候选 SQL 的参数化条件**,
@@ -1290,9 +1379,14 @@ def _candidates(conn, store_name: str, limit: int, *,
     named = bool(only_skus or only_keys)
     # ⚠ SQL 的 LIMIT 是**取数上限**,不是本轮上限:后置闸剔掉的行不许白占名额
     # (2026-09-09 A131 实证 limit=500 只发 45 条),本轮上限在后置闸之后再截
+    # ⚠ 这一份 args **两条 SQL 共用**(`_SQL_CANDIDATES` 与 `_SQL_WHY` 由同一份
+    # `_CONDS` 拼出),所以每加一条带参数的判据都要在这里补一个键 —— 少补一个,
+    # 点名那条路会当场 psycopg 报 KeyError(好在它炸得响,不是静默)。
+    # `migrate_permanent` 的码集从 registry 取(本文件不写码字面量)。
     args = {"store": store_name, "source_types": list(SOURCE_TYPES),
             "limit": CANDIDATE_FETCH_CAP, "unnamed": not named,
             "marketplace": amz_source.MARKETPLACE,
+            "migrate_permanent": sorted(resources.WALMART_ERR_MIGRATE_PERMANENT),
             "only_skus": list(only_skus), "only_keys": list(only_keys),
             "excl_skus": list(exclude_skus), "excl_keys": list(exclude_keys)}
     with conn.cursor() as cur:

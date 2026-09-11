@@ -280,14 +280,22 @@ def test_executing_rows_are_named_and_the_two_groups_go_different_ways():
         作用的对象);
       · 破坏组(delete/retire)**仍不迁**,滞留旧码等 expire_executing 收尾,
         而且它本不该出现在这里 —— 要额外喊「请人工核」。
+
+    ⚠ 2026-09-10 起两组的**报法**也不一样:维护组那句是信息,`_confirm` 只把
+    动作名交回去、由 `_settle` 汇总成一行(逐条报把真正要看的 ⚠ 冲没了,还撑爆
+    飞书 230025);破坏组那句是告警,**仍逐条**。
     """
     import inspect
     src = inspect.getsource(sm._confirm)
     assert "executing_actions_on" in src
     # 先读后改:rekey 之后旧码名下的行已经搬走,再读就读不到了
     assert src.index("executing_actions_on") < src.index("rekey_open")
-    assert "MAINT_ACTIONS" in src and "已迁到新码" in src
+    assert "MAINT_ACTIONS" in src
     assert "DESTRUCTIVE_ACTIONS" in src and "请人工核" in src
+    # 维护组那句人话搬到了 _settle 的归并行,`_confirm` 里不许再逐条拼
+    assert "已迁到新码" not in src
+    assert "已迁到新码" not in inspect.getsource(sm._settle)   # 归并行的措辞另有其人
+    assert "维护账随码迁" in inspect.getsource(sm._settle)
 
 
 def _confirm_wired(monkeypatch, *, stranded=(), taken=()):
@@ -304,32 +312,39 @@ def _confirm_wired(monkeypatch, *, stranded=(), taken=()):
             "source_type": "amz", "source_key": "B0OLD00001"}
 
 
-def test_a_migrated_maintenance_executing_row_is_reported_as_migrated(monkeypatch):
-    """维护组的 executing 迁走之后,摘要说的是「已迁到新码,由维护链按新码观测落定」
-    —— 不再是「不迁,由 expire_executing 判成 ineffective」(A171罗尹鸿 691466 那句)。"""
+def test_a_migrated_maintenance_executing_row_is_returned_not_reported(monkeypatch):
+    """维护组的 executing 迁走之后**一行告警都不出** —— 动作名交回给 `_settle`
+    去汇总(2026-09-10 改口)。
+
+    这件事是**信息不是告警**:每条都对、没有一条要人动手。A131吕灿荣 一轮几百条
+    各占一行,把 `taken`(撞车)与破坏组那两条真正要看的 ⚠ 冲得没影,整段摘要还
+    撑爆了飞书的文本消息长度上限(230025),那一轮一个字都没推出去。
+    """
     row = _confirm_wired(monkeypatch, stranded=["price"])
-    warns = sm._confirm("T1", row)
-    ln = next(ln for ln in warns if "price" in ln)
-    assert "已迁到新码" in ln and "维护链" in ln
-    assert "executed_at 不改" in ln          # 宽限期照旧从原提交时刻算
-    assert "expire_executing" not in ln
+    warns, moved = sm._confirm("T1", row)
+    assert moved == ["price"]                # 原料交回去
+    assert warns == []                       # 逐条那一行没了
 
 
 def test_a_destructive_executing_row_is_still_never_migrated(monkeypatch):
-    """破坏组的告警**原样保留**:不迁、滞留旧码、请人工核。"""
+    """破坏组的告警**原样保留、仍逐条**:不迁、滞留旧码、请人工核。
+
+    归并只归并"信息"那一类:破坏组这条是"本不该出现在这里"的意外,少一条都不行,
+    而且它天然就少(候选判据本该把这种行剔在候选面外)。
+    """
     row = _confirm_wired(monkeypatch, stranded=["delete"])
-    warns = sm._confirm("T1", row)
+    warns, moved = sm._confirm("T1", row)
     ln = next(ln for ln in warns if "delete" in ln)
     assert "不迁" in ln and "expire_executing" in ln and "请人工核" in ln
-    assert "已迁到新码" not in ln
+    assert moved == []                       # 破坏组不进"随码迁"那本账
 
 
 def test_a_maintenance_row_that_collides_is_named_not_reported_as_migrated(monkeypatch):
-    """撞车(新码名下已有同动作未落定行)的**不算迁走**:只报「请人工处置」那一句。"""
+    """撞车(新码名下已有同动作未落定行)的**不算迁走**:仍逐条报「请人工处置」。"""
     row = _confirm_wired(monkeypatch, stranded=["price"], taken=["price"])
-    warns = sm._confirm("T1", row)
+    warns, moved = sm._confirm("T1", row)
     assert any("请人工处置" in ln for ln in warns)
-    assert not any("已迁到新码" in ln for ln in warns)
+    assert moved == []
 
 
 def test_open_retire_cooldown_blocks_the_store(monkeypatch):
@@ -407,6 +422,61 @@ def test_a_double_row_never_becomes_a_candidate_again():
     assert cond in sm._SQL_CANDIDATES and cond in sm._SQL_WHY
     why = next(w for n, w, _sql in sm._CONDS if n == "无未了结改码台账")
     assert "double" in why and "不许开第二条" in why      # 落选要说得出人话
+
+
+def test_a_permanently_rejected_old_code_is_never_reselected():
+    """被沃尔玛以「Product ID 不合规」拒掉的旧码**不再进候选面**(2026-09-10)。
+
+    A171罗尹鸿 两条改码实证:回执码
+    `resources.WALMART_ERR_MIGRATE_PERMANENT`(GTINValidation:这个 Product ID
+    是受限流通号段,不许挂公开 listing)。回滚机制本身是对的 —— 新码弃、旧码复活、
+    不自动补交 —— 坏在**回滚之后**:旧码复活就又满足前十条判据,下一轮又被选中、
+    又 mint 一个新码、又发一条 feed、又被同一句话拒。**每轮白烧一个码和一次 feed**,
+    而回执、摘要、日志全都"正常"。
+
+    判据源是台账 `detail.receipt_code`(`_roll_back` 落的),不是 error 文本:
+    文本随沃尔玛措辞漂,码不漂。选取(候选 SQL)与解释(理由 SQL)两处**同源**。
+    """
+    names = [n for n, _w, _sql in sm._CONDS]
+    assert "非改码永久拒" in names
+    cond = next(sql for n, _w, sql in sm._CONDS if n == "非改码永久拒")
+    assert "listing.sku_migrations m" in cond
+    assert "m.store = w.store" in cond and "m.old_sku = w.sku" in cond
+    assert "m.status = 'rolled_back'" in cond          # 只认"确定没成"的那一档
+    assert "m.detail->>'receipt_code'" in cond         # 判据源是码,不是 error 文本
+    assert "%(migrate_permanent)s::text[]" in cond     # 码集参数化,显式 cast
+    assert cond in sm._SQL_CANDIDATES and cond in sm._SQL_WHY   # 两处同源
+    # 落选说得出人话:换号 ≠ 改码,别让人以为再跑一轮就能好
+    why = next(w for n, w, _sql in sm._CONDS if n == "非改码永久拒")
+    assert "Product ID" in why and "重发必再拒" in why
+    assert "换号" in why and "不再选" in why
+    # 码只写在人话里的那一份也来自 registry,不是手打的字面量
+    for code in resources.WALMART_ERR_MIGRATE_PERMANENT:
+        assert code in why
+
+
+def test_the_permanent_reject_codes_come_from_the_registry():
+    """码集**从 registry 传进 SQL**(工作流里不写字面量),两条 SQL 共用同一份 args。
+
+    少传这个键的表现不是静默:点名那条路会当场炸(psycopg 找不到参数)。这里钉的
+    是"候选与理由两条 SQL 都能跑"——它们本来就由同一份 `_CONDS` 拼出。
+    """
+    conn = _pick_conn(cand_rows=[_cand("B0AAA00001")],
+                      why_rows=[_why("B0AAA00001")])
+    sm._candidates(conn, "T1", 10, only_skus=["B0AAA00001"])
+    for frag in ("LIMIT %(limit)s", "AS c0"):
+        args = _args_of(conn, frag)
+        assert set(args["migrate_permanent"]) == set(
+            resources.WALMART_ERR_MIGRATE_PERMANENT)
+
+
+def test_a_named_permanently_rejected_row_is_told_to_change_the_number():
+    """点名了这种品:逐条说清"为什么不选它、要怎么办",不静默丢也不假装还能重试。"""
+    conn = _pick_conn([], [_why("B0AAA00001", bad=("非改码永久拒",))])
+    rows, notes, _skips = sm._candidates(conn, "T1", 10, only_skus=["B0AAA00001"])
+    assert rows == []
+    ln = next(n for n in notes if "B0AAA00001" in n and "Product ID" in n)
+    assert "换号" in ln and "不再选" in ln
 
 
 def test_candidate_with_an_inflight_feed_is_skipped_and_named():
@@ -978,6 +1048,126 @@ def test_failed_receipt_settles_as_rolled_back_and_never_resubmits(monkeypatch):
     assert counts["rolled_back"] == 1
     assert ("settle", "T1", "B0OLD00001", "AAAAAAAAAAAA", "rolled_back") in calls
     assert any("未自动补交" in ln for ln in lines)
+
+
+def _confirm_rows(n: int, start: int = 1):
+    """n 条"新码在架、旧码缺席"的 confirmed 观测行(id / 旧码各不相同)。"""
+    return [(i, f"B0OLD{i:05d}", f"AAAAAAAAAA{i:02d}", "amz", f"B0OLD{i:05d}",
+             "F1", NOW - timedelta(hours=2), "pending", "W1", None,
+             True, True, True)
+            for i in range(start, start + n)]
+
+
+def test_moved_maintenance_rows_are_merged_into_one_line(monkeypatch):
+    """「维护账随码迁」**一行说完**(2026-09-10):计数 + 分档 + 样本。
+
+    A131吕灿荣 `-p settle_only=1` 一轮,几百条各占一行 —— 飞书应用通知 400
+    `code=230025`(消息体长度超限),又没配 webhook,**整轮摘要一个字都没推出去**。
+    它本来就是信息不是告警(每条都对、没有一条要人动手),所以归并;要人看的
+    `taken`(撞车)与破坏组仍逐条(见另两条用例)。
+    """
+    rows = _confirm_rows(3)
+    read, calls, _tx = _settle_wired(monkeypatch, rows)
+    monkeypatch.setattr(sm.dispositions, "executing_actions_on",
+                        lambda c, s_, sku: (["price", "inventory"]
+                                            if sku.endswith("1") else ["price"]))
+    counts, lines = _settle_at(sm, read, True)
+    assert counts["confirmed"] == 3
+    moved = [ln for ln in lines if "维护账随码迁" in ln]
+    assert len(moved) == 1, lines                 # 一行,不是三行
+    ln = moved[0]
+    assert "随码迁 4 条" in ln                     # 条数按**动作行**数,不是品数
+    assert "price 3" in ln and "inventory 1" in ln  # 分档:人要知道迁的是什么账
+    assert "B0OLD00001→AAAAAAAAAA01" in ln          # 样本:形状对不对一眼可见
+    assert "executed_at 不改" in ln and "维护链" in ln
+    # 归并之后,逐条那种行一条都不许再有
+    assert not any("已迁到新码" in x for x in lines)
+
+
+def test_the_moved_line_samples_a_few_and_says_how_many_more(monkeypatch):
+    """样本**只给前几个**(`_MOVED_SAMPLES`),剩下的报个数 —— 否则又回到逐条。"""
+    n = sm._MOVED_SAMPLES + 2
+    read, calls, _tx = _settle_wired(monkeypatch, _confirm_rows(n))
+    monkeypatch.setattr(sm.dispositions, "executing_actions_on",
+                        lambda c, s_, sku: ["title"])
+    counts, lines = _settle_at(sm, read, True)
+    assert counts["confirmed"] == n
+    ln = next(x for x in lines if "维护账随码迁" in x)
+    assert f"随码迁 {n} 条" in ln and f"等 {n} 个品" in ln
+    assert ln.count("→") == sm._MOVED_SAMPLES
+
+
+def test_a_round_with_nothing_moved_says_nothing(monkeypatch):
+    """一条都没迁 ⇒ **不出这一行**(notify_fmt 规矩 2:例外计数为 0 则省略)。"""
+    read, calls, _tx = _settle_wired(monkeypatch, [_OBS_COLS_CONFIRM])
+    monkeypatch.setattr(sm.dispositions, "executing_actions_on",
+                        lambda c, s_, sku: [])
+    _counts, lines = _settle_at(sm, read, True)
+    assert not any("维护账随码迁" in ln for ln in lines)
+
+
+def test_the_two_warning_kinds_are_still_reported_one_by_one(monkeypatch):
+    """归并只归并"信息"那一类:撞车与破坏组**仍逐条** —— 它们才是待办,而且少。"""
+    read, calls, _tx = _settle_wired(monkeypatch, _confirm_rows(2))
+    monkeypatch.setattr(sm.dispositions, "executing_actions_on",
+                        lambda c, s_, sku: ["price", "delete"])
+    monkeypatch.setattr(sm.dispositions, "rekey_open",
+                        lambda c, s_, o, n, asin=None: (1, ["price"]))
+    _counts, lines = _settle_at(sm, read, True)
+    assert len([ln for ln in lines if "请人工处置" in ln]) == 2      # 撞车逐条
+    assert len([ln for ln in lines if "请人工核" in ln]) == 2        # 破坏组逐条
+    # 撞车的那条**不算迁走**(键没搬成),所以那一行根本不该出现
+    assert not any("维护账随码迁" in ln for ln in lines)
+
+
+def test_a_rollback_records_the_receipt_code_in_the_ledger(monkeypatch):
+    """回滚时把**沃尔玛回执码**写进台账 `detail.receipt_code`(2026-09-10)。
+
+    它是下一轮候选判据「非改码永久拒」的判据源。写进 `detail` 而不是接着用
+    `error`:`error` 存的是人话(随措辞漂、还带时间戳类文案),拿它 LIKE 匹配
+    等于把判据挂在一句会漂的中文上。SQL 里参数**显式 ::text cast**。
+    """
+    code = sorted(resources.WALMART_ERR_MIGRATE_PERMANENT)[0]
+    row = (1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001", "F1",
+           NOW - timedelta(hours=2), "pending", None, None, False, True, True)
+    read, calls, tx = _settle_wired(
+        monkeypatch, [row], receipts={"AAAAAAAAAAAA": ("failed", code)})
+    counts, _lines = _settle_at(sm, read, True)
+    assert counts["rolled_back"] == 1
+    sql, args = next((q, a) for q, a in tx.sqls if "receipt_code" in q)
+    assert args["receipt_code"] == code and args["status"] == "rolled_back"
+    assert "jsonb_build_object('receipt_code'" in sql
+    assert "%(receipt_code)s::text" in sql              # 显式 cast
+    assert "coalesce(detail, '{}'::jsonb)" in sql       # 老行 detail 可能是 NULL
+
+
+def test_an_observation_rollback_writes_no_receipt_code_key(monkeypatch):
+    """观测反证的回滚**没有回执** ⇒ 码为空 ⇒ `detail` 里一个键都不写。
+
+    不许把"没有码"写成"码是空":空字符串会进 `detail.receipt_code`,而下一个人
+    看见这个键就会以为沃尔玛真回了个空码。SQL 那半句 CASE 负责这件事,这里钉的是
+    调用方传的确实是 None(超观测期、新码始终没出现、连回执都没有的那一档)。
+    """
+    row = (1, "B0OLD00001", "AAAAAAAAAAAA", "amz", "B0OLD00001", "F1",
+           NOW - timedelta(hours=48), "pending", None, None, False, True, True)
+    read, calls, tx = _settle_wired(monkeypatch, [row])      # 无回执
+    counts, lines = _settle_at(sm, read, True)
+    assert counts["rolled_back"] == 1
+    args = next(a for q, a in tx.sqls if "receipt_code" in q)
+    assert args["receipt_code"] is None
+    assert any("超观测期" in ln for ln in lines)
+    # CASE 那半句在 SQL 里,不是靠 Python 分支绕过去的(绕的话就是第二条写路径)
+    assert "%(receipt_code)s::text IS NULL" in sm._SQL_LEDGER_SETTLE
+
+
+def test_a_confirm_also_carries_the_receipt_code_parameter(monkeypatch):
+    """`_SQL_LEDGER_SETTLE` 是**一条 SQL 两个调用点**:confirmed 那一侧没有被拒的
+    回执码可写 ⇒ 显式传 None(少传这个键 = psycopg 当场炸,不是静默)。"""
+    read, calls, tx = _settle_wired(monkeypatch, [_OBS_COLS_CONFIRM])
+    counts, _lines = _settle_at(sm, read, True)
+    assert counts["confirmed"] == 1
+    args = next(a for q, a in tx.sqls if "receipt_code" in q)
+    assert args["status"] == "confirmed" and args["receipt_code"] is None
 
 
 #: 一条"新码在架、旧码也在架"的观测行(同店双挂)。`status` 是它当前的台账状态。
@@ -2097,6 +2287,51 @@ def test_pg_rollback_revives_the_old_code_and_burns_nothing(pg, monkeypatch):
 
 
 @needs_pg
+def test_pg_a_permanently_rejected_old_code_drops_out_of_the_face(pg, monkeypatch):
+    """改码永久拒在真库上走一遍(2026-09-10 A171罗尹鸿 实证,§9.15 七)。三件:
+
+      ① 回执码落进台账 `detail.receipt_code`(真 jsonb,不是假连接的参数断言);
+      ② 旧码**照常复活**(回滚机制一字未改),但候选面**不再要它** —— 否则
+         下一轮又抽一个新码、又发一条 feed、又被同一句话拒,每轮白烧一个码;
+      ③ **只有登记在册的那几个码**永久拒:别的失败码是**临时**的(缺省即临时,
+         与 registry 里两张终局清单同一条纪律),那条旧码下一轮照旧可以重来。
+    """
+    perm = sorted(resources.WALMART_ERR_MIGRATE_PERMANENT)[0]
+    _seed(pg, _OLD)                                   # 会被永久拒
+    _seed(pg, "B0PGMIG010", upc="000000000002")       # 只是临时失败
+    monkeypatch.setattr(sm.feeds, "submit_feed", lambda store, ft, items, workflow="":
+                        [{"outcome": "submitted", "feed_id": "FPG9",
+                          "count": len(items)}])
+    rows, _notes, _skips = sm._candidates(pg, _STORE, 10)
+    assert [r["old_sku"] for r in rows] == [_OLD, "B0PGMIG010"]
+    sm._migrate({"name": _STORE}, rows, True)
+    bad_new, ok_new = rows[0]["new_sku"], rows[1]["new_sku"]
+    with pg.cursor() as cur:
+        cur.execute("UPDATE listing.sku_migrations SET submitted_at = "
+                    "now() - interval '2 hours' WHERE store=%s", (_STORE,))
+    monkeypatch.setattr(sm.feed_track, "item_results",
+                        lambda fid: {bad_new: ("failed", perm),
+                                     ok_new: ("failed", "ERR_TEMP_0001")})
+    counts, _lines = sm._settle(pg, _STORE, True)
+    assert counts["rolled_back"] == 2                 # 两条都回滚(机制没变)
+    with pg.cursor() as cur:                          # ① 码进了 detail
+        cur.execute("SELECT old_sku, detail ->> 'receipt_code' "
+                    "FROM listing.sku_migrations WHERE store=%s ORDER BY old_sku",
+                    (_STORE,))
+        assert cur.fetchall() == [(_OLD, perm), ("B0PGMIG010", "ERR_TEMP_0001")]
+        cur.execute("SELECT replaced_by, abandoned_at FROM catalog.listing_sources "
+                    "WHERE store=%s AND sku=%s", (_STORE, _OLD))
+        assert cur.fetchone() == (None, None)         # ② 旧码照常复活
+    # ② 复活了也不再进候选面;③ 临时失败的那条照旧回来
+    rows2, notes, _skips = sm._candidates(pg, _STORE, 10)
+    assert [r["old_sku"] for r in rows2] == ["B0PGMIG010"]
+    # 点名它 ⇒ 逐条说清为什么(而且说的是"换号不是改码",不是"下轮再来")
+    rows3, notes3, _skips = sm._candidates(pg, _STORE, 10, only_skus=[_OLD])
+    assert rows3 == []
+    assert any(_OLD in n and "Product ID" in n and "换号" in n for n in notes3)
+
+
+@needs_pg
 def test_pg_stage_cap_and_observe_read_the_real_ledger(pg, monkeypatch):
     """节奏闸与定案判据读的是真表:pending 未清 ⇒ 上限 0;清完零 confirmed ⇒ 1。"""
     _seed(pg, _OLD)
@@ -2294,7 +2529,9 @@ def test_only_the_live_price_is_a_replace_condition_now():
     names = [n for n, _w, _sql in sm._CONDS]
     assert "有现挂价格" in names
     assert "有采集重量" not in names                 # 删了,别加回来
-    assert len(sm._CONDS) == 10                      # 十条判据(原十一条)
+    # 十一条(2026-09-10 加回一条,但**不是**当年那条重量判据:新的是
+    # 「非改码永久拒」,见 test_a_permanently_rejected_old_code_is_never_reselected)
+    assert len(sm._CONDS) == 11
     price = next(sql for n, _w, sql in sm._CONDS if n == "有现挂价格")
     assert price == "(w.price IS NOT NULL AND w.price > 0)"
     assert price in sm._SQL_CANDIDATES and price in sm._SQL_WHY

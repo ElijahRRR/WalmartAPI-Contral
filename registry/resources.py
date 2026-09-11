@@ -231,6 +231,31 @@ WALMART_ERR_DESTRUCTIVE_PERMANENT = frozenset({
     # ~30 RETIRE_ITEM 的通用异常(近 30 天全船队 RETIRE 三万余条几乎 100% 同款)
     "ERR_PDI_0004",
 })
+# 「改码永久拒」:**Product ID 本身不合规**,同一个 Product ID 重发必再拒。
+# 2026-09-10 A171罗尹鸿 两条改码实证(sku_migrate,MP_ITEM_MATCH 逐条回执):
+#   官方原文「[GTINValidation] This Product ID is designated for special
+#   applications in restricted environments and cannot be used. Please provide
+#   a valid Product ID to complete setup.」
+#   两个品的 GTIN(00263641141000 / 02153217103755)落在 GS1 **受限流通号段**
+#   (只发给特殊场景用,不许挂公开零售 listing)。
+# 语义:被拒的不是我们的载荷、不是新 SKU,是**那个号**。所以
+#   ① 同一个 Product ID 再发一次改码 feed,拿到的还是这一句;
+#   ② 唯一出路是**换一个合规 UPC** —— 那是**换号**,不是改码(要重新走
+#      UPC 池 + 上架/改标那条路),不在 sku_migrate 的范围里;
+#   ③ 于是这类品必须**从改码候选面剔除**并点名(判据在 sku_migrate._CONDS
+#      第十一条「非改码永久拒」),否则旧码回滚复活后下一轮又进候选、
+#      又抽一个新码、又发一次 feed —— 每轮白烧一个码和一次 feed 配额,
+#      而回执、摘要全都"正常"。
+# ⚠ 与上面的 `WALMART_ERR_DESTRUCTIVE_PERMANENT` 是**两个 feed 面**,故意不合并:
+#   那一集是 DELETE_ITEM / RETIRE_ITEM(破坏动作)的「不给做」,消费方是
+#   dispositions 的死档/永久拒闸;这一集是 MP_ITEM_MATCH(改码)的「这个号不能用」,
+#   消费方是改码候选判据。合成一集就等于让破坏面的码去挡改码、改码面的码去挡破坏,
+#   而两边的处置(人工去 Seller Center 转出 WFS / 换一个合规 UPC)根本不是一回事。
+WALMART_ERR_MIGRATE_PERMANENT = frozenset({
+    # 2「[GTINValidation] This Product ID is designated for special applications
+    #   in restricted environments and cannot be used.…」(2026-09-10 A171罗尹鸿)
+    "EXT_DATA_ERROR_54514906640101",
+})
 
 # 每店 **item setup limit** 的缺省值(沃尔玛按「店内现有 item 数 + 本 feed 条数」
 # 对每店的上限做**整 feed 拒收**,报错挂在 feed 级 ingestionError 上,零逐条明细)。

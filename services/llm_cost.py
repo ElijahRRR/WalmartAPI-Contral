@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import datetime as _dt
+
 from registry import resources
 
 _M = 1_000_000
@@ -39,14 +41,18 @@ def money(v: float) -> str:
     return f"{sym}{v:.6f}" if v else f"{sym}0"
 
 
-def cost_of(model: str, tier: str, row: dict) -> float | None:
-    """输入:模型 + 时段 + 一行用量计数 → 输出:金额(元),或 None(该模型无计价)。
+def cost_of(model: str, tier: str, row: dict, when=None) -> float | None:
+    """输入:模型 + 时段 + 一行用量计数(+计费时刻)→ 输出:金额(元),或 None(无计价)。
 
     输入 token 分两档算:命中前缀缓存的便宜一个数量级。供应商没回
     cache_hit/cache_miss 拆分时(两者都是 0)退回按 prompt_tokens 全额
     当未命中算 —— **偏贵不偏便宜**,估出来的账不会让人以为花得比实际少。
+
+    `when`(缺省"现在")只交给 registry 判**官方路由期到没到**:同一个模型名
+    在路由生效前后是两个价(v4-pro 见 LLM_ROUTED_MODELS)。回算历史用量时传
+    那笔用量发生的时刻,否则会按今天的规则给昨天的账定价。
     """
-    table = resources.LLM_PRICING.get(resources.llm_priced_model(model))
+    table = resources.LLM_PRICING.get(resources.llm_priced_model(model, when))
     if not table or tier not in table:
         return None
     p_hit, p_miss, p_out = table[tier]
@@ -57,16 +63,18 @@ def cost_of(model: str, tier: str, row: dict) -> float | None:
             + row.get("completion", 0) * p_out) / _M
 
 
-def summarize(usage_stats: dict, items: int = 0) -> list[str]:
+def summarize(usage_stats: dict, items: int = 0, when=None) -> list[str]:
     """输入:api.llm.USAGE_STATS(+本轮判定条数)→ 输出:摘要行列表。
 
     按**用途**汇总(L1 rerank / L3 语义 / 上架映射各花多少),这是换模型时
     真正要看的维度;单价与峰谷只在总额里体现。
     `items` 非零时额外折算**每千条**单价 —— 抽样跑一轮就是为了推整轮预算,
     不给这个数就得让人自己拿两个都被四舍五入过的数字对除。
+    `when` 缺省"现在",只用于判官方路由期到没到(见 cost_of)。
     """
     if not usage_stats:
         return []
+    when = when or _dt.datetime.now(_dt.timezone.utc)
     by_purpose: dict[str, dict] = {}
     total_cost, unpriced = 0.0, set()
     for (model, purpose, tier), row in usage_stats.items():
@@ -77,7 +85,7 @@ def summarize(usage_stats: dict, items: int = 0) -> list[str]:
         for k in ("calls", "prompt", "completion", "cache_hit", "cache_miss"):
             agg[k] += row.get(k, 0)
         agg["models"].add(model)
-        c = cost_of(model, tier, row)
+        c = cost_of(model, tier, row, when)
         if c is None:
             unpriced.add(model)
         else:
@@ -104,18 +112,23 @@ def summarize(usage_stats: dict, items: int = 0) -> list[str]:
         # 退役名还在用 = 随时可能整条链一起挂,且不会提前预警
         head += (";⚠ **在用已退役的模型名**:" + "、".join(
             f"{m}({why})" for m, why in sorted(retired.items()))
-            + f";计价按 {sorted({resources.llm_priced_model(m) for m in retired})} 折算,"
+            + f";计价按 {sorted({resources.llm_priced_model(m, when) for m in retired})} 折算,"
               "生产请在 .env 把 DEEPSEEK_MODEL 写成 GET /models 返回的名字 —— "
               "退役名一旦真的切断,全仓 LLM 调用同时失败")
     routed = {m: resources.LLM_ROUTED_MODELS[m] for (m, _, _) in usage_stats
               if m in resources.LLM_ROUTED_MODELS}
     if routed:
-        # 路由期结束(V4.1 Pro 上线)单价与实际模型都会变,官方不来通知 ——
-        # 每轮点名比"记得几个月后复核"靠得住
+        # 生效前后是两句话,别只说一句:**生效前钱按它自己的单价扣**
+        # (v4-pro 比 Flash 贵四倍多),生效后才按目标模型计费。日期在
+        # registry,这里只渲染 —— 每轮点名比"记得几个月后复核"靠得住。
         head += (";ℹ 官方路由期:" + "、".join(
-            f"{m} 的请求实际跑 {tgt}、按 {tgt} 单价计费" for m, tgt in sorted(routed.items()))
-            + "(V4.1 Pro 上线后单价与实际模型都会变,复核 "
-              "registry.LLM_MODEL_ALIASES)")
+            (f"{m} 的请求实际跑 {tgt}、按 {tgt} 单价计费"
+             f"({starts:%Y-%m-%d %H:%M} 北京起已生效)" if when >= starts else
+             f"{m} 现在仍按**它自己的**单价计费,{starts:%Y-%m-%d %H:%M}(北京)"
+             f"起才路由到 {tgt} 并按 {tgt} 计费")
+            for m, (tgt, starts) in sorted(routed.items()))
+            + "(日期与目标在 registry.LLM_ROUTED_MODELS;V4.1 Pro 上线后官方"
+              "撤路由,单价与实际模型再变一次)")
     if unpriced:
         # 静默按 0 计价 = 假账。点名说哪个模型没价,让人知道这个数字不全
         head += (f";⚠ 未计价模型 {sorted(unpriced)} —— 在 "

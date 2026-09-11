@@ -273,8 +273,8 @@ def test_default_model_is_not_a_retired_alias():
     """缺省值不许是官方已宣布停用的旧别名,且必须能算出钱、能压掉思考模式。
 
     踩上去的后果不是"某个功能怪怪的",是**全仓 LLM 调用在别名切断当天
-    一起失败**。缺省值 2026-09-10 由 v4-flash 切成 **v4-pro**(官方路由期
-    → 实际跑 V4.1 Flash、按 Flash 计费),这条用例是三件事的守门人:
+    一起失败**。缺省值 2026-09-10 由 v4-flash 切成 **deepseek-flash**
+    (= V4.1 Flash 的正式 id,判据是 GET /models),这条用例是三件事的守门人:
     不是旧别名、算得出钱(经 llm_priced_model 折)、thinking 显式 disabled。
     """
     from registry import resources
@@ -358,20 +358,28 @@ def test_every_model_we_actually_run_has_a_thinking_row():
 
 
 def test_official_routing_window_is_named_every_round():
-    """官方路由期(v4-pro 的请求实际跑 V4.1 Flash)必须每轮进摘要。
+    """官方路由期必须每轮进摘要,**并且分清生效前后**:生效前 v4-pro 是真 Pro
+    价在扣钱(比 Flash 贵四倍多),2026-09-14 12:00(北京)起才按 Flash 计费。
 
-    路由期一结束(V4.1 Pro 上线)单价与实际模型都会变,而官方不会来通知 ——
-    靠人记住"几个月后要复核"是记不住的,所以让每轮摘要自己说。
+    只说"实际跑 V4.1 Flash、按 Flash 计费"会让人以为现在就便宜了 —— 那是
+    2026-09-10 漏掉生效日期时写下的话。路由期结束(V4.1 Pro 上线)单价与实际
+    模型又会变,官方不来通知,所以让每轮摘要自己报当下这一段。
     """
+    import datetime as dt
+    from registry import resources
     from services import llm_cost
 
     row = {"calls": 1, "prompt": 0, "completion": 1_000_000,
            "cache_hit": 0, "cache_miss": 0}
-    out = "\n".join(llm_cost.summarize(
-        {("deepseek-v4-pro", "audit_l3", "offpeak"): row}))
-    assert "官方路由期" in out and "V4.1 Flash" in out
-    assert "LLM_MODEL_ALIASES" in out          # 复核动作指到具体那一行
-    assert "¥4.00" in out                      # 按 Flash 单价(出 4 元/百万)
+    stats = {("deepseek-v4-pro", "audit_l3", "offpeak"): row}
+    starts = resources.LLM_PRO_ROUTING_STARTS
+    before = "\n".join(llm_cost.summarize(stats, 0, starts - dt.timedelta(days=1)))
+    assert "官方路由期" in before and "2026-09-14 12:00" in before
+    assert "¥13.50" in before                  # 生效前:Pro 自己的价(出 13.5)
+    after = "\n".join(llm_cost.summarize(stats, 0, starts))
+    assert "官方路由期" in after and "已生效" in after
+    assert "¥4.00" in after                    # 生效后:按 Flash(出 4 元/百万)
+    assert "LLM_ROUTED_MODELS" in after        # 复核动作指到具体那张表
     # 没用路由期模型的轮次不该出现这条提醒
     plain = "\n".join(llm_cost.summarize(
         {("deepseek-flash", "audit_l3", "offpeak"): row}))
@@ -438,9 +446,10 @@ def test_model_ids_track_the_models_endpoint_not_the_docs_page():
         {"object":"list","data":[
           {"id":"deepseek-flash","object":"model","owned_by":"deepseek"},
           {"id":"deepseek-v4-pro","object":"model","owned_by":"deepseek"}]}
-    只有这两个可调。同一天的定价页却还列着 deepseek-v4-flash /
+    只有这两个可调。同一天上午的定价页却还列着 deepseek-v4-flash /
     deepseek-v4-flash-vision-exp、更新日志最新一条还是 8/21 —— **文档站滞后于
-    线上**。所以价表键与 thinking 登记都必须是这两个,退役名只留在折算表里。
+    线上**(当天 15:21 复核时页面才追上,只剩这两列)。所以价表键与 thinking
+    登记都必须是这两个,退役名只留在折算表里 —— 判据永远是 /models,不是页面。
     """
     from registry import resources
     from api import llm

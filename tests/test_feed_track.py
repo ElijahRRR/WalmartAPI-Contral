@@ -665,3 +665,171 @@ def test_receipt_blocked_passes_the_codes_and_the_store_through():
     assert sql is feed_track._RECEIPT_BLOCKED_SQL
     assert args["codes"] == ["A", "B"] and args["store"] == "T1"
     assert args["feeds"] == list(feed_track.DESTRUCTIVE_FEED_TYPES)
+
+
+# ── 在途 feed 的摘要口径(2026-09-11)────────────────────────────────────────
+# 所有者实见:飞书里这五行每 30 分钟原样再来一遍 ——
+#   A085朱丽霖 改价(maintenance) 18CEF5AC…:INPROGRESS,已收 15,成功 12,失败 2,待处理 1
+#   A109黄威威 上架(list_new) 18CE2095…:已落定 PROCESSED,成功 451,失败 42
+#   …
+# 两件事凑出来的:① 说"已落定"的那几条**其实没落定**(残留 SKU 仍 processing
+# ⇒ poll_feed 不调 mark_feed_done,行留在 feed_log 里下轮重查);② 在途行永不
+# 老化,于是同一段明细一天播 48 遍。下面这组钉住修法。
+
+def _inflight(store="T1", fid="F1", ft="DELETE_ITEM", wf="", age_h=None,
+              created_age_h=None):
+    """在途 feed_log 行;age_h 给了就按"几小时前提交"落 updated_at。"""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    return {"status": "submitted", "feed_id": fid, "store": store,
+            "feed_type": ft, "workflow": wf,
+            "created_at": (now - timedelta(hours=created_age_h)
+                           if created_age_h is not None else "t"),
+            "updated_at": (now - timedelta(hours=age_h)
+                           if age_h is not None else None)}
+
+
+def test_unresolved_counts_the_residue_and_splits_out_unknown():
+    """(未落定数, 其中状态未知数)——**收工判据只有这一处**。
+
+    第二个数是给摘要分因用的:processing 是沃尔玛还在跑(等就行),unknown 是
+    `sku_outcome` 没认出来的枚举值(等到天荒地老也不会变,得补码表)。
+    """
+    assert feed_track.unresolved({}) == (0, 0)
+    assert feed_track.unresolved({"A": ("success", ""), "B": ("failed", "E")}) == (0, 0)
+    assert feed_track.unresolved({"A": ("processing", ""), "B": ("unknown", ""),
+                                  "C": ("success", "")}) == (2, 1)
+
+
+def test_terminal_feed_with_residue_never_claims_it_settled(monkeypatch):
+    """feed 终态 ≠ 落定:有残留就不许说"已落定",也不许计进 `落定 N`。
+
+    poll_feed 这时**不**调 mark_feed_done(残留 SKU 要留在在途队列里下轮重查,
+    否则它们永久卡 submitted、在途拦截会永远跳过)。摘要却说"已落定 PROCESSED,
+    成功 451,失败 42"的后果:行还在 feed_log 里,下一轮一字不差再播一遍、
+    `落定` 每轮把同一个 feed 重数一次 —— 每句话都对,合起来是假的。
+    """
+    monkeypatch.setattr(feeds, "query_pending",
+                        lambda: [_inflight(fid="F1", ft="MP_ITEM", wf="list_new")])
+    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f: (
+        {"feedStatus": "PROCESSED"},
+        {"A": ("success", ""), "B": ("failed", "E1"), "C": ("processing", "")}))
+    out = feed_track.poll_all({"T1": STORE})
+    assert "已落定" not in out
+    assert "落定 0,仍处理中 1" in out
+    assert "T1 上架(list_new) F1:PROCESSED 已终态,但 1 个 SKU 未落定" in out
+
+
+def test_residue_says_out_loud_when_it_is_an_unrecognised_enum(monkeypatch):
+    """残留是 unknown 时摘要要点破:枚举可能已扩,光等是等不来的。
+
+    `sku_outcome` 对没见过的 ingestionStatus 返回 unknown 并告警 —— 那条告警
+    只在日志里,而摘要是发去飞书的那一份。不说,人只看得到"还有 3 个没落定",
+    以为沃尔玛慢,实际是码表该补了。
+    """
+    monkeypatch.setattr(feeds, "query_pending", lambda: [_inflight(fid="F1")])
+    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f: (
+        {"feedStatus": "PROCESSED"},
+        {"A": ("success", ""), "B": ("unknown", "")}))
+    out = feed_track.poll_all({"T1": STORE})
+    assert "1 个状态未知" in out and "枚举可能已扩" in out
+
+
+def test_long_in_flight_feeds_fold_into_one_line_with_a_next_step(monkeypatch):
+    """超过静默闸的在途 feed:折成一行点名,不再逐条复读明细。
+
+    feed_poll 挂 0/30 分两班;卡住的 feed 一天把同一段明细原样发 48 遍,而人
+    对固定文案的反应是不看 —— 真出事的那一轮跟着一起漏掉。折叠只动**排版**:
+    这些行照旧每轮轮询、照旧不落定,一个业务判断都没改。
+    """
+    monkeypatch.setattr(feeds, "query_pending", lambda: [
+        _inflight(fid="F1", ft="MP_MAINTENANCE", wf="maintenance", age_h=36.0),
+        _inflight(fid="F2", ft="MP_INVENTORY", wf="maintenance", age_h=5.0)])
+    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f: (
+        {"feedStatus": "INPROGRESS", "itemsReceived": 15, "itemsSucceeded": 12,
+         "itemsFailed": 2}, None))
+    out = feed_track.poll_all({"T1": STORE})
+    assert "F1" not in out and "F2" not in out          # 明细不再逐条复读
+    assert "⏳ 长期在途 2(最久 36.0h)" in out            # 首行带结论(规矩 1)
+    assert "T1 维护(卡 36h)、T1 分仓库存(卡 5h)" in out   # 点得出是哪几个
+    assert "docs/feed_closure_audit.md" in out          # 自带处置(规矩 3)
+    assert "feed 轮询:2 个在途,落定 0,仍处理中 2" in out
+
+
+def test_a_fresh_in_flight_feed_keeps_its_own_detail_line(monkeypatch):
+    """刚提交的在途 feed 照旧出明细行:人正等着它,进度是有用信息。
+
+    ⚠ 年龄按 **updated_at**(这个 feedId 的提交时刻)算,不是 created_at ——
+    `_log_claim` 重占终态行时不重置 created_at,这一行的 created_at 是 100 小时
+    前那次同载荷提交留下的。拿 created_at 当年龄,刚提交的 feed 一上来就被判成
+    "卡了四天"、当场从摘要里折掉。
+    """
+    monkeypatch.setattr(feeds, "query_pending", lambda: [
+        _inflight(fid="F1", age_h=0.5, created_age_h=100.0)])
+    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f: (
+        {"feedStatus": "INPROGRESS", "itemsReceived": 10, "itemsSucceeded": 3,
+         "itemsFailed": 1}, None))
+    out = feed_track.poll_all({"T1": STORE})
+    assert "T1 删除(-) F1:INPROGRESS,已收 10,成功 3,失败 1,待处理 6" in out
+    assert "长期在途" not in out
+
+
+def test_an_unknowable_age_counts_as_fresh(monkeypatch):
+    """年龄拿不到(updated_at 缺)一律当新鲜:宁可多播一行,不可少播一行。"""
+    monkeypatch.setattr(feeds, "query_pending", lambda: [_inflight(fid="F1")])
+    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f: (
+        {"feedStatus": "INPROGRESS"}, None))
+    out = feed_track.poll_all({"T1": STORE})
+    assert "T1 删除(-) F1:INPROGRESS" in out and "长期在途" not in out
+
+
+def test_a_feed_that_finally_settles_prints_even_after_days(monkeypatch):
+    """落定永远出明细行,哪怕它在途了四天:那是**新信息**,而且下一轮这个
+    feed 就出队了,只播这一次 —— 折叠折的是"还会再播 47 遍"的那些。"""
+    monkeypatch.setattr(feeds, "query_pending",
+                        lambda: [_inflight(fid="F1", age_h=99.0)])
+    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f: (
+        {"feedStatus": "PROCESSED"}, {"A": ("success", "")}))
+    out = feed_track.poll_all({"T1": STORE})
+    assert "T1 删除(-) F1:已落定 PROCESSED,成功 1,失败 0" in out
+    assert "长期在途" not in out
+
+
+def test_every_submittable_feed_type_has_a_chinese_label():
+    """摘要里不许再蹦裸 feedType(2026-09-11 实见「A171罗尹鸿 MP_INVENTORY」)。
+
+    漏登记不报错,只是运营看不出那是分仓库存 —— 守门测试比"记得去加"可靠。
+    """
+    from api.feeds import _SLICE_LIMITS
+    missing = [ft for ft in _SLICE_LIMITS if ft not in feed_track._FEED_LABEL]
+    assert not missing, f"_FEED_LABEL 漏登记 feedType: {missing}"
+
+
+def test_query_pending_carries_the_submit_moment(monkeypatch):
+    """query_pending 必须带 updated_at:在途年龄是拿它算的(见上一条的理由)。"""
+    import contextlib
+
+    from registry import db
+
+    class _C(list):
+        description = ()
+
+        def cursor(self):
+            return self
+
+        def execute(self, sql, args=None):
+            self.append(sql)
+
+        def fetchall(self):
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    c = _C()
+    monkeypatch.setattr(db, "pg_conn", contextlib.contextmanager(lambda: iter([c])))
+    assert feeds.query_pending() == []
+    assert "updated_at" in c[0]

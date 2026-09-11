@@ -19,6 +19,12 @@ ops.feed_items(权威台账)→ feed_log 落 done/failed;pending 行
 用 `python cli.py feed_poll --dry-run` —— 本工作流自己认 params["dry_run"]
 并把 execute 透传给五个反哺器(见 run());漏掉那一句,--dry-run 完全失效。
 
+⚠ **feed 终态 ≠ 落定**:明细里还有 SKU 卡在 INPROGRESS/未知枚举时,行留在途
+下轮重查(摘要照实说,不写"已落定")。这种行**永不老化**,在途超
+`feed_track.FEED_QUIET_HOURS` 的会折成一行点名、不再逐轮复读明细 ——
+一天 48 轮的固定文案没人看。放弃期限待所有者拍板,
+见 docs/feed_closure_audit.md §三.4。
+
 轮询完执行**反哺器列表**(所有者定稿 2026-08-07:一切 feed 结果的表格
 回写都交给轮询,业务表状态不依赖"记得再跑一次业务工作流"):每个反哺器
 是一个 services 积木,纯读 ops.feed_items 台账写自己的业务表,幂等;

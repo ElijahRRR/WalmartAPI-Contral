@@ -66,7 +66,7 @@ executing → 按观测落定),**2026-08-24 起不再是**:删除归口到它之
 维护三类(标题/价格/库存)没有对应的核验事件,2026-08-16 起由
 `dispositions.settle_maintenance()` 比对 `catalog.walmart_items` 现值补上。
 
-## 三、审出来的三个问题
+## 三、审出来的四个问题(第 4 条 2026-09-11 补)
 
 ### 1. `pending` 行(所有者定稿 2026-08-16:**不做对账器,遇到了再说**)
 
@@ -196,6 +196,71 @@ NOT_FOUND 转 failed / 仍 UNKNOWN 留着下轮再来。补交仍由原业务工
 没有任何机制把陈年 pending 行升级告警或归档(曾预留的 `_PENDING_ALARM_HOURS`
 常量从未被引用,2026-08-27 死件清理已删)。将来做对账器时一并设计。
 
+### 4. `submitted` 行永不老化(2026-09-11 补,**有一半已修**)
+
+第 3 节说的是 `pending`。**`submitted` 有一模一样的一条,而且它已经在生产上
+发作了** —— 所有者 2026-09-11 实见,飞书里这五行每 30 分钟原样再来一遍:
+
+```
+A085朱丽霖 改价(maintenance) 18CEF5AC…:INPROGRESS,已收 15,成功 12,失败 2,待处理 1
+A109黄威威 上架(list_new) 18CE2095…:已落定 PROCESSED,成功 451,失败 42
+A162朱行 删除(product_clear) 18CC2F2D…:已落定 PROCESSED,成功 298,失败 1
+A171罗尹鸿 MP_INVENTORY(maintenance) 18D39180…:已落定 PROCESSED,成功 942,失败 3
+L001贾林红 上架(list_new) 18CE2095…:已落定 PROCESSED,成功 439,失败 58
+```
+
+**「已落定」那几条其实一条都没落定。** `poll_feed` 只在残留为 0 时才调
+`mark_feed_done`(第四节那条"确认没问题"的直接后果):feed 自己终态了、但
+明细里还有 SKU 是 `INPROGRESS` 或**枚举没认出来**(`sku_outcome` → unknown),
+行就留在 `feed_log` 里下轮重查。而摘要那句"已落定"只看了 `feedStatus`,
+`落定 N` 还把同一个 feed 每轮重数一次 —— 每句话都对,合起来是假的。
+
+feed_poll 挂 0/30 分两班 ⇒ **同一段明细一天原样发 48 遍**。人对固定文案的反应
+是不看,真出事的那一轮跟着一起漏掉。轮询本身不心疼:`GET /v3/feeds` 是
+5000/min 的大桶,重翻几页明细不烧配额。**真正的伤在防重闸**:在途行(pending
+**与 submitted**)一律拒绝同载荷重提,于是那批 SKU 的那个动作再也发不出去,
+表现与第 3 节那段「看起来完全正常」一字不差。
+
+识别信号:
+
+```sql
+-- 在途超过一天的行:正常 feed 几分钟就落定,这里剩下的都是卡住的
+SELECT store, feed_type, workflow, feed_id, updated_at
+FROM ops.feed_log WHERE status = 'submitted'
+  AND updated_at < now() - interval '1 day' ORDER BY updated_at;
+-- 卡在哪个 SKU、卡成什么样(只读,不动台账、不跑反哺器)
+-- python cli.py feed_poll -p store=<店铺> -p feed_id=<feed>
+```
+
+⚠ 年龄一律按 `updated_at` 算,**不是 `created_at`**:`_log_claim` 重占终态行时
+只改 status/feed_id/workflow/updated_at,`created_at` 留的是这个 payload_key
+**第一次**提交的时刻(可能是几个月前)。
+
+**已修(2026-09-11,纯摘要口径,零业务判断变更)**:
+
+- 终态但有残留的 feed 不再谎称"已落定",改报「PROCESSED 已终态,但 N 个 SKU
+  未落定,保持在途下轮重查」,且**不计进 `落定 N`**;残留里若有 unknown,摘要
+  当场点破"沃尔玛枚举可能已扩"(那句告警此前只在日志里)。
+- "能不能收工"的判据收口到 `feed_track.unresolved()` 一处,`poll_feed`(调不调
+  `mark_feed_done`)与 `poll_all`(说不说"已落定")共用 —— 两处各数一遍正是
+  上面那句假话的来源。
+- 在途超过 `feed_track.FEED_QUIET_HOURS`(2h)的 feed,明细折成一行点名
+  (几个、最久多久、怎么查),不再逐轮复读。**只动排版**:这些行照旧每轮
+  轮询、照旧不落定。
+- `_FEED_LABEL` 补齐八个 feedType(`MP_INVENTORY` / `MP_ITEM_MATCH` 此前漏登记,
+  摘要里蹦的是裸 feedType),守门测试拦下一次遗漏。
+
+**没修、要所有者拍板的那一半**:在途 feed 等多久才该判死?判死之后
+
+- 台账残留行落什么(`missing`?新状态?)—— 它决定飞书投影列与 cleanup
+  在途拦截还跳不跳这些 SKU;
+- 防重闸开不开 —— 开了那批载荷下一轮就会被业务工作流重发。删除/停用重发
+  无实害(所有者已有定稿),但 `MP_ITEM_MATCH` 对**可能其实已经成功**的
+  SKU 重发会新建一条 listing(2026-09-07 A131吕灿荣 真双挂实证),不能一刀切。
+
+在拍板之前,系统**不自动放弃任何在途 feed** —— 与第 1、3 节同一条纪律:
+宁停不重,只保证"遇到时能被发现"。
+
 ## 四、复核过、确认没问题的几处
 
 - **`unknown` 结局不落 `feed_items`** —— 对的。没拿到 feed_id 就没有可挂的
@@ -204,6 +269,9 @@ NOT_FOUND 转 failed / 仍 UNKNOWN 留着下轮再来。补交仍由原业务工
   `meta[sku][2] == "submitted"`(本轮才落定)的 SKU 记事件。有用例钉着。
 - **feed 终态但个别 SKU 仍 processing** —— 不 `mark_feed_done`,下轮重查;
   否则那些 SKU 永久卡 submitted,在途拦截会永远跳过它们。
+  ⚠ 2026-09-11 补:这条判断本身没问题,但它的**下游**有问题 ——
+  沃尔玛若永远不落定这几个 SKU,行就永远在途(摘要还谎称"已落定"),
+  见第三节第 4 条。摘要口径已修,放弃期限待所有者拍板。
 - **台账有、终态明细里查无的 SKU** → 落 `missing`,不装成功也不装失败。
 - **违禁回执自动进 ASIN 黑名单** —— 上架失败反哺"上架前拦截",闭环成立。
 - **`problem_scan` 的反补计数**读 `maintenance_submitted` 且限
@@ -220,3 +288,8 @@ NOT_FOUND 转 failed / 仍 UNKNOWN 留着下轮再来。补交仍由原业务工
 遇到了再说)。本轮只补了"遇到时能被发现":`feed_poll` 摘要摊开明细并明说系统
 不会自动补交,以及上面第三节那份识别信号 —— 它的麻烦不在于难修,
 而在于**长得像正常防重**。
+
+⚠ **2026-09-11 追记**:同一个口子 `submitted` 也有,而且已经在生产上发作
+(第三节第 4 条)。"遇到时能被发现"这半边当时就没做到 —— 摘要把卡死的 feed
+报成"已落定",人每 30 分钟收一遍固定文案,看了两个月都以为一切正常。
+摘要口径已修;**放弃期限仍待所有者拍板**。

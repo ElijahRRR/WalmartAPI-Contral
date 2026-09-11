@@ -2,8 +2,12 @@
 
 用法:
   python cli.py feed_poll                 # 轮询 ops.feed_log 全部在途 feed
+  python cli.py feed_poll -p stuck=1      # 在途清单:**完整 feed_id** + 卡了多久
+                                          # + 每条现成的诊断命令(只读台账)
   python cli.py feed_poll -p feed_id=X    # 诊断:打印该 feed 逐 SKU 完整报错
                                           # (只读,不改台账、不跑反哺器)
+                                          # X 可以只给**前缀**——摘要里那串截断的
+                                          # 码(头 18 位)直接粘过来就行
   python cli.py feed_poll -p stats=1      # 报错排行(默认近 30 天,全 feed 类型)
   python cli.py feed_poll -p stats=1 -p days=7 -p feed_type=MP_ITEM
 
@@ -144,8 +148,99 @@ def _error_stats(days: int, feed_type: str = "") -> str:
     return "\n".join(lines)
 
 
+#: LIKE 前缀里要转义的三个字符(feed_id 是十六进制串,理论上碰不到,
+#: 但拼 LIKE 时不转义就是注入式的通配符行为——便宜的正确)
+_LIKE_ESCAPE = str.maketrans({"\\": "\\\\", "%": "\\%", "_": "\\_"})
+
+
+def _resolve_feed(typed: str, store_hint: str = "") -> tuple[str, str] | str:
+    """输入:完整 feed_id **或它的前缀**(+ 可选店铺)→ 输出:(完整 feed_id, 店铺)
+    / 人话错误串。只读 ops.feed_log。
+
+    摘要里的码是**截断**的(头 18 位 + …),飞书里复制到的就是那一段 ——
+    不认前缀的话,人拿着通知里那串来跑诊断只会得到"不在台账中",而完整码
+    一直在库里(2026-09-11 所有者实见「我找不到这些 feed 的完整的码了」)。
+    末尾的省略号(中文「…」与三个点)顺手吃掉:粘贴多半会带上。
+
+    三条决定:
+      ① **精确匹配优先于前缀匹配**:一个完整码恰好是另一个码的前缀时,人打的
+         是哪个就查哪个。
+      ② **前缀撞上多条 ⇒ 摊开候选让人挑,绝不回退到"按原样查"** —— 那串是
+         截断的,拿去问沃尔玛只会查无,而且查无长得像"这个 feed 不存在"。
+      ③ 店铺**以台账为准**(它是事实),`-p store` 只在台账查无时兜底 ——
+         诊断旧系统或 Seller Center 手发的 feed 仍走得通(那些 feed 我们的
+         feed_log 里本来就没有行)。
+    """
+    q = str(typed).strip().rstrip("….")
+    if not q:
+        return "feed_id 是空的"
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT feed_id, store, status, updated_at FROM ops.feed_log "
+            "WHERE feed_id LIKE %s ESCAPE '\\' ORDER BY updated_at DESC LIMIT 20",
+            (q.translate(_LIKE_ESCAPE) + "%",))
+        rows = cur.fetchall()
+    exact = [r for r in rows if r[0] == q]
+    if exact:
+        return exact[0][0], exact[0][1]
+    if len(rows) == 1:
+        return rows[0][0], rows[0][1]
+    if rows:
+        lines = [f"前缀 {q} 匹配到 {len(rows)} 条,补几位再查(或 "
+                 f"`python cli.py feed_poll -p stuck=1` 看完整码):"]
+        lines.extend(f"  {st} {fid}({stat},{up})" for fid, st, stat, up in rows)
+        return "\n".join(lines)
+    if store_hint:              # 台账查无 + 人指名了店铺 ⇒ 按原样直查
+        return q, store_hint
+    return (f"feed {q} 不在 ops.feed_log 台账中(按前缀也没匹配到)。"
+            f"在途清单:`python cli.py feed_poll -p stuck=1`;"
+            f"要直查台账外的 feed 请补 -p store=<店铺名>")
+
+
+def _inflight_list() -> str:
+    """输入:无 → 输出:在途 feed 清单(完整 feed_id + 卡了多久 + 现成命令)。
+
+    纯读 ops.feed_log(`feeds.query_pending`),**一个沃尔玛接口都不调**。
+    存在的理由:轮询摘要里的码是截断的,而截断的码拼不回完整码;卡住的 feed
+    要人工处置,第一步就是"到底是哪几条"。卡多久的口径与摘要折叠同一处
+    (`feed_track.is_stuck`)。
+    """
+    rows = feeds.query_pending()
+    subs = [r for r in rows if r["status"] == "submitted" and r["feed_id"]]
+    pends = [r for r in rows if r["status"] == "pending"]
+    if not subs and not pends:
+        return "ops.feed_log 里没有在途 feed(全部已落定)"
+
+    ages = {id(r): feed_track.age_hours(r.get("updated_at")) for r in subs}
+    # 老的在前;年龄未知的排最后(不知道多久 ≠ 刚提交,但也不能冒充最老)
+    subs.sort(key=lambda r: (ages[id(r)] is None, -(ages[id(r)] or 0.0)))
+    n_stuck = sum(1 for r in subs if feed_track.is_stuck(ages[id(r)]))
+
+    out = [f"在途 feed {len(subs)} 条(老的在前),其中卡超过 "
+           f"{feed_track.FEED_QUIET_HOURS:g}h 的 {n_stuck} 条"]
+    for r in subs:
+        age = ages[id(r)]
+        mark = "⏳ " if feed_track.is_stuck(age) else "   "
+        label = feed_track._FEED_LABEL.get(r["feed_type"], r["feed_type"])
+        out.append(f"  {mark}{r['store']} {label} {r['feed_type']}"
+                   f"({r['workflow'] or '-'})  {r['feed_id']}")
+        out.append(f"        提交于 {r.get('updated_at') or '?'}"
+                   + (f",卡 {age:.1f}h" if age is not None else ",年龄未知")
+                   + f"  →  python cli.py feed_poll -p store={r['store']} "
+                     f"-p feed_id={r['feed_id']}")
+    if pends:
+        # pending 是另一个口子(提交结局不确定,**系统不会自动补交**),
+        # 它连 feed_id 都没有,查不了逐 SKU —— 处理两步见文档
+        out.append(f"  另有 pending {len(pends)} 条(提交结局不确定、无 feed_id,"
+                   f"系统不会自动补交,处理见 docs/feed_closure_audit.md §三.1):")
+        for p in pends[:10]:
+            out.append(f"      {p['store']} {p['feed_type']}"
+                       f"({p.get('workflow') or '-'}) 提交于 {p['created_at']}")
+    return "\n".join(out)
+
+
 def run(params: dict) -> str:
-    """输入:params(store / feed_id 诊断 / stats 排行 / dry_run)→ 输出:摘要。
+    """输入:params(store / stuck 清单 / feed_id 诊断 / stats 排行 / dry_run)→ 输出:摘要。
 
     ⚠ execute 取的是 `not params["dry_run"]`:cli 对 DANGEROUS=False 的工作流
     恒传 execute=True(缺省即真跑),--dry-run 只体现在单独透传的 dry_run 上。
@@ -155,22 +250,22 @@ def run(params: dict) -> str:
     if params.get("stats"):
         return _error_stats(int(params.get("days", 30)),
                             str(params.get("feed_type", "")))
+    if params.get("stuck"):     # 在途清单(完整码 + 现成命令),只读台账
+        return _inflight_list()
     names = [params["store"]] if params.get("store") else None
     store_list = stores_svc.load_stores(names)
     stores_by_name = {s["name"]: s for s in store_list}
 
     if params.get("feed_id"):       # 诊断模式:只打印详情,不动台账不跑反哺器
-        feed_id = str(params["feed_id"])
-        store = stores_by_name.get(str(params.get("store") or ""))
+        found = _resolve_feed(str(params["feed_id"]),
+                              str(params.get("store") or ""))
+        if isinstance(found, str):          # 查无 / 前缀撞多条:原话回给人
+            return found
+        feed_id, owner = found
+        store = stores_by_name.get(owner)
         if store is None:
-            with db.pg_conn() as conn, conn.cursor() as cur:
-                cur.execute("SELECT store FROM ops.feed_log WHERE feed_id = %s",
-                            (feed_id,))
-                row = cur.fetchone()
-            if not row or row[0] not in stores_by_name:
-                return (f"feed {feed_id} 不在台账中或店铺未加载:"
-                        f"请补 -p store=<店铺名>")
-            store = stores_by_name[row[0]]
+            return (f"feed {feed_id} 在台账里属于店铺 {owner},但该店未加载"
+                    f"(不在营或凭证缺失):补 -p store={owner} 再试")
         # 明说这一模式不写任何东西:所有者 2026-08-09 用它查了维护 feed,
         # 看到结果却发现飞书没变——两条路径长得太像,不说就会被当成故障
         return (_explain(store, feed_id)

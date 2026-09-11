@@ -165,8 +165,12 @@ def unresolved(results: dict) -> tuple[int, int]:
     return len(open_), sum(1 for o in open_ if o == "unknown")
 
 
-def _age_hours(since) -> float | None:
-    """输入:提交时刻 → 输出:至今几小时;拿不到时刻(None/非时间)给 None。"""
+def age_hours(since) -> float | None:
+    """输入:提交时刻 → 输出:至今几小时;拿不到时刻(None/非时间)给 None。
+
+    在途年龄取 `ops.feed_log.updated_at`(这个 feedId 落 submitted 的时刻),
+    **不是 created_at** —— 理由见 `api/feeds.query_pending` 的注释。
+    """
     if not isinstance(since, datetime):
         return None
     if since.tzinfo is None:            # 裸时间按 UTC 读(库里存的是 timestamptz)
@@ -174,14 +178,16 @@ def _age_hours(since) -> float | None:
     return max((datetime.now(timezone.utc) - since).total_seconds() / 3600, 0.0)
 
 
-def _is_stuck(rec: dict) -> bool:
-    """输入:在途 feed 记录 → 输出:是否老到不该再逐条复读(见 FEED_QUIET_HOURS)。
+def is_stuck(age_h: float | None) -> bool:
+    """输入:在途年龄(小时)→ 输出:是否老到不该再逐条复读(见 FEED_QUIET_HOURS)。
 
     年龄拿不到(None)一律当**新鲜**:折叠的语义是"这条别再播了",拿不确定的
     年龄去折,会把刚提交的 feed 从摘要里抹掉 —— 宁可多播一行,不可少播一行。
+
+    摘要折叠(`poll_all`)与清单点名(`feed_poll -p stuck=1`)共用这一处口径:
+    两处各写一个阈值的表现是通知里折掉了、清单里却不认为它卡住。
     """
-    age = rec.get("age_h")
-    return age is not None and age >= FEED_QUIET_HOURS
+    return age_h is not None and age_h >= FEED_QUIET_HOURS
 
 
 def _who(rec: dict) -> str:
@@ -442,7 +448,7 @@ def poll_all(stores_by_name: dict) -> str:
                 # status/feed_id/updated_at,created_at 留的是这个 payload_key
                 # 第一次提交的时刻(可能是几个月前),拿它当年龄会把刚提交的
                 # feed 一上来就判成"卡了三个月"、当场从摘要里折掉。
-                "age_h": _age_hours(r.get("updated_at")),
+                "age_h": age_hours(r.get("updated_at")),
             }
             out.append(rec)
             if store is None:
@@ -502,7 +508,7 @@ def poll_all(stores_by_name: dict) -> str:
                 # 落定的**永远**出明细行:那是新信息,而且下一轮这个 feed 就
                 # 不在队列里了,只播这一次。仍在途的按年龄分档:新鲜的照旧出
                 # 明细(人正等着它),老的折进下面那一行(见 FEED_QUIET_HOURS)。
-                if rec["state"] != "settled" and _is_stuck(rec):
+                if rec["state"] != "settled" and is_stuck(rec["age_h"]):
                     stuck.append(rec)
                 else:
                     detail_lines.append(f"  {_who(rec)}:{rec['detail']}")
@@ -519,11 +525,12 @@ def poll_all(stores_by_name: dict) -> str:
         detail_lines.append(
             f"  ⏳ 长期在途 {len(stuck)} 个(提交超过 {FEED_QUIET_HOURS:g}h 仍未"
             f"落定,最久 {oldest:.1f}h,明细不再逐轮复读):{names}")
+        # ⚠ 上面那些 feed_id 是**截断**的(头 18 位),飞书里复制到的就是那一段
+        # ——所以指引不能是"拿 feed_id 去查"(2026-09-11 所有者:「我找不到这些
+        # feed 的完整的码了」)。`-p stuck=1` 只读台账,直接给完整码与现成命令。
         detail_lines.append(
-            "    逐 SKU 看 `python cli.py feed_poll -p store=<店铺> "
-            "-p feed_id=<feed>`;全量 `SELECT store, feed_type, workflow, "
-            "feed_id, updated_at FROM ops.feed_log WHERE status='submitted' "
-            "ORDER BY updated_at`;处理见 docs/feed_closure_audit.md §三.4")
+            "    完整码 + 现成命令:`python cli.py feed_poll -p stuck=1`"
+            "(只读台账,不调沃尔玛);处理见 docs/feed_closure_audit.md §三.4")
 
     if pendings:
         logger.warning("feed_log 有 %d 条 pending(提交结局不确定),"

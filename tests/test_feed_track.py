@@ -833,3 +833,139 @@ def test_query_pending_carries_the_submit_moment(monkeypatch):
     monkeypatch.setattr(db, "pg_conn", contextlib.contextmanager(lambda: iter([c])))
     assert feeds.query_pending() == []
     assert "updated_at" in c[0]
+
+
+# ── 通知里那串截断的码要能用(2026-09-11 所有者:「我找不到这些 feed 的完整的码了」)
+
+class _Rows(list):
+    """按 execute 的参数返回固定行集的最小假连接。"""
+
+    def __init__(self, rows):
+        super().__init__()
+        self.rows = rows
+
+    def cursor(self):
+        return self
+
+    def execute(self, sql, args=None):
+        self.append((sql, args))
+
+    def fetchall(self):
+        return self.rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _fake_rows(monkeypatch, rows):
+    import contextlib
+
+    from registry import db
+    conn = _Rows(rows)
+    monkeypatch.setattr(db, "pg_conn",
+                        contextlib.contextmanager(lambda: iter([conn])))
+    return conn
+
+
+def test_feed_id_accepts_the_truncated_code_from_the_summary(monkeypatch):
+    """摘要里的码是头 18 位 + 「…」,粘过来就该能查 —— 完整码一直在台账里。
+
+    不认前缀的表现是人拿着通知里那串去跑诊断,得到"不在台账中",而他手上
+    再没有别的地方能拿到完整码(所有者 2026-09-11 实见)。
+    """
+    from workflows import feed_poll
+
+    conn = _fake_rows(monkeypatch, [
+        ("18CEF5AC89245FD596ABCDEF", "A085朱丽霖", "submitted", "t")])
+    assert feed_poll._resolve_feed("18CEF5AC89245FD596…") == (
+        "18CEF5AC89245FD596ABCDEF", "A085朱丽霖")
+    sql, args = conn[0]
+    assert "LIKE" in sql and args[0] == "18CEF5AC89245FD596%"   # 前缀查,省略号吃掉
+
+
+def test_a_prefix_that_hits_several_feeds_never_guesses(monkeypatch):
+    """前缀撞多条 ⇒ 摊开候选让人挑,**绝不**回退到"按原样查"。
+
+    截断的码拿去问沃尔玛只会查无,而查无长得像"这个 feed 不存在" —— 人会
+    以为 feed 丢了,实际是我们拿半截码去查的。
+    """
+    from workflows import feed_poll
+
+    _fake_rows(monkeypatch, [("18CE2095E6975E388B11", "A109黄威威", "submitted", "t"),
+                             ("18CE2095A15D51BA8622", "L001贾林红", "submitted", "t")])
+    out = feed_poll._resolve_feed("18CE2095", store_hint="A109黄威威")
+    assert isinstance(out, str)
+    assert "匹配到 2 条" in out
+    assert "18CE2095E6975E388B11" in out and "18CE2095A15D51BA8622" in out
+
+
+def test_an_exact_code_wins_over_a_longer_sibling(monkeypatch):
+    """一个完整码恰好是另一个码的前缀时,人打的是哪个就查哪个。"""
+    from workflows import feed_poll
+
+    _fake_rows(monkeypatch, [("18CE2095", "A109黄威威", "done", "t"),
+                             ("18CE2095AA", "L001贾林红", "submitted", "t")])
+    assert feed_poll._resolve_feed("18CE2095") == ("18CE2095", "A109黄威威")
+
+
+def test_a_feed_outside_the_ledger_still_works_with_an_explicit_store(monkeypatch):
+    """台账里没有(旧系统 / Seller Center 手发的 feed):指名店铺就按原样直查;
+    不指名则明说去哪儿找码,而不是干巴巴一句"不在台账中"。"""
+    from workflows import feed_poll
+
+    _fake_rows(monkeypatch, [])
+    assert feed_poll._resolve_feed("ZZZ999", store_hint="A085朱丽霖") == (
+        "ZZZ999", "A085朱丽霖")
+    _fake_rows(monkeypatch, [])
+    out = feed_poll._resolve_feed("ZZZ999")
+    assert isinstance(out, str) and "-p stuck=1" in out
+
+
+def test_stuck_list_prints_full_codes_and_ready_to_paste_commands(monkeypatch):
+    """`-p stuck=1`:完整 feed_id + 卡了多久 + 每条现成的诊断命令,老的在前。
+
+    纯读 ops.feed_log,一个沃尔玛接口都不调 —— 卡住的 feed 要人工处置,
+    第一步就是"到底是哪几条、码是什么"。
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from workflows import feed_poll
+
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(feeds, "query_pending", lambda: [
+        {"status": "submitted", "feed_id": "FRESH0001", "store": "A109黄威威",
+         "feed_type": "MP_ITEM", "workflow": "list_new", "created_at": now,
+         "updated_at": now - timedelta(minutes=20)},
+        {"status": "submitted", "feed_id": "18CC2F2D11BA547E88FULL",
+         "store": "A162朱行", "feed_type": "DELETE_ITEM",
+         "workflow": "product_clear", "created_at": now,
+         "updated_at": now - timedelta(hours=300)},
+        {"status": "pending", "feed_id": None, "store": "A171罗尹鸿",
+         "feed_type": "MP_INVENTORY", "workflow": "maintenance",
+         "created_at": "2026-09-01"},
+    ])
+    out = feed_poll._inflight_list()
+    lines = out.splitlines()
+    assert "在途 feed 2 条(老的在前),其中卡超过 2h 的 1 条" in lines[0]
+    assert "18CC2F2D11BA547E88FULL" in out                      # 完整码,不截断
+    assert ("python cli.py feed_poll -p store=A162朱行 "
+            "-p feed_id=18CC2F2D11BA547E88FULL" in out)          # 粘了就能跑
+    assert lines[1].startswith("  ⏳ A162朱行")                   # 老的在前 + 点名
+    assert "FRESH0001" in out and "⏳ A109黄威威" not in out       # 新鲜的不点 ⏳
+    assert "另有 pending 1 条" in out                             # 另一个口子也带上
+
+
+def test_stuck_list_and_the_summary_fold_share_one_threshold():
+    """卡多久的口径只有 `feed_track.is_stuck` 一处:两处各写一个阈值的表现是
+    通知里折掉了、清单里却不认为它卡住(反过来也一样)。"""
+    from workflows import feed_poll
+
+    assert feed_track.is_stuck(None) is False          # 年龄未知一律当新鲜
+    assert feed_track.is_stuck(feed_track.FEED_QUIET_HOURS - 0.01) is False
+    assert feed_track.is_stuck(feed_track.FEED_QUIET_HOURS) is True
+    src = __import__("inspect").getsource(feed_poll._inflight_list)
+    assert "feed_track.is_stuck" in src and "FEED_QUIET_HOURS" not in src.replace(
+        "feed_track.FEED_QUIET_HOURS", "")     # 只准引用,不准自带一个阈值

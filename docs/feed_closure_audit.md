@@ -221,15 +221,19 @@ feed_poll 挂 0/30 分两班 ⇒ **同一段明细一天原样发 48 遍**。人
 **与 submitted**)一律拒绝同载荷重提,于是那批 SKU 的那个动作再也发不出去,
 表现与第 3 节那段「看起来完全正常」一字不差。
 
-识别信号:
+识别与取证(**先跑第一条**:轮询摘要里的 feed_id 是截断的,截断的码拼不回完整码):
+
+```bash
+python cli.py feed_poll -p stuck=1     # 在途清单:完整 feed_id + 卡了多久 + 现成命令
+python cli.py feed_poll -p store=<店铺> -p feed_id=<feed>   # 卡在哪个 SKU、卡成什么样
+#   ⤷ feed_id 可以只给前缀:通知里那串截断的码(头 18 位)直接粘过来
+```
 
 ```sql
--- 在途超过一天的行:正常 feed 几分钟就落定,这里剩下的都是卡住的
+-- 同一件事的 SQL 版(在途超过一天:正常 feed 几分钟就落定,剩下的都是卡住的)
 SELECT store, feed_type, workflow, feed_id, updated_at
 FROM ops.feed_log WHERE status = 'submitted'
   AND updated_at < now() - interval '1 day' ORDER BY updated_at;
--- 卡在哪个 SKU、卡成什么样(只读,不动台账、不跑反哺器)
--- python cli.py feed_poll -p store=<店铺> -p feed_id=<feed>
 ```
 
 ⚠ 年龄一律按 `updated_at` 算,**不是 `created_at`**:`_log_claim` 重占终态行时
@@ -249,6 +253,11 @@ FROM ops.feed_log WHERE status = 'submitted'
   轮询、照旧不落定。
 - `_FEED_LABEL` 补齐八个 feedType(`MP_INVENTORY` / `MP_ITEM_MATCH` 此前漏登记,
   摘要里蹦的是裸 feedType),守门测试拦下一次遗漏。
+- **截断的码能用了**:摘要里只有头 18 位,而人手上再没有别的地方能拿到完整码
+  (所有者 2026-09-11:「我找不到这些 feed 的完整的码了」)。两条路 ——
+  `-p feed_id=` 认**前缀**(末尾省略号顺手吃掉;撞多条就摊开候选,绝不拿半截
+  码去问沃尔玛),新增 `-p stuck=1` 直接列出在途清单(完整码 + 卡了多久 +
+  每条粘了就能跑的诊断命令,只读台账)。
 
 **没修、要所有者拍板的那一半**:在途 feed 等多久才该判死?判死之后
 

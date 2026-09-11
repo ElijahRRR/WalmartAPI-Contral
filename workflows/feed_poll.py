@@ -3,7 +3,11 @@
 用法:
   python cli.py feed_poll                 # 轮询 ops.feed_log 全部在途 feed
   python cli.py feed_poll -p stuck=1      # 在途清单:**完整 feed_id** + 卡了多久
-                                          # + 每条现成的诊断命令(只读台账)
+                                          # + 卡了多少 SKU + 现成的诊断命令(只读台账)
+  python cli.py feed_poll -p stuck=1 -p probe=1
+                                          # 同上,再去沃尔玛问一次 feed 级状态并当场
+                                          # 分档(残留 / 结论没取回来 / 真在跑);
+                                          # 一 feed 一次 GET,零明细翻页,只读
   python cli.py feed_poll -p feed_id=X    # 诊断:打印该 feed 逐 SKU 完整报错
                                           # (只读,不改台账、不跑反哺器)
                                           # X 可以只给**前缀**——摘要里那串截断的
@@ -197,13 +201,92 @@ def _resolve_feed(typed: str, store_hint: str = "") -> tuple[str, str] | str:
             f"要直查台账外的 feed 请补 -p store=<店铺名>")
 
 
-def _inflight_list() -> str:
-    """输入:无 → 输出:在途 feed 清单(完整 feed_id + 卡了多久 + 现成命令)。
+def _ledger_open(feed_ids: list[str]) -> dict[str, int]:
+    """输入:feed_id 列表 → 输出:{feed_id: 台账里仍 submitted 的 SKU 数}。只读。
+
+    「这条 feed 卡住了多少货」——清单里最该有的那一列。一次查询查全部,
+    不逐条问(20 条 feed 就是 20 个来回)。
+    """
+    ids = [f for f in dict.fromkeys(feed_ids) if f]
+    if not ids:
+        return {}
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT feed_id, count(*) FROM ops.feed_items "
+                    "WHERE feed_id = ANY(%s) AND status = 'submitted' "
+                    "GROUP BY 1", (ids,))
+        return {fid: n for fid, n in cur.fetchall()}
+
+
+def _probe_heads(stores_by_name: dict, srows: list[dict]) -> dict[str, str]:
+    """输入:店铺表 + 在途行 → 输出:{feed_id: 沃尔玛 feed 级状态一句话}。
+
+    **feed 级 GET(`limit=0`),零明细翻页**,一个 feed 一次请求 —— 它只回答
+    「沃尔玛那边到底怎么说」。跨店并发、店内串行,理由与 `poll_all` 同一条:
+    配额按 `(店, 端点)` 计,店内并发只会让自己排队等退避。
+    只读,不写任何台账。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    by_store: dict[str, list[dict]] = {}
+    for r in srows:
+        by_store.setdefault(r["store"], []).append(r)
+
+    def _one(store_name: str, rows: list[dict]) -> dict[str, object]:
+        store = stores_by_name.get(store_name)
+        out: dict[str, object] = {}
+        for r in rows:
+            if store is None:
+                out[r["feed_id"]] = "店铺凭证缺失,没问"
+                continue
+            try:
+                out[r["feed_id"]] = feeds.get_feed_status(store, r["feed_id"])
+            except Exception as e:
+                out[r["feed_id"]] = f"查询失败({e})"
+        return out
+
+    got: dict[str, object] = {}
+    if by_store:
+        with ThreadPoolExecutor(
+                max_workers=min(stores_svc.STORE_WORKERS, len(by_store))) as pool:
+            for d in pool.map(lambda kv: _one(*kv), list(by_store.items())):
+                got.update(d)
+    return got
+
+
+def _verdict(head: dict, n_open: int) -> str:
+    """输入:沃尔玛 feed 级汇总 + 台账未落定数 → 输出:这条卡在哪一档(人话)。
+
+    三档的处置完全不同,而光看台账、或光看沃尔玛,都分不出是哪一档:
+      · 沃尔玛已终态、台账还有未落定 ⇒ **残留**:那几个 SKU 自己的
+        ingestionStatus 不是终态(INPROGRESS / 枚举没认出来),feed 因此永不收工;
+      · 沃尔玛没终态、但已经给出成功/失败计数 ⇒ **结论在沃尔玛手上,我们没去取**:
+        `poll_feed` 对非终态 feed 只读 head 计数、不翻明细,于是这些 SKU 在飞书上
+        一直是"处理中",哪怕沃尔玛早就判完了;
+      · 沃尔玛没终态、且全在待处理 ⇒ 它**真的还在跑**,等就行。
+
+    ⚠ 收的是 head **原件**,不是 `_progress` 拼好的那句话:去反解自己刚拼的
+    字符串,等于给同一份数字造第二个出处,改一处忘一处就静默错档。
+    """
+    if head.get("feedStatus") in feeds.FEED_TERMINAL:
+        return (f"⇒ 残留:沃尔玛已终态,{n_open} 个 SKU 的逐条状态仍非终态"
+                if n_open else "⇒ 沃尔玛已终态,下轮轮询即收工")
+    resolved = (head.get("itemsSucceeded") or 0) + (head.get("itemsFailed") or 0)
+    if resolved:
+        return f"⇒ 沃尔玛已给 {resolved} 个结论,台账一个没落(非终态 feed 不翻明细)"
+    return "⇒ 沃尔玛确实还在跑(全部待处理)"
+
+
+def _inflight_list(stores_by_name: dict | None = None) -> str:
+    """输入:(可选)店铺表 → 输出:在途 feed 清单(完整 feed_id + 卡了多久 + 现成命令)。
 
     纯读 ops.feed_log(`feeds.query_pending`),**一个沃尔玛接口都不调**。
     存在的理由:轮询摘要里的码是截断的,而截断的码拼不回完整码;卡住的 feed
     要人工处置,第一步就是"到底是哪几条"。卡多久的口径与摘要折叠同一处
     (`feed_track.is_stuck`)。
+
+    给了 `stores_by_name`(`-p probe=1`)就**再去沃尔玛问一次 feed 级状态**
+    并当场分档(见 `_verdict`):台账说"未落定"有三种完全不同的原因,
+    不并排看就分不出来。仍然只读 —— 一个字都不写台账。
     """
     rows = feeds.query_pending()
     subs = [r for r in rows if r["status"] == "submitted" and r["feed_id"]]
@@ -211,23 +294,35 @@ def _inflight_list() -> str:
     if not subs and not pends:
         return "ops.feed_log 里没有在途 feed(全部已落定)"
 
+    heads = _probe_heads(stores_by_name, subs) if stores_by_name else {}
+    opens = _ledger_open([r["feed_id"] for r in subs])
     ages = {id(r): feed_track.age_hours(r.get("updated_at")) for r in subs}
     # 老的在前;年龄未知的排最后(不知道多久 ≠ 刚提交,但也不能冒充最老)
     subs.sort(key=lambda r: (ages[id(r)] is None, -(ages[id(r)] or 0.0)))
     n_stuck = sum(1 for r in subs if feed_track.is_stuck(ages[id(r)]))
 
     out = [f"在途 feed {len(subs)} 条(老的在前),其中卡超过 "
-           f"{feed_track.FEED_QUIET_HOURS:g}h 的 {n_stuck} 条"]
+           f"{feed_track.FEED_QUIET_HOURS:g}h 的 {n_stuck} 条;"
+           f"台账里共 {sum(opens.values()):,} 个 SKU 卡在「处理中」"]
     for r in subs:
         age = ages[id(r)]
         mark = "⏳ " if feed_track.is_stuck(age) else "   "
         label = feed_track._FEED_LABEL.get(r["feed_type"], r["feed_type"])
         out.append(f"  {mark}{r['store']} {label} {r['feed_type']}"
                    f"({r['workflow'] or '-'})  {r['feed_id']}")
+        n_open = opens.get(r["feed_id"], 0)
         out.append(f"        提交于 {r.get('updated_at') or '?'}"
                    + (f",卡 {age:.1f}h" if age is not None else ",年龄未知")
+                   + f",台账未落定 {n_open}"
                    + f"  →  python cli.py feed_poll -p store={r['store']} "
                      f"-p feed_id={r['feed_id']}")
+        head = heads.get(r["feed_id"])
+        if isinstance(head, dict):
+            out.append(f"        沃尔玛:{head.get('feedStatus')},"
+                       f"{feed_track._progress(head)}  "
+                       f"{_verdict(head, n_open)}".rstrip())
+        elif head:                      # 凭证缺失 / 查询失败:原话摆出来
+            out.append(f"        沃尔玛:{head}")
     if pends:
         # pending 是另一个口子(提交结局不确定,**系统不会自动补交**),
         # 它连 feed_id 都没有,查不了逐 SKU —— 处理两步见文档
@@ -250,9 +345,12 @@ def run(params: dict) -> str:
     if params.get("stats"):
         return _error_stats(int(params.get("days", 30)),
                             str(params.get("feed_type", "")))
-    if params.get("stuck"):     # 在途清单(完整码 + 现成命令),只读台账
-        return _inflight_list()
     names = [params["store"]] if params.get("store") else None
+    if params.get("stuck"):     # 在途清单(完整码 + 现成命令),只读
+        # -p probe=1 才需要凭证:不带它的清单纯读台账,凭证缺失也跑得动
+        return _inflight_list(
+            {s["name"]: s for s in stores_svc.load_stores(names)}
+            if params.get("probe") else None)
     store_list = stores_svc.load_stores(names)
     stores_by_name = {s["name"]: s for s in store_list}
 

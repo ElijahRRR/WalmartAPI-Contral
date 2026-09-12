@@ -665,3 +665,453 @@ def test_receipt_blocked_passes_the_codes_and_the_store_through():
     assert sql is feed_track._RECEIPT_BLOCKED_SQL
     assert args["codes"] == ["A", "B"] and args["store"] == "T1"
     assert args["feeds"] == list(feed_track.DESTRUCTIVE_FEED_TYPES)
+
+
+# ── 在途 feed 的摘要口径(2026-09-11)────────────────────────────────────────
+# 所有者实见:飞书里这五行每 30 分钟原样再来一遍 ——
+#   A085朱丽霖 改价(maintenance) 18CEF5AC…:INPROGRESS,已收 15,成功 12,失败 2,待处理 1
+#   A109黄威威 上架(list_new) 18CE2095…:已落定 PROCESSED,成功 451,失败 42
+#   …
+# 两件事凑出来的:① 说"已落定"的那几条**其实没落定**(残留 SKU 仍 processing
+# ⇒ poll_feed 不调 mark_feed_done,行留在 feed_log 里下轮重查);② 在途行永不
+# 老化,于是同一段明细一天播 48 遍。下面这组钉住修法。
+
+def _inflight(store="T1", fid="F1", ft="DELETE_ITEM", wf="", age_h=None,
+              created_age_h=None):
+    """在途 feed_log 行;age_h 给了就按"几小时前提交"落 updated_at。"""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    return {"status": "submitted", "feed_id": fid, "store": store,
+            "feed_type": ft, "workflow": wf,
+            "created_at": (now - timedelta(hours=created_age_h)
+                           if created_age_h is not None else "t"),
+            "updated_at": (now - timedelta(hours=age_h)
+                           if age_h is not None else None)}
+
+
+def test_unresolved_counts_the_residue_and_splits_out_unknown():
+    """(未落定数, 其中状态未知数)——**收工判据只有这一处**。
+
+    第二个数是给摘要分因用的:processing 是沃尔玛还在跑(等就行),unknown 是
+    `sku_outcome` 没认出来的枚举值(等到天荒地老也不会变,得补码表)。
+    """
+    assert feed_track.unresolved({}) == (0, 0)
+    assert feed_track.unresolved({"A": ("success", ""), "B": ("failed", "E")}) == (0, 0)
+    assert feed_track.unresolved({"A": ("processing", ""), "B": ("unknown", ""),
+                                  "C": ("success", "")}) == (2, 1)
+
+
+def test_terminal_feed_with_residue_never_claims_it_settled(monkeypatch):
+    """feed 终态 ≠ 落定:有残留就不许说"已落定",也不许计进 `落定 N`。
+
+    poll_feed 这时**不**调 mark_feed_done(残留 SKU 要留在在途队列里下轮重查,
+    否则它们永久卡 submitted、在途拦截会永远跳过)。摘要却说"已落定 PROCESSED,
+    成功 451,失败 42"的后果:行还在 feed_log 里,下一轮一字不差再播一遍、
+    `落定` 每轮把同一个 feed 重数一次 —— 每句话都对,合起来是假的。
+    """
+    monkeypatch.setattr(feeds, "query_pending",
+                        lambda: [_inflight(fid="F1", ft="MP_ITEM", wf="list_new")])
+    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f: (
+        {"feedStatus": "PROCESSED"},
+        {"A": ("success", ""), "B": ("failed", "E1"), "C": ("processing", "")}))
+    out = feed_track.poll_all({"T1": STORE})
+    assert "已落定" not in out
+    assert "落定 0,仍处理中 1" in out
+    assert "T1 上架(list_new) F1:PROCESSED 已终态,但 1 个 SKU 未落定" in out
+
+
+def test_residue_says_out_loud_when_it_is_an_unrecognised_enum(monkeypatch):
+    """残留是 unknown 时摘要要点破:枚举可能已扩,光等是等不来的。
+
+    `sku_outcome` 对没见过的 ingestionStatus 返回 unknown 并告警 —— 那条告警
+    只在日志里,而摘要是发去飞书的那一份。不说,人只看得到"还有 3 个没落定",
+    以为沃尔玛慢,实际是码表该补了。
+    """
+    monkeypatch.setattr(feeds, "query_pending", lambda: [_inflight(fid="F1")])
+    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f: (
+        {"feedStatus": "PROCESSED"},
+        {"A": ("success", ""), "B": ("unknown", "")}))
+    out = feed_track.poll_all({"T1": STORE})
+    assert "1 个状态未知" in out and "枚举可能已扩" in out
+
+
+def test_long_in_flight_feeds_fold_into_one_line_with_a_next_step(monkeypatch):
+    """超过静默闸的在途 feed:折成一行点名,不再逐条复读明细。
+
+    feed_poll 挂 0/30 分两班;卡住的 feed 一天把同一段明细原样发 48 遍,而人
+    对固定文案的反应是不看 —— 真出事的那一轮跟着一起漏掉。折叠只动**排版**:
+    这些行照旧每轮轮询、照旧不落定,一个业务判断都没改。
+    """
+    monkeypatch.setattr(feeds, "query_pending", lambda: [
+        _inflight(fid="F1", ft="MP_MAINTENANCE", wf="maintenance", age_h=36.0),
+        _inflight(fid="F2", ft="MP_INVENTORY", wf="maintenance", age_h=5.0)])
+    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f: (
+        {"feedStatus": "INPROGRESS", "itemsReceived": 15, "itemsSucceeded": 12,
+         "itemsFailed": 2}, None))
+    out = feed_track.poll_all({"T1": STORE})
+    assert "F1" not in out and "F2" not in out          # 明细不再逐条复读
+    assert "⏳ 长期在途 2(最久 36.0h)" in out            # 首行带结论(规矩 1)
+    assert "T1 维护(卡 36h)、T1 分仓库存(卡 5h)" in out   # 点得出是哪几个
+    assert "docs/feed_closure_audit.md" in out          # 自带处置(规矩 3)
+    assert "feed 轮询:2 个在途,落定 0,仍处理中 2" in out
+
+
+def test_a_fresh_in_flight_feed_keeps_its_own_detail_line(monkeypatch):
+    """刚提交的在途 feed 照旧出明细行:人正等着它,进度是有用信息。
+
+    ⚠ 年龄按 **updated_at**(这个 feedId 的提交时刻)算,不是 created_at ——
+    `_log_claim` 重占终态行时不重置 created_at,这一行的 created_at 是 100 小时
+    前那次同载荷提交留下的。拿 created_at 当年龄,刚提交的 feed 一上来就被判成
+    "卡了四天"、当场从摘要里折掉。
+    """
+    monkeypatch.setattr(feeds, "query_pending", lambda: [
+        _inflight(fid="F1", age_h=0.5, created_age_h=100.0)])
+    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f: (
+        {"feedStatus": "INPROGRESS", "itemsReceived": 10, "itemsSucceeded": 3,
+         "itemsFailed": 1}, None))
+    out = feed_track.poll_all({"T1": STORE})
+    assert "T1 删除(-) F1:INPROGRESS,已收 10,成功 3,失败 1,待处理 6" in out
+    assert "长期在途" not in out
+
+
+def test_an_unknowable_age_counts_as_fresh(monkeypatch):
+    """年龄拿不到(updated_at 缺)一律当新鲜:宁可多播一行,不可少播一行。"""
+    monkeypatch.setattr(feeds, "query_pending", lambda: [_inflight(fid="F1")])
+    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f: (
+        {"feedStatus": "INPROGRESS"}, None))
+    out = feed_track.poll_all({"T1": STORE})
+    assert "T1 删除(-) F1:INPROGRESS" in out and "长期在途" not in out
+
+
+def test_a_feed_that_finally_settles_prints_even_after_days(monkeypatch):
+    """落定永远出明细行,哪怕它在途了四天:那是**新信息**,而且下一轮这个
+    feed 就出队了,只播这一次 —— 折叠折的是"还会再播 47 遍"的那些。"""
+    monkeypatch.setattr(feeds, "query_pending",
+                        lambda: [_inflight(fid="F1", age_h=99.0)])
+    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f: (
+        {"feedStatus": "PROCESSED"}, {"A": ("success", "")}))
+    out = feed_track.poll_all({"T1": STORE})
+    assert "T1 删除(-) F1:已落定 PROCESSED,成功 1,失败 0" in out
+    assert "长期在途" not in out
+
+
+def test_every_submittable_feed_type_has_a_chinese_label():
+    """摘要里不许再蹦裸 feedType(2026-09-11 实见「A171罗尹鸿 MP_INVENTORY」)。
+
+    漏登记不报错,只是运营看不出那是分仓库存 —— 守门测试比"记得去加"可靠。
+    """
+    from api.feeds import _SLICE_LIMITS
+    missing = [ft for ft in _SLICE_LIMITS if ft not in feed_track._FEED_LABEL]
+    assert not missing, f"_FEED_LABEL 漏登记 feedType: {missing}"
+
+
+def test_query_pending_carries_the_submit_moment(monkeypatch):
+    """query_pending 必须带 updated_at:在途年龄是拿它算的(见上一条的理由)。"""
+    import contextlib
+
+    from registry import db
+
+    class _C(list):
+        description = ()
+
+        def cursor(self):
+            return self
+
+        def execute(self, sql, args=None):
+            self.append(sql)
+
+        def fetchall(self):
+            return []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    c = _C()
+    monkeypatch.setattr(db, "pg_conn", contextlib.contextmanager(lambda: iter([c])))
+    assert feeds.query_pending() == []
+    assert "updated_at" in c[0]
+
+
+# ── 通知里那串截断的码要能用(2026-09-11 所有者:「我找不到这些 feed 的完整的码了」)
+
+class _Rows(list):
+    """按 execute 的参数返回固定行集的最小假连接。"""
+
+    def __init__(self, rows):
+        super().__init__()
+        self.rows = rows
+
+    def cursor(self):
+        return self
+
+    def execute(self, sql, args=None):
+        self.append((sql, args))
+
+    def fetchall(self):
+        return self.rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _fake_rows(monkeypatch, rows):
+    import contextlib
+
+    from registry import db
+    conn = _Rows(rows)
+    monkeypatch.setattr(db, "pg_conn",
+                        contextlib.contextmanager(lambda: iter([conn])))
+    return conn
+
+
+def test_feed_id_accepts_the_truncated_code_from_the_summary(monkeypatch):
+    """摘要里的码是头 18 位 + 「…」,粘过来就该能查 —— 完整码一直在台账里。
+
+    不认前缀的表现是人拿着通知里那串去跑诊断,得到"不在台账中",而他手上
+    再没有别的地方能拿到完整码(所有者 2026-09-11 实见)。
+    """
+    from workflows import feed_poll
+
+    conn = _fake_rows(monkeypatch, [
+        ("18CEF5AC89245FD596ABCDEF", "A085朱丽霖", "submitted", "t")])
+    assert feed_poll._resolve_feed("18CEF5AC89245FD596…") == (
+        "18CEF5AC89245FD596ABCDEF", "A085朱丽霖")
+    sql, args = conn[0]
+    assert "LIKE" in sql and args[0] == "18CEF5AC89245FD596%"   # 前缀查,省略号吃掉
+
+
+def test_a_prefix_that_hits_several_feeds_never_guesses(monkeypatch):
+    """前缀撞多条 ⇒ 摊开候选让人挑,**绝不**回退到"按原样查"。
+
+    截断的码拿去问沃尔玛只会查无,而查无长得像"这个 feed 不存在" —— 人会
+    以为 feed 丢了,实际是我们拿半截码去查的。
+    """
+    from workflows import feed_poll
+
+    _fake_rows(monkeypatch, [("18CE2095E6975E388B11", "A109黄威威", "submitted", "t"),
+                             ("18CE2095A15D51BA8622", "L001贾林红", "submitted", "t")])
+    out = feed_poll._resolve_feed("18CE2095", store_hint="A109黄威威")
+    assert isinstance(out, str)
+    assert "匹配到 2 条" in out
+    assert "18CE2095E6975E388B11" in out and "18CE2095A15D51BA8622" in out
+
+
+def test_an_exact_code_wins_over_a_longer_sibling(monkeypatch):
+    """一个完整码恰好是另一个码的前缀时,人打的是哪个就查哪个。"""
+    from workflows import feed_poll
+
+    _fake_rows(monkeypatch, [("18CE2095", "A109黄威威", "done", "t"),
+                             ("18CE2095AA", "L001贾林红", "submitted", "t")])
+    assert feed_poll._resolve_feed("18CE2095") == ("18CE2095", "A109黄威威")
+
+
+def test_a_feed_outside_the_ledger_still_works_with_an_explicit_store(monkeypatch):
+    """台账里没有(旧系统 / Seller Center 手发的 feed):指名店铺就按原样直查;
+    不指名则明说去哪儿找码,而不是干巴巴一句"不在台账中"。"""
+    from workflows import feed_poll
+
+    _fake_rows(monkeypatch, [])
+    assert feed_poll._resolve_feed("ZZZ999", store_hint="A085朱丽霖") == (
+        "ZZZ999", "A085朱丽霖")
+    _fake_rows(monkeypatch, [])
+    out = feed_poll._resolve_feed("ZZZ999")
+    assert isinstance(out, str) and "-p stuck=1" in out
+
+
+def test_stuck_list_prints_full_codes_and_ready_to_paste_commands(monkeypatch):
+    """`-p stuck=1`:完整 feed_id + 卡了多久 + 每条现成的诊断命令,老的在前。
+
+    纯读 ops.feed_log,一个沃尔玛接口都不调 —— 卡住的 feed 要人工处置,
+    第一步就是"到底是哪几条、码是什么"。
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from workflows import feed_poll
+
+    now = datetime.now(timezone.utc)
+    _fake_rows(monkeypatch, [("18CC2F2D11BA547E88FULL", 298), ("FRESH0001", 7)])
+    monkeypatch.setattr(feeds, "query_pending", lambda: [
+        {"status": "submitted", "feed_id": "FRESH0001", "store": "A109黄威威",
+         "feed_type": "MP_ITEM", "workflow": "list_new", "created_at": now,
+         "updated_at": now - timedelta(minutes=20)},
+        {"status": "submitted", "feed_id": "18CC2F2D11BA547E88FULL",
+         "store": "A162朱行", "feed_type": "DELETE_ITEM",
+         "workflow": "product_clear", "created_at": now,
+         "updated_at": now - timedelta(hours=300)},
+        {"status": "pending", "feed_id": None, "store": "A171罗尹鸿",
+         "feed_type": "MP_INVENTORY", "workflow": "maintenance",
+         "created_at": "2026-09-01"},
+    ])
+    out = feed_poll._inflight_list()
+    lines = out.splitlines()
+    assert "在途 feed 2 条(老的在前),其中卡超过 2h 的 1 条" in lines[0]
+    assert "台账里共 305 个 SKU 卡在「处理中」" in lines[0]   # 卡住多少货
+    assert "18CC2F2D11BA547E88FULL" in out                      # 完整码,不截断
+    assert ("python cli.py feed_poll -p store=A162朱行 "
+            "-p feed_id=18CC2F2D11BA547E88FULL" in out)          # 粘了就能跑
+    assert lines[1].startswith("  ⏳ A162朱行")                   # 老的在前 + 点名
+    assert "FRESH0001" in out and "⏳ A109黄威威" not in out       # 新鲜的不点 ⏳
+    assert "另有 pending 1 条" in out                             # 另一个口子也带上
+
+
+def test_stuck_list_and_the_summary_fold_share_one_threshold():
+    """卡多久的口径只有 `feed_track.is_stuck` 一处:两处各写一个阈值的表现是
+    通知里折掉了、清单里却不认为它卡住(反过来也一样)。"""
+    from workflows import feed_poll
+
+    assert feed_track.is_stuck(None) is False          # 年龄未知一律当新鲜
+    assert feed_track.is_stuck(feed_track.FEED_QUIET_HOURS - 0.01) is False
+    assert feed_track.is_stuck(feed_track.FEED_QUIET_HOURS) is True
+    src = __import__("inspect").getsource(feed_poll._inflight_list)
+    assert "feed_track.is_stuck" in src and "FEED_QUIET_HOURS" not in src.replace(
+        "feed_track.FEED_QUIET_HOURS", "")     # 只准引用,不准自带一个阈值
+
+
+# ── 在途卡住的三种病要分得开(2026-09-11 生产实数据:20 条在途、6162 个 SKU)
+
+def test_verdict_splits_the_three_ways_a_feed_gets_stuck():
+    """台账都写"未落定",但原因有三种,处置完全不同 —— 光看台账分不出来。
+
+      ① 沃尔玛已终态而台账还有未落定 ⇒ **残留**(那几个 SKU 自己不是终态),
+         feed 永不收工,行永不老化;
+      ② 沃尔玛没终态却已给出成功/失败计数 ⇒ **结论在沃尔玛手上、我们没去取**
+         (poll_feed 对非终态 feed 只读 head 不翻明细),飞书上一直"处理中";
+      ③ 沃尔玛没终态且全部待处理 ⇒ 它真的还在跑,等就行。
+    """
+    from workflows import feed_poll
+
+    done_with_residue = {"feedStatus": "PROCESSED", "itemsReceived": 300,
+                         "itemsSucceeded": 298, "itemsFailed": 1}
+    assert "残留" in feed_poll._verdict(done_with_residue, 1)
+    assert "下轮轮询即收工" in feed_poll._verdict(done_with_residue, 0)
+
+    walmart_knows = {"feedStatus": "INPROGRESS", "itemsReceived": 15,
+                     "itemsSucceeded": 12, "itemsFailed": 2}
+    assert "沃尔玛已给 14 个结论,台账一个没落" in feed_poll._verdict(walmart_knows, 15)
+
+    really_running = {"feedStatus": "INPROGRESS", "itemsReceived": 1000,
+                      "itemsSucceeded": 0, "itemsFailed": 0}
+    assert "确实还在跑" in feed_poll._verdict(really_running, 1000)
+
+
+def test_verdict_reads_the_head_itself_not_our_own_formatted_line(monkeypatch):
+    """判档吃 head **原件**,不去反解 `_progress` 拼好的那句话。
+
+    反解自己刚拼的字符串 = 给同一份数字造第二个出处,改一处忘一处就静默错档
+    (而错档的表现是"沃尔玛还在跑",人就真的等下去了)。把 `_progress` 砸了还
+    照样判得对,才算真没走那条路。
+    """
+    from workflows import feed_poll
+
+    def _boom(_head):
+        raise AssertionError("_verdict 不该经过 _progress")
+
+    monkeypatch.setattr(feed_track, "_progress", _boom)
+    assert "沃尔玛已给 14 个结论" in feed_poll._verdict(
+        {"feedStatus": "INPROGRESS", "itemsReceived": 15,
+         "itemsSucceeded": 12, "itemsFailed": 2}, 15)
+
+
+def test_stuck_probe_puts_walmart_next_to_the_ledger(monkeypatch):
+    """`-p probe=1`:feed 级 GET(零明细翻页)的结果与台账并排,当场分档;
+    问不到的(凭证缺失 / HTTP 错)把原话摆出来,不装成"还在跑"。"""
+    import contextlib
+    from datetime import datetime, timedelta, timezone
+
+    from registry import db
+    from workflows import feed_poll
+
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(feeds, "query_pending", lambda: [
+        {"status": "submitted", "feed_id": "F_OLD", "store": "A085朱丽霖",
+         "feed_type": "price", "workflow": "maintenance", "created_at": now,
+         "updated_at": now - timedelta(hours=412.5)},
+        {"status": "submitted", "feed_id": "F_DEAD", "store": "谭总9",
+         "feed_type": "MP_ITEM", "workflow": "list_new", "created_at": now,
+         "updated_at": now - timedelta(hours=5)},
+    ])
+
+    class _C(list):
+        def cursor(self):
+            return self
+
+        def execute(self, sql, args=None):
+            self.append((sql, args))
+
+        def fetchall(self):
+            return [("F_OLD", 15), ("F_DEAD", 40)]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    conn = _C()
+    monkeypatch.setattr(db, "pg_conn",
+                        contextlib.contextmanager(lambda: iter([conn])))
+
+    def _head(store, fid):
+        if fid == "F_DEAD":
+            raise RuntimeError("feed 状态查询失败 HTTP 404")
+        return {"feedStatus": "INPROGRESS", "itemsReceived": 15,
+                "itemsSucceeded": 12, "itemsFailed": 2}
+
+    monkeypatch.setattr(feeds, "get_feed_status", _head)
+    out = feed_poll._inflight_list({"A085朱丽霖": {"name": "A085朱丽霖"},
+                                    "谭总9": {"name": "谭总9"}})
+    assert "台账里共 55 个 SKU 卡在「处理中」" in out      # 首行 = 卡住多少货
+    assert "台账未落定 15" in out                          # 逐条也有
+    assert "沃尔玛:INPROGRESS,已收 15,成功 12,失败 2,待处理 1" in out
+    assert "沃尔玛已给 14 个结论,台账一个没落" in out
+    assert "沃尔玛:查询失败(feed 状态查询失败 HTTP 404)" in out
+    sql = next(s for s, _ in conn if "feed_items" in s)
+    assert "status = 'submitted'" in sql                   # 未落定 = 台账仍 submitted
+
+
+def test_stuck_without_probe_asks_walmart_nothing(monkeypatch):
+    """不带 `-p probe=1` 的清单一个沃尔玛接口都不调 —— 凭证缺失也跑得动,
+    而人要的只是"到底是哪几条、码是什么"。"""
+    import contextlib
+    from datetime import datetime, timezone
+
+    from registry import db
+    from workflows import feed_poll
+
+    now = datetime.now(timezone.utc)
+    monkeypatch.setattr(feeds, "query_pending", lambda: [
+        {"status": "submitted", "feed_id": "F1", "store": "T1",
+         "feed_type": "MP_ITEM", "workflow": "list_new",
+         "created_at": now, "updated_at": now}])
+
+    class _C(list):
+        def cursor(self):
+            return self
+
+        def execute(self, sql, args=None):
+            self.append(sql)
+
+        def fetchall(self):
+            return [("F1", 7)]
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(db, "pg_conn",
+                        contextlib.contextmanager(lambda: iter([_C()])))
+
+    def _boom(*a, **k):
+        raise AssertionError("不带 probe 不许调沃尔玛")
+
+    monkeypatch.setattr(feeds, "get_feed_status", _boom)
+    out = feed_poll._inflight_list()
+    assert "F1" in out and "台账未落定 7" in out and "沃尔玛:" not in out

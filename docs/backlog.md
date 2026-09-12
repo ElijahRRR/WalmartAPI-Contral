@@ -460,3 +460,33 @@ delete/retire 停在 executing 数周;部分唯一索引 `dispositions_open_uidx
 根治方案不变:**ITEM 报表 / 单条 GET 当观测缺席**(对可疑行逐条 `api/items.get_item`,
 404 ⇒ 标 `missing_since`),定案 / 弃码 / 释放 UPC 全走现有路径;单查配额有限,每轮
 限额、几天清完。与 §9.15 的自救用的是同一个端点,可一并落地。
+
+## 十四、新建 item 满 24 小时才能发批量改价(2026-09-12 官方核验,**待核我方链序**)
+
+官方原句(`refdata/walmart_slas.tsv` 有登记,出处
+https://developer.walmart.com/us-marketplace/reference/post_v3-feeds-feedtype-price-and-promotion):
+
+> For newly created items, ensure that the Walmart Part ID (WPID) has been assigned and that
+> **at least 24 hours have passed since item creation** before submitting a bulk price update feed.
+
+我方调度是 `list_new` 20:00、`product_chain`(含 `maintenance` 改价)**次日 13:00**
+—— 相隔 **17 小时 < 24 小时**。而改价选品链路里没看到按 item 年龄过滤的东西
+(`services/maintenance_intents` 只有观测窗口 first_seen/last_seen 那几个 days 过滤,
+那是"观测够不够稳"不是"item 够不够老")。
+
+**待核三问**(没核之前不动代码):
+
+1. 昨夜 20:00 上架的品,次日 13:00 的 `maintenance` 会不会真的被算进改价意图?
+   (list_new 提交时已经按算法给了价,只有亚马逊价格当天漂了才会再生一条意图 ——
+   所以可能"常态不发生、偶发发生",偶发的才最难查。)
+2. 若真发了,回执长什么样?是 DATA_ERROR 带某个码,还是 `status=success` 却**不生效**
+   (后者最坏:台账说成功、线上还是旧价,而且没有任何东西会说)。
+   查法:`ops.feed_item_errors` 按 feed_type='price' 聚合,对着 `catalog.walmart_items`
+   的 wpid 是否为空、以及该 SKU 的 `list_feed_success` 事件时间差 <24h 筛一遍。
+3. 若确认有害,修法**不是**把 maintenance 往后挪(它 13:00 有别的依赖),而是在改价
+   选品处加一条闸:**建品成功事件 <24 小时的 SKU 本轮不改价**,下轮自然轮到。
+   判据来源已有(`catalog.product_events` 的 `list_feed_success`),不新增表。
+
+⚠ 别顺手当 bug 修:官方这句写在**批量价格 feed** 的参考页上,而本仓价格默认走
+`PUT /v3/price` 单品路由(蓝图 §3 的 100/hour 那行),单品路由官方没写这条约束 ——
+先确认我方到底走的哪条路,再决定要不要加闸。

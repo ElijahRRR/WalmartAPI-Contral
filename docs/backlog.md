@@ -166,7 +166,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 - ✅ ~~挂调度:全部工作流一条没挂~~(**2026-08-17 全部上线**:launchd 2 条 + 智能体 9 条,顺序硬约束 `catalog_sync → product_refresh → product_ingest → maintenance` 收在 `product_chain` 一条链里;`feed_poll` 每半小时。唯一出处 `registry/schedule.py`)
 - ✅ ~~停旧 cron 五条~~(**2026-08-17 所有者已全停**并核对;旧上架/审核 worker 按所有者决定保留当备用,不写表)
 - 采集侧一周连续验收(scraper_migration_brief.md:245)未开始;两侧契约副本的定期对账机制未建(:113-116)
-- 连续无货 15 天删除条:2026-08-23 前恒空(采集 08-08 才接线),**该日期已过,待复查**(判据搬到 `services/maintenance_intents.py:100` 的 `LONG_OOS_DAYS` 与 `delete_intents`;同一窗口 2026-08-25 起还分出了「渠道不符 N 天」一档)
+- 连续无货 15 天删除条:2026-08-23 前恒空(采集 08-08 才接线),**该日期已过,待复查**(判据搬到 `services/maintenance_intents.py:100` 的 `LONG_OOS_DAYS` 与 `delete_intents`;同一窗口 2026-08-25 起分出「渠道不符 N 天」、2026-09-14 起再分出「二手 N 天」两档)
 - Phase 1:✅ ~~令牌桶~~(2026-08-12 完成:稀缺桶落 ops.rate_events 跨进程共享,PG 不可达 fail hard——所有者拍板;详见 plan.md Phase 1)、✅ ~~async 订单拉取~~(2026-08-13 完成:fetch_orders_bulk 跨店并发,order_sync 已接线)、feeds errorReport 下载(P3 可选)
 - ✅ ~~历史数据迁移总批次~~(所有者逐项拍板 2026-08-12,**整批关闭**):
   上架表 26 列**不迁**;UPC 池 12 万行**不迁**(还有用的 UPC 所有者手动写入

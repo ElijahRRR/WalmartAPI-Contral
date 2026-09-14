@@ -103,6 +103,30 @@ def feishu_notify_to() -> str | None:
 # 解析天然认 "Yes")。⚠ 错键名 = 闸恒放行("明确真值才拦"方向),改名必须重探。
 AMZ_CUSTOM_FLAG_KEY = "is_customized"
 
+# 二手/翻新判据键(所有者定稿 2026-09-14:「对于二手商品,库存设置为 0,然后沿用
+# 15 天无货就删除的逻辑」)。采集侧 2026-09-14 新增(amazon-scraper-v4 commit
+# 9c70ce0「feat(asin_data): 新增 offer_condition 分辨二手/翻新」),随采集载荷
+# 落 snapshots.raw —— 与 is_customized / is_fba / stock_status 同款先例
+# (契约字段表未列为一等字段,但 `_raw()` 是"裁剪后的原样载荷",本键不在它的
+# 剔除清单里,所以确实到得了我们库里)。
+#
+# 取值域(采集契约 docs/erpapi_contract.md §4.3):
+#   Used - Like New / Used - Very Good / Used - Good / Used - Acceptable /
+#   Open Box / Collectible / Renewed / Refurbished;读不到一律 `N/A`。
+# ⚠ **全新品也是 `N/A` 而不是 `New`** —— 全新 offer 的 buybox 根本不写品相,
+#   所以 `N/A` 的含义是「未知」,不是「全新」。判据据此**反着写**(见
+#   services/maintenance_intents.used_offer),不许在别处正着列白名单。
+# ⚠ 它是**观测值不是产品属性**:同一个 ASIN 上可以同时挂全新与二手 offer,
+#   buybox 换人这个值就变。所以处置是可逆的清零,不是直接删除。
+# ⚠ 错键名 = 闸恒放行(与定制品闸同向:明确真值才拦),改名必须重探:
+#   SELECT raw ->> '<键名>', count(*) FROM catalog.latest_snapshot
+#   WHERE raw ? '<键名>' GROUP BY 1;
+# ⚠ 采集侧该功能**上线后需要一次真实验证**(其 commit 原话:开发环境没有
+#   Amazon 通道、无可回放语料;DOM 结构若已变,症状是**静默全部返回 N/A**)。
+#   在我们这侧的表现就是"一条二手都判不出来",所以首轮真跑要对着上面那条探针
+#   看命中数,别只看摘要没报错。
+AMZ_OFFER_CONDITION_KEY = "offer_condition"
+
 # SKU 身份|来源字母登记(所有者定稿 2026-09-02;sku_plan §2)。
 # ① 这里登记的是**所有者要拍的取值**(source_type → 12 位不透明码的首位字母),
 #    属外部配置,按铁律 3 收在 registry;工作流按自己的 source_type 查表,没人手填。

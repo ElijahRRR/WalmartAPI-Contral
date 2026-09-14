@@ -2,8 +2,11 @@
 
 import contextlib
 import copy
+import pathlib
 import re
 from datetime import date as _date
+
+import pytest
 
 from api import feeds, feishu, inventory as inv_api, prices
 from registry import resources
@@ -113,7 +116,8 @@ class _DelConn(_Conn):
     """删除链假连接:偏移件与「连续无货/渠道不符」两条 SQL **列数不同**。
 
     ⚠ 2026-08-25 之前两条都返 5 列,测试就用一份 rows 喂两边 —— 那是巧合不是
-    契约。渠道维加进来之后 LONG_OOS 返 7 列,共用一份 rows 会当场 ValueError
+    契约。渠道维(2026-08-25)与二手维(2026-09-14)加进来之后 LONG_OOS 返 8 列,
+    共用一份 rows 会当场 ValueError
     (这次就是这么发现的),而列数万一又撞上就会**静默错位**。按 SQL 分开给。
     """
 
@@ -128,7 +132,8 @@ class _DelConn(_Conn):
 def _row(store="T1", sku="B0A", name="Steel Cup", pt="Cups", upc="012345678905",
          wm_price=20.0, avail_qty=10, amz_price=10.0, stock_count=7,
          delivery_days=3, slow=None, fulfillment="FBM", shipping=0.0,
-         outcome="ok", stock_status="In Stock", stock_state="in_stock"):
+         outcome="ok", stock_status="In Stock", stock_state="in_stock",
+         offer_condition="N/A"):
     """一行在线商品夹具(**dict,与 _rows 的真实产出同形**)。
 
     ⚠ 2026-08-16 从元组改成 dict:SQL 加了 outcome/stock_status/stock_state 三列,
@@ -143,7 +148,10 @@ def _row(store="T1", sku="B0A", name="Steel Cup", pt="Cups", upc="012345678905",
                     else {"title": "ACME Steel Cup", "brand": "ACME"},
             "fulfillment": fulfillment, "shipping": shipping,
             "outcome": outcome, "stock_status": stock_status,
-            "stock_state": stock_state}
+            "stock_state": stock_state,
+            # 缺省 N/A = **未知,不是全新**(采集契约:全新品的 buybox 不写品相)。
+            # 判据「未采到不算二手」正是靠这个缺省值在全部既有用例里被钉住
+            "offer_condition": offer_condition}
 
 
 _MULTS = {"T1": {"fbm_range1": "200%", "fbm_range2": "200%"}}
@@ -314,7 +322,8 @@ def test_long_oos_live_cte_carries_the_identity_key():
     assert "o.asin = live.sku" not in q
     assert "GROUP BY live.store, live.sku, live.asin, live.want" in q
     # 最终输出仍是 (store, sku, …):身份键只用来接快照,不外泄
-    assert "SELECT store, sku, obs, first_seen, last_seen, wrong_ch_obs, want" in q
+    assert ("SELECT store, sku, obs, first_seen, last_seen, wrong_ch_obs, "
+            "want, used_obs" in q)
 
 
 def test_variant_offset_intents_gates_and_store_cap(monkeypatch):
@@ -374,7 +383,7 @@ def test_long_oos_delete_sql_guards():
     # 2. 至少一条**明确**卖不了的观测(缺货 或 确定是另一个渠道)
     #    ——防"15 天全是 unknown(采不全)"被当成缺货
     assert "stock_state = 'out_of_stock'" in q
-    assert "oos_obs + wrong_ch_obs > 0" in q
+    assert "oos_obs + wrong_ch_obs + used_obs > 0" in q
     # 3. 窗口两端都有观测——防"两头各采一次、中间断 13 天"被当连续
     assert "interval '36 hours'" in q and "last_seen >= now()" in q
     # 降级采集的 fast 段基本是空的,拿它判缺货是冤案
@@ -410,7 +419,7 @@ def test_long_oos_window_is_evaluated_per_channel():
 
 def test_long_oos_intents_carry_reason(monkeypatch):
     out = mi.delete_intents(
-        _DelConn(oos=[("T1", "B0DEAD", 15, None, None, 0, "")]), [],
+        _DelConn(oos=[("T1", "B0DEAD", 15, None, None, 0, "", 0)]), [],
         oos_days=15)
     assert [(i["sku"], i["code"], i["label"]) for i in out] == [
         ("B0DEAD", "连续无货15天", "删除(连续无货15天)")]
@@ -421,13 +430,161 @@ def test_long_oos_intents_carry_reason(monkeypatch):
 def test_wrong_channel_delete_has_its_own_reason_code(monkeypatch):
     """渠道不符走到头 ≠ 货源断了:原因码分开,删除预览按码分组才说得清。"""
     out = mi.delete_intents(
-        _DelConn(oos=[("T1", "B0WRONG", 15, None, None, 12, "FBA"),
-                      ("T1", "B0DEAD", 15, None, None, 0, "FBA")]), [],
+        _DelConn(oos=[("T1", "B0WRONG", 15, None, None, 12, "FBA", 0),
+                      ("T1", "B0DEAD", 15, None, None, 0, "FBA", 0)]), [],
         oos_days=15)
     assert {i["sku"]: i["code"] for i in out} == {
         "B0WRONG": "渠道不符15天", "B0DEAD": "连续无货15天"}
     why = {i["sku"]: i["reason"] for i in out}
     assert "本店渠道(FBA)" in why["B0WRONG"] and "12 次确认为另一渠道" in why["B0WRONG"]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  二手/翻新 offer(所有者定稿 2026-09-14:「对于二手商品,库存设置为 0,
+#  然后沿用 15 天无货就删除的逻辑」;采集侧字段 offer_condition,commit 9c70ce0)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("value, want", [
+    ("Used - Like New", True), ("Used - Very Good", True),
+    ("Used - Good", True), ("Used - Acceptable", True),
+    ("Open Box", True), ("Collectible", True),
+    ("Renewed", True), ("Refurbished", True),
+    ("Used - Fair", True),          # 契约里还没有的新档位:反着写才认得
+    ("N/A", False), ("n/a", False), ("  N/A  ", False),
+    ("", False), (None, False),
+    ("New", False),                 # 契约说不会出现;真出现按字面读,不反判
+])
+def test_used_offer_reads_the_contract_backwards(value, want):
+    """判据**反着写**:除 N/A / 空 / New 之外都算非全新。
+
+    两条理由都在采集契约里:取值域全是非全新的档位;而**全新品也是 N/A 而不是
+    New**(全新 offer 的 buybox 根本不写品相)。所以 N/A = 未知 ≠ 全新。
+    反着写才对新增档位免疫 —— 正着列白名单会静默漏掉 `Used - Fair` 这种,
+    而漏掉的方向是"当成全新继续卖"。
+    """
+    assert mi.used_offer(value) is want
+
+
+def test_unknown_condition_never_counts_as_used():
+    """**方向题**:未采到一律不算二手(与 is_fba、定制品闸同向)。
+
+    反过来写的后果不是少清几条,是无辜商品先被清零、再被 15 天窗口删掉,
+    而删除不可逆。采集侧这个字段 2026-09-14 才上线且自称未经真实页面验证,
+    DOM 变了就会整批返回 N/A —— 那时这条判据是唯一的护栏。
+    """
+    assert mi.classify(offer_condition=None)[0] is None
+    assert mi.classify(offer_condition="N/A")[0] is None
+
+
+def test_used_offer_zeroes_and_outranks_channel_and_oos():
+    """二手 → 清零,且**排在渠道与无货三档之前**(顺序即优先级)。
+
+    三条都命中时动作一样(清零),差别只在原因码,而处置完全不同:二手是
+    "这个 offer 我们根本不该卖",渠道是"这家店做不了这个渠道",缺货是"等回货"。
+    排在后面就会被天天几百条的缺货盖住。
+    """
+    act, code, why = mi.classify(offer_condition="Used - Good",
+                                 channel_bad=True, channel_note="ch",
+                                 stock_state="out_of_stock")
+    assert (act, code) == ("inventory", "used_offer")
+    assert "Used - Good" in why          # 原因列要读得出是哪一档,机器码读不出
+    # 删除仍压过一切:该删的行不该先花配额去清零
+    assert mi.classify(outcome="not_found",
+                       offer_condition="Renewed")[0] == "delete"
+
+
+def test_inventory_provider_zeroes_used_offers():
+    out = mi.inventory_intents([_row(sku="B0USED", offer_condition="Open Box",
+                                     avail_qty=9, stock_count=9)], {})
+    assert [(i["sku"], i["new"], i["code"]) for i in out] == [
+        ("B0USED", 0, "used_offer")]
+    # 对照组:品相未知的行照常按亚马逊库存走,**不被误伤清零**
+    (same,) = mi.inventory_intents(
+        [_row(sku="B0NEW", offer_condition="N/A", avail_qty=0, stock_count=9)], {})
+    assert (same["sku"], same["new"], same["code"]) == ("B0NEW", 9, "")
+
+
+def test_price_provider_refuses_to_reprice_a_used_offer():
+    """二手**不改价** —— 这是 offer_condition 这个字段存在的头号理由。
+
+    采集契约原话:二手 offer 的 current_price 是**二手价**,与全新价不可混用
+    (实例 B0G449YVHD 采到 $20.70,卖家 Amazon Resale)。改价链的落地价正是
+    amz 现价 + 运费,拿二手价 × 全新倍率改线上价,算得出来、看着也正常、
+    没有任何一侧报错 —— 与"配送方式未知就不改价"同一条纪律。
+
+    ⚠ 这条必须单独钉:price_intents 只在 classify 判 **delete** 时才跳过,
+    而二手返回的是 `inventory` —— 只看 delete 拦不住它(本次接线前的真实状态)。
+    """
+    used = _row(sku="B0USED", offer_condition="Used - Very Good",
+                wm_price=40.0, amz_price=10.0)
+    assert mi.price_intents([used], _MULTS) == []
+    # 对照组:同样的价,品相未知 ⇒ 照常改价(证明拦住它的是品相,不是别的)
+    ok = _row(sku="B0OK", offer_condition="N/A", wm_price=40.0, amz_price=10.0)
+    assert [i["sku"] for i in mi.price_intents([ok], _MULTS)] == ["B0OK"]
+
+
+def test_long_oos_window_counts_used_as_unsellable_evidence():
+    """15 天窗口把二手接成**第三类观测**,与渠道那一维同一种改法。
+
+    最容易漏、且漏了不报错的一处:二手 offer 通常是**有货**的,不从
+    `sellable_obs` 里剔掉的话每条观测都算"卖得了",窗口永远熬不满 ⇒
+    清零了却永远删不掉。
+    """
+    q = mi._SQL_LONG_OOS
+    assert "WHERE o.has_stock AND NOT o.is_used" in q    # 二手不算卖得了
+    assert "count(*) FILTER (WHERE o.is_used) AS used_obs" in q
+    assert "oos_obs + wrong_ch_obs + used_obs > 0" in q  # 算一条明确的卖不了证据
+    # 采不到 ⇒ NULL ⇒ coalesce 成 false ⇒ 算"卖得了",挡住删除(方向题)
+    assert "false) AS is_used" in q
+
+
+def test_long_oos_used_predicate_is_same_source_as_the_python_one():
+    """SQL 谓词与 `used_offer()` **同源**:两处各写一份就是"清零按 A 判、
+    删除按 B 判",而且两边都不报错。键名同理,唯一出处在 registry。"""
+    q = mi._SQL_LONG_OOS
+    assert f"raw ->> '{resources.AMZ_OFFER_CONDITION_KEY}'" in q
+    assert f"NOT IN {mi._NOT_USED_CONDITIONS}" in q
+    # 取数那条 SQL 也走同一个键(否则 classify 永远收到 None)
+    assert f"raw ->> '{resources.AMZ_OFFER_CONDITION_KEY}' AS offer_condition" \
+        in mi._SQL_AMZ_JOIN
+    # 键名不许在 services/workflows 里写字面量(改名时会漏改,且闸恒放行)
+    for path in ("services/maintenance_intents.py", "workflows/maintenance_scan.py"):
+        src = pathlib.Path(path).read_text(encoding="utf-8")
+        # 拦的是 **SQL 里的字面量键名**(单引号那种):改键名时漏改一处,
+        # 闸恒放行且不报错。行 dict 的 `r["offer_condition"]` 是列名不是键名,
+        # 不在此列 —— 列名由本仓的 SQL 自己起,与采集侧改不改名无关。
+        assert "'offer_condition'" not in src, path
+
+
+def test_used_delete_has_its_own_reason_code_and_outranks_channel():
+    """二手走到头 ≠ 货源断了 ≠ 渠道不符:三个原因码分开,删除预览按码分组
+    才说得清该找谁。优先序与 classify 一致(二手 > 渠道 > 缺货)。"""
+    out = mi.delete_intents(
+        _DelConn(oos=[("T1", "B0USED", 15, None, None, 0, "", 9),
+                      ("T1", "B0BOTH", 15, None, None, 4, "FBA", 9),
+                      ("T1", "B0WRONG", 15, None, None, 12, "FBA", 0),
+                      ("T1", "B0DEAD", 15, None, None, 0, "", 0)]), [],
+        oos_days=15)
+    assert {i["sku"]: i["code"] for i in out} == {
+        "B0USED": "二手15天", "B0BOTH": "二手15天",
+        "B0WRONG": "渠道不符15天", "B0DEAD": "连续无货15天"}
+    why = {i["sku"]: i["reason"] for i in out}
+    assert "9 次确认为二手/翻新 offer" in why["B0USED"]
+
+
+def test_scan_summary_names_the_used_rows():
+    """摘要单列一行:补救动作与其余四档都不同(等 buybox 换回全新,或这个品
+    根本不该继续跟卖),而且它会顺着 15 天窗口走到不可逆的删除。"""
+    from workflows import maintenance_scan as ms
+    zeroing = [{"store": "T1", "sku": "A", "code": "used_offer", "reason": "二手"},
+               {"store": "T1", "sku": "B", "code": "used_offer", "reason": "二手"},
+               {"store": "T2", "sku": "C", "code": "used_offer", "reason": "二手"},
+               {"store": "T2", "sku": "D", "code": "out_of_stock", "reason": "缺货"}]
+    lines = ms._used_lines(zeroing)
+    assert "二手/翻新清零 3 行" in lines[0]
+    assert "T1×2" in lines[0] and "T2×1" in lines[0]
+    assert "15 天" in lines[-1]
+    assert ms._used_lines([zeroing[3]]) == []      # 没有二手就不占版面
 
 
 def test_delete_intents_actually_binds_the_store_channels(monkeypatch):
@@ -2344,8 +2501,8 @@ def _collect_conn():
              _row(store="T1", sku="B0I1", avail_qty=5, stock_count=0),
              _row(store="T2", sku="B0I2", avail_qty=5, stock_count=0)],
         offset=[("T1", "B0V1", 1, None, None), ("T2", "B0V2", 1, None, None)],
-        oos=[("T1", "B0O1", 15, None, None, 0, ""),
-             ("T2", "B0O2", 15, None, None, 0, "")],
+        oos=[("T1", "B0O1", 15, None, None, 0, "", 0),
+             ("T2", "B0O2", 15, None, None, 0, "", 0)],
         match=[("T1", "M1", 0, None), ("T2", "M2", 0, None)],
         zero=[("Z1", "S1", 5, None)])
 

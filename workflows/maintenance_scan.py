@@ -87,6 +87,35 @@ def _channel_lines(zeroing: list[dict]) -> list[str]:
     return out
 
 
+def _used_lines(zeroing: list[dict]) -> list[str]:
+    """输入:清零意图 → 输出:二手/翻新那一档的明细行(没有就返空)。
+
+    为什么单独一行,而不是只混在「清零合计」的原因码里:补救动作与其余四档都
+    不同。缺货等回货、渠道不符换店或改配置,而二手是**这个 offer 我们根本不该
+    卖** —— 要么等 buybox 换回全新(它是观测值,会自己变),要么这个品就不该
+    继续跟卖。而且它会顺着 15 天窗口走到不可逆的删除,人得先看见。
+
+    ⚠ 判据来自采集侧 2026-09-14 才上线的 `offer_condition`,且采集侧自己标注
+    **未经真实页面验证**(开发环境没有 Amazon 通道)。DOM 若已变,症状是静默
+    全部返回 N/A ⇒ 这里恒为空。所以**一直是 0 不等于没有二手**,首轮要对着
+    registry.AMZ_OFFER_CONDITION_KEY 头注那条探针 SQL 核一次命中数。
+    """
+    used = [z for z in zeroing if z.get("code") == "used_offer"]
+    if not used:
+        return []
+    by: dict[str, int] = {}
+    for z in used:
+        by[z["store"]] = by.get(z["store"], 0) + 1
+    cells = ",".join(f"{s}×{n}" for s, n in
+                     sorted(by.items(), key=lambda kv: (-kv[1], kv[0])))
+    return [f"  ⚠ 其中二手/翻新清零 {len(used)} 行(buybox 赢的是二手 offer,"
+            f"不是我们要跟卖的全新品;同轮已停止对它们改价 —— 那个价是二手价):"
+            f"{cells}",
+            f"    样本={[(z['store'], z['sku'], z.get('reason', '')[:28]) for z in used[:3]]}",
+            f"    持续二手会被删除链的「二手 {mi.LONG_OOS_DAYS} 天」窗口下架"
+            f"(与缺货、渠道不符同一条阶梯)"]
+
+
 def _preview_lines(intents: list[dict], stockzero: list[str]) -> list[str]:
     """输入:意图 → 输出:人眼闸门要看的几段(删除名单/清零合计/改价分布/分店)。
 
@@ -132,6 +161,7 @@ def _preview_lines(intents: list[dict], stockzero: list[str]) -> list[str]:
         # 五条清零判据在飞书表里长得一模一样(库存 12 → 0),这里按原因码摊开
         lines.append(f"  清零合计 {len(zeroing)} 条,原因:"
                      + ",".join(f"{c}×{n}" for c, n in sorted(codes.items())))
+        lines += _used_lines(zeroing)
         lines += _channel_lines(zeroing)
     by_store: dict[str, dict[str, int]] = {}
     for it in intents:

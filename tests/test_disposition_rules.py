@@ -80,7 +80,8 @@ def _row(**kw):
             "avail_qty": 10, "amz_price": 10.0, "stock_count": 7,
             "delivery_days": 3, "slow": {"title": "ACME Steel Cup", "brand": "ACME"},
             "fulfillment": "FBM", "shipping": 0.0, "outcome": "ok",
-            "stock_status": "In Stock", "stock_state": "in_stock"}
+            "stock_status": "In Stock", "stock_state": "in_stock",
+            "offer_condition": "N/A"}
     base.update(kw)
     return base
 

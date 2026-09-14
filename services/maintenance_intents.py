@@ -29,6 +29,7 @@ delete 是唯一的**不可逆**类(采集永久偏移 / 商品不存在),由 de
 import logging
 import os
 
+from registry import resources
 from services import mp_mapper, order_audit, pricing, store_limits, \
     store_targets
 
@@ -98,6 +99,11 @@ _TRUNC_PRIORITY = {
 # 删除类专属:批次数门槛与单店单轮上限
 MIN_OFFSET_BATCHES = 1          # 出现一次即删(所有者:偏移了就不会恢复)
 LONG_OOS_DAYS = 15              # 连续这么多天没有库存 → 删除(所有者定稿)
+#: 「不算二手」的取值(**反着写**,见 `used_offer`)。取值域与语义由采集契约钉死,
+#: 键名唯一出处 `registry.resources.AMZ_OFFER_CONDITION_KEY`。
+#: ⚠ 定义要排在 `_SQL_LONG_OOS` **之前**:那条 SQL 用 f-string 把它内插进谓词,
+#: 判据因此只有一处出生(Python 与 SQL 同源),挪到后面会 NameError。
+_NOT_USED_CONDITIONS = ("", "N/A", "NEW")
 
 # ── 受管发货节点(多仓批次 2)────────────────────────────────────────────────
 # 三个库存 provider 的比对基准从「全店合计」改成「受管仓现值」。**只改配置了
@@ -203,7 +209,7 @@ WHERE w.store = ANY(%(stores)s::text[]) AND w.missing_since IS NULL
 #     是 ASIN 之后,把 p.asin 直接跟裸 w.sku 比会**静默**匹配不上任何一行:
 #     不报错,只是维护链对新码永久失明(不改价、不清零)。存量 amz 行
 #     source_key = sku,结果逐行相同。
-_SQL_AMZ_JOIN = """
+_SQL_AMZ_JOIN = f"""
 SELECT w.store, w.sku, w.product_name, w.product_type, w.upc,
        w.price AS wm_price, w.avail_qty, nq.avail_qty AS node_qty,
        s.price AS amz_price, s.stock_count, s.delivery_days,
@@ -211,7 +217,7 @@ SELECT w.store, w.sku, w.product_name, w.product_type, w.upc,
        -- 处置三信号(所有者定稿 2026-08-16):采集结局 / 亚马逊在架状态 /
        -- 契约的 fast.stock_state。三者取自**同一条最新快照**,不能各查各的
        -- ——分开查会出现"按昨天的 outcome 配今天的库存"这种错配。
-       s.outcome, s.stock_status, s.stock_state
+       s.outcome, s.stock_status, s.stock_state, s.offer_condition
 FROM catalog.walmart_items w
 JOIN catalog.listing_sources ls
   ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
@@ -224,7 +230,10 @@ LEFT JOIN LATERAL (
     SELECT price, stock_count, delivery_days, shipping, outcome, stock_state,
            raw ->> 'is_fba' AS fulfillment,
            -- 亚马逊在架状态原文(采集侧存 raw,契约未列为一等字段)
-           raw ->> 'stock_status' AS stock_status
+           raw ->> 'stock_status' AS stock_status,
+           -- buybox offer 的品相(二手/翻新)。同款:契约未列为一等字段、
+           -- 随 raw 落库;键名唯一出处在 registry(错键 = 闸恒放行)
+           raw ->> '{resources.AMZ_OFFER_CONDITION_KEY}' AS offer_condition
     FROM catalog.latest_snapshot l
     WHERE l.marketplace = 'US' AND l.asin = coalesce(ls.source_key, w.sku)
       AND coalesce(l.scrape_params ->> 'zip_verify', '') <> 'mismatch'
@@ -322,7 +331,7 @@ WITH req AS (
     WHERE w.missing_since IS NULL
       AND w.published_status = 'PUBLISHED'
       AND (st.store_status IS NULL OR upper(st.store_status) = 'ACTIVE')
-""" + _ONLY_STORE + """), obs AS (
+""" + _ONLY_STORE + f"""), obs AS (
     -- ⚠ 三个派生值全部 coalesce 成**二值**:三值逻辑下 `NOT (… AND NULL)` 是
     -- NULL,而 FILTER 把 NULL 当不命中 —— 渠道采不到的那批观测会因此从
     -- "挡住删除"翻成"不挡",方向正好反了,且一个字的报错都没有
@@ -331,7 +340,13 @@ WITH req AS (
                     OR sn.stock_state = 'in_stock', false) AS has_stock,
            coalesce(sn.stock_state = 'out_of_stock'
                     OR sn.stock_count = 0, false) AS no_stock,
-           coalesce(upper(btrim(sn.raw ->> 'is_fba')), '') AS channel
+           coalesce(upper(btrim(sn.raw ->> 'is_fba')), '') AS channel,
+           -- 二手/翻新(2026-09-14)。谓词与 `used_offer()` **逐字对应**
+           -- (守门用例钉着两处同源):除 N/A / 空 / New 之外都算非全新。
+           -- 采不到 ⇒ NULL ⇒ coalesce 成 false ⇒ **算"卖得了",挡住删除**,
+           -- 与 is_fba 的未知方向一致 —— 把未知当二手会整批误删。
+           coalesce(upper(btrim(sn.raw ->> '{resources.AMZ_OFFER_CONDITION_KEY}'))
+                    NOT IN {_NOT_USED_CONDITIONS}, false) AS is_used
     FROM catalog.snapshots sn
     WHERE sn.scraped_at > now() - make_interval(days => %(days)s)
       AND COALESCE(sn.outcome, 'ok') = 'ok'
@@ -341,8 +356,11 @@ WITH req AS (
            max(o.scraped_at) AS last_seen,
            count(*) AS obs,
            -- 本店卖得了的观测:有货,且**不是确定的另一个渠道**
+           -- ⚠ 二手必须从"卖得了"里剔掉,**这是本维度最容易漏的一处**:
+           -- 二手 offer 通常是**有货**的,不剔的话每条观测都算 sellable,
+           -- 窗口永远熬不满 ⇒ 清零了却永远删不掉,而且一个字的报错都没有
            count(*) FILTER (
-               WHERE o.has_stock
+               WHERE o.has_stock AND NOT o.is_used
                  AND NOT (live.want <> ''
                           AND o.channel IN ('FBA', 'FBM')
                           AND o.channel <> live.want)) AS sellable_obs,
@@ -352,14 +370,16 @@ WITH req AS (
            count(*) FILTER (
                WHERE o.has_stock AND live.want <> ''
                  AND o.channel IN ('FBA', 'FBM')
-                 AND o.channel <> live.want) AS wrong_ch_obs
+                 AND o.channel <> live.want) AS wrong_ch_obs,
+           -- 明确是二手/翻新的观测:与缺货观测等价的**明确**卖不了证据(判据 2)
+           count(*) FILTER (WHERE o.is_used) AS used_obs
     FROM live JOIN obs o ON o.asin = live.asin
     GROUP BY live.store, live.sku, live.asin, live.want
 )
-SELECT store, sku, obs, first_seen, last_seen, wrong_ch_obs, want
+SELECT store, sku, obs, first_seen, last_seen, wrong_ch_obs, want, used_obs
 FROM win
 WHERE sellable_obs = 0
-  AND oos_obs + wrong_ch_obs > 0
+  AND oos_obs + wrong_ch_obs + used_obs > 0
   AND first_seen <= now() - make_interval(days => %(days)s) + interval '36 hours'
   AND last_seen >= now() - interval '3 days'
 ORDER BY store, sku
@@ -486,14 +506,42 @@ def title_mismatched(title_similarity) -> bool:
     return title_similarity is not None and title_similarity < TITLE_SIM_FLOOR
 
 
+def used_offer(offer_condition) -> bool:
+    """输入:snapshot.raw 的 offer_condition → 输出:这次 buybox 是不是二手/翻新。
+
+    **唯一出处**:`classify`(清零)与 `_SQL_LONG_OOS`(15 天窗口)同源于这个
+    口径 —— 两处一漂就成了"清零按 A 判、删除按 B 判",而且两边都不报错。
+    SQL 那边的谓词与本函数逐字对应,守门用例钉着。
+
+    判据**反着写**:除 `N/A` / 空 / `New` 之外的任何取值都算非全新。理由有两条,
+    都在采集契约里(docs/erpapi_contract.md §4.3,采集侧 commit 9c70ce0):
+      · 取值域是 Used 四档 / Open Box / Collectible / Renewed / Refurbished,
+        **全是非全新** —— 没有一个值代表全新;
+      · **全新品也是 `N/A` 而不是 `New`**:全新 offer 的 buybox 根本不写品相,
+        所以 `N/A` 的含义是「未知」,不是「全新」。
+    反着写才对**新增档位免疫**:采集侧哪天加一档 `Used - Fair`,这里自动认得;
+    正着列白名单会静默漏掉它,而漏掉的方向是"当成全新继续卖"。
+    `New` 仍列为不算二手:契约说它不会出现,真出现了也该按字面读,不该反判。
+
+    ⚠ 方向与 `is_fba`、定制品闸同向:**未采到 / 读不到一律不算二手**。把未知
+    当二手的后果是无辜商品先被清零、再被 15 天窗口删掉,而删除不可逆。
+
+    ⚠ 它是**观测值不是产品属性**(契约原话):同一个 ASIN 上可以同时挂全新与
+    二手 offer,buybox 换人这个值就变。所以处置是清零(可逆),不是直接删除 ——
+    与缺货、渠道不符同一条阶梯,熬满窗口才删。
+    """
+    return str(offer_condition or "").strip().upper() not in _NOT_USED_CONDITIONS
+
+
 def classify(*, outcome=None, stock_status=None, stock_state=None,
              title_similarity=None, over_lead=False, lead_note="",
-             channel_bad=False, channel_note="") -> tuple:
+             channel_bad=False, channel_note="", offer_condition=None) -> tuple:
     """输入:一行在线商品的处置信号 → 输出:(动作, 原因码, 原因文案);无动作返回 (None,'','')。
 
     所有者定稿的判据,逐条对应他给的伪代码:
 
       outcome == 'not_found'                     → 删除(ASIN 已从亚马逊下架)
+      **buybox 是二手/翻新 offer**                → 库存 0(所有者定稿 2026-09-14)
       **本店渠道 ≠ 产品渠道**                     → 库存 0(所有者定稿 2026-08-25)
       stock_status == 'Currently unavailable'    → 库存 0(在架但不可售,拿不到价格库存)
       stock_status == 'No Featured Offer'        → 库存 0(无 Buy Box)
@@ -501,6 +549,11 @@ def classify(*, outcome=None, stock_status=None, stock_state=None,
       配送超本店上限                              → 库存 0
       标题相似度 < 0.70                           → 删除(**停闸中:见下**)
       标题相似度 ≥ 0.70 且标题有差异              → 改标题
+
+    ⚠ **二手排在渠道与无货三档之前**(2026-09-14):三条都命中时动作一样(清零),
+    差别只在原因码,而处置完全不同。二手是「这个 offer 我们根本不该卖」——
+    我们跟卖的是全新品,二手 offer 的价与货都不是我们要的;渠道不符是「这家店
+    做不了这个渠道」;缺货是「等回货」。排在后面就会被天天几百条的缺货盖住。
 
     ⚠ **渠道不符排在无货三档之前**(2026-08-25):两条都命中时动作一样(清零),
     差别只在原因码 —— 而这两个原因的处置完全不同。「缺货」是暂时的、等回货;
@@ -527,6 +580,13 @@ def classify(*, outcome=None, stock_status=None, stock_state=None,
         # 停闸中:**不判删除,也不早退**——早退回 (None,"","") 是另一种冻结,
         # 缺货了也不清零,等于删除停闸顺手把库存链也关了。继续往下判无货三档
         # 与货期(停闸口径见 `TITLE_MISMATCH_DELETE` 头注)。
+    if used_offer(offer_condition):
+        # buybox 这次赢的是二手/翻新 offer ⇒ 它的价是二手价、货是二手货,而我们
+        # 跟卖的是全新品。**清零不删除**:offer 是观测值,buybox 换回全新它自己
+        # 就好了(可逆);真长期不好由删除链的 15 天窗口收尾 —— 与"缺货清零 →
+        # 连续无货 N 天才删"完全同一条阶梯(所有者定稿 2026-09-14)。
+        return ("inventory", "used_offer",
+                f"buybox 是二手/翻新 offer(品相 {str(offer_condition).strip()})")
     if channel_bad:
         # 本店只做一个渠道,而这个货现在是另一个渠道 ⇒ 在这家店卖不了。
         # **清零不删除**:清零可逆(货源渠道翻回来自动回补),删除不可逆。
@@ -792,6 +852,7 @@ def price_intents(rows: list[dict], multipliers: dict[str, dict]) -> list[dict]:
     """
     out = []
     skipped_no_rule = skipped_no_channel = skipped_no_shipping = 0
+    skipped_used = 0
     for r in rows:
         store, sku = r["store"], r["sku"]
         wm_price, amz_price = r["wm_price"], r["amz_price"]
@@ -803,6 +864,19 @@ def price_intents(rows: list[dict], multipliers: dict[str, dict]) -> list[dict]:
         if classify(outcome=r["outcome"],
                     title_similarity=title_sim_dual(
                         r["product_name"], r["slow"]))[0] == "delete":
+            continue
+        # 二手/翻新 **不改价**(2026-09-14,随二手清零一起接线)。
+        # 这不是"顺手多挡一道",是这个字段存在的**头号理由**:采集契约原话
+        # ——「二手 offer 的 current_price / buybox_price 是二手价,与全新价
+        # 不可混用」(实例 B0G449YVHD 采到 $20.70,卖家 Amazon Resale)。
+        # 而本函数的落地价正是 amz 现价 + 运费,拿二手价 × 全新倍率改线上价,
+        # 结果是把全新品的售价改成二手价那一档 —— 算得出来、看着也正常、
+        # 没有任何一侧报错,与"配送方式未知就不改价"是同一条纪律:
+        # **不确定价的可比性时,不动比动危险小**。
+        # ⚠ 这里必须自己判,不能指望上面那句 classify:二手返回的是
+        # `inventory` 不是 `delete`,只看 delete 拦不住它。
+        if used_offer(r["offer_condition"]):
+            skipped_used += 1
             continue
         if amz_price is None or wm_price is None:
             continue                    # 缺任一侧现值:没有可比基准,不动
@@ -831,6 +905,12 @@ def price_intents(rows: list[dict], multipliers: dict[str, dict]) -> list[dict]:
                     "old": old, "new": new_price, "code": "price_sync",
                     "reason": f"{channel} 落地价 × 区间倍率 → "
                               f"{old:.2f}→{new_price:.2f}"})
+    if skipped_used:
+        # 必须见人:这批行在架、有价、看起来一切正常,只是它们的"亚马逊现价"
+        # 是二手价。不报的话表现只是"改价条数少了一点",没人会去查为什么
+        logger.warning("改价:%d 行 buybox 是**二手/翻新 offer**,本轮不改价"
+                       "——那个价是二手价,与全新价不可比(库存链已按 "
+                       "used_offer 清零)", skipped_used)
     if skipped_no_rule:
         logger.info("改价:%d 行因该区间倍率未配置跳过(不动,非改 0)",
                     skipped_no_rule)
@@ -878,7 +958,7 @@ def inventory_intents(rows: list[dict],
     lead_caps = store_limits.lead_day_caps()
     chans = store_channels or {}
     out = []
-    n_channel = n_zeroed = 0
+    n_channel = n_zeroed = n_used = 0
     for r in rows:
         store, sku = r["store"], r["sku"]
         # 比对基准 = 受管仓现值(配置店)/ 全店合计(未配置店),唯一出处
@@ -911,7 +991,10 @@ def inventory_intents(rows: list[dict],
             channel_bad=bad_ch,
             channel_note=(f"本店只做 {want_ch},该品现在是 "
                           f"{str(r['fulfillment']).strip().upper()}")
-                         if bad_ch else "")
+                         if bad_ch else "",
+            # 二手/翻新(2026-09-14):判据在 classify,本 provider 只负责喂数。
+            # 未采到不算二手 —— 方向与渠道那一维同款,见 `used_offer` 头注
+            offer_condition=r["offer_condition"])
         if act == "delete":
             continue        # 删除类归 delete_intents,这里不抢
         new_qty = 0 if act == "inventory" else int(stock_count)
@@ -922,6 +1005,17 @@ def inventory_intents(rows: list[dict],
                     "code": code, "reason": why,
                     **_node_of(store, managed)})
         n_zeroed += 1 if code == "channel_mismatch" else 0
+        n_used += 1 if code == "used_offer" else 0
+    if n_used:
+        # 与渠道同款理由:结构性、且会顺着 15 天窗口走到不可逆的删除。
+        # 一次成批出现多半是某个货源整体转成了二手 offer(如 Amazon Resale),
+        # 人要先知道。⚠ 采集侧这个字段 2026-09-14 才上线且**未经真实页面验证**
+        # (它自己的 commit 写着),所以首轮更要盯着这个数:一直是 0 未必是
+        # 真没有二手,也可能是 DOM 变了、采集侧静默返回 N/A
+        logger.warning("库存:%d 行 buybox 是**二手/翻新 offer**,本轮清零"
+                       "(原因码 used_offer)——我们跟卖的是全新品,二手 offer "
+                       "的价与货都不是要的;持续二手会被删除链的 15 天窗口下架",
+                       n_used)
     if n_channel:
         # 渠道不符必须出声:它是结构性的(不像缺货会自己好),而且这批行
         # 会顺着删除链的窗口走到不可逆的删除 —— 一次大面积出现,多半是
@@ -1117,9 +1211,19 @@ def delete_intents(conn, rows: list[dict],
                      "ch_stores": list(chans.keys()),
                      "ch_wants": [chans[k] for k in chans]})
         rows = cur.fetchall()
-    n_wrong_ch = 0
-    for store, sku, obs, first_seen, last_seen, wrong_ch_obs, want in rows:
-        if wrong_ch_obs:
+    n_wrong_ch = n_used = 0
+    for (store, sku, obs, first_seen, last_seen,
+         wrong_ch_obs, want, used_obs) in rows:
+        if used_obs:
+            # 窗口里出现过"有货但是二手/翻新" ⇒ 这行是二手走到头的。
+            # 排在渠道之前,与 classify 的优先序一致(二手 > 渠道 > 缺货):
+            # 三个原因码分开,删除预览按码分组才说得清该找谁
+            n_used += 1
+            _take(store, sku, f"二手{oos_days}天",
+                  f"{oos_days} 天窗口内 {obs} 次观测无一是可售的全新货,"
+                  f"其中 {used_obs} 次确认为二手/翻新 offer",
+                  {"obs": obs, "first_seen": first_seen, "last_seen": last_seen})
+        elif wrong_ch_obs:
             # 窗口里出现过"有货但是另一个渠道" ⇒ 这行是渠道不符走到头的,
             # 不是货源断了。两个原因码分开,删除预览按码分组才说得清
             n_wrong_ch += 1
@@ -1131,6 +1235,14 @@ def delete_intents(conn, rows: list[dict],
             _take(store, sku, f"连续无货{oos_days}天",
                   f"{oos_days} 天窗口内 {obs} 次观测无一有货,货源已断",
                   {"obs": obs, "first_seen": first_seen, "last_seen": last_seen})
+    if n_used:
+        # 与渠道那一档同款理由:必须出声。二手是**观测值**,buybox 换回全新它
+        # 自己就好了 —— 一次成批命中多半是某个货源整体转成了 Amazon Resale
+        # 之类的二手 offer,人要先知道再决定放不放它走到不可逆的删除
+        logger.warning("删除:%d 行是**二手/翻新满 %d 天**(不是货源断)。"
+                       "判据是 buybox 品相(采集侧 offer_condition),"
+                       "未采到一律不算二手 —— 所以这个数只会少不会多",
+                       n_used, oos_days)
     if n_wrong_ch:
         # 向后看的窗口 ⇒ 某店刚填上「配送限制」的当轮就可能整批命中。
         # 必须出声,别让它混在"删除 N 条"里跟着日常波动过去

@@ -792,16 +792,26 @@ PT_TEMPLATE_SHEET = Spreadsheet(
 #   对账对不上时第一嫌疑就是它。折算与渲染统一在 `services/llm_cost.money`,
 #   符号只从 LLM_PRICE_SYMBOL 取(别处写死 '$' 就是又一处暗坑)。
 #
-# 数据来源:官方定价页 + **2026-09-10 官方调价公告**(所有者转述原文):
-#   「在 V4.1 Flash 正式上线之后、V4.1 Pro 上线之前,我们会将对 V4 Pro 的请求
-#     全部路由到 V4.1 Flash,并按 V4.1 Flash 单价计费。新价格将于北京时间
-#     2026 年 9 月 10 日 12 时开始生效。」
-# ⚠ **待复核一次**:定价页在 9/10 11:13(生效前 47 分钟)复核时**仍挂旧价**
-#   (flash 空闲 0.05 / 1.5 / 4.5)。12:00 生效后**再看一眼定价页**:若
-#   `deepseek-v4-flash` 没跟着降到下面这组数,就把本行改回旧价、只给 V4.1 Flash
-#   那一行用新价 —— 宁可估贵不估便宜(与 llm_cost 同一条纪律)。
+# 数据来源:官方定价页,**2026-09-10 15:21(北京)第三次复核时页面已追上线上**
+# (同日早些时候它还列着 v4-flash、更新日志最新一条是 8/21,所以判据当时只能
+# 靠 /models;现在两处一致,下面的数是逐格核对过的)。
+# ⚠ **模型名的唯一判据仍是 `GET /models` 的返回**(所有者 2026-09-10 实测):
+#     HTTP 200 {"data":[{"id":"deepseek-flash"},{"id":"deepseek-v4-pro"}]}
+#   定价页现在也只剩这两列(并发上限 2500 / 500)。`deepseek-flash` 就是
+#   V4.1 Flash 的正式 id(版本号被去掉了;它原生多模态,所以 vision-exp 一并
+#   退役)。文档页可以再滞后一次,**判据永远是 /models 的返回。**
+# ⚠ 官方注(1):「旧模型名 `deepseek-v4-flash`、`deepseek-v4-flash-vision-exp`
+#   仍可调用,但对应模型已下线,请求将由 DeepSeek-V4.1-Flash 模型提供服务,
+#   并按 Flash 价格计费。」⇒ 退役名今天**不会报错**,只是悄悄换了模型:钱按
+#   Flash 算(所以折到 flash 行是对的),但拿回来的答案已经不是 V4 的了。
+# ⚠ 官方注(2):「北京时间 **2026 年 9 月 14 日 12:00** 之后,至未来 V4.1 Pro
+#   上线之前,您访问 `deepseek-v4-pro` 的请求将全部路由到 V4.1 Flash,并按
+#   V4.1 Flash 价格计费。」⇒ **9/14 12:00 之前 v4-pro 是真 Pro 价在扣钱**
+#   (未命中 4.5 倍、输出 3.4 倍),所以它下面有自己的价行,折价按时刻判
+#   (见 llm_priced_model);此前无条件折成 flash 是**低估四倍多**。
 LLM_PRICING_SOURCE = ("api-docs.deepseek.com/zh-cn/quick_start/pricing"
-                      " + 2026-09-10 12:00(北京)官方调价公告")
+                      "(2026-09-10 15:21 北京复核;官方注(1)(2)见"
+                      " LLM_MODEL_ALIASES / LLM_ROUTED_MODELS)")
 
 # 金额单位与符号:摘要渲染只准从这里取
 LLM_PRICE_CURRENCY = "CNY"
@@ -823,35 +833,45 @@ _CST = _dt.timezone(_dt.timedelta(hours=8))      # 北京时间(无夏令时)
 #   按 0 计价会产出一个看着像钱、其实是编的数字。视觉 L4 走火山方舟(另一家
 #   供应商),单价不在本表,故 `deepseek-v4-flash-vision-exp` 也不登记。
 LLM_PRICING = {
-    "deepseek-v4-flash": {"peak":    (0.04, 2.0, 8.0),
-                          "offpeak": (0.02, 1.0, 4.0)},
+    "deepseek-flash": {"peak":    (0.04, 2.0, 8.0),
+                       "offpeak": (0.02, 1.0, 4.0)},
+    # V4 Pro 自己的价:官方路由(9/14 12:00)生效**之前**发给它的请求就是按这个
+    # 真金白银扣 —— 未命中 4.5 倍、输出 3.4 倍于 Flash。到点后 llm_priced_model
+    # 自动折到 flash 行;这一行**不删**:V4.1 Pro 上线时官方撤路由,它又是现价。
+    "deepseek-v4-pro": {"peak":    (0.30, 9.0, 27.0),
+                        "offpeak": (0.15, 4.5, 13.5)},
 }
 
-# 旧别名 → 定价页产品名(2026-08-21 核官方更新日志)。
-# ⚠ `deepseek-chat` / `deepseek-reasoner` 是**官方已宣布停用的旧别名**
-#   (2026-04-24 公告:三个月后即 2026-07-24 停用),当前路由到 v4-flash 的
-#   非思考 / 思考模式。**停用日期已过**,还能用纯属宽限期 —— 一旦切断,
-#   全仓 LLM 调用会同时失败(L1 rerank / L3 / 上架属性映射 / variant_remap)。
-#   生产应在 .env 显式写 `DEEPSEEK_MODEL=deepseek-v4-flash`。
-LLM_LEGACY_ALIASES = {"deepseek-chat", "deepseek-reasoner"}
+# **已退役 / 已不可调的模型名 → 为什么**(摘要点名用;一个集合装不下两种原因,
+# 所以是 {名字: 原因})。用到它们不会立刻坏,但随时可能整条链一起挂:
+#   L1 rerank / L3 / 上架属性映射 / variant_remap 是同一个 key 同一个模型名。
+LLM_RETIRED_MODELS = {
+    "deepseek-chat": "官方 2026-04-24 公告的旧别名,停用日 2026-07-24 已过",
+    "deepseek-reasoner": "官方 2026-04-24 公告的旧别名(思考模式),停用日已过",
+    "deepseek-v4-flash": "官方注(1):模型已下线,名字仍可调但由 V4.1 Flash 顶替",
+}
 
-# 官方"路由期"模型:请求发的是键,实际跑的是值,计价按 LLM_MODEL_ALIASES 折。
-# 摘要每轮点名 —— 路由期一结束(V4.1 Pro 上线)单价与实际模型都会变,而官方
-# 不会来通知我们;靠人记住"几个月后要复核"是记不住的。
-LLM_ROUTED_MODELS = {"deepseek-v4-pro": "V4.1 Flash"}
+# 官方"路由期":**到点之后**请求发的是键、实际跑的是值,并按值的单价计费;
+# **到点之前按键自己的价算**。值 = (到点后的计价键, 生效时刻)。
+# ⚠ 这个"到点"是 2026-09-10 差点踩空的地方:调价公告只说"会把 V4 Pro 的请求
+#   路由到 V4.1 Flash",定价页的注(2)才写清是 **9/14 12:00 起**;在那之前把
+#   v4-pro 折成 flash 计价 = 账少算四倍多,而钱是真按 Pro 扣的。日期写进表里、
+#   到点自己换算,不靠谁记得来改一行(那种"以后要改"从没有人真的回来改)。
+# 摘要每轮点名 —— 路由期一结束(V4.1 Pro 上线)官方会撤路由,单价与实际模型
+# 再变一次,而官方不会来通知我们。
+LLM_PRO_ROUTING_STARTS = _dt.datetime(2026, 9, 14, 12, 0, tzinfo=_CST)
+LLM_ROUTED_MODELS = {
+    "deepseek-v4-pro": ("deepseek-flash", LLM_PRO_ROUTING_STARTS),
+}
+
+# 请求里发的名字 → 价表键。**这张表只装"永久别名"**:官方注(1)那几个退役名,
+# 模型已下线、请求由 V4.1 Flash 顶替并按 Flash 计费,不会再变回去,所以无条件折。
+# ⚠ **带生效日期的折价不许进这张表**(v4-pro 走 LLM_ROUTED_MODELS):混进来就是
+#   "无条件折",而在路由生效前它是真 Pro 价,账会少算四倍多(2026-09-10 实错)。
 LLM_MODEL_ALIASES = {
-    "deepseek-chat": "deepseek-v4-flash",       # 非思考模式
-    "deepseek-reasoner": "deepseek-v4-flash",   # 思考模式,同一张价表
-    # 官方 2026-09-10 公告:V4.1 Flash 上线后、V4.1 Pro 上线前,**对 V4 Pro 的
-    # 请求全部路由到 V4.1 Flash 并按 V4.1 Flash 单价计费** ⇒ 计价走 flash 行。
-    # ⚠ **这一行现在承重**:所有者 2026-09-10 定稿把缺省模型切成 deepseek-v4-pro
-    #   (拿官方文档里有的 id 换到 V4.1 Flash,不必猜未公布的 V4.1 id),于是
-    #   全仓的账都从这一行出。
-    # ⚠ **V4.1 Pro 上线时必须撤掉这一行**并给 Pro 恢复自己的价(定价页
-    #   2026-09-10 值:空闲 0.15 / 4.5 / 13.5,高峰翻倍)—— 不撤,Pro 的账会按
-    #   Flash 少算(未命中 4.5 倍、输出 3.4 倍),而且那天起真的在花 Pro 的钱。
-    #   路由期本身也会在摘要里每轮点名(LLM_ROUTED_MODELS),不靠人记。
-    "deepseek-v4-pro": "deepseek-v4-flash",
+    "deepseek-chat": "deepseek-flash",
+    "deepseek-reasoner": "deepseek-flash",
+    "deepseek-v4-flash": "deepseek-flash",      # 已退役,历史用量仍要能折算
 }
 
 
@@ -864,12 +884,16 @@ LLM_MODEL_ALIASES = {
 #   字段对 Pro 合法 —— 我们下发 disabled 是同一个字段的另一个取值。
 # 值 = 要下发的 thinking 值;**表里没有的模型不下发该字段**(未知模型可能拒
 #   未知字段),api 层会点名警告一次,同时它也必然落进"未计价模型"那条提醒。
-# ⚠ **只登记官方文档里有的正式产品名**。两个旧别名(deepseek-chat /
-#   deepseek-reasoner)故意**不登记**:官方从未记过它们认不认 `thinking` 字段,
-#   给它们下发就是拿"未知字段可能被拒"去赌;而它们今天的行为(不下发)已经在
-#   生产验证过。别名本就该弃用,摘要每轮点名催换,不在这里替它们做假设。
+# ⚠ **只登记 `GET /models` 真实返回的那两个名字**。退役名(deepseek-chat /
+#   deepseek-reasoner / deepseek-v4-flash)故意**不登记**:官方从未记过它们
+#   认不认 `thinking` 字段,给它们下发就是拿"未知字段可能被拒"去赌;而它们
+#   今天的行为(不下发)已经在生产验证过。摘要每轮点名催换,不替它们做假设。
+# ⚠ `deepseek-flash` 认不认这个字段**尚未实测**(官方连它的文档都还没有,只有
+#   /models 返回)。按旧仓铁律仍然下发 disabled;万一它拒收,api/llm 有一道
+#   **只对"400 且报文里提到 thinking"生效**的降级:摘掉该字段重发一次并告警,
+#   不会让整条链因为一个字段挂掉(兜底三要件见 conventions §六)。
 LLM_THINKING = {
-    "deepseek-v4-flash": {"type": "disabled"},
+    "deepseek-flash": {"type": "disabled"},
     "deepseek-v4-pro": {"type": "disabled"},
 }
 
@@ -879,9 +903,25 @@ def llm_thinking(model: str) -> dict | None:
     return LLM_THINKING.get(model)
 
 
-def llm_priced_model(model: str) -> str:
-    """输入:请求里发的 model → 输出:LLM_PRICING 里的键(别名已折叠)。"""
-    return LLM_MODEL_ALIASES.get(model, model)
+def llm_priced_model(model: str, when=None) -> str:
+    """输入:请求里发的 model(+计费时刻,缺省"现在")→ 输出:LLM_PRICING 里的键。
+
+    两种折叠别混:
+      · **永久别名**(LLM_MODEL_ALIASES):模型已下线,永远按顶替它的模型计费;
+      · **官方路由期**(LLM_ROUTED_MODELS):**到点之后**才按目标计费,到点之前
+        按它自己的价 —— `deepseek-v4-pro` 在 2026-09-14 12:00(北京)之前是真
+        Pro 价(未命中 4.5 倍、输出 3.4 倍于 Flash)。
+    `when` 只在回算历史用量时才需要显式传(要带时区);缺省取当下,所以到点
+    当天不需要任何人来改代码。
+    """
+    if model in LLM_MODEL_ALIASES:
+        return LLM_MODEL_ALIASES[model]
+    routed = LLM_ROUTED_MODELS.get(model)
+    if routed:
+        target, starts = routed
+        if (when or _dt.datetime.now(_dt.timezone.utc)) >= starts:
+            return target
+    return model
 
 
 # ── llm_cache 键空间锚点(2026-08-21)──────────────────────────────────────

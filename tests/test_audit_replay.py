@@ -513,7 +513,7 @@ def test_product_rows_have_the_same_shape_as_production_candidates():
 def test_cost_estimate_arithmetic():
     """口径(规格 §3.9):**首条前缀未命中**(所以要串行预热),其余命中;
     每条另加 user 段(未命中价)与输出。"""
-    model, tier = "deepseek-v4-flash", "offpeak"
+    model, tier = "deepseek-flash", "offpeak"
     hit, miss, out = resources.LLM_PRICING[model][tier]
     chars = 35_000                       # 折算成 10,000 token
     est, prefix = ar.estimate_cost(3, chars, model, tier)

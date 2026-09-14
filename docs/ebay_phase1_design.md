@@ -22,8 +22,11 @@
 > 判据唯一出生地 `amz_source.SNAPSHOT_FRESH_HOURS/latest_seen`(§2.3)、
 > LLM 模型与 thinking 登记走 `registry.LLM_THINKING`(§5.3);其余(catalog_sync
 > 切片、item_id 报表、problem_scan 原子归类、sku_migrate 影子双挂)与一期
-> 无交集。⚠ 本文引用的仓库行号以 **2026-09-07 的 main** 为快照,批次实施时
-> 现场重定位。
+> 无交集。
+> **2026-09-14 对齐 main #132**:§6.1 补**二手/翻新闸**——判据唯一出处
+> `maintenance_intents.used_offer()`;库存三态闸挡不住二手(二手 offer 通常
+> 有货),而一期 `condition` 固定 NEW,源是二手却按新品上架是硬违规。
+> ⚠ 本文引用的仓库行号以 **2026-09-07 的 main** 为快照,批次实施时现场重定位。
 
 ## 〇、批次 0 拍板记录(2026-08-30,所有者)
 
@@ -458,7 +461,15 @@ parse_multiplier` 转中立 + `pick_band` 改收 bands、变体三件改名。
 sku) 计次上限 3(对位沃尔玛 `MAX_LIST_ATTEMPTS=3`;没有它,永久失败的
 SKU 每天白烧配额与 LLM),4xx 终态拒的错误码集不进重试通道。
 逐行闸:brand_key 黑名单/库存三态/渠道/运费/落地价/lead/定制品闸
-`is_customized`/图片全 https(services 层预校验)。
+`is_customized`/图片全 https(services 层预校验)/🔴 **二手翻新闸**。
+🔴 **二手/翻新必须单独一条闸(2026-09-14 对齐 main #132 补)**:判据**只准**
+调 `services/maintenance_intents.used_offer()`(源侧 buybox 品相,数据在
+`snapshots.raw -> AMZ_OFFER_CONDITION_KEY`,`_NOT_USED_CONDITIONS` 反着写、
+**未知不当二手**——与 `is_fba` 未知方向一致,把未知当二手会整批误删),严禁
+自写判据。两条理由:① §6.4 定的是 **`condition` 一期固定 `NEW`**,源是二手
+却按新品上架 = 虚假描述,比无货源本身更硬的违规,真发货时买家收到二手品直接
+打到账号健康;② **库存三态闸挡不住它**——#132 逐字点名"二手 offer 通常是
+**有货**的,不剔的话每条观测都算 sellable",这是该维度最容易漏的一处。
 ⚠ **两条与 main #85/#102 的边界(2026-09-03 补)**:① `list_new` 在 #85 后按
 **受管仓节点**切 shipNode、`catalog.walmart_items` 有 `node_count`、库存读
 `avail_qty` 全节点合计——eBay 一期是**单 `merchantLocationKey`**,不做多节点,
@@ -488,7 +499,9 @@ SKU 每天白烧配额与 LLM),4xx 终态拒的错误码集不进重试通道。
 
 ### 6.4 三步链字段要点(全量字段表与错误码表:`docs/ebay_phase1_reference.md` §1)
 
-- **PUT /inventory_item/{sku}**:SKU = `sku_codec.mint` 发的 12 位不透明码
+- **PUT /inventory_item/{sku}**:`condition` 一期固定 `NEW`——⚠ 因此入料
+  必须有 §6.1 的二手/翻新闸兜住,否则源是二手也会按新品发出去;
+  SKU = `sku_codec.mint` 发的 12 位不透明码
   (§3.3);header `Content-Language: en-US`
   (body 里 locale 是 `en_US` 下划线——两形态别混);aspects=
   `dict[str, list[str]]`;product.description ≤4000 只放短摘要;图片全

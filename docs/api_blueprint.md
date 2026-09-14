@@ -157,6 +157,36 @@ docs/legacy_survey.md 的"共享桶"结论与 CLAUDE.md 相应表述据此**修�
 **feed 轮询官方建议节奏**:INPROGRESS 时 15 分钟 → 1 小时 → 2 小时 → 此后每 4 小时;
 价格 feed 至少等 5 分钟再查(SLA 15 分钟)。
 
+### 3.1 各操作「多久生效」的官方窗口(2026-09-12 全量核验)
+
+**明细与官方原句在 `refdata/walmart_slas.tsv`**(一操作一行,带官方 URL 与核对日期)。
+速记:
+
+| 操作 | 官方值 | 判死期限(本仓) |
+|---|---|---|
+| 批量建品/改品处理(MP_ITEM / MP_MAINTENANCE) | 最长 **4 小时** | 72 小时 |
+| 提交成功 → 数据可查(catalog 可见) | 最长 **6 小时** | — |
+| Hazmat 人工审核(Walmart-fulfilled) | 最长 **48 小时** | 见 MP_ITEM |
+| item setup 状态更新(Seller Center 侧) | 最长 **24 小时**;危险品合规审核最长 **3 个工作日** | 见 MP_ITEM |
+| 按匹配上架(MP_ITEM_MATCH) | 最长 **24 小时**;无法导入时文件处理最长 **72 小时** | 72 小时 |
+| 批量改价(price / PRICE_AND_PROMOTION) | SLA **15 分钟** | 8 小时 |
+| 库存更新(inventory / MP_INVENTORY) | 最快 15 分钟,最长 **4 小时** | 24 小时 |
+| 停用/退役(RETIRE_ITEM) | 通常几分钟,catalog 最长 **48 小时** | 72 小时 |
+| 删除(DELETE_ITEM) | **48 小时**内删除,最长 **72 小时**从 Catalog 消失 | 96 小时 |
+
+⚠ **官方不给 feed 级的"最长处理时间"**,也不给 feed 状态的保留窗口(四页核验均无:
+feeds-overview / list-all-feed-statuses / getallfeedstatuses / item-setup-sla)。判死期限
+是这样反推出来的:**feed 落定必然发生在业务生效之前** ⇒ 生效窗口的上限就是"还在正常
+处理"的上限;超过它 + 余量还没落定 = 不可能是慢,只能是卡死(用法见
+docs/feed_closure_audit.md §三.4)。最慢的一档是 72 小时。
+
+⚠ **新建 item 发批量改价有前置条件**(官方原句在 tsv):「ensure that the Walmart Part ID
+(WPID) has been assigned and that **at least 24 hours have passed since item creation**
+before submitting a bulk price update feed」。本仓调度是 list_new 20:00、product_chain
+(含 maintenance 改价)次日 13:00 = **相隔 17 小时 < 24 小时**;改价选品链路里未见按
+item 年龄过滤(`services/maintenance_intents` 只有观测窗口过滤)——**待核**:昨夜新上架的
+品今天会不会被改价 feed 扫到。见 docs/backlog.md。
+
 ## 4. 分页模型(4 种,互不兼容,api 层各自封装)
 
 旧系统 7 个 GET /v3/items 实现里 4 套翻页写法并存,其中 1 套是 bug(fetch_my_walmart_items

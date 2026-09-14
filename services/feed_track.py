@@ -12,6 +12,7 @@ SKU 级状态权威在 ops.feed_items;停用/删除/设置到期日期/未来的
 """
 
 import logging
+from datetime import datetime, timezone
 
 from api import feeds
 from registry import db, resources
@@ -19,11 +20,30 @@ from services import blacklist, product_events, stores as stores_svc
 
 logger = logging.getLogger("services.feed_track")
 
-# feedType → 业务动作名(摘要展示;未登记的原样显示)
+# feedType → 业务动作名(摘要展示;未登记的原样显示)。
+# ⚠ 与 api/feeds._SLICE_LIMITS 的八个 feedType 对齐:漏登记不报错,只是摘要里
+#   蹦出一个裸 feedType(2026-09-11 实见「A171罗尹鸿 MP_INVENTORY(maintenance)」
+#   ——运营看不出那是分仓库存)。
+# MP_ITEM_MATCH 一个 feedType 挂着两条链(跟卖 match_listing / 改码 sku_migrate),
+# 摘要里跟在后面的 `(workflow)` 才分得开,故标"跟卖/改码"。
 _FEED_LABEL = {"DELETE_ITEM": "删除", "RETIRE_ITEM": "停用",
                "MP_MAINTENANCE": "维护", "MP_ITEM": "上架",
                "PRICE_AND_PROMOTION": "改价", "price": "改价",
-               "inventory": "改库存"}
+               "inventory": "改库存", "MP_INVENTORY": "分仓库存",
+               "MP_ITEM_MATCH": "跟卖/改码"}
+
+#: 在途 feed 的**静默闸**(小时,唯一出处):提交超过它还没落定的 feed,摘要
+#: 不再逐条复读明细,折成一行点名(几个、卡多久、怎么查)。
+#: 判据是**年龄**,不是"看着眼熟":feed_poll 挂 0/30 分两班,一段明细一天原样
+#: 发 48 遍(2026-09-11 所有者实见「这几条每次都通知,似乎是固定文案」),
+#: 而人对固定文案的反应是不看——真出事的那一轮也一起漏掉。
+#: ⚠ 它只管**摘要排版**:在途行照旧每轮轮询、照旧不落定,一个业务判断都不改。
+#: 它**不是放弃期限**——在途 feed 等多久才该判死、判死之后防重闸开不开,
+#: 是所有者要拍的板(docs/feed_closure_audit.md §三.4)。
+FEED_QUIET_HOURS = 2.0
+
+#: 折叠行里最多点几个名字(其余给 SQL 自己查:名字越多越没人看)
+_FOLD_NAMES = 3
 
 # SKU 台账状态 → 飞书表结果列文案。状态词只有一个出处(api/feeds.sku_outcome
 # 的 success/failed/processing/unknown,加台账自己的 submitted/missing),中文面
@@ -125,6 +145,56 @@ def _progress(head: dict) -> str:
     return f"已收 {recv},成功 {ok},失败 {bad},待处理 {pending}"
 
 
+def unresolved(results: dict) -> tuple[int, int]:
+    """输入:poll_feed 的 {sku: (结局, 码)} → 输出:(未落定 SKU 数, 其中状态未知的数)。
+
+    **「这个 feed 能不能收工」的唯一判据**:`poll_feed` 拿它决定调不调
+    `mark_feed_done`,`poll_all` 拿它决定摘要说不说"已落定"。两处各数一遍的
+    表现是摘要写「已落定 PROCESSED,成功 451,失败 42」而 feed_log 仍是
+    submitted(轮询那边看见残留、没收工),于是**下一轮原样再播一遍,永远**,
+    `落定 N` 还把同一个 feed 每轮重数一次 —— 每句话都对,合起来是假的
+    (2026-09-11 所有者实见「这几条每次都通知,似乎是固定文案」)。
+
+    第二个数只为摘要**分因**:残留是 processing(沃尔玛还在跑,等就行)还是
+    unknown(`sku_outcome` 没认出来的枚举值,等到天荒地老也不会变,得补码表)
+    —— 两者都卡住 feed 而处置完全不同;摘要不说,就只能去翻日志里那句
+    「未知 SKU ingestionStatus=…」。
+    """
+    open_ = [o for o, _ in (results or {}).values()
+             if o in ("processing", "unknown")]
+    return len(open_), sum(1 for o in open_ if o == "unknown")
+
+
+def age_hours(since) -> float | None:
+    """输入:提交时刻 → 输出:至今几小时;拿不到时刻(None/非时间)给 None。
+
+    在途年龄取 `ops.feed_log.updated_at`(这个 feedId 落 submitted 的时刻),
+    **不是 created_at** —— 理由见 `api/feeds.query_pending` 的注释。
+    """
+    if not isinstance(since, datetime):
+        return None
+    if since.tzinfo is None:            # 裸时间按 UTC 读(库里存的是 timestamptz)
+        since = since.replace(tzinfo=timezone.utc)
+    return max((datetime.now(timezone.utc) - since).total_seconds() / 3600, 0.0)
+
+
+def is_stuck(age_h: float | None) -> bool:
+    """输入:在途年龄(小时)→ 输出:是否老到不该再逐条复读(见 FEED_QUIET_HOURS)。
+
+    年龄拿不到(None)一律当**新鲜**:折叠的语义是"这条别再播了",拿不确定的
+    年龄去折,会把刚提交的 feed 从摘要里抹掉 —— 宁可多播一行,不可少播一行。
+
+    摘要折叠(`poll_all`)与清单点名(`feed_poll -p stuck=1`)共用这一处口径:
+    两处各写一个阈值的表现是通知里折掉了、清单里却不认为它卡住。
+    """
+    return age_h is not None and age_h >= FEED_QUIET_HOURS
+
+
+def _who(rec: dict) -> str:
+    """输入:在途 feed 记录 → 输出:摘要里的"谁"(店铺 动作(工作流) feed 头)。"""
+    return f"{rec['store']} {rec['label']}({rec['workflow']}) {rec['fid']}"
+
+
 #: 破坏类 feed 的两个类型 —— **唯一出处**(2026-09-09 归一)。
 #: 它是 `dispositions.DESTRUCTIVE_ACTIONS`(delete/retire)的 feed 面,
 #: workflows/problem_scan 的在途分档与下面的 `receipt_blocked` 共用这一份:
@@ -220,8 +290,7 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
 
     _STATUS = {"success": "success", "failed": "failed",
                "processing": "submitted", "unknown": "submitted"}
-    n_unresolved = sum(1 for o, _ in results.values()
-                       if o in ("processing", "unknown"))
+    n_unresolved, _ = unresolved(results)      # 收工判据只有这一处,见 unresolved()
     with db.pg_conn() as conn, conn.cursor() as cur:
         # 先取更新前状态:残留 processing/unknown 时 feed 会被重轮询,
         # 回执事件只对"本轮才落定"的 SKU 记,重轮询不得重复灌账
@@ -354,62 +423,114 @@ def poll_all(stores_by_name: dict) -> str:
     for r in submitted:
         by_store.setdefault(r["store"], []).append(r)
 
-    def _one_store(store_name: str, srows: list[dict]) -> tuple:
-        """输入:店铺名 + 该店在途 feed → 输出:(落定, 仍处理中, 跳过, 明细行)。
+    def _one_store(store_name: str, srows: list[dict]) -> list[dict]:
+        """输入:店铺名 + 该店在途 feed → 输出:逐 feed 的**事实记录**(不排版)。
 
-        **各店各自的局部计数**,主线程再合并:`done += 1` 是"读-加-写"三步,
-        两个线程交错会丢计数(丢得随机、不报错);明细行直接 append 则会按完成
-        先后乱序交织,同一轮跑两次输出不一样。
+        **各店各自的局部列表**,主线程再按店铺序合并:`done += 1` 是"读-加-写"
+        三步,两个线程交错会丢计数(丢得随机、不报错);记录直接 append 进共享
+        列表则会按完成先后乱序交织,同一轮跑两次输出不一样。
+
+        排版整个留给 `poll_all`(这里只出事实):折不折叠要看全局 ——「这一轮
+        一共有几个长期在途、最久多久」只有汇总时才知道。
         """
-        done_s = still_s = skipped_s = 0
-        out: list[str] = []
+        out: list[dict] = []
         store = stores_by_name.get(store_name)
         for r in srows:
-            label = _FEED_LABEL.get(r["feed_type"], r["feed_type"])
-            fid_disp = ((r["feed_id"][:18] + "…") if len(r["feed_id"]) > 19
-                        else r["feed_id"])
-            who = f"{r['store']} {label}({r['workflow'] or '-'}) {fid_disp}"
+            rec = {
+                "store": r["store"],
+                "label": _FEED_LABEL.get(r["feed_type"], r["feed_type"]),
+                "workflow": r["workflow"] or "-",
+                # feed_id 只留头 18 位:整串占满一行,头几位已够去后台对
+                "fid": ((r["feed_id"][:18] + "…") if len(r["feed_id"]) > 19
+                        else r["feed_id"]),
+                # 年龄取 updated_at —— 这个 feedId 落 submitted 的时刻。
+                # **不是 created_at**:`_log_claim` 重占终态行时只改
+                # status/feed_id/updated_at,created_at 留的是这个 payload_key
+                # 第一次提交的时刻(可能是几个月前),拿它当年龄会把刚提交的
+                # feed 一上来就判成"卡了三个月"、当场从摘要里折掉。
+                "age_h": age_hours(r.get("updated_at")),
+            }
+            out.append(rec)
             if store is None:
-                skipped_s += 1
-                out.append(f"  {who}:店铺凭证缺失,跳过")
+                rec.update(state="skipped", detail="店铺凭证缺失,跳过")
                 continue
             try:
                 head, results = poll_feed(store, r["feed_id"])
             except Exception as e:
                 logger.warning("feed %s 轮询失败(下轮再试): %s", r["feed_id"], e)
-                still_s += 1
-                out.append(f"  {who}:查询失败({e}),下轮再试")
+                rec.update(state="open", detail=f"查询失败({e}),下轮再试")
                 continue
             if results is None:
-                still_s += 1
-                out.append(f"  {who}:{head.get('feedStatus')},{_progress(head)}")
-            else:
-                done_s += 1
-                n_ok = sum(1 for o, _ in results.values() if o == "success")
-                n_bad = sum(1 for o, _ in results.values() if o == "failed")
-                out.append(f"  {who}:已落定 {head.get('feedStatus')},"
-                           f"成功 {n_ok},失败 {n_bad}")
-        return done_s, still_s, skipped_s, out
+                rec.update(state="open",
+                           detail=f"{head.get('feedStatus')},{_progress(head)}")
+                continue
+            n_open, n_unk = unresolved(results)
+            if n_open:
+                # ⚠ **feed 终态 ≠ 落定**:残留 processing/unknown 时 poll_feed
+                # 不调 mark_feed_done(那些 SKU 要留在在途队列里下轮重查),
+                # 摘要跟着说"已落定"就是假的 —— 行还在 feed_log 里,下一轮
+                # 一字不差再播一遍,而 `落定 N` 每轮把它重数一次。
+                tail = (f",其中 {n_unk} 个状态未知(沃尔玛枚举可能已扩,查日志"
+                        f"「未知 SKU ingestionStatus」)" if n_unk else "")
+                rec.update(state="open",
+                           detail=f"{head.get('feedStatus')} 已终态,但 {n_open} 个 "
+                                  f"SKU 未落定{tail},保持在途下轮重查")
+                continue
+            n_ok = sum(1 for o, _ in results.values() if o == "success")
+            n_bad = sum(1 for o, _ in results.values() if o == "failed")
+            rec.update(state="settled",
+                       detail=f"已落定 {head.get('feedStatus')},"
+                              f"成功 {n_ok},失败 {n_bad}")
+        return out
 
     done = still = skipped = 0
     detail_lines: list[str] = []
+    stuck: list[dict] = []
     # 摘要按人看的店铺序排(sort_key),**不是**按完成先后:query_pending 本身
     # 没有 ORDER BY,原来那份顺序是 PG 的堆序,本来就不稳定。
     todo = sorted(by_store.items(), key=lambda kv: stores_svc.sort_key(kv[0]))
     if todo:
         from concurrent.futures import ThreadPoolExecutor, as_completed
-        per_store: dict[str, tuple] = {}
+        per_store: dict[str, list[dict]] = {}
         with ThreadPoolExecutor(
                 max_workers=min(stores_svc.STORE_WORKERS, len(todo))) as pool:
             futs = {pool.submit(_one_store, sn, sr): sn for sn, sr in todo}
             for f in as_completed(futs):
                 per_store[futs[f]] = f.result()
         for sn, _ in todo:
-            d, s, k, out = per_store[sn]
-            done += d
-            still += s
-            skipped += k
-            detail_lines.extend(out)
+            for rec in per_store[sn]:
+                if rec["state"] == "settled":
+                    done += 1
+                elif rec["state"] == "skipped":
+                    skipped += 1
+                else:
+                    still += 1
+                # 落定的**永远**出明细行:那是新信息,而且下一轮这个 feed 就
+                # 不在队列里了,只播这一次。仍在途的按年龄分档:新鲜的照旧出
+                # 明细(人正等着它),老的折进下面那一行(见 FEED_QUIET_HOURS)。
+                if rec["state"] != "settled" and is_stuck(rec["age_h"]):
+                    stuck.append(rec)
+                else:
+                    detail_lines.append(f"  {_who(rec)}:{rec['detail']}")
+
+    oldest = max((r["age_h"] for r in stuck), default=0.0)
+    if stuck:
+        # ⚠ 自带处置(排版规矩 3):只说"5 个卡住了"等于把排查甩给读的人。
+        # 这些行**不会自己好** —— 沃尔玛那边早就没动静了,而在途行永不老化
+        # (docs/feed_closure_audit.md §三.4),放着只会一天原样播 48 遍。
+        names = "、".join(f"{r['store']} {r['label']}(卡 {r['age_h']:.0f}h)"
+                          for r in stuck[:_FOLD_NAMES])
+        if len(stuck) > _FOLD_NAMES:
+            names += f" 等 {len(stuck)} 个"
+        detail_lines.append(
+            f"  ⏳ 长期在途 {len(stuck)} 个(提交超过 {FEED_QUIET_HOURS:g}h 仍未"
+            f"落定,最久 {oldest:.1f}h,明细不再逐轮复读):{names}")
+        # ⚠ 上面那些 feed_id 是**截断**的(头 18 位),飞书里复制到的就是那一段
+        # ——所以指引不能是"拿 feed_id 去查"(2026-09-11 所有者:「我找不到这些
+        # feed 的完整的码了」)。`-p stuck=1` 只读台账,直接给完整码与现成命令。
+        detail_lines.append(
+            "    完整码 + 现成命令:`python cli.py feed_poll -p stuck=1`"
+            "(只读台账,不调沃尔玛);处理见 docs/feed_closure_audit.md §三.4")
 
     if pendings:
         logger.warning("feed_log 有 %d 条 pending(提交结局不确定),"
@@ -419,6 +540,10 @@ def poll_all(stores_by_name: dict) -> str:
     line = (f"feed 轮询:{len(submitted)} 个在途,落定 {done},仍处理中 {still}")
     if skipped:
         line += f",店铺凭证缺失跳过 {skipped}"
+    if stuck:
+        # 首行 = 结论 + 最重要的那个数(排版规矩 1:飞书列表/手机推送/ops.runs
+        # 都只显示第一行)。长期在途是**例外计数**,0 则整段消失(规矩 2)。
+        line += f";⏳ 长期在途 {len(stuck)}(最久 {oldest:.1f}h)"
     if pendings:
         # ⚠ 只报个数**没法处理**(2026-08-16 feed 闭环审计):摘要是发去飞书的
         # 那一份,人看到"pending 3"接下来要干什么?明细只在日志里,而 pending

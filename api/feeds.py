@@ -250,9 +250,17 @@ def _log_update(log_id, status: str, feed_id: str | None = None) -> None:
 
 
 def query_pending() -> list[dict]:
-    """输入:无 → 输出:pending/submitted 的 feed_log 行(启动对账用)。"""
+    """输入:无 → 输出:pending/submitted 的 feed_log 行(启动对账用)。
+
+    带 `updated_at` 是给 feed_poll 算**在途年龄**用的(摘要折叠,见
+    `services/feed_track.FEED_QUIET_HOURS`)。⚠ 年龄别拿 `created_at` 算:
+    `_log_claim` 重占终态行时只改 status/feed_id/workflow/updated_at,
+    created_at 留的是这个 payload_key **第一次**提交的时刻(可能是几个月前);
+    submitted 行的 updated_at 才是这个 feedId 自己的提交时刻(`_log_update` 写的)。
+    """
     sql = ("SELECT id, workflow, store, feed_type, payload_key, feed_id, status, "
-           "created_at FROM ops.feed_log WHERE status IN ('pending', 'submitted')")
+           "created_at, updated_at FROM ops.feed_log "
+           "WHERE status IN ('pending', 'submitted')")
     with db.pg_conn() as conn, conn.cursor() as cur:
         cur.execute(sql)
         cols = [d.name for d in cur.description]

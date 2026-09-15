@@ -115,6 +115,16 @@ _QUOTA_EXHAUSTED_CODE = 99991403      # 官方:月度 API 调用量耗尽,**不�
 #     本月 API 调用次数已达上限，请联系企业管理员升级飞书版本。」配额按自然月 1 号
 #     刷新,退避多久都不会好——所以它**不进**可重试集合,见 _QUOTA_EXHAUSTED_HINT。
 
+# ── 消息(im v1 发消息 / 群机器人 webhook)────────────────────────────────────
+_MESSAGE_TEXT_MAX_BYTES = 145_920     # 官方 150 KB(= 153,600 字节)| https://open.feishu.cn/document/server-docs/im-v1/message/create | 核对 2026-09-10
+#     官方错误码 230025 原句「The length of the message content reaches its limit.
+#     消息体长度超出限制。文本消息最大不能超过 150 KB、卡片及富文本消息最大不能
+#     超过 30 KB。」本仓只发 text 消息,故按 150 KB 那一档 × 95% 取 145,920 字节。
+#     ⚠ 单位是**字节不是字符**:一个汉字 UTF-8 占 3 字节,中文摘要按字符数估会
+#     差出三倍。2026-09-10 实证触发:A131吕灿荣 `sku_migrate -p settle_only=1`
+#     一轮,几百条「维护账随码迁」逐条各占一行,应用通知直接 400 code=230025,
+#     那轮摘要一个字都没推出去(店里又没配 webhook 退路)。
+
 _TRANSIENT_CODES = {90235, 90217, 50502, 99991400}
 _RATELIMIT_CODES = {99991400, 90217}   # 频控码:优先读 reset 头精确等待
 _TOKEN_INVALID_CODES = {99991663, 99991664}
@@ -1158,6 +1168,36 @@ def _notify_via_app(text: str) -> bool:
     return True
 
 
+#: 超长截断的尾巴(**只有这一处措辞**)。带走了多少字节要说出来:
+#: 静默截断的表现是所有者读到一条看起来完整、其实少了半截的摘要。
+_TRUNCATE_NOTE = ("\n\n……(本条通知超长,已截掉尾部 {dropped:,} 字节;"
+                  "**首行与前文完整**,全文见运行日志与 ops.runs)")
+
+
+def _fit_message(text: str) -> tuple[str, int]:
+    """输入:通知文本 → 输出:(不超限的文本, 被截掉的字节数)。**纯函数**。
+
+    飞书文本消息有硬上限(`_MESSAGE_TEXT_MAX_BYTES`,官方 150 KB × 95%),超了
+    整条消息**被拒**(code=230025)—— 不是截断发出,是一个字都不发。2026-09-10
+    A131吕灿荣 的 settle_only 一轮就是这么整轮没推出去的。
+
+    截法是**保前缀**:第一行是链通知的唯一内容(cli 只取首行进飞书/推送),
+    丢了它这条通知就等于没发;而摘要本来就是"结论在前、明细在后"的排版
+    (services/notify_fmt 规矩 1),砍尾部砍掉的正是最不要紧的那段明细。
+    ⚠ 按**字节**切、切完 `decode(errors="ignore")`:UTF-8 一个汉字 3 字节,
+    按字符估会差三倍,而切在半个字符上会发出一条乱码结尾的消息。
+    尾巴的位置先留出来(按最坏情况的位数预留),所以拼完一定还在上限内。
+    """
+    raw = text.encode("utf-8")
+    if len(raw) <= _MESSAGE_TEXT_MAX_BYTES:
+        return text, 0
+    # 先按"截掉的字节数 = 全文长度"预留尾巴(位数只多不少)⇒ 真尾巴一定塞得下
+    reserve = len(_TRUNCATE_NOTE.format(dropped=len(raw)).encode("utf-8"))
+    kept = raw[:max(_MESSAGE_TEXT_MAX_BYTES - reserve, 0)].decode("utf-8", "ignore")
+    dropped = len(raw) - len(kept.encode("utf-8"))
+    return kept + _TRUNCATE_NOTE.format(dropped=dropped), dropped
+
+
 def notify(text: str) -> bool:
     """输入:通知文本 → 输出:是否真正发出。**绝不抛异常**(通知失败不能拖垮工作流)。
 
@@ -1168,7 +1208,18 @@ def notify(text: str) -> bool:
 
     留两条而不是一刀切换,是为了切换期不把通知打断:应用权限还没批下来时
     webhook 照样能发,反过来也一样。
+
+    **超长保护在这一层做一次**(2026-09-10):两条路发的是同一段文字、撞的是
+    同一个上限,所以 `_fit_message` 放在分叉**之前** —— 放到某一条路里就是
+    "换条路发就没有闸"(而 webhook 那条正是应用发不出去时的退路)。
+    截断**记 warning**,不静默:摘要少了半截而没人知道,比发不出去更坏。
     """
+    text, dropped = _fit_message(text)
+    if dropped:
+        logger.warning("飞书通知超长:已截掉尾部 %s 字节(文本消息上限 %s 字节,"
+                       "官方 150KB×95%%),首行与前文照发;全文见运行日志与 "
+                       "ops.runs —— 摘要该更短了(明细归并成一行,别逐条报)",
+                       f"{dropped:,}", f"{_MESSAGE_TEXT_MAX_BYTES:,}")
     try:
         if _notify_via_app(text):
             return True

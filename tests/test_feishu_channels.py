@@ -69,6 +69,10 @@ def _rows_of(body: dict) -> int:
 _SRC = Path(feishu.__file__).read_text(encoding="utf-8")
 
 
+#: 行内注释里的核对日期:`核对 2026-08-27` 这种写法(日期本身随条目走)。
+_CHECKED_RE = re.compile(r"核对 20\d\d-\d\d-\d\d")
+
+
 def _registry_block() -> list[str]:
     """限额登记表那一段的源码行(从表头横幅到 _TRANSIENT_CODES 之前)。"""
     lines = _SRC.splitlines()
@@ -93,7 +97,10 @@ def test_every_limit_constant_cites_an_official_source():
         note = ln.split("#", 1)[1]
         assert "官方" in note, f"{name} 的注释没写官方出处"
         assert "https://" in note, f"{name} 的注释没有官方 URL"
-        assert "核对 2026-08-27" in note, f"{name} 的注释没有核对日期"
+        # ⚠ 日期只钉**格式**,不钉某一天(2026-09-10 放宽):登记表最初整张出自
+        # 2026-08-27 那一次调研,而后来补的条目(如文本消息长度 230025)有自己的
+        # 核对日期 —— 钉死那一天等于逼下一个人把新条目的日期写成假的。
+        assert _CHECKED_RE.search(note), f"{name} 的注释没有核对日期(核对 YYYY-MM-DD)"
 
 
 def test_engineering_values_declare_themselves_as_unofficial():
@@ -141,7 +148,9 @@ def test_official_quote_archive_covers_the_registry():
     rows = [ln.split("\t") for ln in lines[1:] if ln.strip()]
     assert all(len(r) == len(head) for r in rows)
     assert len(rows) > 100
-    assert all(r[-1] == "2026-08-27" for r in rows)
+    # 日期同上:整张表出自 2026-08-27,后补的条目带自己的核对日期(格式仍要对)
+    assert all(re.fullmatch(r"20\d\d-\d\d-\d\d", r[-1]) for r in rows)
+    assert sum(1 for r in rows if r[-1] == "2026-08-27") > 100
     # 官方未说明的项也必须在册(否则下一个人会以为「没查过」而重查/瞎猜)
     assert sum(1 for r in rows if r[2] == "官方未说明") >= 10
     blob = "\n".join(lines)

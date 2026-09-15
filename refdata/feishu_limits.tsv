@@ -189,3 +189,4 @@
 多维表格(bitable v1)	官方未说明	官方未说明	未采用(仅存档)	(官方未说明,不许推断)		【官方未说明】错误码 1254102 FileExceedLimit、1254105 ColumnExceedLimit、1254106 AttachExceedLimit 的具体阈值(错误码表只写「超限」「字段数量超限」「附件过多」,数字要去概述页/帮助中心另找)。	2026-08-27
 多维表格(bitable v1)	官方未说明	官方未说明	未采用(仅存档)	(官方未说明,不许推断)		【官方未说明】多维表格 v2 / v3 接口版本——开放平台的多维表格接口只有 v1(全部端点均为 /open-apis/bitable/v1/...),不存在 v2/v3,因此无版本差异可列。题目里的 v2/v3 属于电子表格(Sheets)。	2026-08-27
 多维表格(bitable v1)	官方未说明	官方未说明	未采用(仅存档)	(官方未说明,不许推断)		【官方未说明】错误码 90202 / 90204 / 90221 / 90227 在任何多维表格文档页中的语义——这四个码属于电子表格(Sheets)错误码,不出现在 Bitable 的任何错误码表里。	2026-08-27
+消息(im v1 / 群机器人 webhook)	文本消息内容长度上限	150 KB(= 153,600 字节)	145920 字节(_MESSAGE_TEXT_MAX_BYTES;超长保首行+尾部截断说明,记 warning)	发送消息 POST /open-apis/im/v1/messages(msg_type=text)	https://open.feishu.cn/document/server-docs/im-v1/message/create	230025 | The length of the message content reaches its limit. 消息体长度超出限制。文本消息最大不能超过 150 KB、卡片及富文本消息最大不能超过 30 KB。	2026-09-10

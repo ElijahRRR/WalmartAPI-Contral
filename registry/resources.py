@@ -724,6 +724,50 @@ MATCH_SHEET = Spreadsheet(
 )
 
 
+# 产品分配表(**点名分配**的驱动表,所有者建表 2026-09-17;口径见
+# docs/allocation_plan.md 口径 #19):「产品中心」spreadsheet 内的工作表 —— 与
+# 「在线产品总表」/「上架表」是同一个飞书文件,token 复用 FEISHU_ONLINE_SHEET_TOKEN,
+# 这里只要 sheet_id(URL 的 ?sheet= 参数)。
+# 列权责:**运营只填 ASIN 一列**;其余 16 列全是机器域,`alloc_plan -p from_sheet=1`
+# 一次写满。「店铺」已填的行 = 上一轮处理过,重跑**跳过不读不写**(所有者定稿)。
+# 「流别」只写三个值:自由流 / 定向流 / 未分配,细节全在「未分配原因」列;
+# 「是否在线」写 是/否(已在架的点名品:店铺列写它所在的店,不再分配)。
+# ⚠ 读写一律**按表头名定位列**(services/sheet_layout,与上架表同一套):
+#   所有者挪列顺序代码不用改;表头缺列/重名 fail-closed 拒绝读写。
+#   表头文字只在这里出生(铁律三),业务代码不许写中文表头字面量。
+# 17 列今天的顺序(不是契约):A=店铺 B=ASIN C=品牌 D=产品分 E=罚分 F=罚分原因
+#   G=流别 H=未分配原因 I=商品品类(五大类) J=商品大类(26类) K=评分 L=评论数
+#   M=配送方式 N=配送天数 O=落地价 P=窗口销售额(毛额) Q=是否在线
+ALLOC_SHEET = Spreadsheet(
+    name="产品分配表",
+    token=os.environ.get("FEISHU_ONLINE_SHEET_TOKEN", ""),
+    sheet_id=os.environ.get("FEISHU_ALLOC_SHEET_ID", ""),
+    columns=("store", "asin", "brand", "score", "penalty", "penalty_why",
+             "flow", "unassigned_why", "super_category", "category",
+             "rating", "reviews", "channel", "lead", "landed_price",
+             "gross", "online"),
+    headers={
+        "store": "店铺",
+        "asin": "ASIN",
+        "brand": "品牌",
+        "score": "产品分",
+        "penalty": "罚分",
+        "penalty_why": "罚分原因",
+        "flow": "流别",
+        "unassigned_why": "未分配原因",
+        "super_category": "商品品类(五大类)",
+        "category": "商品大类(26类)",
+        "rating": "评分",
+        "reviews": "评论数",
+        "channel": "配送方式",
+        "lead": "配送天数",
+        "landed_price": "落地价",
+        "gross": "窗口销售额(毛额)",
+        "online": "是否在线",
+    },
+)
+
+
 # 黑名单中心两张新表(所有者定稿 2026-08-13:黑名单只维护一份,与品牌总表
 # 同一个黑名单 wiki 承载;取代旧审核系统的独立三列表)。镜像语义 = 单事务
 # TRUNCATE 全量重灌 + 空读/骤缩护栏(飞书删行必须跟着消失,残留即幽灵拦截)。

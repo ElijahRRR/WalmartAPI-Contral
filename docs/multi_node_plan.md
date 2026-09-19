@@ -111,7 +111,9 @@ stockzero 静默失效(P0)、库存永久重写循环 + settle 恒 ineffective(P
   **FC ID**(即 shipNode,17-18 位数字)。
 - **校验**(fail-closed):读到非空值 → 调 `GET shipnodes` 比对;对不上 →
   该店维护/上架**整店跳过并告警**(填错了宁可不动,不能静默回落 Virtual
-  Node——那会把新仓的货写到旧节点)。校验结果缓存一天(节点不会天天变)。
+  Node——那会把新仓的货写到旧节点)。校验结果缓存一天(节点不会天天变)
+  —— ✅ 2026-09-19 才真正落地(`ops.node_validations`,见文末同日节;此前只有
+  进程内 lru,"缓存一天"一直是句空话,每天每进程从零校验)。
 
 ## 4. 批次 0|止血 + 探测 ✅ 已完成(2026-08-24)
 
@@ -216,10 +218,16 @@ stockzero 静默失效(P0)、库存永久重写循环 + settle 恒 ineffective(P
 | 小批量写 | `api.inventory.put_inventory(..., ship_node)` | 带节点走 `PUT /v3/inventories/{sku}`,**逐节点解析 status** |
 | 大批量写 | `api.feeds.build_payload("MP_INVENTORY", …)` | v1.5 小写 key,每 SKU `shipNodes[]` |
 | 落定判据 | `dispositions.settle_maintenance()` | 带 `ship_node` 的行按 `item_node_inventory` 判 |
+| 校验记忆 | `store_limits._resolve()` + `ops.node_validations` | 保鲜期 24h 内不调沃尔玛;读不到沿用 ≤30 天旧记忆并计数;只认沃尔玛的明确否定(2026-09-19) |
+| 校验失败分两类 | `NodeUnknownError` / `NodeUnreachableError` | 填错(改表)vs 读不到(可补试,走 `store_retry.serial_second_pass`);归类词进摘要(2026-09-19) |
+| 校验失败整店剔除(扫描侧) | `workflows/maintenance_scan.run()` | `skipped` 里的店意图/截断顺延**整店不产出**,首行点名「店(归类词)」,withdraw 护住存量行(2026-09-19) |
+| 缺节点不执行(执行侧) | `workflows/maintenance._hold_nodeless()` | 填了「维护仓库」的店,库存建议不带 `ship_node` 就扣下:留 suggested、表上「未执行(受管仓建议缺节点)」(2026-09-19) |
 
-三处**故意的响亮失败**(都不回落):FC ID 认不出 → 整店跳过;受管仓明细本轮
-没扫到 → 该行跳过并计数;同批混着带/不带节点 → 本店不提交。回落的共同后果
-是"写到官方无定义的默认节点且全程不报错",比少动一轮坏得多。
+五处**故意的响亮失败**(都不回落):FC ID 认不出 → 整店跳过(**扫描件整店
+不产意图**,不只是摘要里一句话,2026-09-19 前只有那句话);受管仓明细本轮
+没扫到 → 该行跳过并计数;同批混着带/不带节点 → 本店不提交;配置店的库存
+建议不带节点 → 执行件扣下不发。回落的共同后果是"写到官方无定义的默认节点
+且全程不报错",比少动一轮坏得多。
 
 **存量行路由(所有者拍板 2026-08-30)**:配置店 **只维护受管仓**,不做
 "按 SKU 所在仓路由"。§2.4 第 4 条实测定案后,这条**不再需要任何人工搬仓
@@ -280,3 +288,82 @@ stockzero 静默失效(P0)、库存永久重写循环 + settle 恒 ineffective(P
 修:表里补 `MP_INVENTORY`,守门测试钉「每种 dict 条目的 feedType 台账 sku 不得以 { 开头」。
 存量脏行由所有者核对后处置(`SELECT count(*) FROM ops.feed_items WHERE
 feed_type='MP_INVENTORY' AND sku LIKE '{%'`),本仓不自动清理。
+
+## 2026-09-19 生产缺陷:「校验失败整店跳过」只跳了摘要,意图照发到默认节点
+
+**现象**(所有者发现):配置了「维护仓库」的店,同一 SKU **两个节点都有货**;
+其中有配置之后才上架的商品,旧节点(Virtual Node)按设计根本不该出现库存。
+船队盘点(2026-09-19):A171罗尹鸿 383、A131吕灿荣 227、谭总23 122、谭总22 6、
+A085朱丽霖 2 个 SKU 双节点有货。
+
+**取证**(谭总23 / A9NV2CGP689D 的建议行序列):09-09 至 09-15 四次改库存都
+带节点、都 confirmed;**09-17 那次 `detail.ship_node` 为 NULL**,34→50 走了
+legacy 通道,受管仓值没变 ⇒ ineffective,而旧节点被写成 50;09-19 再次
+34→58 带节点 —— 此后两个节点都有货。09-17 当天谭总23 **235 条无节点库存
+建议全部执行**;同日的 maintenance_scan 摘要正写着「校验失败整店跳过:
+A173夏雨,谭总12,谭总23」(09-06 是谭总22/23/24,09-18 是 A131吕灿荣)。
+
+**根因**:`store_limits.managed_nodes()` 把校验失败(`resolve_node` 抛
+NodeConfigError:多为节点列表接口瞬时读不到)的店放进 `skipped`、不进
+`managed`;`maintenance_scan` 只把 `skipped` 摊进摘要那一行(§6 第 6 条),
+**意图一条没少**:`maintenance_intents._node_of()` 对不在 `managed` 里的店返回
+`{}`,于是该店的库存意图不带 `ship_node`、比对基准退回全店合计,执行件按
+"未配置店"走 legacy `PUT /v3/inventory` / v1.4 `inventory` feed —— 恰是
+`resolve_node` 头注拼命避免的"回落 Virtual Node",只是绕了一圈发生在别处。
+list_new(批次 3)一开始就做对了(`managed_bad` 整店 `continue`),维护链漏了。
+
+**修**(两道闸,守门用例 `tests/test_maintenance.py` 末尾两条):
+1. 扫描侧:`skipped` 里的店**整店剔除**意图与截断顺延,首行点名
+   「受管仓校验失败整店跳过 N 店:…(M 条意图不产出,不回落默认节点)」,
+   并把这些店加进 `withdraw_stale(exclude_stores=…)`(跳过 ≠ 恢复正常,
+   与缺席避让同款)。
+2. 执行侧:`_hold_nodeless()` 重读 `maint_nodes()`,填了「维护仓库」的店,
+   库存建议不带 `ship_node` 就扣下:留 suggested 原地(claim 不转态)、表上
+   一行「未执行(受管仓建议缺节点)」、账本记 unexecuted、摘要点名条数。
+   来源只可能是修复前存量行 / 扫描与执行之间改了配置 / 将来哪条 provider
+   漏节点,三种都不许发。配置读不到时**不扣只喊**(fail-open,与本件缺席
+   避让同向:扫描件几分钟前刚按同一张表整店剔过,这道闸拦的是存量行)。
+
+**存量处置**(本仓不自动清,所有者操作):受影响的店按 §7 runbook 第 3 步
+`node_clear -p store=<店> -p node=<旧节点> --dry-run` → 人眼确认 → 真跑;
+`node_clear` 只清受管仓已接管的 SKU,未接管的默认跳过。⚠ A171罗尹鸿 /
+A085朱丽霖 不在任何一天的「校验失败」名单里,它们的双节点有货另有出处
+(接管后未跑 node_clear 的设计内状态,或别的写入方),先查
+`ops.dispositions` 里该店 `action='inventory' AND detail->>'ship_node' IS NULL`
+的执行日分布再定。
+
+### 为什么会校验失败(所有者追问 2026-09-19:「治标不治本,从为什么会校验失败出发」)
+
+生产日志(`logs/maintenance_scan.log` / `list_new.log`)三天 15 条 `services.store_limits`
+WARNING **全部**是「发货节点列表读不到(店铺代理故障 …)」——即校验链的第一跳
+`POST /v3/token`(经该店代理)就断了,根本没到 shipnodes:
+- 09-17 14:36:31–34:A173夏雨 / 谭总12 / 谭总23 三家 3 秒内同报 `SSL: UNEXPECTED_EOF_WHILE_READING`
+  (出口/代理商抖动窗连击;同日 13:02 catalog_sync 对谭总12/22/24 也遇到同款,
+  但它有串行补试所以救回来了);
+- 09-18:A131吕灿荣整天 `ProxyError: Invalid username/password`(**代理账号错**,归类词
+  「代理无效」,改凭证表才能好);A085朱丽霖 / A156赵红艳 `Malformed reply`(代理波动);
+- 09-06:谭总22/23/24 **没有任何 WARNING** —— 走的是「不在可调用店铺列表里」这条
+  无日志分支(那一刻凭证表里没读到它们)。
+
+代码层面的根子(五处,都已改):
+1. 校验 = 每天每进程从零来一次远程读:product_chain 八步同进程,catalog_sync 换的
+   token 840s 后过期、连接 5s 关闭,到 maintenance_scan 时每家配置店都要重新
+   TCP→SOCKS→TLS→换 token —— 最容易被抖断的一跳,且 `get_token` 对传输异常零重试
+   (`api/_client.py:485-514`;transport 的 `retries=2` 对走代理的连接不生效,httpcore
+   1.0.9 `SOCKSProxy/HTTPProxy.create_connection` 不传 retries,本机已核)。
+   **修:校验记忆落库**(`ops.node_validations`,§3 原句的落地),保鲜期内不调沃尔玛。
+2. `resolve_node` 把"读不到"当"不认识":一次失败就改判整店路由。**修:读不到沿用
+   ≤30 天内的旧记忆并计数进摘要;记忆只认沃尔玛的明确否定**(200 且列表非空且不含)。
+3. `managed_nodes` 逐店一次、零补试,是全仓唯一不走店维失败标准的按店远程调用。
+   **修:读不到且无记忆的店走 `store_retry.serial_second_pass`**(凭证死不补、规模闸同款)。
+4. 200 但空体/非 JSON → `_parse_nodes` 返回空 → 判成「不在列表(认识的:(空))」且空结果
+   进 lru 缓存整进程。**修:`api/settings._cached_ship_nodes` 空解析抛错不缓存**。
+5. 原因不可见:NodeConfigError 一个类、摘要只列店名、文案与 `diagnose` 对不上。
+   **修:拆 `NodeUnknownError`(填错)/ `NodeUnreachableError`(读不到);摘要首行
+   「店(归类词)」;settings 文案改「沃尔玛返回 NNN」让 diagnose 认得;「不在可调用
+   店铺列表里」分支补日志**。
+
+**没做**(所有者未拍板,单列):`get_token` 自身加传输层重试。它惠及全部调用点的
+首跳,但整段在全局 `_token_lock` 内,照写会让一家坏店把 24 并发的换 token 全卡住
+~100s —— 要做得先把重试挪到锁外或按 client_id 分锁。有了记忆之后,这条对受管仓
+校验已不关键。

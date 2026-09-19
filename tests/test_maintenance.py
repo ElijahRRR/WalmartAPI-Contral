@@ -830,7 +830,8 @@ def _scan_wire(monkeypatch, intents, sz=("T1",), capped=(), absent=()):
     calls = {"suggest": [], "withdraw": [], "collect": []}
     monkeypatch.setattr(ms.store_limits, "stockzero_stores", lambda: list(sz))
     # 默认没有店配「维护仓库」= 现状;要钉受管仓的用例自己覆盖这一项
-    monkeypatch.setattr(ms.store_limits, "managed_nodes", lambda: ({}, {}))
+    monkeypatch.setattr(ms.store_limits, "managed_nodes",
+                        lambda conn=None, stats=None: ({}, {}))
     monkeypatch.setattr(ms.store_absence, "stale_stores",
                         lambda conn, since=None, hours=None: list(absent))
     # ⚠ 桩**故意不理会 only**(照旧返回全部意图):workflow 里的 Python 侧过滤
@@ -2031,52 +2032,144 @@ def _store(name="T1"):
             "proxy": None}
 
 
+class _NodeConn:
+    """ops.node_validations 的假连接:validated_at 按 age_hours 给(None=没认过)。"""
+
+    def __init__(self, age_hours=None):
+        self.age_hours = age_hours
+        self.writes = []            # (动词, 参数):INSERT / DELETE
+        self._last = ""
+
+    def cursor(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, sql, args=None):
+        self._last = sql
+        verb = sql.strip().split()[0]
+        if verb != "SELECT":
+            self.writes.append((verb, args))
+
+    def fetchone(self):
+        from datetime import datetime, timedelta, timezone
+        if "FROM ops.node_validations" in self._last and self.age_hours is not None:
+            return (datetime.now(timezone.utc) - timedelta(hours=self.age_hours),)
+        return None
+
+
+def _node_wire(monkeypatch, age_hours=None, nodes=None, err=None):
+    """受管仓校验的三件桩:记忆年龄 / shipnodes 返回(或抛)/ 补试不睡。"""
+    from services import store_limits, store_retry
+
+    conn = _NodeConn(age_hours)
+    _fake_db(monkeypatch, conn)
+    calls = []
+
+    def _ship(store):
+        calls.append(store["name"])
+        if err is not None:
+            raise err
+        return nodes if nodes is not None else {}
+
+    monkeypatch.setattr(store_limits.settings, "list_ship_nodes", _ship)
+    monkeypatch.setattr(store_retry.time, "sleep", lambda s: None)
+    return conn, calls
+
+
 def test_resolve_node_returns_none_when_unconfigured(monkeypatch):
-    """没填「维护仓库」= 现状(Virtual Node):**根本不调沃尔玛**,零成本零变化。"""
+    """没填「维护仓库」= 现状(Virtual Node):**根本不调沃尔玛、不开连接**,零成本零变化。"""
     from services import store_limits
 
     monkeypatch.setattr(store_limits.settings, "list_ship_nodes",
                         lambda s: (_ for _ in ()).throw(
                             AssertionError("未配置的店不该调 shipnodes")))
+    monkeypatch.setattr(store_limits.db, "pg_conn",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("未配置的店不该开连接")))
     assert store_limits.resolve_node(_store(), {}) is None
     assert store_limits.resolve_node(_store(), {"别的店": "123"}) is None
 
 
-def test_resolve_node_accepts_a_known_fc_id(monkeypatch):
+def test_resolve_node_accepts_a_known_fc_id_and_remembers_it(monkeypatch):
+    """没认过 → 真调 shipnodes;认识 → 记一行(下次保鲜期内不再调)。"""
     from services import store_limits
 
-    monkeypatch.setattr(store_limits.settings, "list_ship_nodes",
-                        lambda s: {"91539778610008065": {"nodeType": "PHYSICAL"}})
+    conn, calls = _node_wire(monkeypatch, None,
+                             nodes={"91539778610008065": {"nodeType": "PHYSICAL"}})
     assert store_limits.resolve_node(
         _store(), {"T1": "91539778610008065"}) == "91539778610008065"
+    assert calls == ["T1"]
+    assert [w[0] for w in conn.writes] == ["INSERT"]
+    assert conn.writes[0][1][:2] == ("T1", "91539778610008065")
+
+
+def test_resolve_node_trusts_fresh_memory_without_calling_walmart(monkeypatch):
+    """多仓 §3 原句「校验结果缓存一天」:保鲜期内**一次沃尔玛调用都不发**。
+
+    这是根治的核心:常态店不再有那次"经代理、零重试、决定整店路由"的远程读。
+    """
+    from services import store_limits
+
+    conn, calls = _node_wire(monkeypatch, age_hours=1,
+                             err=AssertionError("保鲜期内不该调 shipnodes"))
+    assert store_limits.resolve_node(_store(), {"T1": "999"}) == "999"
+    assert calls == [] and conn.writes == []
 
 
 def test_resolve_node_fails_closed_on_unknown_id(monkeypatch):
     """⚠ 填错不回落 Virtual Node —— 那等于把新仓的货写到旧节点,而且不报错。
 
-    宁可这店今天不动:抛 NodeConfigError,调用方整店跳过并告警。
+    宁可这店今天不动:抛 NodeUnknownError(配置错),调用方整店跳过并告警;
+    记忆一并抹掉 —— 沃尔玛的**明确否定**是记忆唯一的失效条件。
     """
-    import pytest
-
     from services import store_limits
 
-    monkeypatch.setattr(store_limits.settings, "list_ship_nodes",
-                        lambda s: {"111": {}})
-    with pytest.raises(store_limits.NodeConfigError) as e:
+    conn, _calls = _node_wire(monkeypatch, age_hours=30, nodes={"111": {}})
+    with pytest.raises(store_limits.NodeUnknownError) as e:
         store_limits.resolve_node(_store(), {"T1": "999"})
     assert "999" in str(e.value) and "整店跳过" in str(e.value)
+    assert isinstance(e.value, store_limits.NodeConfigError)   # 老调用方照接
+    assert [w[0] for w in conn.writes] == ["DELETE"]
 
 
-def test_resolve_node_fails_closed_when_node_list_unreadable(monkeypatch):
-    """接口失败也算"认不出":同理宁可不动,不许因为查不到就放行。"""
-    import pytest
+def test_resolve_node_uses_stale_memory_when_list_unreadable(monkeypatch):
+    """读不到 ≠ 不认识(2026-09-19 根因):值没变、昨天刚认过,今天代理抖一下不改判。
 
+    此前这一条是"接口失败也算认不出",一次零重试的远程读就把整店从受管仓
+    改判成默认节点(09-17 三家店 SSL EOF,235 条库存写到旧节点)。
+    """
     from services import store_limits
 
-    monkeypatch.setattr(store_limits.settings, "list_ship_nodes",
-                        lambda s: (_ for _ in ()).throw(RuntimeError("HTTP 500")))
-    with pytest.raises(store_limits.NodeConfigError):
+    conn, calls = _node_wire(monkeypatch, age_hours=30,
+                             err=RuntimeError("shipnodes 查询失败,沃尔玛返回 None"))
+    node, how = store_limits._resolve(_store(), {"T1": "999"}, conn)
+    assert (node, how) == ("999", "memory_stale")      # 兜底要计数,how 就是计数键
+    assert calls == ["T1"] and conn.writes == []       # 试过、没成、记忆不动
+
+
+def test_resolve_node_fails_closed_when_unreadable_and_no_memory(monkeypatch):
+    """从没认过(新配置第一天)且读不到:仍然宁可不动 —— 但抛的是「读不到」,可补试。"""
+    from api import _client
+    from services import store_limits
+
+    cause = _client.StoreProxyError("client_id=abc…",
+                                    ConnectionError("Malformed reply"))
+    _node_wire(monkeypatch, None, err=cause)
+    with pytest.raises(store_limits.NodeUnreachableError) as e:
         store_limits.resolve_node(_store(), {"T1": "999"})
+    assert e.value.__cause__ is cause                 # 归类/补试判据看原始异常
+    assert "没有可沿用的校验记忆" in str(e.value)
+
+    # 记忆超上限也不沿用:一家店 API 整月不通,别的链早就天天喊了
+    _node_wire(monkeypatch, age_hours=24 * 31, err=cause)
+    with pytest.raises(store_limits.NodeUnreachableError) as e:
+        store_limits.resolve_node(_store(), {"T1": "999"})
+    assert "记忆已超 30 天" in str(e.value)
 
 
 # ── 多仓:维护链切受管仓(批次 2)──────────────────────────────────────────
@@ -2091,15 +2184,119 @@ def test_managed_nodes_splits_effective_from_skipped(monkeypatch):
 
     monkeypatch.setattr(store_limits, "maint_nodes",
                         lambda: {"T1": "111", "T2": "999", "T3": "222"})
+    _node_wire(monkeypatch, None)
     monkeypatch.setattr(store_limits.settings, "list_ship_nodes",
                         lambda s: {"T1": {"111": {}}, "T2": {"333": {}}}[s["name"]])
+    stats: dict = {}
     ok, skipped = store_limits.managed_nodes(
-        [_store("T1"), _store("T2")])          # T3 填了但不在可调用店铺列表里
+        [_store("T1"), _store("T2")], stats=stats)   # T3 填了但不在可调用店铺列表里
     assert ok == {"T1": "111"}
     assert set(skipped) == {"T2", "T3"}
     assert "不在可调用店铺列表里" in skipped["T3"]
-    note = store_limits.managed_note(ok, skipped)
+    note = store_limits.managed_note(ok, skipped, stats)
     assert "T1=111" in note and "整店跳过 2 家" in note
+    # 归类词跟着店名:填错改表、不可调用查凭证表 —— 只报店名等于让人翻日志
+    assert "T2(FC ID 不在列表)" in note and "T3(不可调用)" in note
+    assert "接口校验 1 家" in note and "沿用旧记忆" not in note
+
+
+def test_managed_nodes_retries_unreachable_stores_once_and_names_the_cause(monkeypatch):
+    """「读不到」走店维失败标准①:串行补试一遍(凭证死不补),归类词进摘要。
+
+    此前 managed_nodes 是全仓唯一不走这套标准的按店远程调用 —— 一次抖动就
+    整店改判,而摘要只说「校验失败」,人分不清该改表还是该等。
+    """
+    from api import _client
+    from services import store_limits
+
+    monkeypatch.setattr(store_limits, "maint_nodes",
+                        lambda: {"T1": "111", "T2": "222", "T3": "333"})
+    conn, calls = _node_wire(monkeypatch, None)
+    flaky = {"T1": 1}          # T1 首轮抖一次、补试成功;T2 一直代理坏;T3 凭证死
+
+    def _ship(store):
+        n = store["name"]
+        calls.append(n)
+        if n == "T1" and flaky["T1"]:
+            flaky["T1"] -= 1
+            raise _client.StoreProxyError("client_id=a…", ConnectionError("Malformed reply"))
+        if n == "T2":
+            raise _client.StoreProxyError("client_id=b…",
+                                          ConnectionError("Invalid username/password"))
+        if n == "T3":
+            raise _client.StoreDeadError("client_id=c…", 400)
+        return {"111": {}}
+
+    monkeypatch.setattr(store_limits.settings, "list_ship_nodes", _ship)
+    stats: dict = {}
+    ok, skipped = store_limits.managed_nodes(
+        [_store("T1"), _store("T2"), _store("T3")], stats=stats)
+    assert ok == {"T1": "111"}
+    assert calls == ["T1", "T2", "T3", "T1", "T2"]    # 补试串行;凭证死不补
+    assert set(skipped) == {"T2", "T3"}
+    assert stats["words"] == {"T2": "代理无效", "T3": "凭证失效"}
+    assert stats["retried"] == 3 and stats["fresh"] == 1
+    note = store_limits.managed_note(ok, skipped, stats)
+    assert "T2(代理无效)" in note and "T3(凭证失效)" in note and "补试 3 家" in note
+    assert [w[0] for w in conn.writes] == ["INSERT"]  # 只有真认过的才落记忆
+
+
+def test_managed_nodes_counts_stale_memory_fallback_in_the_note(monkeypatch):
+    """兜底(接口读不到沿用旧记忆)触发必须见人(conventions §六 三要件)。"""
+    from services import store_limits
+
+    monkeypatch.setattr(store_limits, "maint_nodes", lambda: {"T1": "111"})
+    _node_wire(monkeypatch, age_hours=48,
+               err=RuntimeError("shipnodes 查询失败,沃尔玛返回 503: x"))
+    stats: dict = {}
+    ok, skipped = store_limits.managed_nodes([_store("T1")], stats=stats)
+    assert ok == {"T1": "111"} and skipped == {}
+    assert stats["memory_stale"] == 1 and stats["retried"] == 0
+    assert "⚠ 接口读不到沿用旧记忆 1 家" in store_limits.managed_note(ok, skipped, stats)
+
+
+def test_managed_nodes_logs_the_uncallable_branch_in_fleet_mode(monkeypatch, caplog):
+    """2026-09-06 谭总22/23/24 走的就是这条无日志分支 —— 事后只能靠摘要里的店名猜。"""
+    import logging
+
+    from services import store_limits
+
+    monkeypatch.setattr(store_limits, "maint_nodes", lambda: {"T9": "111"})
+    _fake_db(monkeypatch, _NodeConn())
+    from services import stores as stores_mod
+    monkeypatch.setattr(stores_mod, "load_stores", lambda names=None: [])
+    with caplog.at_level(logging.WARNING, logger="services.store_limits"):
+        ok, skipped = store_limits.managed_nodes()
+    assert skipped == {"T9": "不在可调用店铺列表里"}
+    assert any("T9" in r.message and "不在可调用店铺列表里" in r.message
+               for r in caplog.records)
+
+
+def test_ship_nodes_empty_parse_raises_and_is_not_cached(monkeypatch):
+    """200 但没解析出节点:抛而不是返回空 —— 返回空会被判成「不在列表(认识的:(空))」
+
+    (瞬时故障伪装成配置错),而且空结果进 lru 缓存,整个进程再也不重打接口。
+    """
+    from api import _client, settings as settings_api
+
+    settings_api._cached_ship_nodes.cache_clear()
+    monkeypatch.setattr(_client, "rate_acquire", lambda b, c: 0.0)
+    monkeypatch.setattr(_client, "get_token", lambda *a: "tok")
+    monkeypatch.setattr(_client, "safe_get_ex",
+                        lambda *a, **k: (200, {}, None))   # 空体 / 非 JSON
+    with pytest.raises(RuntimeError, match="没解析出任何节点"):
+        settings_api.list_ship_nodes(_store())
+    assert settings_api._cached_ship_nodes.cache_info().currsize == 0
+    # 非 200 的文案要让 store_retry.diagnose 认得出(沃尔玛NNN / 网络未达)
+    from services import store_retry
+    monkeypatch.setattr(_client, "safe_get_ex", lambda *a, **k: (None, {}, None))
+    with pytest.raises(RuntimeError) as e:
+        settings_api.list_ship_nodes(_store("T2"))
+    assert store_retry.diagnose(e.value) == "网络未达"
+    monkeypatch.setattr(_client, "safe_get_ex", lambda *a, **k: (503, {}, None))
+    with pytest.raises(RuntimeError) as e:
+        settings_api.list_ship_nodes(_store("T3"))
+    assert store_retry.diagnose(e.value) == "沃尔玛503"
 
 
 def test_managed_nodes_costs_nothing_when_unconfigured(monkeypatch):
@@ -2170,7 +2367,8 @@ def test_scan_reports_which_stores_the_managed_node_took_effect_for(monkeypatch)
     """配置生效与否必须天天见人(计划 §6 第 6 条)。"""
     ms, _calls = _scan_wire(monkeypatch, _zero(1))
     monkeypatch.setattr(ms.store_limits, "managed_nodes",
-                        lambda: ({"T1": "111"}, {"T2": "认不出"}))
+                        lambda conn=None, stats=None: (
+                            {"T1": "111"}, {"T2": "认不出"}))
     out = ms.run({"preview": "1"})
     assert "T1=111" in out and "整店跳过 1 家" in out
 
@@ -2640,12 +2838,20 @@ def test_scan_drops_every_intent_of_a_store_whose_node_failed_validation(monkeyp
     capped = [{"store": "T1", "kind": "inventory", "total": 9, "kept": 8,
                "deferred_keys": [("T1", "S9", "inventory")]}]
     ms, calls = _scan_wire(monkeypatch, intents, capped=capped)
-    monkeypatch.setattr(ms.store_limits, "managed_nodes",
-                        lambda: ({"T2": "222"}, {"T1": "认不出"}))
+
+    def _mn(conn=None, stats=None):
+        stats.update(words={"T1": "代理波动"}, memory=1, fresh=0,
+                     memory_stale=0, retried=1, gate_note="")
+        return {"T2": "222"}, {"T1": "读不到"}
+
+    monkeypatch.setattr(ms.store_limits, "managed_nodes", _mn)
     out = ms.run({})
     first = out.splitlines()[0]
-    # 只有首行能到飞书:剔了多少条必须写在首行,且不回落默认节点
-    assert "受管仓校验失败整店跳过 1 店:T1(2 条意图不产出,不回落默认节点" in first
+    # 只有首行能到飞书:剔了多少条必须写在首行,且不回落默认节点;归类词跟着店名
+    # (「代理波动」等下轮、「FC ID 不在列表」改表 —— 只报店名人还得翻日志)
+    assert ("受管仓校验失败整店跳过 1 店:T1(代理波动)(2 条意图不产出,"
+            "不回落默认节点") in first
+    assert "记忆沿用 1 家" in out and "补试 1 家" in out
     assert "维护意图 1 条" in first
     assert "截断" not in first                   # 跳过店的截断顺延一并剔掉
     assert [(r["store"], r["sku"]) for r in calls["suggest"]] == [("T2", "X1")]

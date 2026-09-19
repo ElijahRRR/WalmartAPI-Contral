@@ -1087,6 +1087,31 @@ CREATE INDEX report_requests_open_idx ON ops.report_requests (store, report_type
 读写只在 `services/item_reports.py`;`docs` 之外的判据(表头守门 / 两列互校 / 报表为准)
 也在那里。
 
+### ops.node_validations(受管仓校验记忆,2026-09-19)
+
+多仓 §3 所有者原句「校验结果缓存一天(节点不会天天变)」的落地——此前只有进程内
+lru,每天每进程从零校验,而校验 = 经该店代理换 token 再 `GET shipnodes` 的一次
+**零重试**远程读,读不到就被判成"不认识"、整店改走默认节点(2026-09-17 三家店
+SSL EOF、09-18 代理账号错,库存全写到了旧节点,`docs/multi_node_plan.md` 2026-09-19 节)。
+
+```sql
+CREATE TABLE ops.node_validations (
+    store         text NOT NULL,
+    node          text NOT NULL,          -- 「维护仓库」填的 FC ID(shipNode)
+    validated_at  timestamptz NOT NULL,   -- 最近一次被 shipnodes 列表认过的时刻
+    known_nodes   jsonb,                  -- 当时列表里的全部 shipNode(排障用)
+    PRIMARY KEY (store, node)
+);
+```
+
+**唯一读写者 `services/store_limits._resolve`**(各链经 `managed_nodes()` 进入)。
+判定四档:保鲜期内(`NODE_VALIDATION_TTL_HOURS`=24)直接用记忆、不调沃尔玛;过期
+才调 shipnodes,认识 ⇒ upsert 刷新;读不到 ⇒ 沿用 ≤`NODE_VALIDATION_MAX_AGE_DAYS`
+(30)天内的旧记忆并**计数进摘要**(兜底三要件);只有「200 且列表非空且不含该 ID」
+才 DELETE 行并判配置错。配置值变了 = 新 (store, node) 无行 = 必须真校验。
+两个常量只在 `store_limits` 出生。排障:`SELECT * FROM ops.node_validations ORDER BY validated_at`
+看每家配置店最近一次被认过的时间;行不存在 = 从没认过(新填 / 填错被抹)。
+
 ### ops.dispositions(处置建议台账:「建议」与「执行」的分界面)
 
 两条链共用一张表:`maintenance_scan`/`problem_scan` 写建议,

@@ -173,6 +173,16 @@ def _preview_lines(intents: list[dict], stockzero: list[str]) -> list[str]:
     return lines
 
 
+def _node_skip_names(skipped: dict, stats: dict) -> list[str]:
+    """输入:跳过的店 + managed_nodes 的 stats → 输出:「店(归类词)」列表(首行用)。
+
+    归类词是给人指路的:「代理波动」等下轮、「代理无效」改代理账号、
+    「FC ID 不在列表」改「维护仓库」—— 只报店名,人还得翻日志才知道该干什么
+    """
+    words = (stats or {}).get("words") or {}
+    return [f"{n}({words[n]})" if words.get(n) else n for n in sorted(skipped)]
+
+
 def run(params: dict) -> str:
     """输入:params(store/preview/oos_days)→ 输出:意图分布 + 建议行落账摘要。"""
     # --dry-run 与 -p preview=1 等价:本工作流 DANGEROUS=False(不碰沃尔玛写
@@ -182,10 +192,15 @@ def run(params: dict) -> str:
     only = params.get("store")
 
     stockzero = store_limits.stockzero_stores()
-    # 受管仓(多仓批次 2):未配置「维护仓库」的店返回空表 —— 三个库存
-    # provider 的比对基准逐字节维持现状,一次沃尔玛调用都不会发生
-    managed, skipped_nodes = store_limits.managed_nodes()
+    node_stats: dict = {}
     with db.pg_conn() as conn:
+        # 受管仓(多仓批次 2):未配置「维护仓库」的店返回空表 —— 三个库存
+        # provider 的比对基准逐字节维持现状,一次沃尔玛调用都不会发生。
+        # 校验记忆在库里(ops.node_validations,2026-09-19),所以在连接内调;
+        # 记忆的写入**不受 preview 约束**:它是"沃尔玛认过这个 FC ID"的缓存,
+        # 不是建议行 —— preview 也真校验、真记住,下轮真跑才不用再打接口
+        managed, skipped_nodes = store_limits.managed_nodes(
+            conn=conn, stats=node_stats)
         # 缺席避让(店级重试标准③,所有者定稿 2026-08-26):catalog_sync 补试后
         # 仍缺席的店,整店目录水位停在上一轮 —— 拿陈旧现值算差异会误伤
         # (生产老账:38 条改库存 + 30 条改价 not found)。判据从库里水位派生
@@ -247,8 +262,9 @@ def run(params: dict) -> str:
                 f"{n_avoided} 条意图不产出,等链尾重赛/下轮补上)"
                 if absent else "")
              + (f";⚠ 受管仓校验失败整店跳过 {len(skipped_nodes)} 店:"
-                f"{','.join(sorted(skipped_nodes))}({n_node_skipped} 条意图"
-                f"不产出,不回落默认节点;修好「维护仓库」后下轮自动恢复)"
+                f"{','.join(_node_skip_names(skipped_nodes, node_stats))}"
+                f"({n_node_skipped} 条意图不产出,不回落默认节点;"
+                f"填错改「维护仓库」,读不到等下轮)"
                 if skipped_nodes else "")
              + absence_gap]
     for c in capped:
@@ -258,7 +274,7 @@ def run(params: dict) -> str:
                      f"优先级取,其余下轮;上限=按店配额×单 feed 条数,"
                      f"见 services/maintenance_intents.MAX_INTENTS_PER_STORE)")
     lines += _preview_lines(intents, stockzero)
-    node_note = store_limits.managed_note(managed, skipped_nodes)
+    node_note = store_limits.managed_note(managed, skipped_nodes, node_stats)
     if node_note:
         lines.append("  " + node_note)
 

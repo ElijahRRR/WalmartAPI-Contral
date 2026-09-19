@@ -34,8 +34,15 @@
 > ③ §6.1 补 `product_pool.load(asins=)` / `norm_channel()` /
 > `score_all(gated_by_asin=)` 三个接口对齐,并把新的 `services/sheet_layout.py`
 > 定为按表头认列的唯一实现(eBay 上架表投影必须用它 + 登记守门测试)。
-> ⚠ 本文引用的仓库行号以 **2026-09-17 的 main(9959ece)** 为快照(§2.1/§2.2
-> 已按它重定位;其余节仍是 09-07 快照),批次实施时现场重定位。
+> **2026-09-19 对齐 main #134**(多仓校验根治:校验记忆落库、读不到≠不认识、
+> 补试、原因进摘要):§3.2 补 🔴 **vendor 词两处同源**(#134 把沃尔玛 api 文案
+> 改成「沃尔玛返回 {status}」,而 `diagnose` 的正则 vendor-blind,归类词的
+> vendor 只来自参数——eBay 两处各写各的会静默对不上)+ 守门行号 241→247 +
+> 「守门只扫 workflows 不扫 services」;§3.4 补 🔴 **「200 但解析不出」抛错
+> 且不进缓存** 与 🔴 **「读不到」≠「不认识」** 两条定式(令牌/getPrivileges/
+> 类目树三处同形;入料的 fail-closed 拦下要把两种原因分开计数)。
+> ⚠ 本文引用的仓库行号以 **2026-09-19 的 main(1930e23)** 为快照(§2.1/§2.2/
+> §3.2 已按它重定位;其余节仍是 09-07 快照),批次实施时现场重定位。
 
 ## 〇、批次 0 拍板记录(2026-08-30,所有者)
 
@@ -236,8 +243,24 @@ SKU↔offerId/listingId 权威在 `ops.feed_items`)。
   「其他」档、进 absent 不进 dead,归类与分流同时错)。
 - `store_retry.diagnose(err, vendor="沃尔玛")` 参数化,六档不加档;eBay api
   层报错逐字用同一文案形状(`返回 {status}`/`返回 None`)。守门:
-  `test_store_retry_standard:241` 的 `Path("api").glob("*.py")` **换 rglob**
-  (现扫不到 api/ebay/),并加 `diagnose(err, vendor="eBay")` 六档逐档断言。
+  `test_store_retry_standard:247`
+  (`test_classify_message_patterns_match_the_api_layer`)的
+  `Path("api").glob("*.py")` **换 rglob**(现扫不到 api/ebay/),
+  并加 `diagnose(err, vendor="eBay")` 六档逐档断言。
+- 🔴 **vendor 词必须两处同源(2026-09-19 对齐 main #134)**:#134 把沃尔玛
+  api 层的文案改成「**沃尔玛**返回 {status}」——vendor 词进了消息体,而
+  `diagnose` 认的正则是 `返回 (\d{3})`,**vendor-blind**:归类词里的 vendor
+  只来自那个新参数,消息体里的 vendor 只来自 api 层文案。两处各写各的 ⇒
+  eBay 的报错正文说「eBay返回 404」、摘要归类词却说「沃尔玛404」,**两边都
+  不报错**。定稿:api/ebay 文案写「eBay返回 {status}」+ 调用点显式传
+  `vendor="eBay"`,守门测试把这对同源关系也钉住(rglob 出来的 api/ebay/
+  文案与 `diagnose(..., vendor="eBay")` 的输出对拍)。
+- ⚠ **守门只扫 workflows,不扫 services**:`test_store_retry_standard:612`
+  的 `test_workflows_that_use_store_retry_import_it` 只 AST 扫
+  `workflows/*.py`;#134 起 `services/store_limits` 也调 store_retry 了,
+  这条守门扫不到它。eBay 若把店级失败标准用在 `services/ebay_*` 里,同样
+  没有守门兜着"复制了分诊块却漏 import"那个事故形状——自己保证 import,
+  或顺手把该测试的扫描面扩到 services(本批不强制)。
 - 账号 dict 用 **`"name"` 键**(fan_out 只认它)。
 - **一期不继承标准③④**(水位避让+链尾重赛:数据源与触发条件都写死沃尔玛)
   ——eBay 链不声明 SUPPORTS_STORE,随批次 5 回读链一起补。
@@ -327,6 +350,25 @@ SKU↔offerId/listingId 权威在 `ops.feed_items`)。
   (invalid_grant=已吊销——卖家可在 My eBay 撤授权)+ **重采
   `getPrivileges` 刷新 `catalog.ebay_accounts.privileges_json/sampled_at`**
   (§6.2 的 selling limit 闸靠它);已吊销/<7 天抛停链,<30 天首行预警。
+- 🔴 **"200 但解析不出" 一律抛错、且不进缓存(2026-09-19 对齐 main #134)**:
+  #134 给 `api/settings._cached_ship_nodes` 定的形状——响应 200 但一个条目
+  都没解析出来(空体 / 非 JSON / 形状变了)时**抛 RuntimeError,不返回空**。
+  两条理由逐字适用于 eBay:① 返回空会被调用方判成"这东西不存在"(配置错),
+  **瞬时故障伪装成配置错**;② 空结果一旦进 `lru_cache`,**整个进程再也不
+  重打这个接口**,一次抖动毒死一整轮。eBay 侧同形的三处照此办:令牌缓存
+  (`api/ebay/_client`)、`getPrivileges` 采样(§6.2 的 selling limit 闸靠它,
+  空 privileges 会被读成"配额为 0"或"无限制",两种都危险)、
+  `ebay_taxonomy_sync` 的类目树。**非 200 才是"接口回了什么"**,200 空体是
+  "我们没读懂",两者的归类词不能撞在一起。
+- 🔴 **"读不到" ≠ "不认识"(同批,#134 的另一半)**:#134 把
+  `NodeConfigError` 拆成 `NodeUnknownError`(沃尔玛**明确否定**:这个节点
+  不在你的列表里)/ `NodeUnreachableError`(**没读到**:超时、代理波动、
+  200 空体),只有前者算配置错,后者走 `store_retry.serial_second_pass` 补试
+  并沿用旧记忆。对位到 eBay 一期有两处要照此分开:**§6.1 入料的"类目映射
+  approved+高 fail-closed 拦下"**——"库里确实没有 approved 映射"与"这一轮
+  没读到映射表"拦下动作相同,但**归类与计数必须分开**,否则一次读故障会在
+  摘要里伪装成"这批品没有类目映射",查都没处查;**§3.4 账号/令牌读取**同理
+  (refresh_token 读不到 ≠ 账号未授权,后者才该停链)。
 - 摘要与参数标准件:`-p` 布尔一律 `from services.params import flag`
   (⚠ 按名导入,模块名会被 run(params) 形参遮住);摘要一律
   `notify_fmt.head/summary`。八条新 workflow 统一,不许各自手搓。

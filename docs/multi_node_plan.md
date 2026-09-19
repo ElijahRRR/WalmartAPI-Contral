@@ -216,10 +216,14 @@ stockzero 静默失效(P0)、库存永久重写循环 + settle 恒 ineffective(P
 | 小批量写 | `api.inventory.put_inventory(..., ship_node)` | 带节点走 `PUT /v3/inventories/{sku}`,**逐节点解析 status** |
 | 大批量写 | `api.feeds.build_payload("MP_INVENTORY", …)` | v1.5 小写 key,每 SKU `shipNodes[]` |
 | 落定判据 | `dispositions.settle_maintenance()` | 带 `ship_node` 的行按 `item_node_inventory` 判 |
+| 校验失败整店剔除(扫描侧) | `workflows/maintenance_scan.run()` | `skipped` 里的店意图/截断顺延**整店不产出**,首行点名条数,withdraw 护住存量行(2026-09-19) |
+| 缺节点不执行(执行侧) | `workflows/maintenance._hold_nodeless()` | 填了「维护仓库」的店,库存建议不带 `ship_node` 就扣下:留 suggested、表上「未执行(受管仓建议缺节点)」(2026-09-19) |
 
-三处**故意的响亮失败**(都不回落):FC ID 认不出 → 整店跳过;受管仓明细本轮
-没扫到 → 该行跳过并计数;同批混着带/不带节点 → 本店不提交。回落的共同后果
-是"写到官方无定义的默认节点且全程不报错",比少动一轮坏得多。
+五处**故意的响亮失败**(都不回落):FC ID 认不出 → 整店跳过(**扫描件整店
+不产意图**,不只是摘要里一句话,2026-09-19 前只有那句话);受管仓明细本轮
+没扫到 → 该行跳过并计数;同批混着带/不带节点 → 本店不提交;配置店的库存
+建议不带节点 → 执行件扣下不发。回落的共同后果是"写到官方无定义的默认节点
+且全程不报错",比少动一轮坏得多。
 
 **存量行路由(所有者拍板 2026-08-30)**:配置店 **只维护受管仓**,不做
 "按 SKU 所在仓路由"。§2.4 第 4 条实测定案后,这条**不再需要任何人工搬仓
@@ -280,3 +284,46 @@ stockzero 静默失效(P0)、库存永久重写循环 + settle 恒 ineffective(P
 修:表里补 `MP_INVENTORY`,守门测试钉「每种 dict 条目的 feedType 台账 sku 不得以 { 开头」。
 存量脏行由所有者核对后处置(`SELECT count(*) FROM ops.feed_items WHERE
 feed_type='MP_INVENTORY' AND sku LIKE '{%'`),本仓不自动清理。
+
+## 2026-09-19 生产缺陷:「校验失败整店跳过」只跳了摘要,意图照发到默认节点
+
+**现象**(所有者发现):配置了「维护仓库」的店,同一 SKU **两个节点都有货**;
+其中有配置之后才上架的商品,旧节点(Virtual Node)按设计根本不该出现库存。
+船队盘点(2026-09-19):A171罗尹鸿 383、A131吕灿荣 227、谭总23 122、谭总22 6、
+A085朱丽霖 2 个 SKU 双节点有货。
+
+**取证**(谭总23 / A9NV2CGP689D 的建议行序列):09-09 至 09-15 四次改库存都
+带节点、都 confirmed;**09-17 那次 `detail.ship_node` 为 NULL**,34→50 走了
+legacy 通道,受管仓值没变 ⇒ ineffective,而旧节点被写成 50;09-19 再次
+34→58 带节点 —— 此后两个节点都有货。09-17 当天谭总23 **235 条无节点库存
+建议全部执行**;同日的 maintenance_scan 摘要正写着「校验失败整店跳过:
+A173夏雨,谭总12,谭总23」(09-06 是谭总22/23/24,09-18 是 A131吕灿荣)。
+
+**根因**:`store_limits.managed_nodes()` 把校验失败(`resolve_node` 抛
+NodeConfigError:多为节点列表接口瞬时读不到)的店放进 `skipped`、不进
+`managed`;`maintenance_scan` 只把 `skipped` 摊进摘要那一行(§6 第 6 条),
+**意图一条没少**:`maintenance_intents._node_of()` 对不在 `managed` 里的店返回
+`{}`,于是该店的库存意图不带 `ship_node`、比对基准退回全店合计,执行件按
+"未配置店"走 legacy `PUT /v3/inventory` / v1.4 `inventory` feed —— 恰是
+`resolve_node` 头注拼命避免的"回落 Virtual Node",只是绕了一圈发生在别处。
+list_new(批次 3)一开始就做对了(`managed_bad` 整店 `continue`),维护链漏了。
+
+**修**(两道闸,守门用例 `tests/test_maintenance.py` 末尾两条):
+1. 扫描侧:`skipped` 里的店**整店剔除**意图与截断顺延,首行点名
+   「受管仓校验失败整店跳过 N 店:…(M 条意图不产出,不回落默认节点)」,
+   并把这些店加进 `withdraw_stale(exclude_stores=…)`(跳过 ≠ 恢复正常,
+   与缺席避让同款)。
+2. 执行侧:`_hold_nodeless()` 重读 `maint_nodes()`,填了「维护仓库」的店,
+   库存建议不带 `ship_node` 就扣下:留 suggested 原地(claim 不转态)、表上
+   一行「未执行(受管仓建议缺节点)」、账本记 unexecuted、摘要点名条数。
+   来源只可能是修复前存量行 / 扫描与执行之间改了配置 / 将来哪条 provider
+   漏节点,三种都不许发。配置读不到时**不扣只喊**(fail-open,与本件缺席
+   避让同向:扫描件几分钟前刚按同一张表整店剔过,这道闸拦的是存量行)。
+
+**存量处置**(本仓不自动清,所有者操作):受影响的店按 §7 runbook 第 3 步
+`node_clear -p store=<店> -p node=<旧节点> --dry-run` → 人眼确认 → 真跑;
+`node_clear` 只清受管仓已接管的 SKU,未接管的默认跳过。⚠ A171罗尹鸿 /
+A085朱丽霖 不在任何一天的「校验失败」名单里,它们的双节点有货另有出处
+(接管后未跑 node_clear 的设计内状态,或别的写入方),先查
+`ops.dispositions` 里该店 `action='inventory' AND detail->>'ship_node' IS NULL`
+的执行日分布再定。

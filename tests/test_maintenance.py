@@ -1064,6 +1064,8 @@ def _wire(monkeypatch, intents, stores=(STORE,), absent=()):
     monkeypatch.setattr(mi, "record_submitted", lambda conn, items: len(items))
     monkeypatch.setattr(mw.stores_svc, "load_stores",
                         lambda names=None: list(stores))
+    # 默认没有店配「维护仓库」= 现状;要钉第二道闸的用例自己覆盖这一项
+    monkeypatch.setattr(mw.store_limits, "maint_nodes", lambda: {})
     monkeypatch.setattr(inv_api, "put_inventory",
                         lambda store, sku, qty, node=None: (
                             calls["put_inv"].append(
@@ -2620,3 +2622,94 @@ def test_scan_pushes_the_store_filter_and_keeps_the_python_belt(monkeypatch):
     out = ms.run({"store": "T1", "preview": "1"})
     assert calls["collect"] == ["T1"]           # 下推了
     assert "T2" not in out and "B0B" not in out  # 双保险仍在
+
+
+# ── 多仓:校验失败整店跳过要真的跳过(2026-09-19 生产缺陷)────────────────────
+
+def test_scan_drops_every_intent_of_a_store_whose_node_failed_validation(monkeypatch):
+    """「校验失败整店跳过」此前只是摘要里一句话,意图一条没少。
+
+    managed_nodes() 把校验失败的店放进 skipped、不进 managed,于是 collect_all
+    给它算出的库存意图**不带 ship_node**,执行件拿到就走 legacy 通道写到默认
+    节点 —— 谭总23 2026-09-17 一天 235 条全部执行,受管仓值没变(ineffective)、
+    旧节点被写上货,双节点有货由此而来。整店剔除、首行点名、护住存量行。
+    """
+    intents = _zero(2) + [{"store": "T2", "sku": "X1", "kind": "inventory",
+                           "old": 3, "new": 0, "code": "out_of_stock",
+                           "reason": "亚马逊缺货", "ship_node": "222"}]
+    capped = [{"store": "T1", "kind": "inventory", "total": 9, "kept": 8,
+               "deferred_keys": [("T1", "S9", "inventory")]}]
+    ms, calls = _scan_wire(monkeypatch, intents, capped=capped)
+    monkeypatch.setattr(ms.store_limits, "managed_nodes",
+                        lambda: ({"T2": "222"}, {"T1": "认不出"}))
+    out = ms.run({})
+    first = out.splitlines()[0]
+    # 只有首行能到飞书:剔了多少条必须写在首行,且不回落默认节点
+    assert "受管仓校验失败整店跳过 1 店:T1(2 条意图不产出,不回落默认节点" in first
+    assert "维护意图 1 条" in first
+    assert "截断" not in first                   # 跳过店的截断顺延一并剔掉
+    assert [(r["store"], r["sku"]) for r in calls["suggest"]] == [("T2", "X1")]
+    # 跳过 ≠ 恢复正常:该店挂着的 suggested 不许被撤成「商品自己恢复正常了」
+    _src, keep, _store, excluded = calls["withdraw"][0]
+    assert "T1" in excluded
+    assert ("T1", "S9", "inventory") not in keep
+
+
+def test_executor_holds_nodeless_inventory_intents_of_a_configured_store(monkeypatch):
+    """第二道闸:填了「维护仓库」的店,库存建议不带节点就**不执行**。
+
+    来源只可能是修复前的存量行 / 扫描与执行之间改了配置 / provider 漏节点;
+    三种都不许走 legacy 写默认节点。留在 suggested 原地、表上一行「未执行」;
+    价格与节点无关照常;同店带节点的库存建议照常。
+    """
+    intents = _zero(2) + [
+        {"store": "T1", "sku": "P1", "kind": "price", "old": 9.0, "new": 8.0,
+         "code": "price_sync", "reason": "跟价"},
+        {"store": "T1", "sku": "S9", "kind": "inventory", "old": 1, "new": 0,
+         "code": "out_of_stock", "reason": "亚马逊缺货", "ship_node": "N1"}]
+    calls = _wire(monkeypatch, intents)
+    monkeypatch.setattr(mw.store_limits, "maint_nodes", lambda: {"T1": "N1"})
+    out = mw.run({"execute": True})
+    assert calls["put_inv"] == [("T1", "S9", 0, "N1")]     # 带节点的照常
+    assert calls["put_price"] == [("T1", "P1", 8.0)]        # 价格与节点无关
+    assert calls["feeds"] == []
+    assert "受管仓建议缺节点扣下 2 条(不写默认节点):T1×2" in out
+    held = [r for r in calls["sheet"] if mw.NODELESS_HELD in r]
+    assert len(held) == 2 and all("S0" in r or "S1" in r for r in held)
+    # 扣下的行没转 executing(留在 suggested 等扫描件重算)
+    marked = {i for ids, _ in calls["marked"] for i in ids}
+    assert marked == {102, 103}                      # _disp 的 id 从 100 起
+
+    # 全被扣下:没有可提交的,但扣下的行照样进表
+    calls = _wire(monkeypatch, _zero(2))
+    monkeypatch.setattr(mw.store_limits, "maint_nodes", lambda: {"T1": "N1"})
+    out = mw.run({"execute": True})
+    assert calls["put_inv"] == [] and calls["feeds"] == []
+    assert "没有待执行的维护建议" in out and "扣下 2 条" in out
+    assert sum(1 for r in calls["sheet"] if mw.NODELESS_HELD in r) == 2
+
+    # dry-run 也要说出来(人眼闸门看的就是它)
+    calls = _wire(monkeypatch, _zero(2))
+    monkeypatch.setattr(mw.store_limits, "maint_nodes", lambda: {"T1": "N1"})
+    out = mw.run({"execute": False})
+    assert "扣下 2 条" in out and calls["sheet"] == []
+
+    # 未配置店逐字节维持现状:不带节点就是正常的 legacy 路由
+    calls = _wire(monkeypatch, _zero(2))
+    monkeypatch.setattr(mw.store_limits, "maint_nodes", lambda: {"T9": "N1"})
+    out = mw.run({"execute": True})
+    assert calls["put_inv"] == [("T1", "S0", 0), ("T1", "S1", 0)]
+    assert "扣下" not in out
+
+
+def test_executor_node_gate_fails_open_but_loudly_when_config_unreadable(monkeypatch):
+    """配置读不到:不扣、只喊(与本件缺席避让同方向;扫描件刚按同一张表剔过)。"""
+    calls = _wire(monkeypatch, _zero(2))
+
+    def boom():
+        raise RuntimeError("feishu 503")
+
+    monkeypatch.setattr(mw.store_limits, "maint_nodes", boom)
+    out = mw.run({"execute": True})
+    assert calls["put_inv"] == [("T1", "S0", 0), ("T1", "S1", 0)]
+    assert "受管仓配置读不到(feishu 503)" in out

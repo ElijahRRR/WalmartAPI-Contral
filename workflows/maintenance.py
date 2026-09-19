@@ -87,7 +87,7 @@ from api import _client, feeds, inventory as inv_api, prices
 from registry import db
 from services import dispositions, kpi, maint_sheet, \
     maintenance_intents as mi, notify_fmt as nf, store_absence, \
-    store_events, store_retry, stores as stores_svc
+    store_events, store_limits, store_retry, stores as stores_svc
 
 DANGEROUS = True
 SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重赛靠它识别)
@@ -130,6 +130,51 @@ def _record(name: str, it: dict, action: str, feed_id, today: str,
         name, it["sku"], it.get("label") or _KIND_LABEL.get(kind, kind),
         it.get("reason", ""), action, feed_id, today, result, err,
         old=it.get("old"), new=it.get("new"))
+
+
+#: 受管仓第二道闸扣下的建议在维护记录表「结果」列的字样(动作留空)
+NODELESS_HELD = "未执行(受管仓建议缺节点)"
+
+
+def _hold_nodeless(intents: list[dict]) -> tuple[list[dict], list[dict], str]:
+    """输入:领取的意图 → 输出:(放行的, 扣下的, 摘要句;没扣下时为空串)。
+
+    执行件的**第二道闸**(2026-09-19 生产缺陷,与扫描件的「校验失败整店剔除」
+    成对):填了「维护仓库」的店,库存意图不带 `ship_node` 就意味着它是按
+    全店合计算的、执行下去会走 legacy 通道写到官方无定义的默认节点
+    (Virtual Node)—— 谭总23 2026-09-17 一天 235 条这样的建议全部执行,
+    受管仓值没变(ineffective)、旧节点却被写上了货,双节点有货由此而来。
+    这种意图的来源只可能是三种:修复前留下的存量 suggested 行、扫描与执行
+    之间有人改了配置、将来哪条 provider 又漏了节点。三种都不许执行:留在
+    suggested 原地(claim 不转态),等下轮扫描件按受管仓重算。价格/标题
+    与节点无关,照常。
+
+    ⚠ 配置读不到(飞书抖动)**不扣、只喊**:与本件的缺席避让同一方向
+    (fail-open,头注里那段"一次飞书抖动就能让全船队整轮不更新"的取舍);
+    扫描件几分钟前刚按同一张表校验过并已整店剔除,这道闸拦的是存量行与
+    中途改配置,不是主路径。
+    """
+    try:
+        configured = store_limits.maint_nodes()
+    except Exception as e:                          # noqa: BLE001
+        logger.warning("受管仓配置读不到,执行件第二道闸本轮不判:%s", e)
+        return intents, [], (f"⚠ 受管仓配置读不到({e}),本轮无法核对库存建议"
+                             f"是否带节点 —— 扫描件已按同一张表整店剔除,照常执行")
+    held = [i for i in intents
+            if i["kind"] == "inventory" and i["store"] in configured
+            and not i.get("ship_node")]
+    if not held:
+        return intents, [], ""
+    held_ids = {id(i) for i in held}
+    kept = [i for i in intents if id(i) not in held_ids]
+    by_store: dict[str, int] = {}
+    for i in held:
+        by_store[i["store"]] = by_store.get(i["store"], 0) + 1
+    note = (f"⚠ 受管仓建议缺节点扣下 {len(held)} 条(不写默认节点):"
+            + ",".join(f"{n}×{c}" for n, c in sorted(by_store.items()))
+            + " —— 留在 suggested 原地,等 maintenance_scan 按受管仓重算"
+            "(存量旧行/中途改了「维护仓库」;见 docs/multi_node_plan.md 2026-09-19)")
+    return kept, held, note
 
 
 def _submit_kind(store: dict, kind: str, items: list[dict], today: str,
@@ -319,6 +364,14 @@ def run(params: dict) -> str:
         intents = [i for i in intents if i["store"] == params["store"]]
     if only:
         intents = [i for i in intents if i["kind"] == only]
+    # 受管仓第二道闸(说明见 _hold_nodeless 头注):扣下的建议**也要写表**
+    # (动作留空、结果「未执行」),否则它们在飞书完全不可见
+    intents, held_node, node_note = _hold_nodeless(intents)
+    if node_note:
+        lines.append(node_note)
+    today = datetime.now(kpi.CN_TZ).strftime("%Y-%m-%d")
+    held_records = [_record(it["store"], it, "", "", today, NODELESS_HELD, "")
+                    for it in held_node]
 
     mode = "" if execute else "🧪 [DRY-RUN] "
     if not mi.TITLE_SYNC:
@@ -327,6 +380,9 @@ def run(params: dict) -> str:
                      f"库里 {n_title_held} 条 title 建议留在 suggested 不动;"
                      f"改价/改库存照常。恢复条件见 services/maintenance_intents.TITLE_SYNC")
     if not intents:
+        if execute and held_records:
+            # 领到的全被第二道闸扣下:没有可提交的,但扣下的行照样进表
+            _write_sheet(held_records, lines)
         return "\n".join(lines + [
             f"{mode}没有待执行的维护建议 —— 先跑 "
             f"`python cli.py maintenance_scan`"
@@ -372,12 +428,17 @@ def run(params: dict) -> str:
         return "\n".join(lines)
 
     stores_by_name = {s["name"]: s for s in stores_svc.load_stores()}
-    today = datetime.now(kpi.CN_TZ).strftime("%Y-%m-%d")
 
     per_store: dict[str, list[str]] = {}    # 各店摘要行(补试重跑同店即覆盖)
     records_by_store: dict[str, list[tuple]] = {}   # 各店维护记录行(跨补试累加)
     done_by_store: dict[str, set] = {}      # 已写过记录的建议 id(同上,跨补试)
     cnt_by_store: dict[str, dict] = {}      # 各店动作计数(店铺事件账本,跨补试累加)
+    for it, rec in zip(held_node, held_records):
+        # 第二道闸扣下的:表上一行「未执行」,账本记「领了没动」——
+        # 与 _unexecuted 同一口径,只是它们没进 by_store、不会被提交
+        records_by_store.setdefault(it["store"], []).append(rec)
+        c = cnt_by_store.setdefault(it["store"], {})
+        c["unexecuted"] = c.get("unexecuted", 0) + 1
 
     def _one_store(store_name: str, kinds: dict) -> str:
         """输入:店铺名 + 该店三类意图 → 输出:店铺名;网络类失败**抛出**待补试。
@@ -533,7 +594,9 @@ def run(params: dict) -> str:
     store_events.record_round_safe("maintenance", store_events.MAINT_ROUND,
                                    cnt_by_store, lines)
 
-    all_records = [r for name, _ in todo for r in records_by_store.get(name, [])]
+    # 按店名排序(与摘要同序);扣下的店可能不在 todo 里,所以按记录表的键走
+    all_records = [r for name in sorted(records_by_store)
+                   for r in records_by_store[name]]
     _write_sheet(all_records, lines)
     lines.append("生效确认在下一轮本工作流开头(等 catalog_sync 重新观测)")
     return "\n".join(lines)

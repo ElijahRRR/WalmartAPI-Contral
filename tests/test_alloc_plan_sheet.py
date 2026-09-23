@@ -302,16 +302,29 @@ def test_sheet_mode_dry_run_writes_the_csv_but_neither_claims_nor_the_sheet(
     assert body[1].startswith("2,B,B0FREE0001,acme,")
 
 
-def test_cutoff_is_overridable_only_here_and_defaults_to_the_global_line(
+def test_sheet_mode_has_no_cutoff_by_default_and_only_adds_one_on_request(
         monkeypatch, tmp_path):
+    """所有者定稿 2026-09-23:点名缺省不设淘汰线,`-p cutoff=` 才临时加一条。
+
+    夹具是 4.8 分、零评论、没卖过的品:口碑 36 分、销量加分 0,在全库那条 40 的线
+    下面 —— 正是所有者问的「我选的产品可能评论很少」那种。点名的品是他亲手挑的,
+    缺的是**我们这边的证据**(评论少、没在我们店卖过),不是品差。
+    """
     cap = _wire(monkeypatch, tmp_path, rows=[_row(2, "B0FREE0001")],
-                raw=[_raw("B0FREE0001", "acme")])
+                raw=[_raw("B0FREE0001", "acme", rating="4.8", reviews="0")])
+    out = wf.run({"from_sheet": "1", "execute": True})
+    row = _by_row(cap)[2]
+    assert row["flow"] == "自由流" and row["store"] == "B" and cap["landed"]
+    assert 0 < float(row["score"]) < wf.ps.CUTOFF            # 分照算照写,只管顺序
+    assert "淘汰线 不设(点名缺省" in out
+    # 要筛就自己加线:加了就按线淘汰,摘要说清这条线是临时加的
+    cap["landed"].clear()
     out = wf.run({"from_sheet": "1", "cutoff": "99", "execute": True})
-    assert _by_row(cap)[2]["flow"] == "未分配"
-    assert "低于淘汰线 99" in _by_row(cap)[2]["unassigned_why"] and cap["landed"] == []
-    assert "淘汰线 99(-p cutoff= 临时覆盖)" in out
-    out = wf.run({"from_sheet": "1", "execute": False})
-    assert f"淘汰线 {wf.ps.CUTOFF:g}(product_score.CUTOFF)" in out
+    row = _by_row(cap)[2]
+    assert row["flow"] == "未分配" and "低于淘汰线 99" in row["unassigned_why"]
+    assert cap["landed"] == [] and "淘汰线 99(-p cutoff= 临时加的线)" in out
+    # 全库那条线一字不动
+    assert wf.ps.CUTOFF == 40.0
 
 
 def test_sheet_write_failure_is_shouted_first_and_claims_stay(monkeypatch, tmp_path):

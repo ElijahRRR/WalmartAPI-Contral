@@ -7,7 +7,7 @@
   python cli.py alloc_plan -p as_of=2026-08-16   # 钉住销量窗口右端
   python cli.py alloc_plan -p from_sheet=1 --dry-run   # 点名分配:只分「产品分配表」里的 ASIN
   python cli.py alloc_plan -p from_sheet=1             # 同上,落占用 + 逐行回写表格
-  python cli.py alloc_plan -p from_sheet=1 -p cutoff=30  # 点名模式临时改淘汰线(缺省 40)
+  python cli.py alloc_plan -p from_sheet=1 -p cutoff=30  # 点名模式临时加一条淘汰线(缺省不设)
 
 把候选池打分、组队、切批、发牌,产出**分配方案表**。真跑只多做一件事:
 把方案里的品牌与 ASIN 落成占用(`catalog.claims`)。上架表另说 —— 分配是
@@ -1163,8 +1163,12 @@ def _run_sheet(params: dict) -> str:
     (池口在 SQL 里筛,不拉全库)。与全库分配的差别只有三处:
 
     ① `-p batch=` 不许给 —— 点名池本身就是切口,再封顶等于两个上限打架;
-    ② 淘汰线可用 `-p cutoff=` 临时覆盖(缺省仍 `product_score.CUTOFF`;
-       所有者原话「淘汰线 40 需要到时候再考虑具体设置多少」);
+    ② **缺省不设淘汰线**(所有者定稿 2026-09-23),`-p cutoff=` 才临时加一条。
+       点名的品是所有者亲手挑的,挑选本身就是质量判断;而 40 那条线是为
+       "货多得用不完"的全库池子设计的兜底,量的又是评论数与**我们自己店里**
+       的销量 —— 新挑的品两样都天然没有(销量加分恒 0,4.8 分零评论也只有
+       36 分),拿它一票否决等于让所有者的判断给缺数据让路。硬闸(落地价 /
+       库存)与四道店铺闸照旧;产品分照算照写,只管发牌顺序;
     ③ 发牌序 = **缺口大的店先挑、梯队拍平**(甲1,见 `_build_stores`);
        落占用 source 记 `alloc_plan_sheet`。
 
@@ -1182,7 +1186,10 @@ def _run_sheet(params: dict) -> str:
     if params.get("batch"):
         raise ValueError("-p batch= 不能与 -p from_sheet=1 连用:点名池本身就是切口,"
                          "再封顶等于两个上限打架")
-    cutoff = float(params.get("cutoff", ps.CUTOFF))
+    # 缺省 0 = 不设线(分数夹在 0~100,`score < 0` 恒假);见 docstring ②。
+    # ⚠ 别把它改回 ps.CUTOFF:那条线的松紧是跟着全库的 60/40 权重调的,
+    #   与点名池无关(2026-09-23 所有者定稿前,点名品大面积卡在它下面)
+    cutoff = float(params.get("cutoff", 0.0))
     days = int(params.get("days", 90))
     sales_days = int(params.get("sales_days", ps.SALES_WINDOW_DAYS))
     as_of = str(params.get("as_of", ""))
@@ -1340,8 +1347,8 @@ def _run_sheet(params: dict) -> str:
           f"▍表里 {len(rows)} 行:已有店铺 {len(done)} 行(重跑跳过);"
           f"本轮处理 {len(todo)} 行 / {len(asins)} 个 ASIN"
           + (f";ASIN 格式不对 {len(bad)} 行" if bad else ""),
-          f"  淘汰线 {cutoff:g}"
-          + ("(-p cutoff= 临时覆盖)" if "cutoff" in params else "(product_score.CUTOFF)")
+          (f"  淘汰线 {cutoff:g}(-p cutoff= 临时加的线)" if "cutoff" in params
+           else "  淘汰线 不设(点名缺省:硬闸与四道店铺闸照旧,产品分只管发牌顺序)")
           + f";窗口 {win['day']} 往前 —— 店铺经营水平 {days} 天、产品销量信号 {sales_days} 天",
           f"▍去向:自由流 {n_flow[FLOW_FREE]} 件 · 定向流 {n_flow[FLOW_DIRECTED]} 件 · "
           f"未分配 {n_flow[FLOW_NONE]} 件"]

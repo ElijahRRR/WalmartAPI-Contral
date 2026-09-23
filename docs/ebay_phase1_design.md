@@ -41,7 +41,13 @@
 > 「守门只扫 workflows 不扫 services」;§3.4 补 🔴 **「200 但解析不出」抛错
 > 且不进缓存** 与 🔴 **「读不到」≠「不认识」** 两条定式(令牌/getPrivileges/
 > 类目树三处同形;入料的 fail-closed 拦下要把两种原因分开计数)。
-> ⚠ 本文引用的仓库行号以 **2026-09-19 的 main(1930e23)** 为快照(§2.1/§2.2/
+> **2026-09-23 对齐 main #135**(alloc_plan 点名模式缺省不设淘汰线):§6.1 补
+> 🔴 **eBay 入料一期不设分数淘汰线**——#135 的判据逐字适用(那条线量的是
+> "证据多不多",而证据来自评论数与**我们自己店里**的销量,eBay 候选两样
+> 天然没有),照搬 `product_score.CUTOFF` 会把整池一票否决;分数只决定
+> 排序。§2.1 的点名分配行号随 #135 重定位(1222/1223→1229/1230、
+> 1300→1307、1301→1308)。
+> ⚠ 本文引用的仓库行号以 **2026-09-23 的 main(06140c3)** 为快照(§2.1/§2.2/
 > §3.2 已按它重定位;其余节仍是 09-07 快照),批次实施时现场重定位。
 
 ## 〇、批次 0 拍板记录(2026-08-30,所有者)
@@ -98,9 +104,9 @@ SKU↔offerId/listingId 权威在 `ops.feed_items`)。
   真实存在(同 key 两平台各一行),谓词本身就是修复。
 - **调用面全量**(2026-09-17 对齐 main #133 后现场重核;P1-2 验收写明
   "以下红/改是预期内的"):读侧 `load_active` **6 文件 11 处**
-  (alloc_push:83 / alloc_plan:254,255 **+1222,1223** / claim_audit:96 /
+  (alloc_push:83 / alloc_plan:254,255 **+1229,1230** / claim_audit:96 /
   alloc_audit:187,188 / alloc_products:102 / list_new:453,456)全部显式传
-  walmart 常量;写侧 `claim_many` **3 处**(alloc_plan:430 **+1300**、
+  walmart 常量;写侧 `claim_many` **3 处**(alloc_plan:430 **+1307**、
   alloc_backfill:162)——⚠ 它在 #85 后
   **返回三元组 `(ok, conflicts, landed)`**,两处调用点已按三元组解包,平台化
   不改这个形态;测试替身 test_alloc_push:43、test_alloc_plan:221/265/326…、
@@ -108,14 +114,14 @@ SKU↔offerId/listingId 权威在 `ops.feed_items`)。
   `_OWNER` 的 platform 谓词保证;Owner 具名改形留二期)。
 - 🔴 **alloc_plan 现在有两条领用路径(2026-09-17 对齐 main #133)**:
   缺省的全库分配(254/255 读、430 写、434 记事件、`SOURCE`)之外,
-  `-p from_sheet=1` 点名分配(口径 #19)自带一整套(1222/1223 读、1300 写、
-  1301 记事件、**`SOURCE_SHEET`**)。平台化改造**两条都要改**——它们不是
+  `-p from_sheet=1` 点名分配(口径 #19)自带一整套(1229/1230 读、1307 写、
+  1308 记事件、**`SOURCE_SHEET`** = `alloc_plan_sheet`)。平台化改造**两条都要改**——它们不是
   同一段代码的两个分支,是并列的两段;只改缺省那条,点名分配会拿**不带
   platform 谓词**的占用表去判冲突(eBay 行会挡住沃尔玛点名),而且
   **事件桥那条 🔴 "跳过 eBay" 的规则在 1301 也得再落一遍**。P1-2 验收的
   "预期红清单"按 **11 读 + 3 写 + 3 事件桥** 数,不是旧稿的 9+2+2。
 - 🔴 **事件桥必须显式跳过 eBay(#99 新增,本设计原稿完全没有)**:`claims`
-  在 #99 后多了两个桥函数 `claim_created_rows`(alloc_plan:434 **+1301**、
+  在 #99 后多了两个桥函数 `claim_created_rows`(alloc_plan:434 **+1308**、
   alloc_backfill:165)与 `released_rows`(store_release:216/325/385),它们把
   占用/释放写进 **`ops.store_events`**——而那张账本的身份键是 `store`、
   语义是**沃尔玛店铺状态迁移与 TRO 封店预警**(`store_watch` 按 store 扫描
@@ -525,7 +531,19 @@ parse_multiplier` 转中立 + `pick_band` 改收 bands、变体三件改名。
 日上架条数闸) × 放大系数)——分数不在库里,"SQL 里 ORDER BY 分数"不可
 实现;🔴 **`_SQL_POOL` 本体一个字不动**(它是分配链两件套逐字同源的存在
 理由),eBay 侧谓词收窄走 `services/ebay_admission` 自己的过滤,不就地改
-共享 SQL。入料谓词:audit approved + 类目映射 approved+高(fail-closed
+共享 SQL。
+🔴 **分数只管排序,一期不设淘汰线(2026-09-23 对齐 main #135 所有者定稿)**:
+#135 给点名分配定的理由**逐字适用于 eBay 一期**——那条 40 分线量的是
+"证据多不多",而证据的两个来源(评论数、**我们自己店里**的销量)在这里
+天然缺席:eBay 候选**从没在 eBay 上过架**,`score_all` 的销量维度又只吃
+沃尔玛店的销售,所以"4.8 分零评论也只有 36 分"那个形状在 eBay 侧是**全池
+普遍状态**,不是个别差品。照搬 `product_score.CUTOFF` = 整池被一票否决。
+定稿:eBay 入料**不设 cutoff**,分数只决定 `ORDER BY`(前 cap 条),
+拦品全靠上面那串硬闸与逐行闸。⚠ 两条附带后果写明白:① 排序天然偏向
+"沃尔玛已验证"的品(它们的销量维度非零)——这是有意的(先上验证过的),
+**但不许把它升级成闸**;② 若二期真要加线,得先有 eBay 自己的销量回流,
+拿沃尔玛的证据去卡 eBay 的新品就是 #135 定稿前那个坑。
+入料谓词:audit approved + 类目映射 approved+高(fail-closed
 拦下计数)+ claims 平台内未占 + **去重谓词写死
 `feed_items.feed_type IN ('ebay_offer','ebay_publish') AND status IN
 ('submitted','success')`**(按"存在任意行"判会把 item 步成功 publish 步

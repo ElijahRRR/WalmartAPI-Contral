@@ -136,6 +136,7 @@ legacy_survey.md:1350,写解析器前先 grep 摸底文档;seen/brand 参数传�
 | ✅ | ~~审核把「无货」报成「采集缺字段」~~(2026-08-17 修:`stock_block` 三档 unavailable/no_buybox/out_of_stock 收成唯一出处,维护链与审核链共用**原因码**、措辞各归各链) | `services/order_audit.py:stock_block` |
 | ⛔ | **`problem_scan` 的逐行建议不投影**(所有者拍板 2026-08-17:**不需要进表,也不需要导出**)。⚠ 它与 `maintenance_scan` 形状相同(同产 `ops.dispositions`、同由危险执行件消费),后者做了飞书投影 —— **两者的差别是所有者的决定,不是遗漏**,别再当缺口提。要看明细直接读 `ops.dispositions`;原「错误商品记录」表 2026-08-11 已拍板裁撤 | `workflows/problem_scan.py` |
 | ⛔ | **`order_audit` 等截图的 180 秒不是 bug**(2026-08-17 核采集器源码):截图行建批次时就为每个 ASIN 预建(`common/pgdb/tasks.py:211`),由**独立子进程**渲染(`worker/engine.py:2345`)——任务完成 ≠ 截图完成,采集侧自己的 `status="completed"` 也要求 `screenshots.open==0`。日志那句「数据已采完」正说明任务信号读对了。唯一白等的情形是任务失败后其截图槽位永久 pending(代码注释已记) | `workflows/order_audit.py:_SHOT_GRACE_SEC` |
+| ✅ | ~~**批次状态收口漏洞:超 20 分钟 wait 的批次永远停在 running,截图永不上传**~~(所有者 2026-09-24 生产诊断:9/23 13:23、9/24 13:22 两批耗时 20'43"/26' 超 wait 上限,远端已完成并出图;下一小时快照经全局泵到齐、`_SETTLE_SQL` 先把组合标 done,而批次复查只查「还有 pending 组合」的批次 ⇒ 永远不再问;取图门禁只放行不在途批次 ⇒ 3 天窗口 12 行现成的图永不上传。修:`_OPEN_BATCHES_SQL` 并上「台账仍在途」的批次,在途超 24h 仍未落定按 timeout 收口) | `workflows/order_audit.py:_OPEN_BATCHES_SQL / _INFLIGHT_STALE_HOURS` |
 
 ## 六、配置与安全(便宜,但都在裸奔)
 

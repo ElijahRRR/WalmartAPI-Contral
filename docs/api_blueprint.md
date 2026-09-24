@@ -180,6 +180,16 @@ feeds-overview / list-all-feed-statuses / getallfeedstatuses / item-setup-sla)�
 处理"的上限;超过它 + 余量还没落定 = 不可能是慢,只能是卡死(用法见
 docs/feed_closure_audit.md §三.4)。最慢的一档是 72 小时。
 
+⚠ **汇总(feed 级 head)会停更,别拿它当处理进度**(2026-09-22 生产实证,所有者
+09-23 核实):A131吕灿荣 改价 feed(71 SKU)汇总 31 小时停在 `INPROGRESS / 成功 0 /
+失败 0 / 处理中 71`、`modifiedDtm` 自提交后不动,**明细却 71/71 SUCCESS**、价格已
+观测生效;同轮 16 条跨店改价 feed(1,960 SKU)同样。与官方 Legacy 改价页那句
+「Individual SKU price update success or failure is only available after the entire
+feed is processed」正好相反 —— 明细先有了,汇总没收口。⇒ 汇总未终态时它的计数不作数:
+`services/feed_track.poll_feed` 对提交超 `HEAD_STALE_HOURS`(1 小时)仍非终态的 feed
+改读明细(端点 17 的 `includeDetails=true`,50/页,吃 `feeds.get` 同一个桶,不另立桶),
+有结论的落账,台账全部有结论就按明细收口(docs/feed_closure_audit.md §三.4「缺口 ②」)。
+
 ⚠ **新建 item 发批量改价有前置条件**(官方原句在 tsv):「ensure that the Walmart Part ID
 (WPID) has been assigned and that **at least 24 hours have passed since item creation**
 before submitting a bulk price update feed」。本仓调度是 list_new 20:00、product_chain

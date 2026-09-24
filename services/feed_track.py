@@ -42,6 +42,24 @@ _FEED_LABEL = {"DELETE_ITEM": "删除", "RETIRE_ITEM": "停用",
 #: 是所有者要拍的板(docs/feed_closure_audit.md §三.4)。
 FEED_QUIET_HOURS = 2.0
 
+#: 汇总**停更闸**(小时,唯一出处):提交超过它、沃尔玛 feed 级汇总(head)仍非
+#: 终态的 feed,不再只信汇总 —— `poll_feed` 改翻一次逐 SKU 明细,把明细已给终态
+#: 的 SKU 落账;台账里这个 feed 还没落定的 SKU 全部拿到终态,就**按明细收口**
+#: (feed_log 落 done)。
+#: 2026-09-22 生产实证(所有者 09-23 核实):A131吕灿荣 改价 feed(71 SKU)汇总
+#: 31 小时停在 INPROGRESS / 成功 0 / 失败 0 / 处理中 71,`modifiedDtm` 自提交后
+#: 再没动过,**明细却 71/71 SUCCESS**、71 个价格 09-23 13:01 已观测生效;同一轮
+#: 16 条跨店改价 feed(1,960 SKU)同样。旧口径「汇总不终态就不翻明细」把这些
+#: SKU 在台账与飞书上一直挂成「处理中」,feed 永远在途、每轮复查。
+#: 取 1 小时:官方批量改价 SLA 15 分钟、INPROGRESS 轮询建议 15 分钟 → 1 小时 →
+#: 2 小时 → 此后每 4 小时(refdata/walmart_slas.tsv),正常 feed 在第二班轮询前
+#: 早已终态,闸只落在已经不正常的那批上。早读无害:明细里终态 SKU 的结论就是
+#: 最终结论(与正常收口落的是同一份数据);还在处理的、明细里查无的照旧在途,
+#: **不**标 missing(汇总没收工时,明细里缺席说明不了任何事)。
+#: ⚠ 它**不是放弃期限**:明细里一个结论都没有的 SKU 照样挂着,判死仍待所有者
+#: 拍板(docs/feed_closure_audit.md §三.4)。
+HEAD_STALE_HOURS = 1.0
+
 #: 折叠行里最多点几个名字(其余给 SQL 自己查:名字越多越没人看)
 _FOLD_NAMES = 3
 
@@ -190,6 +208,15 @@ def is_stuck(age_h: float | None) -> bool:
     return age_h is not None and age_h >= FEED_QUIET_HOURS
 
 
+def head_stale(age_h: float | None) -> bool:
+    """输入:在途年龄(小时)→ 输出:汇总非终态时该不该改读明细(见 HEAD_STALE_HOURS)。
+
+    年龄拿不到(None)一律**不读**,与 `is_stuck` 同一态度:不确定时走老路
+    (只信汇总),不拿不确定的年龄去触发新行为。
+    """
+    return age_h is not None and age_h >= HEAD_STALE_HOURS
+
+
 def _who(rec: dict) -> str:
     """输入:在途 feed 记录 → 输出:摘要里的"谁"(店铺 动作(工作流) feed 头)。"""
     return f"{rec['store']} {rec['label']}({rec['workflow']}) {rec['fid']}"
@@ -261,18 +288,32 @@ def receipt_blocked(conn, codes, store: str | None = None
         return {(st, sk) for st, sk in cur.fetchall()}
 
 
-def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
-    """输入:店铺 + feed_id → 输出:(feed 汇总 head, SKU 结果)。
+def poll_feed(store: dict, feed_id: str, *, age_h: float | None = None
+              ) -> tuple[dict, dict | None]:
+    """输入:店铺 + feed_id(+ 在途年龄)→ 输出:(feed 汇总 head, SKU 结果)。
 
-    未终态:结果为 None(head 自带 itemsReceived/Succeeded/Failed 进度计数,
-    不翻明细);终态:ops.feed_items 逐 SKU 落 success/failed(+错误码),
-    台账里有而明细里查无的 SKU 落 missing;feed_log 落 done/failed。
+    汇总终态:ops.feed_items 逐 SKU 落 success/failed(+错误码),台账里有而
+    明细里查无的 SKU 落 missing;残留为 0 才 feed_log 落 done/failed。
+
+    汇总未终态:
+      · 提交不足 `HEAD_STALE_HOURS`(或没给年龄)⇒ 结果为 None,不翻明细
+        (head 自带 itemsReceived/Succeeded/Failed 进度计数);
+      · 超过 ⇒ 汇总不再全信,**翻一次明细**,只落台账里仍 submitted、明细已给
+        终态的 SKU,**不**标 missing。返回的结果里,台账仍 submitted 而明细没给
+        结论的 SKU 一律记作 processing ——「能不能收工」于是仍只看 `unresolved()`
+        这一处;为 0 ⇒ **按明细收口**,feed_log 落 done(2026-09-22 汇总停更
+        实证,见 HEAD_STALE_HOURS)。台账里这个 feed 一行都没有 ⇒ 没有可落的
+        对象,照旧返回 None。
 
     **例外:feed 级拒收(终态 ERROR + 一条明细都没有)⇒ 台账逐 SKU 落 failed**,
     回执用 head 里 feed 级 `ingestionErrors` 的第一条(见下面那段注释)。
+
+    `age_h` 只有全局轮询 `poll_all` 传;业务工作流提交后就地的即时轮询
+    (product_clear / sku_locked_heal)不传 ⇒ 行为一字不变,超龄的由 feed_poll 兜。
     """
     head = feeds.get_feed_status(store, feed_id)
-    if head.get("feedStatus") not in feeds.FEED_TERMINAL:
+    terminal = head.get("feedStatus") in feeds.FEED_TERMINAL
+    if not terminal and not head_stale(age_h):
         return head, None
 
     results: dict[str, tuple[str, str]] = {}
@@ -290,13 +331,14 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
 
     _STATUS = {"success": "success", "failed": "failed",
                "processing": "submitted", "unknown": "submitted"}
-    n_unresolved, _ = unresolved(results)      # 收工判据只有这一处,见 unresolved()
     with db.pg_conn() as conn, conn.cursor() as cur:
         # 先取更新前状态:残留 processing/unknown 时 feed 会被重轮询,
         # 回执事件只对"本轮才落定"的 SKU 记,重轮询不得重复灌账
         cur.execute("SELECT sku, workflow, feed_type, status FROM ops.feed_items "
                     "WHERE feed_id = %s", (feed_id,))
         meta = {sku: (wf, ft, st) for sku, wf, ft, st in cur.fetchall()}
+        if not terminal and not meta:
+            return head, None           # 台账里没有这个 feed 的行:无可落的对象
         # ── feed 级拒收:终态 ERROR 而**一条明细都没有**(itemsReceived=0)────
         # 沃尔玛这时把整个 feed 退回,报错只挂在 feed 级 `ingestionErrors` 上,
         # `iter_feed_items` 一条都翻不出来。按"明细里查无 ⇒ missing"办的后果:
@@ -327,20 +369,32 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
                            "零明细):台账 %d 个 SKU 全部落 failed,回执 %s | %s",
                            feed_id, head.get("itemsReceived") or 0, len(meta),
                            head_code or "(无码)", head_desc)
+        # 汇总终态:明细里的每一行照旧落(本就如此)。汇总**没**收工:只落本轮
+        # 才拿到终态的 SKU —— 已落定的不重写。每轮重写会把 resolved_at 刷成
+        # 当下,problem_scan 的在途闸「success 且 resolved_at > last_seen_at ⇒
+        # 待观测」就一直成立,那批 SKU 被永久当成在途
+        # (workflows/problem_scan._SQL_INFLIGHT;汇总停更的 feed 每轮都会重读)。
+        landing = results if terminal else {
+            sku: r for sku, r in results.items()
+            if r[0] in ("success", "failed")
+            and meta.get(sku, ("", "", ""))[2] == "submitted"}
         cur.executemany(
             "UPDATE ops.feed_items SET status = %s, error_code = %s, "
             "error_desc = %s, resolved_at = now() "
             "WHERE feed_id = %s AND sku = %s",
             [(_STATUS[o], code or None, descs.get(sku) or None, feed_id, sku)
-             for sku, (o, code) in results.items()])
+             for sku, (o, code) in landing.items()])
         # 报错明细同步落账(标准动作,不是排障时才拉)
         _save_errors(cur, feed_id, store["name"], all_errs, meta)
-        # 台账里有、终态明细里查无 → missing(不装成功也不装失败)
-        cur.execute(
-            "UPDATE ops.feed_items SET status = 'missing', resolved_at = now() "
-            "WHERE feed_id = %s AND status = 'submitted' AND NOT (sku = ANY(%s))",
-            (feed_id, list(results) or [""]))
-        n_missing = cur.rowcount
+        n_missing = 0
+        if terminal:
+            # 台账里有、终态明细里查无 → missing(不装成功也不装失败)。
+            # 汇总没收工时**不做**这一步:明细里缺席说明不了任何事
+            cur.execute(
+                "UPDATE ops.feed_items SET status = 'missing', resolved_at = now() "
+                "WHERE feed_id = %s AND status = 'submitted' AND NOT (sku = ANY(%s))",
+                (feed_id, list(results) or [""]))
+            n_missing = cur.rowcount
         # 产品事件账本:逐 SKU 回执落账(success 是沃尔玛的一面之词,
         # 删除的最终真相由 catalog_sync 观测核验)。
         # 入账白名单(所有者定稿 2026-08-07):改价/改库存/改标题/清库存等
@@ -373,11 +427,13 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
         # 拉黑(record_asins 是 PERMANENT),list_new/match_listing 的黑名单闸
         # 下一轮就开始拦,而没有任何摘要会说是改码干的。既有工作流名一个都不
         # 叫 sku_migrate ⇒ 改码前逐字节零行为变化。meta[sku][0] 是提交来源工作流。
+        # 取 landing(汇总终态时就是 results,一字不变):汇总停更的 feed 每轮都会
+        # 重读明细,上一轮已入黑名单的不必每轮再报一遍「命中违禁」
         prohibited = [
             {"store": store["name"], "sku": sku, "category": "POLICY",
              "reasons": f"上架回执违禁 {(code or '').strip()}|"
                         f"{(descs.get(sku) or '')[:150]}"}
-            for sku, (o, code) in results.items()
+            for sku, (o, code) in landing.items()
             if o == "failed" and sku in meta
             and product_events.feed_kind(meta[sku][1]) == "list"
             and meta[sku][0] != "sku_migrate"
@@ -391,13 +447,28 @@ def poll_feed(store: dict, feed_id: str) -> tuple[dict, dict | None]:
     if n_missing:
         logger.warning("feed %s:%d 个 SKU 在终态明细中查无,已标 missing",
                        feed_id, n_missing)
+    if not terminal:
+        # 汇总没收工:台账里仍 submitted、明细没给结论(还在处理 / 明细里查无)
+        # 的 SKU 记作 processing —— 能不能收工仍只问 unresolved() 这一处,
+        # poll_all 说不说"已落定"也看同一个数,两边不会各说各话
+        for sku, (_wf, _ft, st) in meta.items():
+            if st == "submitted" and sku not in results:
+                results[sku] = ("processing", "")
+    n_unresolved, _ = unresolved(results)      # 收工判据只有这一处,见 unresolved()
     if n_unresolved:
-        # feed 终态但个别 SKU 仍 INPROGRESS/未知:feed_log 保持 submitted,
-        # 下轮再查——否则这些行永久卡 submitted,cleanup 在途拦截会永远跳过它们
-        logger.warning("feed %s 已终态但 %d 个 SKU 仍 processing/unknown,"
-                       "保持在途下轮重查", feed_id, n_unresolved)
+        if terminal:
+            # feed 终态但个别 SKU 仍 INPROGRESS/未知:feed_log 保持 submitted,
+            # 下轮再查——否则这些行永久卡 submitted,cleanup 在途拦截会永远跳过它们
+            logger.warning("feed %s 已终态但 %d 个 SKU 仍 processing/unknown,"
+                           "保持在途下轮重查", feed_id, n_unresolved)
     else:
-        feeds.mark_feed_done(feed_id, head.get("feedStatus") == "PROCESSED")
+        if not terminal:
+            logger.warning("feed %s 汇总停在 %s(提交 %.1fh,%s),台账 SKU 已按明细"
+                           "全部拿到终态 ⇒ 按明细收口(沃尔玛汇总停更)",
+                           feed_id, head.get("feedStatus"), age_h, _progress(head))
+        # 汇总停更的按明细收口落 done:feed 本身没被拒,成败在逐 SKU 的结论里
+        feeds.mark_feed_done(feed_id, head.get("feedStatus") == "PROCESSED"
+                             or not terminal)
     return head, results
 
 
@@ -455,35 +526,52 @@ def poll_all(stores_by_name: dict) -> str:
                 rec.update(state="skipped", detail="店铺凭证缺失,跳过")
                 continue
             try:
-                head, results = poll_feed(store, r["feed_id"])
+                # 年龄一并递过去:汇总超 HEAD_STALE_HOURS 仍非终态的,poll_feed
+                # 改读明细(2026-09-22 汇总停更实证)
+                head, results = poll_feed(store, r["feed_id"], age_h=rec["age_h"])
             except Exception as e:
                 logger.warning("feed %s 轮询失败(下轮再试): %s", r["feed_id"], e)
                 rec.update(state="open", detail=f"查询失败({e}),下轮再试")
                 continue
+            fs = head.get("feedStatus")
             if results is None:
-                rec.update(state="open",
-                           detail=f"{head.get('feedStatus')},{_progress(head)}")
+                rec.update(state="open", detail=f"{fs},{_progress(head)}")
                 continue
+            terminal = fs in feeds.FEED_TERMINAL
             n_open, n_unk = unresolved(results)
-            if n_open:
+            n_ok = sum(1 for o, _ in results.values() if o == "success")
+            n_bad = sum(1 for o, _ in results.values() if o == "failed")
+            tail = (f",其中 {n_unk} 个状态未知(沃尔玛枚举可能已扩,查日志"
+                    f"「未知 SKU ingestionStatus」)" if n_unk else "")
+            if n_open and terminal:
                 # ⚠ **feed 终态 ≠ 落定**:残留 processing/unknown 时 poll_feed
                 # 不调 mark_feed_done(那些 SKU 要留在在途队列里下轮重查),
                 # 摘要跟着说"已落定"就是假的 —— 行还在 feed_log 里,下一轮
                 # 一字不差再播一遍,而 `落定 N` 每轮把它重数一次。
-                tail = (f",其中 {n_unk} 个状态未知(沃尔玛枚举可能已扩,查日志"
-                        f"「未知 SKU ingestionStatus」)" if n_unk else "")
                 rec.update(state="open",
-                           detail=f"{head.get('feedStatus')} 已终态,但 {n_open} 个 "
+                           detail=f"{fs} 已终态,但 {n_open} 个 "
                                   f"SKU 未落定{tail},保持在途下轮重查")
                 continue
-            n_ok = sum(1 for o, _ in results.values() if o == "success")
-            n_bad = sum(1 for o, _ in results.values() if o == "failed")
-            rec.update(state="settled",
-                       detail=f"已落定 {head.get('feedStatus')},"
-                              f"成功 {n_ok},失败 {n_bad}")
+            if n_open:
+                # ⚠ **汇总未终态 ≠ 没处理**:汇总停更的 feed,明细里已有结论的
+                # 那部分已经落账(飞书跟着回写);剩下的是明细里也还没结论的
+                rec.update(state="open",
+                           detail=f"{fs}(汇总:{_progress(head)}),明细已判 "
+                                  f"{n_ok + n_bad} 个(成功 {n_ok},失败 {n_bad}),"
+                                  f"余 {n_open} 个未落定{tail},保持在途")
+                continue
+            if terminal:
+                rec.update(state="settled",
+                           detail=f"已落定 {fs},成功 {n_ok},失败 {n_bad}")
+            else:
+                # 汇总与明细自相矛盾(汇总"处理中"、明细全终态)这句要原样摆出来:
+                # 它就是沃尔玛汇总停更的证据,别只报一个"已落定"把它藏掉
+                rec.update(state="settled", by_items=True,
+                           detail=f"已按明细落定(沃尔玛汇总仍停在 {fs}:"
+                                  f"{_progress(head)}),成功 {n_ok},失败 {n_bad}")
         return out
 
-    done = still = skipped = 0
+    done = still = skipped = by_items = 0
     detail_lines: list[str] = []
     stuck: list[dict] = []
     # 摘要按人看的店铺序排(sort_key),**不是**按完成先后:query_pending 本身
@@ -501,6 +589,7 @@ def poll_all(stores_by_name: dict) -> str:
             for rec in per_store[sn]:
                 if rec["state"] == "settled":
                     done += 1
+                    by_items += bool(rec.get("by_items"))
                 elif rec["state"] == "skipped":
                     skipped += 1
                 else:
@@ -537,7 +626,12 @@ def poll_all(stores_by_name: dict) -> str:
                        "请人工核对后处理:%s", len(pendings),
                        [(p["store"], p["feed_type"], str(p["created_at"]))
                         for p in pendings[:10]])
-    line = (f"feed 轮询:{len(submitted)} 个在途,落定 {done},仍处理中 {still}")
+    line = f"feed 轮询:{len(submitted)} 个在途,落定 {done}"
+    if by_items:
+        # 例外计数(规矩 2:0 则整段消失)。个数本身就是信号:沃尔玛那边的
+        # 汇总/收口出了故障,不该只埋在明细行里
+        line += f"(其中按明细收口 {by_items}:沃尔玛汇总停更)"
+    line += f",仍处理中 {still}"
     if skipped:
         line += f",店铺凭证缺失跳过 {skipped}"
     if stuck:

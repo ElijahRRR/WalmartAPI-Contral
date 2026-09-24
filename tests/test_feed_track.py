@@ -271,7 +271,7 @@ def test_poll_all_summary_and_pending_alarm(monkeypatch, caplog):
          "feed_type": "RETIRE_ITEM", "created_at": "t"},
     ])
     monkeypatch.setattr(feed_track, "poll_feed",
-                        lambda store, fid: ({"feedStatus": "PROCESSED"},
+                        lambda store, fid, **_: ({"feedStatus": "PROCESSED"},
                                             {"A": ("success", "")}))
     with caplog.at_level(_logging.WARNING, logger="services.feed_track"):
         out = feed_track.poll_all({"T1": STORE})
@@ -464,7 +464,7 @@ def test_poll_all_is_cross_store_concurrent_and_in_store_serial(monkeypatch):
     in_store: dict[str, int] = {}
     peak_in_store = {"v": 0}
 
-    def fake_poll(store, fid):
+    def fake_poll(store, fid, **_):
         name = store["name"]
         with lock:
             in_store[name] = in_store.get(name, 0) + 1
@@ -711,7 +711,7 @@ def test_terminal_feed_with_residue_never_claims_it_settled(monkeypatch):
     """
     monkeypatch.setattr(feeds, "query_pending",
                         lambda: [_inflight(fid="F1", ft="MP_ITEM", wf="list_new")])
-    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f: (
+    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f, **_: (
         {"feedStatus": "PROCESSED"},
         {"A": ("success", ""), "B": ("failed", "E1"), "C": ("processing", "")}))
     out = feed_track.poll_all({"T1": STORE})
@@ -728,7 +728,7 @@ def test_residue_says_out_loud_when_it_is_an_unrecognised_enum(monkeypatch):
     以为沃尔玛慢,实际是码表该补了。
     """
     monkeypatch.setattr(feeds, "query_pending", lambda: [_inflight(fid="F1")])
-    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f: (
+    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f, **_: (
         {"feedStatus": "PROCESSED"},
         {"A": ("success", ""), "B": ("unknown", "")}))
     out = feed_track.poll_all({"T1": STORE})
@@ -745,7 +745,7 @@ def test_long_in_flight_feeds_fold_into_one_line_with_a_next_step(monkeypatch):
     monkeypatch.setattr(feeds, "query_pending", lambda: [
         _inflight(fid="F1", ft="MP_MAINTENANCE", wf="maintenance", age_h=36.0),
         _inflight(fid="F2", ft="MP_INVENTORY", wf="maintenance", age_h=5.0)])
-    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f: (
+    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f, **_: (
         {"feedStatus": "INPROGRESS", "itemsReceived": 15, "itemsSucceeded": 12,
          "itemsFailed": 2}, None))
     out = feed_track.poll_all({"T1": STORE})
@@ -766,7 +766,7 @@ def test_a_fresh_in_flight_feed_keeps_its_own_detail_line(monkeypatch):
     """
     monkeypatch.setattr(feeds, "query_pending", lambda: [
         _inflight(fid="F1", age_h=0.5, created_age_h=100.0)])
-    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f: (
+    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f, **_: (
         {"feedStatus": "INPROGRESS", "itemsReceived": 10, "itemsSucceeded": 3,
          "itemsFailed": 1}, None))
     out = feed_track.poll_all({"T1": STORE})
@@ -777,7 +777,7 @@ def test_a_fresh_in_flight_feed_keeps_its_own_detail_line(monkeypatch):
 def test_an_unknowable_age_counts_as_fresh(monkeypatch):
     """年龄拿不到(updated_at 缺)一律当新鲜:宁可多播一行,不可少播一行。"""
     monkeypatch.setattr(feeds, "query_pending", lambda: [_inflight(fid="F1")])
-    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f: (
+    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f, **_: (
         {"feedStatus": "INPROGRESS"}, None))
     out = feed_track.poll_all({"T1": STORE})
     assert "T1 删除(-) F1:INPROGRESS" in out and "长期在途" not in out
@@ -788,7 +788,7 @@ def test_a_feed_that_finally_settles_prints_even_after_days(monkeypatch):
     feed 就出队了,只播这一次 —— 折叠折的是"还会再播 47 遍"的那些。"""
     monkeypatch.setattr(feeds, "query_pending",
                         lambda: [_inflight(fid="F1", age_h=99.0)])
-    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f: (
+    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f, **_: (
         {"feedStatus": "PROCESSED"}, {"A": ("success", "")}))
     out = feed_track.poll_all({"T1": STORE})
     assert "T1 删除(-) F1:已落定 PROCESSED,成功 1,失败 0" in out
@@ -975,14 +975,13 @@ def test_stuck_list_and_the_summary_fold_share_one_threshold():
 
 # ── 在途卡住的三种病要分得开(2026-09-11 生产实数据:20 条在途、6162 个 SKU)
 
-def test_verdict_splits_the_three_ways_a_feed_gets_stuck():
-    """台账都写"未落定",但原因有三种,处置完全不同 —— 光看台账分不出来。
+def test_verdict_judges_terminal_heads_and_never_trusts_a_non_terminal_one():
+    """汇总终态:残留 / 下轮收工,当场分得开。汇总**未终态:不拿它的计数下结论**。
 
-      ① 沃尔玛已终态而台账还有未落定 ⇒ **残留**(那几个 SKU 自己不是终态),
-         feed 永不收工,行永不老化;
-      ② 沃尔玛没终态却已给出成功/失败计数 ⇒ **结论在沃尔玛手上、我们没去取**
-         (poll_feed 对非终态 feed 只读 head 不翻明细),飞书上一直"处理中";
-      ③ 沃尔玛没终态且全部待处理 ⇒ 它真的还在跑,等就行。
+    2026-09-22 生产实证(所有者 09-23 核实):A131吕灿荣 改价 feed 汇总 31 小时
+    停在 INPROGRESS / 成功 0 / 失败 0 / 处理中 71,明细却 71/71 SUCCESS、价格
+    早已生效。此前这里按汇总计数判「沃尔玛确实还在跑(全部待处理)」,正好把
+    人引向了"沃尔玛一条都没处理"的错误结论。
     """
     from workflows import feed_poll
 
@@ -991,13 +990,15 @@ def test_verdict_splits_the_three_ways_a_feed_gets_stuck():
     assert "残留" in feed_poll._verdict(done_with_residue, 1)
     assert "下轮轮询即收工" in feed_poll._verdict(done_with_residue, 0)
 
-    walmart_knows = {"feedStatus": "INPROGRESS", "itemsReceived": 15,
-                     "itemsSucceeded": 12, "itemsFailed": 2}
-    assert "沃尔玛已给 14 个结论,台账一个没落" in feed_poll._verdict(walmart_knows, 15)
-
-    really_running = {"feedStatus": "INPROGRESS", "itemsReceived": 1000,
-                      "itemsSucceeded": 0, "itemsFailed": 0}
-    assert "确实还在跑" in feed_poll._verdict(really_running, 1000)
+    frozen_head = {"feedStatus": "INPROGRESS", "itemsReceived": 71,
+                   "itemsSucceeded": 0, "itemsFailed": 0, "itemsProcessing": 71}
+    partial_head = {"feedStatus": "INPROGRESS", "itemsReceived": 15,
+                    "itemsSucceeded": 12, "itemsFailed": 2}
+    for head, n_open in ((frozen_head, 71), (partial_head, 15)):
+        got = feed_poll._verdict(head, n_open)
+        assert "还在跑" not in got and "等就行" not in got       # 不再替汇总背书
+        assert "以明细为准" in got and "上一行命令" in got        # 指到能看到真相的地方
+        assert f"{feed_track.HEAD_STALE_HOURS:g}h" in got         # 闸只准引用,不自带数
 
 
 def test_verdict_reads_the_head_itself_not_our_own_formatted_line(monkeypatch):
@@ -1013,7 +1014,10 @@ def test_verdict_reads_the_head_itself_not_our_own_formatted_line(monkeypatch):
         raise AssertionError("_verdict 不该经过 _progress")
 
     monkeypatch.setattr(feed_track, "_progress", _boom)
-    assert "沃尔玛已给 14 个结论" in feed_poll._verdict(
+    assert "残留" in feed_poll._verdict(
+        {"feedStatus": "PROCESSED", "itemsReceived": 15,
+         "itemsSucceeded": 12, "itemsFailed": 2}, 1)
+    assert "以明细为准" in feed_poll._verdict(
         {"feedStatus": "INPROGRESS", "itemsReceived": 15,
          "itemsSucceeded": 12, "itemsFailed": 2}, 15)
 
@@ -1069,7 +1073,7 @@ def test_stuck_probe_puts_walmart_next_to_the_ledger(monkeypatch):
     assert "台账里共 55 个 SKU 卡在「处理中」" in out      # 首行 = 卡住多少货
     assert "台账未落定 15" in out                          # 逐条也有
     assert "沃尔玛:INPROGRESS,已收 15,成功 12,失败 2,待处理 1" in out
-    assert "沃尔玛已给 14 个结论,台账一个没落" in out
+    assert "以明细为准" in out                             # 汇总未终态不替它下结论
     assert "沃尔玛:查询失败(feed 状态查询失败 HTTP 404)" in out
     sql = next(s for s, _ in conn if "feed_items" in s)
     assert "status = 'submitted'" in sql                   # 未落定 = 台账仍 submitted
@@ -1115,3 +1119,174 @@ def test_stuck_without_probe_asks_walmart_nothing(monkeypatch):
     monkeypatch.setattr(feeds, "get_feed_status", _boom)
     out = feed_poll._inflight_list()
     assert "F1" in out and "台账未落定 7" in out and "沃尔玛:" not in out
+
+
+# ── 汇总停更(2026-09-22 生产实证,所有者 09-23 核实)────────────────────────────
+# A131吕灿荣 改价 feed(71 SKU):汇总 31 小时停在 INPROGRESS / 成功 0 / 失败 0 /
+# 处理中 71、modifiedDtm 提交后再没动过,明细却 71/71 SUCCESS、价格 09-23 13:01
+# 已观测生效;同轮 16 条跨店改价 feed(1,960 SKU)同样。旧口径「汇总不终态就
+# 不翻明细」让这些 SKU 在台账与飞书上一直是「处理中」。下面这组钉住修法。
+
+_STALE_HEAD = {"feedStatus": "INPROGRESS", "itemsReceived": 3,
+               "itemsSucceeded": 0, "itemsFailed": 0, "itemsProcessing": 3}
+
+
+class _Ledger(_Conn):
+    """台账里这个 feed 的行(sku, workflow, feed_type, status)按构造参数给出。"""
+
+    def __init__(self, rows):
+        super().__init__()
+        self.rows = rows
+
+    def fetchall(self):
+        if "SELECT sku, workflow, feed_type, status" in self._last:
+            return self.rows
+        return []
+
+
+def _stale_feed(monkeypatch, ledger_rows, items):
+    conn = _Ledger(ledger_rows)
+    _fake_db(monkeypatch, conn)
+    done = []
+    monkeypatch.setattr(feeds, "get_feed_status", lambda s, f: dict(_STALE_HEAD))
+    monkeypatch.setattr(feeds, "iter_feed_items", lambda s, f: iter(items))
+    monkeypatch.setattr(feeds, "mark_feed_done",
+                        lambda fid, ok: done.append((fid, ok)))
+    return conn, done
+
+
+def _landed(conn):
+    """本轮 UPDATE 落账的 (status, sku);没有落账语句时为空。"""
+    got = [x for x in conn.sqls if "SET status = %s" in x[0]]
+    return sorted((r[0], r[4]) for _sql, rows in got for r in rows)
+
+
+def test_a_stale_head_whose_details_are_all_terminal_settles_by_the_details(
+        monkeypatch):
+    """汇总停在 INPROGRESS、明细全终态 ⇒ 逐 SKU 落账 + **按明细收口**(落 done)。
+
+    这就是 09-22 那 71 条:沃尔玛早判完了,只是汇总没收口。
+    """
+    conn, done = _stale_feed(
+        monkeypatch,
+        [(s, "maintenance", "price", "submitted") for s in ("A", "B", "C")],
+        [{"sku": s, "ingestionStatus": "SUCCESS"} for s in ("A", "B", "C")])
+    head, out = feed_track.poll_feed(STORE, "F1", age_h=31.0)
+    assert head["feedStatus"] == "INPROGRESS"
+    assert out == {s: ("success", "") for s in ("A", "B", "C")}
+    assert _landed(conn) == [("success", "A"), ("success", "B"), ("success", "C")]
+    assert done == [("F1", True)]             # 落 done:feed 没被拒,成败在逐条里
+    assert feed_track.unresolved(out) == (0, 0)
+
+
+def test_a_stale_head_lands_only_the_verdicts_and_never_marks_missing(monkeypatch):
+    """明细里有结论的落账;还在处理的、明细里查无的**照旧在途**,不标 missing。
+
+    missing 那一步只在汇总终态后做:汇总没收工时,明细里缺席说明不了任何事。
+    返回值把台账里仍 submitted 而没结论的 SKU 记作 processing ——「能不能收工」
+    与摘要说不说"已落定",都只问 unresolved() 这一处。
+    """
+    conn, done = _stale_feed(
+        monkeypatch,
+        [(s, "maintenance", "price", "submitted") for s in ("A", "B", "C", "D")],
+        [{"sku": "A", "ingestionStatus": "SUCCESS"},
+         {"sku": "B", "ingestionStatus": "DATA_ERROR",
+          "ingestionErrors": {"ingestionError": [{"code": "E1"}]}},
+         {"sku": "C", "ingestionStatus": "INPROGRESS"}])       # D:明细里查无
+    _head, out = feed_track.poll_feed(STORE, "F1", age_h=5.0)
+    assert _landed(conn) == [("failed", "B"), ("success", "A")]
+    assert not any("'missing'" in sql for sql, _ in conn.sqls)
+    assert out["C"] == ("processing", "") and out["D"] == ("processing", "")
+    assert feed_track.unresolved(out) == (2, 0)
+    assert done == []                                          # 不收口
+
+
+def test_a_stale_head_never_rewrites_rows_it_already_landed(monkeypatch):
+    """上一轮已落定的行不重写:重写会把 resolved_at 刷成当下,problem_scan 的在途闸
+    「success 且 resolved_at > last_seen_at ⇒ 待观测」就一直成立 —— 汇总停更的
+    feed 每轮都会重读明细,那批 SKU 会被永久当成在途。"""
+    conn, done = _stale_feed(
+        monkeypatch,
+        [("A", "maintenance", "price", "success"),
+         ("B", "maintenance", "price", "submitted")],
+        [{"sku": "A", "ingestionStatus": "SUCCESS"},
+         {"sku": "B", "ingestionStatus": "SUCCESS"}])
+    feed_track.poll_feed(STORE, "F1", age_h=3.0)
+    assert _landed(conn) == [("success", "B")]                # A 不再写
+    assert done == [("F1", True)]
+
+
+def test_a_fresh_or_ageless_non_terminal_head_reads_no_details(monkeypatch):
+    """闸前(或年龄未知)一字不变:结果 None、一页明细都不翻 —— 刚提交的 feed
+    本来就该等;业务工作流就地的即时轮询不传年龄,行为也不变。"""
+    def _boom(*a, **k):
+        raise AssertionError("闸前不许翻明细")
+
+    monkeypatch.setattr(feeds, "get_feed_status", lambda s, f: dict(_STALE_HEAD))
+    monkeypatch.setattr(feeds, "iter_feed_items", _boom)
+    assert feed_track.poll_feed(STORE, "F1")[1] is None
+    assert feed_track.poll_feed(STORE, "F1", age_h=None)[1] is None
+    assert feed_track.poll_feed(
+        STORE, "F1", age_h=feed_track.HEAD_STALE_HOURS - 0.01)[1] is None
+
+
+def test_a_stale_head_without_ledger_rows_changes_nothing(monkeypatch):
+    """台账里这个 feed 一行都没有 ⇒ 无可落的对象:照旧返回 None,不写、不收口。"""
+    conn, done = _stale_feed(
+        monkeypatch, [], [{"sku": "A", "ingestionStatus": "SUCCESS"}])
+    head, out = feed_track.poll_feed(STORE, "F1", age_h=31.0)
+    assert out is None and head["feedStatus"] == "INPROGRESS"
+    assert _landed(conn) == [] and done == []
+
+
+def test_head_stale_threshold_and_its_relation_to_the_fold():
+    """年龄未知一律不读;闸在 1h(官方批量改价 SLA 15 分钟,轮询建议 15 分钟 →
+    1 小时)。它先于摘要折叠(2h)生效:折进「长期在途」的,都已经按明细读过。"""
+    assert feed_track.head_stale(None) is False
+    assert feed_track.head_stale(feed_track.HEAD_STALE_HOURS - 0.01) is False
+    assert feed_track.head_stale(feed_track.HEAD_STALE_HOURS) is True
+    assert feed_track.HEAD_STALE_HOURS <= feed_track.FEED_QUIET_HOURS
+
+
+def test_poll_all_hands_each_feed_its_age(monkeypatch):
+    """poll_all 必须把在途年龄递给 poll_feed:少了它,停更闸永远不开。"""
+    seen = {}
+
+    def fake_poll(store, fid, **k):
+        seen[fid] = k.get("age_h")
+        return {"feedStatus": "PROCESSED"}, {"A": ("success", "")}
+
+    monkeypatch.setattr(feeds, "query_pending", lambda: [
+        _inflight(fid="F1", age_h=31.0), _inflight(fid="F2")])
+    monkeypatch.setattr(feed_track, "poll_feed", fake_poll)
+    feed_track.poll_all({"T1": STORE})
+    assert 30.9 < seen["F1"] < 31.1 and seen["F2"] is None
+
+
+def test_summary_names_a_feed_settled_by_its_details(monkeypatch):
+    """按明细收口的 feed:明细行把「汇总处理中 / 明细全终态」这对矛盾原样摆出来
+    (那就是沃尔玛汇总停更的证据),首行点个数 —— 例外计数,0 则整段消失。"""
+    monkeypatch.setattr(feeds, "query_pending", lambda: [
+        _inflight(fid="F1", ft="price", wf="maintenance", age_h=31.0)])
+    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f, **_: (
+        dict(_STALE_HEAD), {s: ("success", "") for s in ("A", "B", "C")}))
+    out = feed_track.poll_all({"T1": STORE})
+    first = out.splitlines()[0]
+    assert "落定 1(其中按明细收口 1:沃尔玛汇总停更),仍处理中 0" in first
+    assert ("T1 改价(maintenance) F1:已按明细落定(沃尔玛汇总仍停在 INPROGRESS:"
+            "已收 3,成功 0,失败 0,待处理 3),成功 3,失败 0") in out
+    assert "长期在途" not in out                  # 落定的永远出明细行,不折叠
+
+
+def test_summary_for_a_stale_head_with_items_still_open(monkeypatch):
+    """明细给了一部分结论:那部分已落账,剩下的照旧在途 —— 不许说"已落定"。"""
+    monkeypatch.setattr(feeds, "query_pending", lambda: [
+        _inflight(fid="F1", ft="price", wf="maintenance", age_h=1.5)])
+    monkeypatch.setattr(feed_track, "poll_feed", lambda s, f, **_: (
+        dict(_STALE_HEAD), {"A": ("success", ""), "B": ("failed", "E1"),
+                            "C": ("processing", "")}))
+    out = feed_track.poll_all({"T1": STORE})
+    assert "已落定" not in out and "按明细收口" not in out
+    assert "落定 0,仍处理中 1" in out
+    assert ("T1 改价(maintenance) F1:INPROGRESS(汇总:已收 3,成功 0,失败 0,待处理 3),"
+            "明细已判 2 个(成功 1,失败 1),余 1 个未落定,保持在途") in out

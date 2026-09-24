@@ -5,8 +5,9 @@
   python cli.py feed_poll -p stuck=1      # 在途清单:**完整 feed_id** + 卡了多久
                                           # + 卡了多少 SKU + 现成的诊断命令(只读台账)
   python cli.py feed_poll -p stuck=1 -p probe=1
-                                          # 同上,再去沃尔玛问一次 feed 级状态并当场
-                                          # 分档(残留 / 结论没取回来 / 真在跑);
+                                          # 同上,再去沃尔玛问一次 feed 级状态:汇总
+                                          # 终态的当场判残留;未终态的**不按汇总计数
+                                          # 下结论**(汇总会停更,见 _verdict);
                                           # 一 feed 一次 GET,零明细翻页,只读
   python cli.py feed_poll -p feed_id=X    # 诊断:打印该 feed 逐 SKU 完整报错
                                           # (只读,不改台账、不跑反哺器)
@@ -26,12 +27,21 @@ ops.feed_items(权威台账)→ feed_log 落 done/failed;pending 行
 ⚠ 但**反哺器会写 PG**(UPC 池状态、登记簿弃码,两者都不可逆),空跑必须
 用 `python cli.py feed_poll --dry-run` —— 本工作流自己认 params["dry_run"]
 并把 execute 透传给五个反哺器(见 run());漏掉那一句,--dry-run 完全失效。
+⚠ --dry-run **只拦反哺器**:台账落定(ops.feed_items / feed_log 收口 / 产品事件 /
+违禁回执入黑名单)是轮询本体,空跑照写(一直如此)。要零写入地先看一眼,用
+`-p stuck=1 [-p probe=1]`(纯读台账 + 只读 GET)。
 
 ⚠ **feed 终态 ≠ 落定**:明细里还有 SKU 卡在 INPROGRESS/未知枚举时,行留在途
 下轮重查(摘要照实说,不写"已落定")。这种行**永不老化**,在途超
 `feed_track.FEED_QUIET_HOURS` 的会折成一行点名、不再逐轮复读明细 ——
 一天 48 轮的固定文案没人看。放弃期限待所有者拍板,
 见 docs/feed_closure_audit.md §三.4。
+
+⚠ **汇总未终态 ≠ 没处理**(2026-09-22 生产实证,所有者 09-23 核实):沃尔玛
+feed 级汇总会停更 —— A131吕灿荣 改价 feed 汇总 31 小时停在 INPROGRESS / 0 / 0 /
+71,明细 71/71 SUCCESS、价格早已生效,同轮 16 条跨店改价 feed 同样。提交超
+`feed_track.HEAD_STALE_HOURS` 仍非终态的,轮询改读明细:有结论的落账,台账里
+全部有了结论就**按明细收口**(摘要首行点名「按明细收口 N:沃尔玛汇总停更」)。
 
 轮询完执行**反哺器列表**(所有者定稿 2026-08-07:一切 feed 结果的表格
 回写都交给轮询,业务表状态不依赖"记得再跑一次业务工作流"):每个反哺器
@@ -256,13 +266,16 @@ def _probe_heads(stores_by_name: dict, srows: list[dict]) -> dict[str, str]:
 def _verdict(head: dict, n_open: int) -> str:
     """输入:沃尔玛 feed 级汇总 + 台账未落定数 → 输出:这条卡在哪一档(人话)。
 
-    三档的处置完全不同,而光看台账、或光看沃尔玛,都分不出是哪一档:
-      · 沃尔玛已终态、台账还有未落定 ⇒ **残留**:那几个 SKU 自己的
+      · 汇总终态、台账还有未落定 ⇒ **残留**:那几个 SKU 自己的
         ingestionStatus 不是终态(INPROGRESS / 枚举没认出来),feed 因此永不收工;
-      · 沃尔玛没终态、但已经给出成功/失败计数 ⇒ **结论在沃尔玛手上,我们没去取**:
-        `poll_feed` 对非终态 feed 只读 head 计数、不翻明细,于是这些 SKU 在飞书上
-        一直是"处理中",哪怕沃尔玛早就判完了;
-      · 沃尔玛没终态、且全在待处理 ⇒ 它**真的还在跑**,等就行。
+      · 汇总终态、台账已全落定 ⇒ 下一轮轮询即收工;
+      · 汇总**未终态** ⇒ **不拿汇总的计数下任何结论**。汇总会停更(2026-09-22
+        实证:A131吕灿荣 改价 feed 汇总 31 小时停在 INPROGRESS / 0 / 0 / 71,
+        明细却 71/71 SUCCESS、价格早已生效)。此前这里按汇总计数判出的
+        「沃尔玛确实还在跑(全部待处理)」恰恰把人引向错误结论(2026-09-23
+        那次排查就是这样错的)。逐条真相只在明细里:轮询对提交超
+        `feed_track.HEAD_STALE_HOURS` 的已自动改读明细落账;现场要看,就跑
+        清单里这一条上面那行给的 `-p feed_id=` 命令(只读)。
 
     ⚠ 收的是 head **原件**,不是 `_progress` 拼好的那句话:去反解自己刚拼的
     字符串,等于给同一份数字造第二个出处,改一处忘一处就静默错档。
@@ -270,10 +283,8 @@ def _verdict(head: dict, n_open: int) -> str:
     if head.get("feedStatus") in feeds.FEED_TERMINAL:
         return (f"⇒ 残留:沃尔玛已终态,{n_open} 个 SKU 的逐条状态仍非终态"
                 if n_open else "⇒ 沃尔玛已终态,下轮轮询即收工")
-    resolved = (head.get("itemsSucceeded") or 0) + (head.get("itemsFailed") or 0)
-    if resolved:
-        return f"⇒ 沃尔玛已给 {resolved} 个结论,台账一个没落(非终态 feed 不翻明细)"
-    return "⇒ 沃尔玛确实还在跑(全部待处理)"
+    return (f"⇒ 汇总未终态,其计数不作数(汇总会停更),以明细为准:轮询对提交超 "
+            f"{feed_track.HEAD_STALE_HOURS:g}h 的已按明细落账,逐条看上一行命令")
 
 
 def _inflight_list(stores_by_name: dict | None = None) -> str:

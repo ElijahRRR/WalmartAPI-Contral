@@ -79,6 +79,26 @@ TRO 跨仓边界(暂放)。
 maintenance/list_new)→ 按域停旧切换。
 **✅ 2026-08-17 全部完成** —— 验收记录见 `docs/production_cutover.md` §九。
 
+### 2026-09-24 feed 汇总停更:超 1 小时仍非终态的改读明细,全部有结论就按明细收口
+
+**所有者实证(09-23)**:A131吕灿荣 改价 feed(71 SKU,09-22 14:22 提交)汇总 31 小时
+停在 `INPROGRESS / 成功 0 / 失败 0 / 处理中 71`,`modifiedDtm` 不动;**明细 71/71
+SUCCESS**,71 个价格 09-23 13:01 已观测到、14:08 判定生效。同轮 16 条跨店改价 feed
+(1,960 SKU)同样。**价格早已生效,卡住的只是沃尔玛的 feed 汇总/收口。**
+本地一直挂 `submitted`,因为 `poll_feed` 汇总不终态就不翻明细;`-p probe=1` 还按汇总
+计数判「沃尔玛确实还在跑(全部待处理)」,09-23 那次排查被它带偏成"一条都没处理"。
+
+已改:`poll_feed` 对提交超 `feed_track.HEAD_STALE_HOURS`(1h)汇总仍非终态的翻明细 ——
+终态 SKU 落账(不标 missing、不重写已落定行);台账 SKU 全部有终态 ⇒ **按明细收口**
+(feed_log done),摘要首行「按明细收口 N:沃尔玛汇总停更」。闸只由 feed_poll 全局轮询开,
+product_clear / sku_locked_heal 的即时轮询不变。`_verdict` 不再按未终态汇总的计数下结论。
+这就是 09-11 挂着待拍板的「缺口 ②」,本次实证等于给了答案(`docs/feed_closure_audit.md` §三.4)。
+
+**仍待拍板(不变)**:明细里一个结论都没有的 SKU 等多久判死、判死后防重闸开不开。
+旁记(所有者提):改价走的旧版 `feedType=price`(PriceFeed 1.7)属已 Deprecated 的
+Price Management 族(sunset 只写 2026),迁 `PRICE_AND_PROMOTION` 另排(backlog §十五);
+不能断定它是本次的直接原因。
+
 ### 2026-09-19 多仓生产缺陷:校验失败整店跳过只跳了摘要,意图照发到默认节点
 
 所有者发现配置了「维护仓库」的店同一 SKU 两个节点都有货(含配置后才上架的

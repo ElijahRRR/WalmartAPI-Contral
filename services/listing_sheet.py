@@ -61,18 +61,13 @@ from datetime import datetime
 
 from api import feishu
 from registry import db, resources
-from services import feed_track, kpi, sku_asin, sku_codec, upc_pool
+from services import feed_track, kpi, sheet_layout, sku_asin, sku_codec, upc_pool
 
 logger = logging.getLogger("services.listing_sheet")
 
 _APPEND_BLOCK = 500 # 单次写飞书的行数上限(一次裹上千行会被 90202 拒;
                     # 与 maint_sheet 同值,那边是实遇被拒后定的)
 PENDING_O = ("", "处理中", "ASYNC_PENDING")   # 上架结果列这些值反哺器继续跟
-#: 表头行往登记列数之外多扫几列 —— 只为发现"登记之外的新列"并告警。
-#: 多出的列不算错(所有者随时会加自己的列),但要说出来,免得下一个人
-#: 以为程序看得见它。
-_HEADER_SCAN_SLACK = 5
-
 #: 中文表头文字(字段名 → 表头原文)**只在 registry 出生**:
 #: `resources.LISTING_SHEET.headers`。审核链第三步曾把这张对照表抄一份放在
 #: 本文件(`_HEADER_NAMES` 字面量),那样它就有了第二个出生地 —— 表头一改要
@@ -92,15 +87,9 @@ def _header() -> tuple:
     return tuple(sheet.headers[c] for c in sheet.columns)
 
 
-class HeaderMismatch(LookupError, ValueError):
-    """表头行与 registry 登记对不上 —— 本轮拒绝一切读写。
-
-    **两个基类都要**(合并 2026-09-04):SKU 改造这一侧的调用方按
-    `LookupError` 捕(与 `Spreadsheet.require()` 的"表没登记"同一类失败,
-    heal_unknown / sync_from_ledger 的 except 就是这么写的);审核链第三步
-    的表头核验按 `ValueError` 捕。谁的 except 都不该在合并里被静默改掉。
-    """
-
+#: 表头认列的算法在 services/sheet_layout(2026-09-17 起与产品分配表共用);
+#: 消费方按它捕错,名字留在这里不动。
+HeaderMismatch = sheet_layout.HeaderMismatch
 
 #: 进程内列布局缓存:字段名 → **1-based 列号**。None = 还没读过表头行。
 #: 每进程读一次(表头不会在一轮跑里被改);测试与"表头刚改完"用
@@ -119,25 +108,8 @@ def reset_layout_cache() -> None:
 
 
 def _read_header_row() -> list[str]:
-    """输入:无 → 输出:表头行的单元格文本(已 strip,右侧多扫几列)。"""
-    sheet = resources.LISTING_SHEET.require()
-    width = len(sheet.headers) + _HEADER_SCAN_SLACK
-    last = feishu._col_letter(width)
-    got = feishu.sheet_values_small(sheet, f"A1:{last}1")
-    raw = (got or [[]])[0] or []
-    return [(str(c).strip() if c is not None else "") for c in raw]
-
-
-def _norm_head(s) -> str:
-    """输入:表头单元格 → 输出:比对用的规范形(去掉全部空白 + casefold)。
-
-    审核链第三步定的宽容口径,合并时原样保住:运营在表头里多敲一个空格、
-    把 walmart 写成 Walmart 都是常事,**为这个 fail-closed 停掉一整轮不值**;
-    真正要拦的是"少一列/多一列/两列重名"这种会让值写进别人列的漂移。
-    ⚠ 只在比对时规范化,报错与告警一律回显**表上的原文**,不然人对着
-    规范化过的字符串找不到自己那一格。
-    """
-    return "".join(str(s or "").split()).casefold()
+    """输入:无 → 输出:上架表表头行的单元格文本(已 strip,右侧多扫几列)。"""
+    return sheet_layout.read_header_row(resources.LISTING_SHEET)
 
 
 def _index_map() -> dict[str, int]:
@@ -146,44 +118,11 @@ def _index_map() -> dict[str, int]:
     **fail-closed**:registry 登记的表头只要缺一个、或在表头行里出现两次,
     直接抛 `HeaderMismatch` 拒绝一切读写 —— 宁可这一轮不跑,也不能把标题写进
     SKU 列(2026-09-02 重排之前那套硬编码字母,插一列就是全体静默错位)。
-    表头行里多出登记之外的列**只告警**:所有者随时会加自己的列,那不是错。
-    比对忽略大小写与空白(`_norm_head`):那种差别不会让值写错列。
+    判法在 `sheet_layout.resolve`(与产品分配表同一份),这里只管缓存。
     """
     global _LAYOUT
-    if _LAYOUT is not None:
-        return _LAYOUT
-    want = resources.LISTING_SHEET.headers
-    if not want:
-        raise LookupError("上架表未登记 headers(字段名→中文表头):"
-                          "按表头名定位列是本模块的前提,先补 registry")
-    cells = _read_header_row()
-    seen: dict[str, list[int]] = {}       # 规范形 → 1-based 列号们
-    raw_of: dict[str, str] = {}           # 规范形 → 表上原文(报错时回显)
-    for i, text in enumerate(cells, 1):
-        key = _norm_head(text)
-        if key:
-            seen.setdefault(key, []).append(i)
-            raw_of.setdefault(key, text)
-    known = {_norm_head(h) for h in want.values()}
-    missing = [h for h in want.values() if _norm_head(h) not in seen]
-    dupes = [h for h in want.values() if len(seen.get(_norm_head(h), ())) > 1]
-    extra = [raw_of[k] for k in seen if k not in known]
-    if extra:
-        logger.warning("上架表表头有登记之外的列 %s —— 程序看不见它们"
-                       "(要接线先登记 registry.LISTING_SHEET.headers)", extra)
-    if missing or dupes:
-        logger.warning("上架表表头对不上登记:缺失 %s;重复 %s", missing, dupes)
-        # 点名到列:缺的那几个说不出位置(压根没有),重复的把撞在一起的
-        # 列字母一并报出来 —— 光说"重复"人得自己一列列数过去。
-        where = {h: "/".join(feishu._col_letter(i)
-                             for i in seen[_norm_head(h)])
-                 for h in dupes}
-        raise HeaderMismatch(
-            f"上架表表头与 registry 登记对不上(缺失 {missing};"
-            f"重复 {where or dupes})——本轮**拒绝一切读写**:列认不准就会把值"
-            f"写进别人的列,而且不报错。表头行实际读到的是 {cells};"
-            f"请核对飞书表头行或 registry.LISTING_SHEET.headers")
-    _LAYOUT = {f: seen[_norm_head(h)][0] for f, h in want.items()}
+    if _LAYOUT is None:
+        _LAYOUT = sheet_layout.resolve(resources.LISTING_SHEET, _read_header_row())
     return _LAYOUT
 
 
@@ -199,7 +138,7 @@ def layout() -> dict[str, str]:
     (它还会按真实列号粘/拆段)。留两套推字母的路子就是双轨 —— 而且那套认的
     是登记顺序,不是表上真实位置,所有者一挪列两套就会给出不同答案。
     """
-    return {f: feishu._col_letter(i) for f, i in _index_map().items()}
+    return sheet_layout.letters(_index_map())
 
 
 def verify_header() -> None:
@@ -220,37 +159,19 @@ def _ranges(row_from: int, fields: list[str],
             rows_vals: list[list]) -> list[tuple[str, list[list]]]:
     """输入:起始行号 + 字段序列 + 每行的等长值序列 → 输出:[(A1范围, 值矩阵)]。
 
-    **列字母在这里出生,别处一律不许写字母**。列号相邻的字段粘成一段
-    (少一个飞书请求位),不相邻就拆多段 —— 所有者在中间插一列,同一批
-    写入会自动从一段变两段,值一个都不会落到隔壁列。
+    **列字母在 sheet_layout.ranges 里出生,别处一律不许写字母**。列号相邻的
+    字段粘成一段(少一个飞书请求位),不相邻就拆多段 —— 所有者在中间插一列,
+    同一批写入会自动从一段变两段,值一个都不会落到隔壁列。
     """
-    idx = _index_map()
-    unknown = [f for f in fields if f not in idx]
-    if unknown:
-        raise LookupError(f"上架表没有这些字段:{unknown}(先登记 registry)")
-    segs: list[list[int]] = []          # 每段 = fields 里的下标序列
-    for pos, f in enumerate(fields):
-        if segs and idx[f] == idx[fields[segs[-1][-1]]] + 1:
-            segs[-1].append(pos)
-        else:
-            segs.append([pos])
-    row_to = row_from + len(rows_vals) - 1
-    out = []
-    for seg in segs:
-        a = feishu._col_letter(idx[fields[seg[0]]])
-        b = feishu._col_letter(idx[fields[seg[-1]]])
-        out.append((f"{a}{row_from}:{b}{row_to}",
-                    [[vals[pos] for pos in seg] for vals in rows_vals]))
-    return out
+    return sheet_layout.ranges(resources.LISTING_SHEET, _index_map(),
+                               row_from, fields, rows_vals)
 
 
 def _row_ranges(updates: list[tuple[int, list]],
                 fields: list[str]) -> list[tuple[str, list[list]]]:
     """输入:[(行号, 等长值序列)] + 字段序列 → 输出:逐行展开的 [(A1范围, 值矩阵)]。"""
-    out: list[tuple[str, list[list]]] = []
-    for rownum, vals in updates:
-        out += _ranges(rownum, fields, [list(vals)])
-    return out
+    return sheet_layout.row_ranges(resources.LISTING_SHEET, _index_map(),
+                                   updates, fields)
 
 
 def read_rows(upto: str | None = None) -> list[dict]:

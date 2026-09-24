@@ -1305,6 +1305,22 @@ CREATE TABLE IF NOT EXISTS ops.cursors (
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
 
+-- ── 受管仓校验记忆(2026-09-19,多仓 §3「校验结果缓存一天」的落地)──────────
+-- 「维护仓库」填的 FC ID 被该店 GET shipnodes 认过一次就记一行;配置值不变
+-- 就按 TTL 复用(期内不调沃尔玛),接口读不到时沿用旧记忆(有上限)。
+-- 根因:此前每天每进程从零校验、经代理零重试的一次远程读决定整店路由,
+-- 2026-09-17 三家店 SSL EOF / 09-18 代理账号错,库存全写到了默认节点。
+-- 唯一读写者 services/store_limits._resolve;只有「200 且列表非空且不含该 ID」
+-- 才 DELETE(真填错);配置值变了 = 新 (store, node) 无行 = 必须真校验。
+-- TTL/上限两个常量只在 store_limits 出生。
+CREATE TABLE IF NOT EXISTS ops.node_validations (
+    store         text NOT NULL,
+    node          text NOT NULL,          -- 「维护仓库」填的 FC ID(shipNode)
+    validated_at  timestamptz NOT NULL,   -- 最近一次被 shipnodes 列表认过的时刻
+    known_nodes   jsonb,                  -- 当时列表里的全部 shipNode(排障用)
+    PRIMARY KEY (store, node)
+);
+
 -- 店铺日报 KPI:每 (店铺, 日期) 一行,32 列语义对齐旧飞书「店铺KPI」表
 CREATE TABLE IF NOT EXISTS ops.store_kpi_daily (
     store            text NOT NULL,

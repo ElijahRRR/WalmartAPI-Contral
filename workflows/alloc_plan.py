@@ -5,6 +5,9 @@
   python cli.py alloc_plan                       # 各店按自己的容量与缺口分满 + 落占用
   python cli.py alloc_plan -p batch=3000         # 安全阀:总量封顶,等比缩配额
   python cli.py alloc_plan -p as_of=2026-08-16   # 钉住销量窗口右端
+  python cli.py alloc_plan -p from_sheet=1 --dry-run   # 点名分配:只分「产品分配表」里的 ASIN
+  python cli.py alloc_plan -p from_sheet=1             # 同上,落占用 + 逐行回写表格
+  python cli.py alloc_plan -p from_sheet=1 -p cutoff=30  # 点名模式临时加一条淘汰线(缺省不设)
 
 把候选池打分、组队、切批、发牌,产出**分配方案表**。真跑只多做一件事:
 把方案里的品牌与 ASIN 落成占用(`catalog.claims`)。上架表另说 —— 分配是
@@ -28,6 +31,12 @@
   那批 top 货**。实测切 `可分×1.5` 与整池逐字同结果(§7.4b)。
 
 **只写占用,不碰沃尔玛。** 上架由 list_new 按自己的节奏执行。
+
+## 点名分配(`-p from_sheet=1`,口径 #19,所有者定稿 2026-09-17)
+
+同一个引擎、同一套闸,只换候选池:不拉全库,只取飞书「产品分配表」ASIN 列
+点名的品(池口在 SQL 里筛)。结局逐行回写表格的 16 个机器列(所有者只填
+ASIN);「店铺」已填的行重跑跳过。与全库分配的差别只有三处,见 `_run_sheet`。
 """
 
 import logging
@@ -36,8 +45,8 @@ from collections import Counter
 
 from registry import db, resources
 from services import alloc_engine as ae
-from services import alloc_groups, alloc_survey as sv
-from services import claims, product_pool, product_score as ps
+from services import alloc_groups, alloc_sheet, alloc_survey as sv
+from services import brand_key, claims, product_pool, product_score as ps
 from services import report_csv
 from services import store_events as se
 from services import store_perf, store_targets, stores as stores_svc
@@ -48,6 +57,22 @@ DANGEROUS = True
 logger = logging.getLogger("workflows.alloc_plan")
 
 SOURCE = "alloc_plan"
+#: 点名模式落占用的 source:与全库分配分开记,台账上一眼看得出这条占用是
+#: 所有者点名来的还是引擎从全库挑的(store_release / claim_audit 都按 source 报)。
+SOURCE_SHEET = "alloc_plan_sheet"
+
+#: 产品分配表「流别」列只写这三个值(所有者定稿 2026-09-17),细节全在
+#: 「未分配原因」列 —— 表上筛「流别 ≠ 未分配」就是要动手上架的那批。
+FLOW_FREE, FLOW_DIRECTED, FLOW_NONE = "自由流", "定向流", "未分配"
+
+# 认识的 -p 参数;不认识的**宁炸不吞**(与 product_audit 同款纪律)。
+# 这条闸是点名分配带来的:`-p from_sheet=1` 打错一个字(fromsheet / from_sheets),
+# 静默吞掉就退化成**全库分配并真落几千条占用**,而占用撤不回。
+_KNOWN_PARAMS = {"batch", "days", "sales_days", "as_of", "export",
+                 "from_sheet", "cutoff"}
+# cli 自己塞进 params 的键,不是人敲的(product_audit 那边 2026-08-16 `dry_run`
+# 上线当天就炸过一次:白名单漏放行 cli 级开关,整条工作流起不来)
+_CLI_INJECTED = {"execute", "dry_run"}
 
 # ⚠ `HEADROOM`(候选切口倍数 1.5)2026-08-22 **删掉了**。它有两个毛病:
 #   · **单位错配** —— `cut = int(total_q * HEADROOM)` 里 total_q 的单位是
@@ -123,13 +148,29 @@ def _listed_asins(conn, registered) -> set:
     ⚠ 规划外店(谭总系)的在架行不算:它们退出分配体系,不占任何品牌与产品,
     同一个 ASIN 在那边在架不妨碍规划内的店上它(§六)。
     """
+    return set(_listed_where(conn, registered))
+
+
+def _listed_where(conn, registered) -> dict[str, list[str]]:
+    """输入:连接 + 在册店名 → 输出:{已在架 ASIN: [在架的规划内店, …]}(店名有序)。
+
+    `_listed_asins` 的带店版本,**同一条 SQL、同一个身份键**(登记簿优先,
+    模式提取只兜存量):点名分配要在表上写"这个品已经在哪家店在架"
+    (所有者定稿 2026-09-17:已在架的点名品,店铺列写它所在的店、是否在线写「是」)。
+    一个 ASIN 在多家规划内店同时在架(品牌冲突那种)就全列出来,用「、」连 ——
+    那正是所有者要看见的事实,不挑一家藏起来。
+    """
     from services import sku_asin
     with conn.cursor() as cur:
         cur.execute(_SQL_ONLINE_SKU)
         rows = cur.fetchall()
-    return {a for store, sku, k in rows
-            if store in registered and not sv.is_excluded(store)
-            and (a := sku_asin.pick_asin(k, sku))}
+    out: dict[str, set] = {}
+    for store, sku, k in rows:
+        if store in registered and not sv.is_excluded(store):
+            a = sku_asin.pick_asin(k, sku)
+            if a:
+                out.setdefault(a, set()).add(store)
+    return {a: sorted(s) for a, s in out.items()}
 
 
 def _quota(qq: dict, m: dict, target) -> tuple[int, str]:
@@ -162,8 +203,23 @@ def _quota(qq: dict, m: dict, target) -> tuple[int, str]:
             "剩余容量(缺口要得更多)" if want > room else "缺口换算")
 
 
+def _flag(v) -> bool:
+    """输入:-p 开关原文 → 输出:是不是"开"(1/true/yes)。"""
+    return str(v if v is not None else "").strip().lower() in {"1", "true", "yes", "y"}
+
+
 def run(params: dict) -> str:
-    """输入:params(batch/days/as_of/export/execute)→ 输出:方案摘要。"""
+    """输入:params(batch/days/sales_days/as_of/export/execute;from_sheet/cutoff)→ 输出:方案摘要。"""
+    unknown = sorted(set(params) - _KNOWN_PARAMS - _CLI_INJECTED)
+    if unknown:
+        raise ValueError(
+            f"alloc_plan 不认识这些参数:{unknown}(认识的:{sorted(_KNOWN_PARAMS)})。"
+            f"宁炸不吞:`-p from_sheet=1` 打错一个字就会退化成全库分配并真落几千条占用")
+    if _flag(params.get("from_sheet")):
+        return _run_sheet(params)
+    if "cutoff" in params:
+        raise ValueError("-p cutoff= 只能与 -p from_sheet=1 连用:全库分配的淘汰线是 "
+                         "product_score.CUTOFF(口径 #17b),不给临时覆盖")
     execute = bool(params.get("execute"))
     # 默认**不设总量上限**:每家店能接多少由容量与缺口算出来(见 `_quota`)。
     # `-p batch=` 是想小步试跑时的安全阀,不是模型的一部分
@@ -205,40 +261,11 @@ def run(params: dict) -> str:
     #   配送时长 / 准入类目),所以店必须先建好。所有者 2026-08-21 原话:
     #   "每一个店,对于配送时间的限制、配送方式的限制都在表格里……分配的时候
     #   会读取表,这些信息都能拿到,再拿着条件去拿品过来分配"。
-    metrics = store_perf.derive(perf_raw, days)
-    q = store_perf.quota_inputs(metrics, cfg, online_now, pending)
-    stores: dict = {}
-    for s, qq in q.items():
-        if s not in registered or sv.is_excluded(s) or not qq.get("participates"):
-            continue
-        stores[s] = {"quota": 0, "room": int(qq.get("room") or 0),
-                     "categories": (cfg.get(s) or {}).get("categories") or [],
-                     "channel": (cfg.get(s) or {}).get("channel"),
-                     "lead_limit": (cfg.get(s) or {}).get("lead_limit"),
-                     "fit": 0.0, "tier": 1 if online_now.get(s) else 2}
+    stores, basis, no_gap, at_target, total_q = _build_stores(
+        perf_raw, cfg, registered, online_now, pending, days, batch)
     if not stores:
         return ("⛔ 没有一家店可以接货(在册 ∧ 规划内 ∧「单店最大在线数」> 0)。"
                 "先跑 alloc_stores 看是谁被挡下的")
-
-    # ── 配额(**在漏斗之前算**,所有者 2026-08-22 纠正)────────────────
-    # 为什么必须先算:切口的单位是**产品**,数量 = 各店配额之和。不先算配额
-    # 就不知道该从候选池里取多少件,只能像旧版那样在组这一层拍一个倍数 ——
-    # 而组分取最高分时,那等于把一堆低分品跟着高分同门牌一起拉进牌堆。
-    basis, no_gap, at_target = {}, [], []
-    for s in stores:
-        stores[s]["quota"], basis[s] = _quota(
-            q[s], metrics.get(s, {}), (cfg.get(s) or {}).get("gmv"))
-        if q[s].get("gap") is None:
-            no_gap.append(s)
-        elif stores[s]["quota"] == 0 and (q[s].get("room") or 0) > 0:
-            at_target.append(s)
-    # `-p batch=` 只是**可选的安全阀**(想先小步试跑时用),不是模型的一部分。
-    # 给了就按比例等比缩,保持各店之间的形状不变
-    total_q = sum(v["quota"] for v in stores.values())
-    if batch and total_q > batch:
-        for s in stores:
-            stores[s]["quota"] = math.ceil(stores[s]["quota"] * batch / total_q)
-        total_q = sum(v["quota"] for v in stores.values())
 
     # ── 候选漏斗 ──────────────────────────────────────────────────────
     scored, gated = product_pool.score_all(data)
@@ -413,8 +440,8 @@ def run(params: dict) -> str:
     return "\n".join(L)
 
 
-def _to_claim(assign: list) -> list:
-    """输入:发牌结果 → 输出:待落占用行。
+def _to_claim(assign: list, source: str = SOURCE) -> list:
+    """输入:发牌结果(+ 落库 source)→ 输出:待落占用行。
 
     ⚠ **定向流的组不再落品牌占用**:它带着 `store` 进的牌堆,就是因为品牌
     已经被占了。重复落不会出错(ON CONFLICT DO NOTHING),但会让"落库 N 条"
@@ -425,15 +452,68 @@ def _to_claim(assign: list) -> list:
         grp, store = a["group"], a["store"]
         if grp.get("brand") and not grp.get("store"):
             out.append({"kind": claims.BRAND, "claim_key": grp["brand"],
-                        "store": store, "source": SOURCE})
-        out += _prod_claims(grp, store)
+                        "store": store, "source": source})
+        out += _prod_claims(grp, store, source)
     return out
 
 
-def _prod_claims(grp: dict, store: str) -> list:
+def _prod_claims(grp: dict, store: str, source: str = SOURCE) -> list:
     return [{"kind": claims.PRODUCT, "claim_key": it["asin"], "store": store,
-             "source": SOURCE, "walmart_pt": it.get("pt"), "pt_source": None}
+             "source": source, "walmart_pt": it.get("pt"), "pt_source": None}
             for it in grp["items"]]
+
+
+def _build_stores(perf_raw: dict, cfg: dict, registered, online_now: dict,
+                  pending: dict, days: int, batch: int | None,
+                  *, by_gap: bool = False) -> tuple[dict, dict, list, list, int]:
+    """输入:经营原始行 + 限额表 + 在册店 + 在线数 + 待下架 + 窗口 + 安全阀
+    → 输出:(stores, 配额依据, 没填目标的店, 已达目标的店, 本轮可分总货位)。
+
+    stores 为空 = 没有一家店可以接货,调用方硬拒。全库分配与点名分配**共用
+    这一份**建店逻辑(第二份就是双轨,配额口径迟早漂开),只差一个开关:
+
+    · 缺省(全库):`fit` 恒 0(§7.5 设计的店铺适配分从未落地,发牌序退化成
+      「已接÷配额 → 店名」),梯队 1 = 有在线品的店先吃、空店只吃剩货
+      (§7.5:空店缺口天然巨大,同池竞争会把最好的品吸走);
+    · `by_gap=True`(点名,所有者定稿 2026-09-17 **甲1**):`fit` = 缺口比例
+      —— 离日目标越远越先挑。点名池小、常常一圈发完,**第一圈的顺序就是全部
+      结果**,不能再按店名字母序;且**梯队拍平**:点名的品是所有者手选的,
+      优先喂缺口最大的店(含空店)正是目的,不存在"吸走好货"的顾虑。
+
+    配额**在漏斗之前算**(所有者 2026-08-22 纠正):切口的单位是产品,数量 =
+    各店配额之和;不先算配额就不知道该从候选池里取多少件,只能像旧版那样在
+    组这一层拍一个倍数 —— 而组分取最高分时,那等于把一堆低分品跟着高分同门牌
+    一起拉进牌堆。`batch` 只是可选的安全阀(想先小步试跑时用),不是模型的
+    一部分:给了就按比例等比缩,保持各店之间的形状不变。
+    """
+    metrics = store_perf.derive(perf_raw, days)
+    q = store_perf.quota_inputs(metrics, cfg, online_now, pending)
+    stores: dict = {}
+    for s, qq in q.items():
+        if s not in registered or sv.is_excluded(s) or not qq.get("participates"):
+            continue
+        stores[s] = {"quota": 0, "room": int(qq.get("room") or 0),
+                     "categories": (cfg.get(s) or {}).get("categories") or [],
+                     "channel": (cfg.get(s) or {}).get("channel"),
+                     "lead_limit": (cfg.get(s) or {}).get("lead_limit"),
+                     "fit": float(qq.get("gap") or 0.0) if by_gap else 0.0,
+                     "tier": 1 if (by_gap or online_now.get(s)) else 2}
+    if not stores:
+        return {}, {}, [], [], 0
+    basis, no_gap, at_target = {}, [], []
+    for s in stores:
+        stores[s]["quota"], basis[s] = _quota(
+            q[s], metrics.get(s, {}), (cfg.get(s) or {}).get("gmv"))
+        if q[s].get("gap") is None:
+            no_gap.append(s)
+        elif stores[s]["quota"] == 0 and (q[s].get("room") or 0) > 0:
+            at_target.append(s)
+    total_q = sum(v["quota"] for v in stores.values())
+    if batch and total_q > batch:
+        for s in stores:
+            stores[s]["quota"] = math.ceil(stores[s]["quota"] * batch / total_q)
+        total_q = sum(v["quota"] for v in stores.values())
+    return stores, basis, no_gap, at_target, total_q
 
 
 # ⚠ 与 `alloc_产品分.csv` 的同名列**必须是同一个数**(同一个 product_pool
@@ -484,24 +564,35 @@ def _in_reach(cands: list, reach: dict) -> tuple[list, list]:
     自由流的未发出归因刚为同一个毛病返过工(见 alloc_engine 常量段)。
     """
     kept, bad = [], Counter()
-    cap, cats = reach["lead_cap"], reach["super_cats"]
     for c in cands:
-        ch, lead = c.get("channel"), c.get("lead")
-        if ch not in reach["channels"]:
-            bad[f"渠道 {ch or '未知'}"] += 1
-        elif cap is not None and lead is None:
-            bad["配送天数没采到(补一次采集就能进池)"] += 1
-        elif cap is not None and int(lead) > int(cap):
-            bad[f"配送超 {int(cap)} 天(各店限制里最宽的那个)"] += 1
-        elif cats is not None and resources.super_bucket(c.get("category")) not in cats:
-            # ⚠ 与 `store_targets.allowed` 同一个折法(`super_bucket`)。
-            # 这里用 `super_category` 的实测后果:填了「其他」的店在 allowed
-            # 那边收得了 Everything Else,池口却把它当"归不到"筛掉 —— 那家店
-            # 于是永远等不到它唯一能收的那批货,而且报告说的是"品类 归不到"
-            bad[f"品类 {resources.super_bucket(c.get('category')) or '大类未知'}"] += 1
+        why = _reach_why(c, reach)
+        if why:
+            bad[why] += 1
         else:
             kept.append(c)
     return kept, bad.most_common()
+
+
+def _reach_why(c: dict, reach: dict) -> str | None:
+    """输入:一件候选 + 准入并集 → 输出:第一道拦下它的池口条件(报告用标签);都过返回 None。
+
+    `_in_reach` 按它计数,点名分配按它逐行写「未分配原因」—— 判据只有这一份。
+    """
+    ch, lead = c.get("channel"), c.get("lead")
+    cap, cats = reach["lead_cap"], reach["super_cats"]
+    if ch not in reach["channels"]:
+        return f"渠道 {ch or '未知'}"
+    if cap is not None and lead is None:
+        return "配送天数没采到(补一次采集就能进池)"
+    if cap is not None and int(lead) > int(cap):
+        return f"配送超 {int(cap)} 天(各店限制里最宽的那个)"
+    if cats is not None and resources.super_bucket(c.get("category")) not in cats:
+        # ⚠ 与 `store_targets.allowed` 同一个折法(`super_bucket`)。
+        # 这里用 `super_category` 的实测后果:填了「其他」的店在 allowed
+        # 那边收得了 Everything Else,池口却把它当"归不到"筛掉 —— 那家店
+        # 于是永远等不到它唯一能收的那批货,而且报告说的是"品类 归不到"
+        return f"品类 {resources.super_bucket(c.get('category')) or '大类未知'}"
+    return None
 
 
 def _report_deal(result: dict, acc: dict, stores: dict, basis: dict) -> list[str]:
@@ -924,3 +1015,375 @@ def _rows(flow, store, layer, grp) -> list:
              it["sales"], round(it.get("gross") or 0, 2),
              it["rating"], it["reviews"], it["lead"]]
             for it in grp["items"]]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  点名分配(口径 #19,所有者定稿 2026-09-17):只分「产品分配表」ASIN 列点名的品
+# ══════════════════════════════════════════════════════════════════════════════
+
+# 点名品不在候选池时回库问一句"哪一条把它挡在池外"。判据顺序与
+# product_pool._SQL_POOL 的 WHERE 逐条对应(美站 / 已审核 / 有标题 / PT 已映射 /
+# 大类可解析)—— 池口条件改了这里要跟着改,否则「未分配原因」会撒谎。
+_SQL_ABSENT = """
+SELECT p.asin, p.brand, p.audit_status,
+       (p.title IS NOT NULL AND btrim(p.title) <> '') AS has_title,
+       p.walmart_pt, r.category
+FROM catalog.products p
+LEFT JOIN catalog.risk_product_types r ON r.product_type = p.walmart_pt
+WHERE p.marketplace = 'US' AND p.asin = ANY(%(asins)s)
+"""
+
+
+def _why_absent(conn, asins: list) -> dict[str, tuple[str, str | None]]:
+    """输入:连接 + 不在池里的点名 ASIN → 输出:{ASIN: (原因, 品牌原文或 None)}。
+
+    所有者定稿 2026-09-17:「不在库 / 未审核的 ASIN 只报」—— 报就要报准是哪一条
+    池口条件挡的(不在库 ≠ 未审核 ≠ PT 没映射,三者处置不同:去采集 / 去审核 /
+    去补类目映射)。品牌原文一并带回:表上的「品牌」列不在池里也要有字。
+    """
+    if not asins:
+        return {}
+    with conn.cursor() as cur:
+        cur.execute(_SQL_ABSENT, {"asins": list(asins)})
+        found = {r[0]: r for r in cur.fetchall()}
+    out: dict[str, tuple[str, str | None]] = {}
+    for a in asins:
+        r = found.get(a)
+        if r is None:
+            out[a] = ("不在库(产品库没有这个 ASIN)", None)
+            continue
+        _a, brand, status, has_title, pt, cat = r
+        if status != "approved":
+            why = ("未审核" if status in (None, "", "pending")
+                   else f"审核未过({status})")
+        elif not has_title:
+            why = "无标题(产品库 title 为空)"
+        elif not pt or pt == "unknown":
+            why = "PT 未映射(walmart_pt 空或 unknown)"
+        elif not str(cat or "").strip():
+            why = "PT 没有登记大类(risk_product_types 缺这个 PT 或 category 为空)"
+        else:
+            why = "不在候选池(池口条件之外的原因,对照 product_pool._SQL_POOL 查)"
+        out[a] = (why, brand)
+    return out
+
+
+def _facts(asin: str, by_asin: dict, raw_by_asin: dict, data: dict,
+           absent: dict) -> dict:
+    """输入:一个点名 ASIN + 三份取数 → 输出:表格数据列的值(能拿到多少写多少)。
+
+    三层回落:打过分的候选(全字段)→ 池里但被硬闸挡下的(原始池行,没有分)
+    → 池外的(只有回库带回的品牌原文)。**不猜**:拿不到的列留空,不写 0。
+    """
+    c = by_asin.get(asin)
+    if c is not None:
+        return {k: c.get(k) for k in ("brand", "category", "rating", "reviews",
+                                      "channel", "lead", "price", "shipping",
+                                      "gross", "score", "penalty", "why")}
+    r = raw_by_asin.get(asin)
+    if r is not None:
+        (_a, brand, _m, _pt, cat, price, shipping, _st, _ss, lead,
+         rating, reviews, ful) = r
+        return {"brand": brand, "category": cat, "rating": rating,
+                "reviews": reviews, "channel": product_pool.norm_channel(ful),
+                "lead": lead,
+                "price": float(price) if price is not None else None,
+                "shipping": float(shipping) if shipping is not None else None,
+                "gross": data.get("gross", {}).get(asin),
+                "score": None, "penalty": None, "why": ""}
+    return {"brand": (absent.get(asin) or (None, None))[1]}
+
+
+def _sheet_row(oc: dict, f: dict) -> dict:
+    """输入:结局 {flow, store?, why?, online?} + 数据列 → 输出:机器域 16 字段的值。
+
+    键 = registry.ALLOC_SHEET 的字段名(不是列字母、不是位置):落到哪一列由
+    `alloc_sheet.write_rows` 按表头名算。「品牌」写**原文**(所有者定稿),不写
+    归一键;「是否在线」只有 是/否 两个值。
+    """
+    price, shipping = f.get("price"), f.get("shipping")
+    cat = f.get("category")
+    return {
+        "store": oc.get("store") or "",
+        "brand": f.get("brand") or "",
+        "score": "" if f.get("score") is None else round(float(f["score"]), 1),
+        "penalty": "" if f.get("penalty") is None else round(float(f["penalty"]), 1),
+        "penalty_why": f.get("why") or "",
+        "flow": oc["flow"],
+        "unassigned_why": oc.get("why") or "",
+        "super_category": resources.super_label(cat) if cat else "",
+        "category": cat or "",
+        "rating": f.get("rating") or "",
+        "reviews": f.get("reviews") or "",
+        "channel": f.get("channel") or "",
+        "lead": "" if f.get("lead") is None else int(f["lead"]),
+        "landed_price": ("" if price is None or shipping is None
+                         else round(price + shipping, 2)),
+        "gross": "" if f.get("gross") is None else round(float(f["gross"]), 2),
+        "online": "是" if oc.get("online") else "否",
+    }
+
+
+def _leftover_why(c: dict, brand_store: dict, stores: dict) -> str:
+    """输入:进了牌堆却哪儿都没出现的候选 → 输出:它是在引擎哪一步静默掉的。
+
+    引擎对这两类只留**计数**不留 ASIN(`dropped` / `dir_trim`),全库模式够用,
+    点名模式要逐行写原因,只能按同一套判据倒推:渠道未知 → 组队时整组剔除;
+    品牌有主且占用店收不了这一件(类目 / 货期)→ 定向流按件剪掉
+    (`alloc_engine._fit_to_store` 的判据,同一对 store_targets 谓词);
+    其余 → 渠道少数派(随品牌走不了)。
+    """
+    if c.get("channel") is None:
+        return "渠道未知(快照采不到配送方式,组队时整组剔除)"
+    key = brand_key.brand_key(c.get("brand"), c.get("manufacturer"))
+    st = brand_store.get(key) if key else None
+    row = stores.get(st) if st else None
+    if row is not None:
+        if not store_targets.allowed({"categories": row.get("categories") or []},
+                                     c.get("category")):
+            return f"定向流按件剪掉:占用店 {st} 的类目不收「{c.get('category')}」"
+        if not store_targets.lead_ok({"lead_limit": row.get("lead_limit")},
+                                     c.get("lead")):
+            return (f"定向流按件剪掉:货期 {c.get('lead')} 天超出占用店 {st} "
+                    f"的配送时长限制")
+    return "渠道少数派(随品牌走不了:组里多数派是另一个渠道)"
+
+
+def _sheet_csv_header() -> list[str]:
+    """输入:无 → 输出:点名结果 csv 表头 = 表行号 + 产品分配表的 17 个表头原文。"""
+    sheet = resources.ALLOC_SHEET
+    return ["表行号"] + [sheet.headers[c] for c in sheet.columns]
+
+
+def _run_sheet(params: dict) -> str:
+    """输入:params(from_sheet=1;cutoff/days/sales_days/as_of/export/execute)→ 输出:点名分配摘要。
+
+    口径 #19(所有者定稿 2026-09-17)。同一个引擎、同一套闸(四道闸 / 容量 /
+    配额 / 品牌排他一样不少),只换候选池 = 「产品分配表」ASIN 列点名的品
+    (池口在 SQL 里筛,不拉全库)。与全库分配的差别只有三处:
+
+    ① `-p batch=` 不许给 —— 点名池本身就是切口,再封顶等于两个上限打架;
+    ② **缺省不设淘汰线**(所有者定稿 2026-09-23),`-p cutoff=` 才临时加一条。
+       点名的品是所有者亲手挑的,挑选本身就是质量判断;而 40 那条线是为
+       "货多得用不完"的全库池子设计的兜底,量的又是评论数与**我们自己店里**
+       的销量 —— 新挑的品两样都天然没有(销量加分恒 0,4.8 分零评论也只有
+       36 分),拿它一票否决等于让所有者的判断给缺数据让路。硬闸(落地价 /
+       库存)与四道店铺闸照旧;产品分照算照写,只管发牌顺序;
+    ③ 发牌序 = **缺口大的店先挑、梯队拍平**(甲1,见 `_build_stores`);
+       落占用 source 记 `alloc_plan_sheet`。
+
+    逐行结局(「流别」只有 自由流 / 定向流 / 未分配 三个值,细节在「未分配原因」):
+    · 已在架 → 未分配,「店铺」写它在架的店、「是否在线」写 是;
+    · 不在库 / 未审核 / 硬闸 / 低于淘汰线 / 没有店的条件容得下 → 未分配 + 原因;
+    · 品牌或 ASIN 已被别店占位 → **定向回占用店算成功**(定向流);
+    · 「店铺」已填的行 → 跳过不读不写(所以 dry-run **不回写表格**:回写了
+      这些行下次就被跳过了,真跑反而分不到)。
+
+    **先落库再回写表**(防重纪律):回写失败只告警,占用已经在台账里;重跑会把
+    这批按定向流补写进表,不会重复占。
+    """
+    execute = bool(params.get("execute"))
+    if params.get("batch"):
+        raise ValueError("-p batch= 不能与 -p from_sheet=1 连用:点名池本身就是切口,"
+                         "再封顶等于两个上限打架")
+    # 缺省 0 = 不设线(分数夹在 0~100,`score < 0` 恒假);见 docstring ②。
+    # ⚠ 别把它改回 ps.CUTOFF:那条线的松紧是跟着全库的 60/40 权重调的,
+    #   与点名池无关(2026-09-23 所有者定稿前,点名品大面积卡在它下面)
+    cutoff = float(params.get("cutoff", 0.0))
+    days = int(params.get("days", 90))
+    sales_days = int(params.get("sales_days", ps.SALES_WINDOW_DAYS))
+    as_of = str(params.get("as_of", ""))
+    win = sv.sales_window(as_of, days)                    # 店铺侧
+    pwin = sv.sales_window(as_of, sales_days)             # 产品侧
+    export = str(params.get("export", "1")).lower() not in {"0", "false", "no"}
+
+    try:
+        cfg = store_targets.load_targets()
+    except Exception as e:                          # noqa: BLE001
+        return f"⛔ 限额表读不到({e}):没有类目/渠道/容量就没法分配"
+    try:
+        registered = stores_svc.enabled_names()
+    except Exception as e:                          # noqa: BLE001
+        return f"⛔ 凭证表读不到({e}):分不清在营店与冻结行,拒绝分配"
+    try:
+        rows = alloc_sheet.read_targets()
+    except Exception as e:                          # noqa: BLE001
+        return (f"⛔ 产品分配表读不到({e}):检查 .env 的 FEISHU_ALLOC_SHEET_ID "
+                f"与表头 17 列是否与 registry.ALLOC_SHEET.headers 一致")
+
+    done = [r for r in rows if r["store"]]
+    todo = [r for r in rows if not r["store"]]
+    if not todo:
+        return (f"▍产品分配表 {len(rows)} 行,其中 {len(done)} 行已有店铺(重跑跳过),"
+                f"没有待分配的 ASIN —— 在 ASIN 列填上要分的品再跑")
+    from services import sku_asin
+    bad = [r for r in todo if not sku_asin.is_standard_asin(r["asin"])]
+    asins = sorted({r["asin"] for r in todo} - {r["asin"] for r in bad})
+
+    with db.pg_conn() as conn:
+        data = product_pool.load(conn, pwin, asins=asins)
+        perf_raw = store_perf.load(conn, win)
+        with conn.cursor() as cur:
+            cur.execute(_SQL_ONLINE_NOW)
+            online_now = {s: int(n) for s, n in cur.fetchall()}
+        held_brand = claims.load_active(conn, claims.BRAND)
+        held_prod = claims.load_active(conn, claims.PRODUCT)
+        pending = _pending_delist(conn, cfg, registered)
+        listed_where = _listed_where(conn, registered)
+        in_pool = {row[0] for row in data["pool"]}
+        absent = _why_absent(conn, [a for a in asins if a not in in_pool])
+
+    stores, basis, no_gap, at_target, _total_q = _build_stores(
+        perf_raw, cfg, registered, online_now, pending, days, None, by_gap=True)
+    if not stores:
+        return ("⛔ 没有一家店可以接货(在册 ∧ 规划内 ∧「单店最大在线数」> 0)。"
+                "先跑 alloc_stores 看是谁被挡下的")
+
+    gate_why: dict = {}
+    scored, _gated = product_pool.score_all(data, gated_by_asin=gate_why)
+    by_asin = {c["asin"]: c for c in scored}
+    raw_by_asin = {row[0]: row for row in data["pool"]}
+
+    def _none(why: str) -> dict:
+        return {"flow": FLOW_NONE, "why": why}
+
+    outcome: dict[str, dict] = {}
+    # ① 已在架:店铺列写它所在的店,不再分配(所有者定稿)。先于池口判:
+    #   一个在架的品哪怕今天掉到淘汰线下,所有者要看见的也是"它已经在 X 店"
+    for a in asins:
+        if a in listed_where:
+            outcome[a] = {"flow": FLOW_NONE, "store": "、".join(listed_where[a]),
+                          "why": "已在架(不重复分配)", "online": True}
+    # ② 不在池(不在库 / 未审核 / …) ③ 硬闸(落地价 / 库存)
+    for a, (why, _brand) in absent.items():
+        outcome.setdefault(a, _none(why))
+    for a, why in gate_why.items():
+        outcome.setdefault(a, _none(why))
+    # ④ 淘汰线 ⑤ 池口条件(没有一家店的条件容得下)—— 逐件归因,判据同 `_in_reach`
+    reach = _pool_reach(stores)
+    live: list = []
+    for c in scored:
+        a = c["asin"]
+        if a in outcome:
+            continue
+        if c["score"] < cutoff:
+            outcome[a] = _none(f"产品分 {c['score']:.1f} 低于淘汰线 {cutoff:g}")
+            continue
+        why = _reach_why(c, reach)
+        if why:
+            outcome[a] = _none(f"没有店的条件容得下({why})")
+            continue
+        live.append(c)
+
+    # ⑥ 发牌:同一个引擎。已占位未上架的只能回占用店(bound),品牌有主的定向
+    listed = set(listed_where)
+    bound = {a: s for a, s in held_prod.items() if a not in listed}
+    result = ae.deal(live, stores, held_brand=held_brand, bound=bound)
+    brand_store = dict(held_brand)
+    for a_ in result["assign"]:
+        grp, st = a_["group"], a_["store"]
+        if grp.get("brand"):
+            brand_store[grp["brand"]] = st
+        flow = FLOW_DIRECTED if grp.get("store") else FLOW_FREE
+        for it in grp["items"]:
+            outcome[it["asin"]] = {"flow": flow, "store": st}
+    for u in result["unplaced"]:
+        for it in u["group"]["items"]:
+            outcome[it["asin"]] = _none(ae.REASON_LABEL[u["reason"]])
+    for grp, why in result["dir_out"]:
+        for it in grp["items"]:
+            outcome[it["asin"]] = _none(f"定向流淘汰:{why}(占用店 {grp['store']})")
+    for c in result["queued"]:
+        outcome[c["asin"]] = _none("排队:各店配额与容量在它之前已填满")
+    for c in live:
+        outcome.setdefault(c["asin"], _none(_leftover_why(c, brand_store, stores)))
+    for r in bad:
+        outcome[r["asin"]] = _none(f"ASIN 格式不对(表上原文「{r['asin_raw']}」)")
+
+    to_claim = _to_claim(result["assign"], source=SOURCE_SHEET)
+    ok, conflicts = 0, []
+    if execute and to_claim:
+        with db.pg_conn() as conn:
+            ok, conflicts, landed = claims.claim_many(conn, to_claim)
+            se.record_many(conn, claims.claim_created_rows(landed, SOURCE_SHEET))
+        logger.warning("alloc_plan(点名)落库:成功 %d,已被别店占 %d", ok, len(conflicts))
+        # 取数到落库之间台账变了(别家抢先):表上不能写"分给 A"而台账归 B
+        for kind, key, _want, owner in conflicts:
+            hit = ([key] if kind == claims.PRODUCT else
+                   [it["asin"] for a_ in result["assign"]
+                    for it in a_["group"]["items"]
+                    if a_["group"].get("brand") == key])
+            for a in hit:
+                outcome[a] = _none(f"落占用时发现已被 {owner} 占(重跑会定向回它)")
+
+    updates, csv_rows = [], []
+    for r in todo:
+        vals = _sheet_row(outcome[r["asin"]],
+                          _facts(r["asin"], by_asin, raw_by_asin, data, absent))
+        updates.append((r["rownum"], vals))
+        csv_rows.append([r["rownum"]] + [r["asin_raw"] if c == "asin" else vals[c]
+                                         for c in resources.ALLOC_SHEET.columns])
+    p_csv = report_csv.write("alloc_点名分配.csv", _sheet_csv_header(),
+                             csv_rows) if export else None
+    sheet_err, written = None, 0
+    if execute:
+        try:
+            written = alloc_sheet.write_rows(updates, execute=True)
+        except Exception as e:                      # noqa: BLE001
+            logger.exception("产品分配表回写失败")
+            sheet_err = (str(e).strip().splitlines() or [repr(e)])[0]
+
+    n_flow = Counter(outcome[r["asin"]]["flow"] for r in todo)
+    why_ct = Counter(outcome[r["asin"]].get("why") for r in todo
+                     if outcome[r["asin"]]["flow"] == FLOW_NONE)
+    by_store: Counter = Counter(outcome[r["asin"]]["store"] for r in todo
+                                if outcome[r["asin"]]["flow"] != FLOW_NONE)
+    L: list[str] = []
+    if sheet_err:
+        # 首行点名(与缺席店同款纪律):通知里第一眼就得看见表没写
+        L.append(f"⚠ 产品分配表回写失败({sheet_err}):占用已落库 {ok} 条;"
+                 f"重跑 `alloc_plan -p from_sheet=1` 会把这批按定向流补写进表,不会重复占")
+    L += ["", "═══ 点名分配(产品分配表)═══", "",
+          f"▍表里 {len(rows)} 行:已有店铺 {len(done)} 行(重跑跳过);"
+          f"本轮处理 {len(todo)} 行 / {len(asins)} 个 ASIN"
+          + (f";ASIN 格式不对 {len(bad)} 行" if bad else ""),
+          (f"  淘汰线 {cutoff:g}(-p cutoff= 临时加的线)" if "cutoff" in params
+           else "  淘汰线 不设(点名缺省:硬闸与四道店铺闸照旧,产品分只管发牌顺序)")
+          + f";窗口 {win['day']} 往前 —— 店铺经营水平 {days} 天、产品销量信号 {sales_days} 天",
+          f"▍去向:自由流 {n_flow[FLOW_FREE]} 件 · 定向流 {n_flow[FLOW_DIRECTED]} 件 · "
+          f"未分配 {n_flow[FLOW_NONE]} 件"]
+    if why_ct:
+        L.append("  未分配原因:" + " · ".join(f"{k} {v}" for k, v in why_ct.most_common()))
+    if by_store:
+        L.append("  按店:" + " · ".join(f"{s} {n}" for s, n in by_store.most_common()))
+    L.append(f"▍参与分配的店 {len(stores)} 家(发牌序 = 缺口大的先挑、梯队拍平;"
+             f"配额 = min(剩余容量, 缺口 ÷ 单品日产出)):")
+    L += textfmt.table(
+        ["店铺", "剩余容量", "本轮配额", "缺口", "分到", "配额依据"],
+        [[s, f"{stores[s]['room']:,}", f"{stores[s]['quota']:,}",
+          f"{stores[s]['fit']:.0%}",
+          f"{result['by_store'].get(s, {}).get('items', 0):,}", basis[s]]
+         for s in sorted(stores, key=lambda x: (-stores[x]["fit"], x))],
+        align="<>>>><")
+    if no_gap:
+        L.append(f"  ⚠ {len(no_gap)} 家没填日目标销售额(或算不出货位值),"
+                 f"**配额退回剩余容量、缺口按 0 算**(它们排在最后挑):"
+                 + "、".join(no_gap[:6]))
+    if at_target:
+        L.append(f"  {len(at_target)} 家已达日目标,本轮配额 0(所有者口径:"
+                 f"把货给离目标最远的店):" + "、".join(at_target[:6]))
+    if p_csv:
+        L.append(f"▍逐行结果 {len(csv_rows)} 行 → {p_csv}(与表格同 17 列 + 表行号)")
+    if not execute:
+        L += ["", f"🧪 dry-run:未落占用、**未回写产品分配表**(将落品牌 "
+              f"{sum(1 for c in to_claim if c['kind'] == claims.BRAND):,} + 产品 "
+              f"{sum(1 for c in to_claim if c['kind'] == claims.PRODUCT):,} 条)。"
+              f"表格只在真跑时回写 —— 「店铺」一填这些行下次就被跳过了。"
+              f"审完 csv 后去掉 --dry-run 重跑"]
+        return "\n".join(L)
+    L += ["", f"✅ 已落占用 {ok:,} 条"
+          + (f";与已有占用冲突 {len(conflicts)} 条(保持原归属不动,表上记为未分配)"
+             if conflicts else ";无冲突"),
+          (f"  产品分配表已回写 {written} 行;货还没上架 —— 照着表上「店铺」列去上架"
+           if not sheet_err else "  产品分配表**未回写**(见首行)")]
+    return "\n".join(L)

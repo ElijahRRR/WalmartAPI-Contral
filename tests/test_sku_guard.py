@@ -968,6 +968,10 @@ def test_feed_track_does_not_resolve_asin_itself():
 
 #: 上架表读写积木本体 —— 列字母只准在它内部由 layout 算出来。
 _LISTING = "services/listing_sheet.py"
+#: 按表头名认列的全部文件:算法本体(2026-09-17 从上架表积木里搬出来共用)
+#: 与两张消费它的表。新来一张按表头认列的表,登记在这里。
+_HEADER_LAYOUT_FILES = (_LISTING, "services/sheet_layout.py",
+                        "services/alloc_sheet.py")
 #: 会问"这一行的 SKU 是什么"的三个文件。
 _ROW_SKU_CONSUMERS = (_LISTING, "workflows/list_new.py",
                       "workflows/sku_locked_heal.py")
@@ -1002,11 +1006,12 @@ def test_listing_sheet_has_no_hardcoded_column_letters():
     起点 "A"(表格左边界)与表头行的 `A1:…1`,两者都不随列序变。
     """
     offenders = []
-    for lineno, text in _string_literals(ROOT / _LISTING):
-        if _HARDCODED_COL_RE.search(text) or _LITERAL_RANGE_RE.match(text):
-            offenders.append(f"{_LISTING}:{lineno} {text[:60]!r}")
+    for rel in _HEADER_LAYOUT_FILES:
+        for lineno, text in _string_literals(ROOT / rel):
+            if _HARDCODED_COL_RE.search(text) or _LITERAL_RANGE_RE.match(text):
+                offenders.append(f"{rel}:{lineno} {text[:60]!r}")
     assert not offenders, _fmt(
-        offenders, "上架表写死了列字母(改用 layout()/_ranges 算):")
+        offenders, "按表头认列的表写死了列字母(改用 layout()/_ranges 算):")
 
 
 def test_the_row_sku_fallback_lives_in_exactly_one_place():

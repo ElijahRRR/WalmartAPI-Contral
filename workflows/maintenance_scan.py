@@ -173,6 +173,16 @@ def _preview_lines(intents: list[dict], stockzero: list[str]) -> list[str]:
     return lines
 
 
+def _node_skip_names(skipped: dict, stats: dict) -> list[str]:
+    """输入:跳过的店 + managed_nodes 的 stats → 输出:「店(归类词)」列表(首行用)。
+
+    归类词是给人指路的:「代理波动」等下轮、「代理无效」改代理账号、
+    「FC ID 不在列表」改「维护仓库」—— 只报店名,人还得翻日志才知道该干什么
+    """
+    words = (stats or {}).get("words") or {}
+    return [f"{n}({words[n]})" if words.get(n) else n for n in sorted(skipped)]
+
+
 def run(params: dict) -> str:
     """输入:params(store/preview/oos_days)→ 输出:意图分布 + 建议行落账摘要。"""
     # --dry-run 与 -p preview=1 等价:本工作流 DANGEROUS=False(不碰沃尔玛写
@@ -182,10 +192,15 @@ def run(params: dict) -> str:
     only = params.get("store")
 
     stockzero = store_limits.stockzero_stores()
-    # 受管仓(多仓批次 2):未配置「维护仓库」的店返回空表 —— 三个库存
-    # provider 的比对基准逐字节维持现状,一次沃尔玛调用都不会发生
-    managed, skipped_nodes = store_limits.managed_nodes()
+    node_stats: dict = {}
     with db.pg_conn() as conn:
+        # 受管仓(多仓批次 2):未配置「维护仓库」的店返回空表 —— 三个库存
+        # provider 的比对基准逐字节维持现状,一次沃尔玛调用都不会发生。
+        # 校验记忆在库里(ops.node_validations,2026-09-19),所以在连接内调;
+        # 记忆的写入**不受 preview 约束**:它是"沃尔玛认过这个 FC ID"的缓存,
+        # 不是建议行 —— preview 也真校验、真记住,下轮真跑才不用再打接口
+        managed, skipped_nodes = store_limits.managed_nodes(
+            conn=conn, stats=node_stats)
         # 缺席避让(店级重试标准③,所有者定稿 2026-08-26):catalog_sync 补试后
         # 仍缺席的店,整店目录水位停在上一轮 —— 拿陈旧现值算差异会误伤
         # (生产老账:38 条改库存 + 30 条改价 not found)。判据从库里水位派生
@@ -214,6 +229,20 @@ def run(params: dict) -> str:
     if absent:
         intents = [i for i in intents if i["store"] not in absent]
         capped = [c for c in capped if c["store"] not in absent]
+    # 受管仓校验失败的店**整店剔除**(2026-09-19 生产缺陷,与 list_new 对齐):
+    # managed_nodes() 把这些店放进 skipped_nodes、不进 managed,于是
+    # collect_all 给它们算出的意图**不带 ship_node**、比对基准还是全店合计
+    # —— 执行件拿到不带节点的库存意图就走 legacy 通道,把数量写到官方
+    # 无定义的默认节点(Virtual Node)。此前这里只把 skipped 摊进摘要那一行
+    # (「校验失败整店跳过 N 家」),意图本身一条没少,写着"跳过"实际全发了:
+    # 谭总23 2026-09-17 一天 235 条无节点库存建议全部执行,受管仓值没变
+    # (ineffective)、旧节点却被写上了货,双节点有货由此而来。
+    # 跳过 ≠ 不建议:这些店的存量 suggested 行也要护住(下面 withdraw 的
+    # exclude_stores),否则被撤成「商品自己恢复正常了」是错误取证
+    n_node_skipped = sum(1 for i in intents if i["store"] in skipped_nodes)
+    if skipped_nodes:
+        intents = [i for i in intents if i["store"] not in skipped_nodes]
+        capped = [c for c in capped if c["store"] not in skipped_nodes]
 
     n_kind = {k: sum(1 for i in intents if i["kind"] == k) for k in _KIND_ORDER}
     n_zero = sum(1 for i in intents
@@ -232,6 +261,11 @@ def run(params: dict) -> str:
                 f"(目录落后船队 >{store_absence.LAG_HOURS}h,"
                 f"{n_avoided} 条意图不产出,等链尾重赛/下轮补上)"
                 if absent else "")
+             + (f";⚠ 受管仓校验失败整店跳过 {len(skipped_nodes)} 店:"
+                f"{','.join(_node_skip_names(skipped_nodes, node_stats))}"
+                f"({n_node_skipped} 条意图不产出,不回落默认节点;"
+                f"填错改「维护仓库」,读不到等下轮)"
+                if skipped_nodes else "")
              + absence_gap]
     for c in capped:
         # 逐店明细留在后续行(全文进 ops.runs 与单跑通知;首行只放总数)
@@ -240,7 +274,7 @@ def run(params: dict) -> str:
                      f"优先级取,其余下轮;上限=按店配额×单 feed 条数,"
                      f"见 services/maintenance_intents.MAX_INTENTS_PER_STORE)")
     lines += _preview_lines(intents, stockzero)
-    node_note = store_limits.managed_note(managed, skipped_nodes)
+    node_note = store_limits.managed_note(managed, skipped_nodes, node_stats)
     if node_note:
         lines.append("  " + node_note)
 
@@ -280,11 +314,13 @@ def run(params: dict) -> str:
         # 不限范围会把**其余全部店铺**的待执行建议一次清空(批次 E 的坑)
         # ⚠ exclude_stores=缺席店 不能省:缺席店的行不在 keep 里(本轮避让了),
         # 不排除的话它们挂着的 suggested 会被撤成「商品自己恢复正常了」——
-        # 错误取证,且下轮又原样重建(缺席 ≠ 恢复正常)
+        # 错误取证,且下轮又原样重建(缺席 ≠ 恢复正常)。受管仓校验失败
+        # 整店跳过的店同理(跳过 ≠ 恢复正常)
         n_wd = dispositions.withdraw_stale(
             conn, "maint", keep,
             why=f"本轮扫描不再建议{f'(限 {only})' if only else ''}",
-            store=only or None, exclude_stores=sorted(absent))
+            store=only or None,
+            exclude_stores=sorted(set(absent) | set(skipped_nodes)))
         n_open = dispositions.count_open(conn,
                                          sources=dispositions.MAINT_SOURCES)
         n_sup = dispositions.count_suppressed(conn, dispositions.MAINT_ACTIONS)

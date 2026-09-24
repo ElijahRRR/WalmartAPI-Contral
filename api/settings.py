@@ -58,7 +58,8 @@ def _parse_nodes(data) -> dict[str, dict]:
     """输入:shipnodes 响应 → 输出:{shipNode: 该节点原始字段}。
 
     响应可能是裸数组,也可能包在 payload/elements 里(官方样例给的是裸数组,
-    但同族端点两种都出现过)—— 两种都收,认不出返回空 dict 并由调用方告警。
+    但同族端点两种都出现过)—— 两种都收,认不出返回空 dict,由调用方
+    _cached_ship_nodes 抛错(不缓存)。
     """
     rows = data
     if isinstance(data, dict):
@@ -82,12 +83,19 @@ def _cached_ship_nodes(client_id: str, client_secret: str, proxy) -> tuple:
     status, _, data = _client.safe_get_ex(
         f"{_client.base_url()}/v3/settings/shipping/shipnodes",
         token, client_id, proxy, max_retries=3)
+    # 文案里的「返回 NNN」/「返回 None」是 services/store_retry.diagnose 认的
+    # 格式(沃尔玛NNN / 网络未达),改字样要同步那边
     if status != 200:
-        raise RuntimeError(f"shipnodes 查询失败 HTTP {status}: {str(data)[:200]}")
+        raise RuntimeError(f"shipnodes 查询失败,沃尔玛返回 {status}: {str(data)[:200]}")
     nodes = _parse_nodes(data)
     if not nodes:
-        logger.warning("shipnodes 响应里没解析出任何节点(响应形状变了?):%s",
-                       str(data)[:200])
+        # 200 但一个节点都没解析出来(空体 / 非 JSON / 形状变了):**抛而不是
+        # 返回空**(2026-09-19)。返回空会被调用方判成「FC ID 不在列表(认识的:
+        # (空))」—— 瞬时故障伪装成配置错,而且空结果进 lru 缓存,整个进程再也
+        # 不重打接口。每家店的列表至少含 Virtual 节点(2026-08-30 谭总12 单店
+        # 实证,docs/multi_node_plan.md §2.4),空列表不可能是合法 200
+        raise RuntimeError("shipnodes 返回 200 但没解析出任何节点(响应形状变了?):"
+                           + str(data)[:200])
     # 存 tuple、每次调用重建 dict:缓存的是**同一个对象**,直接返回 dict 的话
     # 任何调用方 pop 一下就改到了全进程的缓存里(get_partner_id 返回的是 str,
     # 不可变,没这个问题)

@@ -38,6 +38,9 @@ FEISHU_LIMITS_TABLE_ID=
 # 上架表(电子表格):alloc_push 把已落占用追加进 A/B 两列。
 #   token 复用下面的 FEISHU_ONLINE_SHEET_TOKEN,这里只要 sheet_id
 FEISHU_LISTING_SHEET_ID=
+# 产品分配表(电子表格):点名分配 `alloc_plan -p from_sheet=1` 的驱动表,
+#   运营只填 ASIN 列。同一个文件,token 同上,这里只要 sheet_id(?sheet= 参数)
+FEISHU_ALLOC_SHEET_ID=
 
 # 订单审核两张配置表
 # 黑名单邮编(wiki 电子表格:token=/wiki/ 后段,sheet_id=?sheet= 参数)

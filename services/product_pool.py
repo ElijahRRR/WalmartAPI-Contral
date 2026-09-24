@@ -42,6 +42,12 @@ WHERE p.marketplace = 'US'
   AND btrim(coalesce(r.category, '')) <> ''
 """
 
+# 点名分配(口径 #19)的池口白名单:**在 SQL 里筛,不是拉全库再过滤**。
+# 全库 LATERAL 取最近快照要跑几十万行,点名只有几十个 ASIN,筛在库里是几毫秒;
+# 拉回来再过滤则每次点名都付一遍全库分配的取数成本。追加在 WHERE 末尾,
+# 缺省路径(asins=None)的 SQL 逐字不变 —— 体检与全库分配看到的池子还是同一个。
+_POOL_ASIN_FILTER = "  AND p.asin = ANY(%(asins)s)\n"
+
 # 窗口内销量与销售额:**按 asin 聚合**(A1.5 补的列,99.2% 行有值)。
 # asin IS NULL 的行进不了这个维度 —— 它们只在店×SKU 维度起作用。
 # ⚠ 金额是**毛额**(未扣退款):逐产品的退款只有 API 期算得出(§7.4e),
@@ -100,14 +106,22 @@ WHERE delete_times > 0 OR unexplained_missing OR audit_reject_times > 0
 """
 
 
-def load(conn, win: dict) -> dict:
-    """输入:连接 + 销量窗口 → 输出:{pool, sales, refund, risk, risk_err}。
+def load(conn, win: dict, asins: list | None = None) -> dict:
+    """输入:连接 + 销量窗口(+ 点名 ASIN 白名单)→ 输出:{pool, sales, gross, refund, risk, risk_err}。
 
     `product_risk` 读不到只降级(黑历史罚分全为 0)并把错误回传 —— 视图缺了
     不该拖垮整条分配链,但**必须让人看见**,否则"这批怎么没人扣分"查不出来。
+
+    `asins` 给了就只取这些 ASIN 的池行(点名分配,口径 #19);**准入条件
+    一条不少**(美站 / 已审核 / 有标题 / PT 已映射 / 大类可解析)—— 点名的品
+    不在池里,调用方要自己回库查是哪一条把它挡在池外。销量/退货/黑历史三份
+    维度照旧按窗口聚合(它们是按 ASIN 的字典,多取的键只是没人查)。
     """
     with conn.cursor() as cur:
-        cur.execute(_SQL_POOL)
+        if asins is None:
+            cur.execute(_SQL_POOL)
+        else:
+            cur.execute(_SQL_POOL + _POOL_ASIN_FILTER, {"asins": list(asins)})
         pool = cur.fetchall()
         cur.execute(_SQL_SALES, win)
         rows = cur.fetchall()
@@ -143,15 +157,27 @@ def lifetime_sales(conn) -> dict:
                 for a, u, g, f, l in cur.fetchall()}
 
 
-def score_all(data: dict) -> tuple[list, dict]:
-    """输入:`load()` 产物 → 输出:(打过分的候选 list, 硬闸淘汰计数)。
+def norm_channel(fulfillment) -> str | None:
+    """输入:快照里的 is_fba 原文 → 输出:FBA / FBM,认不出归 None(**不猜**)。
+
+    渠道闸的产品侧只有这一个归一口:打分产物与点名分配表的「配送方式」列
+    都从这里出,两处各写一遍 upper+白名单迟早分叉。
+    """
+    from services import store_targets           # 只为 CHANNELS 白名单,避免循环
+    ch = (fulfillment or "").strip().upper() or None
+    return ch if ch in store_targets.CHANNELS else None
+
+
+def score_all(data: dict, gated_by_asin: dict | None = None) -> tuple[list, dict]:
+    """输入:`load()` 产物(+ 可选的逐 ASIN 淘汰原因收集器)→ 输出:(打过分的候选 list, 硬闸淘汰计数)。
 
     每个元素:{asin, brand, manufacturer, pt, category, channel, score,
               base, bonus, penalty, why, missing, sales, rating, reviews, lead}
     `channel` 已归一到 FBA/FBM;认不出的值归 None(**不猜**,由调用方决定
     是丢是留 —— 猜错等于把 FBM 的货分给 FBA 店)。
+    `gated_by_asin` 给了就把每个被硬闸挡下的 ASIN 的**完整原因**填进去
+    (点名分配要逐行写「未分配原因」;计数那份只留括号前的归类名)。
     """
-    from services import store_targets           # 只为 CHANNELS 白名单,避免循环
     out, gated = [], {}
     for (asin, brand, manuf, pt, cat, price, shipping, stock, stock_state,
          lead, rating, reviews, ful) in data["pool"]:
@@ -162,6 +188,8 @@ def score_all(data: dict) -> tuple[list, dict]:
         if why:
             k = why.split("(")[0]
             gated[k] = gated.get(k, 0) + 1
+            if gated_by_asin is not None:
+                gated_by_asin[asin] = why
             continue
         sold, ret = data["refund"].get(asin, (0, 0))
         r = ps.score({"sales": data["sales"].get(asin),
@@ -171,12 +199,11 @@ def score_all(data: dict) -> tuple[list, dict]:
                       "rating": rating, "reviews": reviews, "lead": lead,
                       "refund": (ret / sold if sold else None)},
                      data["risk"].get(asin))
-        ch = (ful or "").strip().upper() or None
         out.append({"asin": asin, "brand": brand, "manufacturer": manuf,
                     "pt": pt, "category": cat,
                     "price": row["price"], "shipping": row["shipping"],
                     "gross": data.get("gross", {}).get(asin),
-                    "channel": ch if ch in store_targets.CHANNELS else None,
+                    "channel": norm_channel(ful),
                     "score": r["score"], "base": r["base"], "bonus": r["bonus"],
                     "penalty": r["penalty"], "why": r["why"],
                     "missing": r["missing"], "sales": data["sales"].get(asin),

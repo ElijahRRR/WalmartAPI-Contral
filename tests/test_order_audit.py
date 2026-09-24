@@ -5,7 +5,7 @@
 """
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -1011,8 +1011,9 @@ def _reap_conn(pending=(("B0A", "10001"), ("B0B", "10001")),
     """
     return FakeConn({
         "ORDER BY b.submitted_at":
-            (["batch_name", "batch_id", "asin_count"],
-             [("wm-audit-10001-x", "7", 2)]),
+            (["batch_name", "batch_id", "asin_count", "status", "submitted_at"],
+             [("wm-audit-10001-x", "7", 2, "running",
+               datetime.now(timezone.utc))]),
         "ORDER BY b.finished_at":
             (["batch_name", "batch_id"],
              [("wm-audit-10001-x", "7")] if reapable else []),
@@ -1033,6 +1034,83 @@ def _stub_pump_batch(monkeypatch, wf, *, ok=True, gone=False, error=None):
                 "gone": gone, "error": error}
     monkeypatch.setattr(wf.ingest, "pump_batch", fake)
     return pulled
+
+
+def test_open_batches_query_includes_inflight_without_pending_pairs():
+    """批次仍记在途就要复查,哪怕它的组合已经全部 done(所有者 2026-09-24 诊断)。
+
+    批次超过 wait 上限 ⇒ 台账停在 running;下一小时快照经全局泵到齐,
+    _SETTLE_SQL 先把组合全标 done ⇒ "还有 pending 组合"不再成立 ⇒ 批次永远
+    没人再问、永远 running ⇒ 取图门禁永远不放行 ⇒ 远端早已生成的图永远不上传。
+    两个条件必须是并集。
+    """
+    from workflows import order_audit as wf
+    sql = wf._OPEN_BATCHES_SQL
+    assert "b.status IN ('pushed', 'running')" in sql
+    assert "a.state = 'pending'" in sql
+    assert " OR EXISTS" in sql                      # 并集,不是把旧条件换掉
+    assert "b.status, b.submitted_at" in sql        # 收口判据要用的两列
+
+
+def test_reap_finishes_stuck_running_batch_with_no_pending_pairs(wired, monkeypatch):
+    """组合全 done、台账仍 running、远端其实早采完 ⇒ 这轮就记 completed。
+
+    completed 之后取图门禁(_SETTLED_BATCH_SQL)才放行,同一轮的推送阶段就能
+    把现成的截图贴上飞书。
+    """
+    wf, _ = wired
+    conn = _reap_conn(pending=(), reapable=False)
+    _stub_pump_batch(monkeypatch, wf, ok=True)
+    monkeypatch.setattr(wf.scraper, "batch_status",
+                        lambda n: {"stats": {"open": 0, "done": 2, "failed": 0},
+                                   "screenshots": {"open": 0, "done": 2}})
+    finished = []
+    monkeypatch.setattr(wf.batches, "finish",
+                        lambda *a, **k: finished.append(a))
+    reaped, failed_pairs, _notes = wf._reap_batches(conn)
+    assert reaped == 1 and failed_pairs == 0
+    assert finished and finished[0][:2] == ("wm-audit-10001-x", "completed")
+
+
+def test_reap_times_out_batch_stuck_inflight_for_a_day(wired, monkeypatch):
+    """在途超过 _INFLIGHT_STALE_HOURS 仍未落定 ⇒ 标 timeout 收口,不再逐小时白问。
+
+    timeout 不在途,取图门禁照常放行:采到几张贴几张。
+    """
+    wf, _ = wired
+    old = datetime.now(timezone.utc) - timedelta(hours=wf._INFLIGHT_STALE_HOURS + 6)
+    conn = FakeConn({
+        "ORDER BY b.submitted_at":
+            (["batch_name", "batch_id", "asin_count", "status", "submitted_at"],
+             [("wm-audit-old", "9", 3, "running", old)]),
+        "ORDER BY b.finished_at": (["batch_name", "batch_id"], []),
+        "state = 'pending' AND batch_name": (["asin", "zip"], []),
+    })
+    monkeypatch.setattr(wf.scraper, "batch_status",
+                        lambda n: {"stats": {"open": 1, "done": 2, "failed": 0},
+                                   "screenshots": {"open": 1, "done": 2}})
+    finished, recorded = [], []
+    monkeypatch.setattr(wf.batches, "finish", lambda *a, **k: finished.append(a))
+    monkeypatch.setattr(wf.batches, "record", lambda *a, **k: recorded.append(a))
+    _reaped, _failed, notes = wf._reap_batches(conn)
+    assert finished and finished[0][:2] == ("wm-audit-old", "timeout")
+    assert recorded == []                       # 不再当 running 续记
+    assert any("timeout" in n for n in notes)   # 收口要见人
+
+
+def test_reap_keeps_fresh_inflight_batch_running(wired, monkeypatch):
+    """刚推的批次还在跑 ⇒ 照旧记 running,不许把它当卡死收口。"""
+    wf, _ = wired
+    conn = _reap_conn(pending=(), reapable=False)
+    monkeypatch.setattr(wf.scraper, "batch_status",
+                        lambda n: {"stats": {"open": 1, "done": 1, "failed": 0},
+                                   "screenshots": {"open": 1, "done": 1}})
+    finished, recorded = [], []
+    monkeypatch.setattr(wf.batches, "finish", lambda *a, **k: finished.append(a))
+    monkeypatch.setattr(wf.batches, "record", lambda *a, **k: recorded.append(a))
+    wf._reap_batches(conn)
+    assert finished == []
+    assert recorded and recorded[0][3] == "running"
 
 
 def test_reap_batches_blames_the_real_reason(wired, monkeypatch):

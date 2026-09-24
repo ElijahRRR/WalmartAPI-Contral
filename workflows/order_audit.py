@@ -92,6 +92,12 @@ product_refresh 那条链(维护/上架用的快照)还是靠它摄。
   的批次**"而不只是在途的(否则记成 completed 之后就再没人看它一眼,重新入队
   完全看不见);② 批次弹回在途时 `record()` 清空 finished_at,稳定窗口从零重计。
   在途批次不判超时、不重推。进程中途死掉不丢状态,这正是旧系统缺的那块。
+  **① 的范围还要并上"台账仍记在途的批次"**(所有者 2026-09-24 生产诊断):
+  批次超过 20 分钟 wait 上限时台账停在 running;下一小时快照经全局泵到齐,
+  `_SETTLE_SQL` 先把组合全标 done,于是"还有 pending 组合"这个条件不再成立,
+  批次永远没人再问一次,永远 running —— 而取图门禁只放行不在途的批次,远端
+  早就生成好的截图就永远不上传(实测 3 天窗口 12 行卡在这里)。在途批次
+  超过 `_INFLIGHT_STALE_HOURS` 仍未落定按 timeout 收口,不再逐小时白问。
   **落定判据不含 `screenshots.open`**(2026-08-10 所有者实测后改):失败任务
   的截图槽位不会再有人去截,shots_open 永久 >0,带上它就永远落不定。
   `-p wait=1` 在数据齐了之后另给截图 180 秒宽限,到点照常出结论,图下轮补贴。
@@ -137,7 +143,7 @@ import json
 import logging
 import math
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import httpx
@@ -301,14 +307,28 @@ _BATCH_PREFIX = "wm-audit-"
 # 失败任务推回 worker 再循环两轮,`tasks.open` 归零**不代表最终** —— 归零之后
 # 还可能重新入队。只查在途批次的话,一个批次被我们记成 completed 之后就再也
 # 不会被看一眼,重新入队完全看不见,而我们已经按"它结束了"去认账失败了。
+#
+# 也不能只查"还有 pending 组合"的(2026-09-24 所有者生产诊断):批次超过 wait
+# 上限时台账停在 running,下一小时快照经全局泵到齐、组合先被 _SETTLE_SQL 标成
+# done,这个条件就不再成立 —— 批次永远停在 running,而取图门禁
+# (_SETTLED_BATCH_SQL)只放行不在途的批次,远端早已生成的截图永远不上传。
+# 两个条件**取并集**:有 pending 组合的复查(为了认账),台账仍在途的复查
+# (为了收口)。
 _OPEN_BATCHES_SQL = """
-SELECT b.batch_name, b.batch_id, b.asin_count
+SELECT b.batch_name, b.batch_id, b.asin_count, b.status, b.submitted_at
 FROM ops.scrape_batches b
 WHERE b.batch_name LIKE %(prefix)s
-  AND EXISTS (SELECT 1 FROM ops.audit_scrape a
-              WHERE a.batch_name = b.batch_name AND a.state = 'pending')
+  AND (b.status IN ('pushed', 'running')
+       OR EXISTS (SELECT 1 FROM ops.audit_scrape a
+                  WHERE a.batch_name = b.batch_name AND a.state = 'pending'))
 ORDER BY b.submitted_at
 """
+
+# 台账在途超过这么久仍未落定 ⇒ 按 timeout 收口,不再逐小时复查。
+# 采集侧一批最慢也是几十分钟(13:2x 与产品线撞车的那些 20~26 分钟),
+# 24 小时还开着只能是采集侧那边卡死了;timeout 不在途,取图门禁照常放行
+# (采到多少图贴多少),组合侧另有 _TIMEOUT_SQL 兜底。
+_INFLIGHT_STALE_HOURS = 24
 
 # 可以认账的批次:已落定、还有 pending 组合、且落定已稳住窗口期。
 #
@@ -551,7 +571,7 @@ def _reap_batches(conn) -> tuple[int, int, list[str]]:
     settled_batches, failed_pairs, notes = 0, 0, []
 
     # ① 在途批次:问状态,落定的记账(**本轮不认账失败**,等摄取追上)
-    for name, batch_id, n in open_batches:
+    for name, batch_id, n, local_status, submitted_at in open_batches:
         try:
             st = scraper.batch_status(name)
         except LookupError:
@@ -566,10 +586,21 @@ def _reap_batches(conn) -> tuple[int, int, list[str]]:
         # 只认 batch_id,缺了这批的失败原因就永远问不出来
         batch_id = batch_id or st.get("batch_id")
         if not batches.is_settled(st):
-            # 可能是首次在途,也可能是**已落定后又被 server 推回重采**——
-            # 后者靠 record() 把 finished_at 清空,稳定窗口从零重计。
             stats = st.get("stats") or {}
             shots = st.get("screenshots") or {}
+            if (local_status in ("pushed", "running")
+                    and _stale(submitted_at, _INFLIGHT_STALE_HOURS)):
+                # 在途一整天还没落定:采集侧卡死了,按 timeout 收口,别每小时
+                # 白问一次;已采到的快照早进增量流了,已生成的图取图门禁照常放行
+                batches.finish(name, "timeout", stats.get("done"),
+                               stats.get("failed"),
+                               f"在途超 {_INFLIGHT_STALE_HOURS} 小时仍未落定,"
+                               f"open={stats.get('open')}")
+                notes.append(f"{name}:在途超 {_INFLIGHT_STALE_HOURS}h 未落定,"
+                             f"已标 timeout")
+                continue
+            # 可能是首次在途,也可能是**已落定后又被 server 推回重采**——
+            # 后者靠 record() 把 finished_at 清空,稳定窗口从零重计。
             batches.record(name, batch_id, n, "running",
                            f"open={stats.get('open')} shots_open={shots.get('open')}")
             continue
@@ -632,6 +663,17 @@ def _reap_batches(conn) -> tuple[int, int, list[str]]:
                     waiting)
     conn.commit()
     return settled_batches, failed_pairs, notes
+
+
+def _stale(submitted_at, hours: int) -> bool:
+    """输入:批次提交时间 + 小时数 → 输出:是否已超过该时长(取不到时间视为未超)。"""
+    if submitted_at is None:
+        return False
+    try:
+        age = datetime.now(timezone.utc) - submitted_at.astimezone(timezone.utc)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return age > timedelta(hours=hours)
 
 
 def _settle_ledger(conn) -> tuple[int, int, dict, list[str]]:

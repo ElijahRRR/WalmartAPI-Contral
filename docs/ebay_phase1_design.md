@@ -47,6 +47,13 @@
 > 天然没有),照搬 `product_score.CUTOFF` 会把整池一票否决;分数只决定
 > 排序。§2.1 的点名分配行号随 #135 重定位(1222/1223→1229/1230、
 > 1300→1307、1301→1308)。
+> **2026-09-24 对齐 main #136**(order_audit 批次收口漏洞):§6.5 补三条 🔴
+> ——① `submit_poll` 选行面取**并集**(`feed_log` 自己 pending ∪ `feed_items`
+> 有未落定行),#136 正是只看下游信号、被另一条路径抹掉信号后永远停在
+> running;② 在途超 `_INFLIGHT_STALE_HOURS=24` 按 timeout 收口,但 **timeout
+> ≠ 确认未达**,eBay 侧绝不自动重发(写操作不兜底);③ §6.1 去重谓词必须
+> **并上 `feed_log` 仍 pending/timeout 的 (account, sku)**,不许靠"对账跑在
+> 推送前"这个调度顺序——丢响应的提交没有 `feed_items` 行,谓词看不见它。
 > ⚠ 本文引用的仓库行号以 **2026-09-23 的 main(06140c3)** 为快照(§2.1/§2.2/
 > §3.2 已按它重定位;其余节仍是 09-07 快照),批次实施时现场重定位。
 
@@ -547,7 +554,10 @@ parse_multiplier` 转中立 + `pick_band` 改收 bands、变体三件改名。
 拦下计数)+ claims 平台内未占 + **去重谓词写死
 `feed_items.feed_type IN ('ebay_offer','ebay_publish') AND status IN
 ('submitted','success')`**(按"存在任意行"判会把 item 步成功 publish 步
-失败的 SKU 永久排除)+ upc_usage 活跃用量去重。**重试闸**:按 (account,
+失败的 SKU 永久排除)+ upc_usage 活跃用量去重。🔴 **这条谓词还不够——必须
+并上 `feed_log` 里该 (account, sku) 仍 pending/timeout 的行**,理由与事故
+形状见 §6.5 第三条(丢响应的提交没有 `feed_items` 行,谓词看不见它,下一轮
+就重发)。**重试闸**:按 (account,
 sku) 计次上限 3(对位沃尔玛 `MAX_LIST_ATTEMPTS=3`;没有它,永久失败的
 SKU 每天白烧配额与 LLM),4xx 终态拒的错误码集不进重试通道。
 逐行闸:brand_key 黑名单/库存三态/渠道/运费/落地价/lead/定制品闸
@@ -652,6 +662,31 @@ gated_by_asin=None)` 现在能回收**逐 ASIN 的完整淘汰原因**:eBay 入�
   FOUND=**`status=='PUBLISHED'`**(封闭集 {PUBLISHED, UNPUBLISHED} 已证;
   listingId 只作辅证——withdraw 后残留形态待沙箱 C3)。NOT_FOUND 同方法
   补交一次;双确认 5~10s(工程值)。
+- 🔴 **选行面取并集,别只靠下游信号(2026-09-24 对齐 main #136)**:#136 的
+  生产事故形状——复查 SQL 只选「还有 pending 子行」的批次,而**另一条路径**
+  (结算)把子行全标 done 之后,**台账自己仍在途的那一行再没人看**,永远停
+  在 running;下游门禁只放行"不在途"的批次,现成的产物永不发出(3 天窗口
+  252 行卡住 12 行)。对位到 `ebay_submit_poll`:选行 SQL 必须是**并集**
+  ——「`feed_log` 自己 `status='pending'`」∪「`feed_items` 还有未落定的行」,
+  **不许只靠其中一个信号**。两个信号由不同代码路径维护,总有一天对不上。
+- 🔴 **在途超上限按 timeout 收口,但 timeout ≠ 确认未达**:对位常量
+  `_INFLIGHT_STALE_HOURS = 24`(#136 的值),没有它就逐小时白问、永不落定。
+  ⚠ eBay 侧必须比沃尔玛**再保守一档**:#136 里 timeout 放行的是取图上传
+  (只读产物),而 eBay 这边"放行"意味着这个 SKU 重新进入上架候选——那是
+  **写操作自动兜底**,CLAUDE.md 安全红线明令禁止。定稿:timeout 只做三件事
+  ——停止轮询、摘要**首行**点名、留痕 `product_events`;**绝不**自动重发,
+  由人看过再定。
+- 🔴 **去重谓词必须自己覆盖"在途",不许靠调度顺序**:§6.1 的去重谓词只看
+  `feed_items` 的 submitted/success,而**丢响应的那次提交根本没有
+  `feed_items` 行**(§6.5 第一条:offer/publish 两阶段 2xx **后**才落),
+  只在 `feed_log` 留一条 pending。所以 `submit_poll` 一旦漏查或收口成
+  timeout,`list_new` 下一轮就把同一个 SKU 再发一遍。#136 是靠"同一轮 ②对账
+  在 ④推送之前"兜住的,但铁律写死**调度顺序不许承载判据**——eBay 这边要把
+  去重谓词**并上 `feed_log` 该 (account, sku) 仍 pending/timeout 的行**,
+  谓词自己站得住。⚠ 代价对比说清楚:沃尔玛那次漏的是一张截图,eBay 这边
+  漏的是**一条重复 listing + 一个烧掉的 UPC**,而重复 listing 触发的是
+  eBay 的 duplicate listing 政策。P1-4 验收补一条:造一条"`feed_log` pending
+  但无 `feed_items` 行"的残局,断言 `list_new` 下一轮**不选中**该 SKU。
 - 自适应降档一期不做(`api/ebay/_client` 已有官方处方 429 读 reset,
   workflow 层再做=两套限流;头注防补)。起跑抖动保留(应用桶全账号共享)。
 
@@ -697,7 +732,7 @@ api 留签名。要做=+4~5 人日,四项前置:①UPC 结构裁决落地(本文
 | P1-1 | _http 抽取+registry(含 platforms.py/飞书两表)+ebay_accounts+_client+tokens+authorize+runbook+文档勘误回改 | 7 | 沃尔玛 pytest 全绿(18 处 monkeypatch 例外清单)/sandbox 与 production 各铸令牌+getRateLimits/进程超时 90.0 冒烟/账号互斥断言单测(含停用店名反例)/state 不符抛错单测 |
 | P1-2 | 全部 DDL+claims/upc 改造+台账谓词补全+**risk_trace 四证据源谓词(§4.4)**+events 契约 | 7 | db_init 两跑+六格对拍+读 SQL count·md5 对拍/沃尔玛上架与分配链 --dry-run 摘要逐字一致(claims 11 读+3 写+3 事件桥、upc 7 写+6 读投影,**含 `alloc_plan -p from_sheet=1` 点名分配那条路径**——预期红清单按 §2.1/§2.2 的现场重核数,别按旧稿的 9+2)/UPC 三级取号+烧号保护+「烧后重上领新号」单测/飞书 UPC 表投影逐行对拍/browse_node_id 空行占比落数/**risk_trace 展开结果不含 eBay 账号**(造 claims+listing_sources+product_events 三条 eBay 行) |
 | P1-3 | bootstrap+taxonomy+catmap 测试链+account_health | 6 | sandbox 户口链重入两遍/生产拉真树+版本哨兵/aspects 解耦拉取(新 promote 类目当日拿到 aspects)/promote 三格(缺省中、入料只吃高、置高路径逐条点名)/refresh 探活停链 |
-| P1-4 | 中立抽取(3)+admission/conform/pricing+api 两文件+list_new+submit_poll+飞书投影 | 15 | 沙箱清单 13 项完成/sandbox 端到端 3 SKU PUBLISHED/防重三态+熔断+双闸+重试闸单测/**抽码即登记单测**(eBay 行落 `listing_sources` 且 `abandoned_at IS NULL`、码形符 `OPAQUE_SQL_PREDICATE`、`-p dry_run` 走 `DRYRUN_PLACEHOLDER` 不落码)/--dry-run 人眼确认/中立抽取后沃尔玛输出逐字不变 |
+| P1-4 | 中立抽取(3)+admission/conform/pricing+api 两文件+list_new+submit_poll+飞书投影 | 15 | 沙箱清单 13 项完成/sandbox 端到端 3 SKU PUBLISHED/防重三态+熔断+双闸+重试闸单测/**抽码即登记单测**(eBay 行落 `listing_sources` 且 `abandoned_at IS NULL`、码形符 `OPAQUE_SQL_PREDICATE`、`-p dry_run` 走 `DRYRUN_PLACEHOLDER` 不落码)/**残局单测:造一条「`feed_log` pending 但无 `feed_items` 行」,断言 `list_new` 下一轮不选中该 SKU、`submit_poll` 的选行面选得中它**/--dry-run 人眼确认/中立抽取后沃尔玛输出逐字不变 |
 | P1-5 | 生产单账号试点 | 2+观察 | 首批 ≤10 条人工放行类目/真实 PUBLISHED/错误账收官/两周观察后再谈放量。**界定:试点 ≠ ebay_plan 批次 10;试点期不拉订单、库内无买家数据,不触发合规订阅义务;放量、拉订单、提额之前批次 11 仍是硬门槛** |
 
 合计 **≈37 人日 + 2 周试点观察**。P1-3 的 taxonomy 半批**编码**可与 P1-2

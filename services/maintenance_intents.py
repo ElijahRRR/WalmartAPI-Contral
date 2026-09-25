@@ -934,8 +934,6 @@ def _qty_reason(code: str, stock, cap) -> str:
         return "亚马逊库存数未采到(采不到就不卖)"
     if code == store_limits.QTY_BELOW_MIN:
         return f"亚马逊库存 {stock} 低于门槛 {amz_source.MIN_INVENTORY}"
-    if code == store_limits.QTY_BELOW_CAP:
-        return f"亚马逊库存 {stock} 低于本店最大库存 {cap}"
     if code == store_limits.QTY_CAPPED:
         return f"按本店最大库存 {cap} 写(亚马逊 {stock})"
     return ""
@@ -966,12 +964,12 @@ def inventory_intents(rows: list[dict],
         (与上架同一个函数):
           - **没采到(NULL)→ 写 0**(原因码 no_count)。采不到就不卖,是运营
             口径;库里 NULL 与 0 仍然分得清(catalog.snapshots 原样存),只在
-            决策这一层把"不知道"当成"别卖"。也**不算达到最大库存**
+            决策这一层把"不知道"当成"别卖"
           - **< 门槛 `amz_source.MIN_INVENTORY`(5)→ 写 0**(below_min;
             **所有店**,所有者 2026-09-25「库存维护也需要门槛5」—— 此前 1~4
             件照写原数,是旧系统「同步时 <5 推 0」没迁过来的漏项)
-          - 设了最大库存 N:≥ N → 写 N(store_cap),< N → 写 0(below_cap)
-          - 没设 N → 同步该值
+          - 过了门槛 → 写 min(亚马逊库存, 本店最大库存 N)(超过 N 时原因码
+            store_cap);没设 N 就同步该值。门槛决定卖不卖,N 决定卖多少
       · 配送超上限 → 写 0。上限取限额表**本店**「配送时长限制」
         (`lead_limit`,与分配链共用同一列同一常量);该店没填就回落全局
         `MAX_LEAD_DAYS`(**7 天**,所有者两次收紧 12 →08-09→ 8 →08-15→ 7)。

@@ -1633,8 +1633,9 @@ RETIRE_LIMITS = Bitable(
         item_setup_limit="商品上限",
         # 每店**单品最大库存 N**(所有者建列 2026-09-25)。**留空或填 0 = 不限**。
         # 规则(两条链同一换算,唯一实现 `services/store_limits.stock_for`):
-        #   亚马逊库存 ≥ 门槛(`amz_source.MIN_INVENTORY`)且 ≥ N → 写 N;
-        #   其余一律 0(上架侧 = 不上架并写理由);**没采到数量不算达到 N**。
+        #   门槛(`amz_source.MIN_INVENTORY`,全局 5)决定卖不卖:低于门槛
+        #   上架侧不上架、维护侧写 0;N 决定卖多少:过了门槛写
+        #   min(亚马逊库存, N)。例:N=3 时亚马逊 5 件及以上写 3。
         # 谁在读:上架 list_new(上架数量 / 不上架理由)、维护 maintenance_intents
         # (跟随亚马逊的那一支);取数唯一口 `services/store_limits.stock_caps`。
         # ⚠ 不复用「库存特殊要求」:那一格的 "0" 是整店停售开关(stockzero),

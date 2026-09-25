@@ -211,10 +211,10 @@ def test_inventory_intents_unknown_stock_goes_zero(monkeypatch):
 
 
 def test_inventory_threshold_applies_to_every_store_and_cap_to_its_store():
-    """门槛 5 对**所有店**生效(所有者 2026-09-25「库存维护也需要门槛5,小于5个
-    库存就设置为0」—— 此前 1~4 件照写原数);限额表「最大库存」N 只管设了的店:
-    ≥N 写 N、<N 写 0;没采到数量不算达到 N。清零判据(缺货/渠道/货期…)照旧
-    排在前面,上限不改变它们。换算与上架同一个函数 `store_limits.stock_for`。"""
+    """门槛决定卖不卖,最大库存决定卖多少(所有者定稿 2026-09-25):
+    亚马逊 <5 写 0,**所有店**(「库存维护也需要门槛5」—— 此前 1~4 件照写原数);
+    过了门槛写 min(亚马逊库存, 本店最大库存 N),没设 N 照原数。清零判据
+    (缺货/渠道/货期…)照旧排在前面。换算与上架同一个函数 `store_limits.stock_for`。"""
     caps = {"T_CAP3": 3, "T_CAP20": 20}
     rows = [
         _row(store="T_FREE", sku="B0FOUR", avail_qty=4, stock_count=4),
@@ -222,7 +222,7 @@ def test_inventory_threshold_applies_to_every_store_and_cap_to_its_store():
         _row(store="T_CAP3", sku="B0BIG", avail_qty=50, stock_count=50),
         _row(store="T_CAP3", sku="B0AT3", avail_qty=3, stock_count=99),  # 已是 3
         _row(store="T_CAP3", sku="B0FOUR3", avail_qty=3, stock_count=4),
-        _row(store="T_CAP20", sku="B0TWELVE", avail_qty=12, stock_count=12),
+        _row(store="T_CAP20", sku="B0TWELVE", avail_qty=20, stock_count=12),
         _row(store="T_CAP20", sku="B0NULL", avail_qty=20, stock_count=None),
         _row(store="T_CAP3", sku="B0OOS", avail_qty=3, stock_count=50,
              stock_state="out_of_stock"),
@@ -232,16 +232,15 @@ def test_inventory_threshold_applies_to_every_store_and_cap_to_its_store():
     assert got == {
         "B0FOUR": (0, store_limits.QTY_BELOW_MIN),     # 没设 N 的店也卡门槛
         "B0FIVE": (5, ""),                             # 没设 N:原样跟随
-        "B0BIG": (3, store_limits.QTY_CAPPED),
-        "B0FOUR3": (0, store_limits.QTY_BELOW_MIN),    # N=3 不替代门槛
-        "B0TWELVE": (0, store_limits.QTY_BELOW_CAP),   # 够门槛不够 N
-        "B0NULL": (0, store_limits.QTY_NO_COUNT),      # 没采到不算达到 N
+        "B0BIG": (3, store_limits.QTY_CAPPED),         # 50 → 3
+        "B0FOUR3": (0, store_limits.QTY_BELOW_MIN),    # 4 件:过不了门槛
+        "B0TWELVE": (12, ""),                          # 12 < 20:写 12,不是 0
+        "B0NULL": (0, store_limits.QTY_NO_COUNT),
         "B0OOS": (0, "out_of_stock"),                  # 清零判据在前
     }
     reasons = {i["sku"]: i["reason"]
                for i in mi.inventory_intents(rows, stock_caps=caps)}
     assert reasons["B0BIG"] == "按本店最大库存 3 写(亚马逊 50)"
-    assert reasons["B0TWELVE"] == "亚马逊库存 12 低于本店最大库存 20"
     assert reasons["B0FOUR"] == "亚马逊库存 4 低于门槛 5"
     # 不传上限 = 不限(直接调本函数的排查不会静默拿到一份飞书读)
     assert {i["sku"]: i["new"] for i in mi.inventory_intents(rows)}["B0AT3"] == 99

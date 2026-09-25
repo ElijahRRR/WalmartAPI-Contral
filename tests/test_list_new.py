@@ -2647,10 +2647,9 @@ def test_weight_fallbacks_are_bucketed_by_reason_in_the_summary(monkeypatch):
 
 
 def test_store_max_stock_gate(monkeypatch):
-    """限额表「最大库存」N(所有者定稿 2026-09-25):≥N 按 N 上架,<N 不上架;
-    门槛 5 照旧在前、不被 N 替代;设了 N 的店,**没采到数量不算达到 N**
-    (不再按 IN_STOCK_QTY 保守铺货 —— 那条只留给没设 N 的店)。
-    理由列写判出 0 的那道闸的值。"""
+    """门槛决定**上不上**,限额表「最大库存」N 决定**上多少**(所有者定稿
+    2026-09-25):亚马逊库存 <5 不上架(理由写门槛的值);过了门槛,上架数量
+    = min(亚马逊库存, N);没设 N 的店是亚马逊原数。"""
     rows = [_sheet_row(2, store="T_CAP3", asin="B0CAPBIG01"),
             _sheet_row(3, store="T_CAP3", asin="B0CAPLOW01"),
             _sheet_row(4, store="T_CAP3", asin="B0CAPNULL1"),
@@ -2682,15 +2681,15 @@ def test_store_max_stock_gate(monkeypatch):
     monkeypatch.setattr(ln.amz_source, "fetch_products", lambda a: products)
 
     out = ln.run({"execute": False})
-    min_inv = ln.amz_source.MIN_INVENTORY
-    assert f"第3行:亚马逊库存不足{min_inv}" in out            # 4 件:卡门槛,不是卡 N
-    assert "第4行:亚马逊库存数未采到,不算达到本店最大库存3" in out
-    assert "第5行:亚马逊库存不足本店最大库存20" in out         # 12 件:够门槛不够 N
-    assert "低于本店最大库存 2" in out                        # 闸门行单独计数
-    assert "按本店最大库存上架 2 行" in out
-    assert f"库存数未采到按 {ln.amz_source.IN_STOCK_QTY} 铺货 1 行" in out  # 只有没设 N 的店
-    assert "T_CAP3 B0CAPBIG01 定价" in out and "库存 3 待提交" in out
-    assert "T_CAP20 B0MIDBIG01" in out and "库存 20 待提交" in out
-    assert f"T_FREE B0FREENUL1 定价 46.0 库存 {ln.amz_source.IN_STOCK_QTY} 待提交" in out
-    assert "T_FREE B0FREEBIG1 定价 46.0 库存 50 待提交" in out  # 没设 N:原样跟随
-    assert "共 4 行将进入" in out
+    assert f"第3行:亚马逊库存不足{ln.amz_source.MIN_INVENTORY}" in out  # 4 件:门槛
+    fill = ln.amz_source.IN_STOCK_QTY
+    for line in ("T_CAP3 B0CAPBIG01 定价 46.0 库存 3 待提交",     # 50 → 封顶 3
+                 "T_CAP3 B0CAPNULL1 定价 46.0 库存 3 待提交",     # 保守铺货量也封顶
+                 "T_CAP20 B0MIDLOW01 定价 46.0 库存 12 待提交",   # 12 < 20:原数
+                 "T_CAP20 B0MIDBIG01 定价 46.0 库存 20 待提交",   # 25 → 封顶 20
+                 f"T_FREE B0FREENUL1 定价 46.0 库存 {fill} 待提交",
+                 "T_FREE B0FREEBIG1 定价 46.0 库存 50 待提交"):   # 没设 N:原数
+        assert line in out, line
+    assert "按本店最大库存上架 3 行" in out
+    assert "共 6 行将进入" in out
+    assert "最大库存" not in out.split("闸门:")[1].split(";")[0]  # N 不拦任何行

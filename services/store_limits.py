@@ -121,38 +121,35 @@ def stock_caps() -> dict[str, int]:
 #: **只在这里出生**:两条链按码分支,不各自重判一遍。
 QTY_NO_COUNT = "no_count"        # 亚马逊库存数没采到
 QTY_BELOW_MIN = "below_min"      # 低于全局门槛 amz_source.MIN_INVENTORY
-QTY_BELOW_CAP = "below_cap"      # 过了门槛,但低于本店最大库存
-QTY_CAPPED = "store_cap"         # 按本店最大库存写 N
+QTY_CAPPED = "store_cap"         # 亚马逊库存超过本店最大库存,按 N 写
 
 
 def stock_for(stock, cap: int | None) -> tuple[int, str]:
     """输入:亚马逊库存数(None = 没采到)+ 本店最大库存(None/≤0 = 没设)→ 输出:(沃尔玛该写的库存, 判定码)。
 
-    **上架与维护共用的唯一换算**(所有者定稿 2026-09-25)。先门槛、后上限:
+    **上架与维护共用的唯一换算**(所有者定稿 2026-09-25)。门槛与最大库存
+    **各管一件事**:
 
-      没采到数量(None)      → (0, no_count)   不算达到门槛,也不算达到 N
-      < MIN_INVENTORY(5)    → (0, below_min)  亚马逊库存要多,少了不卖
-      设了 N 且 < N          → (0, below_cap)
-      设了 N 且 ≥ N          → (N, store_cap)
-      没设 N                 → (原数, "")      原样跟随
+      · 门槛(`amz_source.MIN_INVENTORY`,全局常量 5)决定**卖不卖**:
+        低于门槛 → 上架侧不上架、维护侧写 0;
+      · 最大库存 N 决定**卖多少**:过了门槛,写 min(亚马逊库存, N)。
 
-    门槛与 N 是**两件事**,不互相替代(所有者原话:门槛是为了确保亚马逊库存
-    是多的,N 是为了确保我卖的数量不会太多)。所以 N=3 时亚马逊 3~4 件照样
-    判 0 —— 过不了门槛;N=20 时亚马逊 12 件也判 0 —— 够门槛但不够 N。
+      没采到数量(None)      → (0, no_count)
+      < 门槛                 → (0, below_min)
+      ≥ 门槛,设了 N 且 > N   → (N, store_cap)
+      其余                   → (原数, "")     没设 N,或亚马逊库存 ≤ N
 
-    ⚠ 两条链对 0 的**动作**不同,判定是同一个:上架侧 = 不上架并写理由;
-    维护侧 = 库存写 0。上架侧「没采到数量但页面显示有货」的保守铺货
-    (`amz_source.IN_STOCK_QTY`)只在**没设 N** 的店成立,在调用方判,
-    不进这里 —— 这里的 None 恒为"没采到 = 不卖"。
+    所有者给的两个例子(门槛 5 为现行值,门槛 3 只作说明):
+      门槛 5、N=3:0~4 件 → 0;5 件及以上 → 3
+      门槛 3、N=5:0~2 件 → 0;3 → 3,4 → 4,5 件及以上 → 5
     """
     if stock is None:
         return 0, QTY_NO_COUNT
     qty = int(stock)
     if qty < amz_source.MIN_INVENTORY:
         return 0, QTY_BELOW_MIN
-    if cap is not None and int(cap) > 0:
-        n = int(cap)
-        return (n, QTY_CAPPED) if qty >= n else (0, QTY_BELOW_CAP)
+    if cap is not None and 0 < int(cap) < qty:
+        return int(cap), QTY_CAPPED
     return qty, ""
 
 

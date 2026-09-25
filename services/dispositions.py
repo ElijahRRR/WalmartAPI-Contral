@@ -54,8 +54,9 @@ delete_verified / delete_not_effective ——"不信回执信观测"那套规则
   ③ **破坏组存在即压制同 SKU 的维护组**,实现在 `claim()` 的 _SUPPRESS_CLAUSE
      ——按库里所有未落定的破坏类建议判,**与两个扫描件谁先跑无关**。
      压制条数由 `count_suppressed()` 报,不许静默。
-     ⚠ 破坏组内部**不合并**:retire + delete 同 SKU 是 problem_scan 对顽固件
-     的有意设计(双 feed 齐发),合成一条会让一个的落定覆盖另一个。
+     ⚠ 破坏组内部**不合并**:retire + delete 同 SKU 曾是 problem_scan 对顽固件
+     的有意设计(双 feed 齐发,2026-09-25 所有者定稿停用:删除未生效改交人工),
+     存量行与将来别的来源仍可能同 SKU 各一条,合成一条会让一个的落定覆盖另一个。
   ④ **多来源支撑**:`sources` 列按来源分格记 {action, code, reason, at}。
      部分唯一索引 `(store, sku, action)` 跨来源,同一条被两条链命中时合成
      一行 —— 但两条理由都留在 sources 里,`reason`/`category` 由 claim() 现算

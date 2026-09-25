@@ -79,9 +79,11 @@ def test_plan_routing_and_dedup():
                          inflight={("T1", "S_FLY"), ("T1", "S_NEW")},
                          stubborn={("T1", "S_ZOMBIE")},
                          inflight_disposal={("T1", "S_FLY")})
-    # 顽固 SKU 停用+删除双 feed;过期与 Stage 留下,其余进删除桶
-    assert {r["sku"] for r in plans["T1"]["delete"]} == {"S_B", "S_ZOMBIE"}
-    assert [r["sku"] for r in plans["T1"]["retire"]] == ["S_ZOMBIE"]
+    # 删除未生效的 SKU 不再自动停用+删除双发(所有者 2026-09-25):不建议、点名交人工;
+    # 过期与 Stage 留下,其余进删除桶
+    assert {r["sku"] for r in plans["T1"]["delete"]} == {"S_B"}
+    assert plans["T1"]["retire"] == []
+    assert next(i for i in items if i["sku"] == "S_ZOMBIE")["stubborn"] is True
     assert "relist" not in plans["T1"]          # 反补桶不存在了
     assert n["stubborn"] == 1
     # 非 ACTIVE 店不再整店跳过(所有者 2026-09-10:「非 ACTIVE 店也需要在扫描范围内」)
@@ -89,7 +91,7 @@ def test_plan_routing_and_dedup():
     assert "inactive" not in n
     assert n["inflight"] == 1
     assert n["inflight_listing"] == 1        # S_NEW:上架 feed 在途,单列一桶
-    assert n["delete"] == 2                  # S_B + S_X;双击那条不计在 delete(摘要按行重算)
+    assert n["delete"] == 2                  # S_B + S_X;删除未生效那条交人工,不计在 delete
     assert n["recoverable"] == 2             # S_A / S_STAGE
     # 留下的行照常归类(进病历/摘要),走向由 recoverable 标出
     for it in items:
@@ -98,16 +100,23 @@ def test_plan_routing_and_dedup():
     assert items[1]["recoverable"] is False
 
 
-def test_to_dispositions_splits_double_hit():
-    """顽固双击 = **两条**建议行,不是一条。它们是两个 feed、两次独立的生效
-    判定,合成一行会让其中一个的落定结果覆盖另一个。"""
-    plans, _ = scan.plan([_item("T1", "S_Z", "prohibited product policy")],
-                         inflight=set(),
-                         stubborn={("T1", "S_Z")})
-    rows = scan.to_dispositions(plans)
-    assert sorted(r["action"] for r in rows) == ["delete", "retire"]
-    assert all(r["store"] == "T1" and r["sku"] == "S_Z" for r in rows)
-    assert all(r["source"] == "scan" for r in rows)
+def test_stubborn_skus_are_named_for_a_human_not_double_fed():
+    """删除未生效(delete_not_effective)的 SKU:2026-09-25 起**不再**自动停用+删除
+    双发(所有者:feed 显示成功但观测未生效「这种是人需要看的」,自动再处理「目前
+    来说没有必要」)。一条建议行都不出,但必须在摘要里点名 —— 静默不删等于让它们
+    从视野里消失。"""
+    items = [_item("T1", "S_Z", "prohibited product policy"),
+             _item("T2", "S_Y", "prohibited product policy")]
+    plans, n = scan.plan(items, inflight=set(),
+                         stubborn={("T1", "S_Z"), ("T2", "S_Y")})
+    assert scan.to_dispositions(plans) == []
+    assert n["stubborn"] == 2 and n["delete"] == 0
+    note = scan._stubborn_note(items)
+    assert "删除未生效 2 个" in note and "交人工复核" in note
+    assert "('T1', 'S_Z')" in note and "T2×1" in note
+    assert scan._stubborn_note([_item("T1", "S_A", "x")]) == ""
+    head = scan._summarize([], [], dict(n), 2)
+    assert "删除未生效交人工 2" in head[0] and "停用" not in head[0]
 
 
 def test_to_dispositions_carries_category_and_reason():
@@ -485,7 +494,7 @@ def test_summarize_counts_the_rows_that_actually_land():
     # 删除报 2(retire 之外的全部 delete 行),不是 n['delete'] 的 1
     assert "删除 2" in head[0]
     assert "扫描 99 行" in head[0]          # 2026-09-10 起扫描面是目录全量
-    assert "顽固停用 1" in head[0]
+    assert "停用 1" in head[0]                # retire 行照实报(2026-09-25 起扫描件不再产出)
     assert "其中审核判拒 1" in head[0]
     # 分店明细按建议行重建,audit 来源没有 category → 显示 '-'
     t1 = [l for l in head if l.startswith("  T1")][0]
@@ -640,7 +649,7 @@ def test_permanent_refusal_skus_are_skipped_and_counted_separately():
 
 
 def test_both_receipt_gates_also_block_the_stubborn_double_feed():
-    """顽固件的 retire+delete 双发同样拦(两桶都拦)。
+    """删除未生效的顽固件也先过两道回执闸(两桶都拦,按闸报数)。
 
     死档:delete 与 retire 都会拿到同一句「这个 SKU 不在了」;
     永久拒:delete 注定被拒,而 retire 对 WFS 件行不行官方没有明文。
@@ -651,7 +660,7 @@ def test_both_receipt_gates_also_block_the_stubborn_double_feed():
         items = [_item("T1", "S_Z", "prohibited product policy")]
         plans, n = scan.plan(items, set(), stubborn={("T1", "S_Z")},
                              **{bucket: {("T1", "S_Z")}})
-        assert n[key] == 1 and n["stubborn"] == 0, bucket
+        assert n[key] == 1 and n["stubborn"] == 0, bucket    # 闸在前,按闸报数
         assert plans.get("T1", {"delete": [], "retire": []})["delete"] == []
         assert plans.get("T1", {"delete": [], "retire": []})["retire"] == []
 
@@ -870,6 +879,11 @@ def _seed_pair(conn, *, replaced: bool):
             " 'failed', %s, now() - interval '3 days'),"
             "('F_INF', %s, 'list_new', %s, 'MP_ITEM', 'submitted', NULL, now())",
             (_OLD, _STORE, _PERM_CODE, _OLD, _STORE))
+        # 在途 = 台账 submitted **且** feed_log 未收口(feed_track.IN_FLIGHT_SQL,2026-09-25)
+        cur.execute(
+            "INSERT INTO ops.feed_log (workflow, store, feed_type, payload_key,"
+            " feed_id, status) VALUES ('list_new', %s, 'MP_ITEM', 'k-scan-inf',"
+            " 'F_INF', 'submitted')", (_STORE,))
 
 
 def _read(conn):

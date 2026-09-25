@@ -593,8 +593,8 @@ CREATE TABLE listing.sku_migrations (   -- 改码过程台账(2026-09-02,SKU 改
 -- 只有一个工作流看的过程列。两者的状态迁移必须**同一事务**完成(与
 -- retire_cooldown 之于 catalog.upc_pool 同款分工)。
 -- 状态(2026-09-07 起五个):pending(已落库,可能已发 feed)→ confirmed(catalog_sync
--- 观测到"新码在架且旧码缺席")/ rolled_back(回执失败或观测反证)/ stalled(超期判不准,
--- 点名人工)/ **double**(同店双挂:新码与旧码同时在架 —— 2026-09-07 所有者定稿,原话
+-- 观测到"新码在架且旧码缺席")/ rolled_back(回执失败)/ stalled(观测过了跟卖落定期限
+-- 新码仍未出现 —— 2026-09-25 起交人工不再自动回滚;或超期判不准,点名人工)/ **double**(同店双挂:新码与旧码同时在架 —— 2026-09-07 所有者定稿,原话
 -- 「双挂的就让他继续挂着,等到我其他的处理完了,我再回头处理他,中途不重复提交这种双挂
 -- 的就可以」)。double **不是终态**(不写 settled_at):它不进节奏闸的 open(`_SQL_STAGE`
 -- 只数 pending/stalled)⇒ 后续改码照发;不许再开第二条台账(候选判据「无未了结改码台账」
@@ -739,6 +739,8 @@ CREATE TABLE ops.feed_log (         -- feed 防重(核心安全表):先落 pendi
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX ON ops.feed_log (feed_type, store, payload_key);
+CREATE INDEX feed_log_feed_id_idx ON ops.feed_log (feed_id);   -- 2026-09-25:在途口径
+-- (feed_track.IN_FLIGHT_SQL = 台账 submitted 且 feed_log 未收口)按 feed_id 反查
 -- 启动对账:凡 status='pending'/'submitted' 的行,先查 Walmart 实际 feed 状态再决定补交
 -- 防重语义(2026-08-07 定稿):唯一索引拦的是在途行(pending/submitted);
 -- 终态行(done/failed)被 _log_claim 重占回 pending 后同载荷可再发(不设时间防重窗)

@@ -352,6 +352,16 @@ def receipt_blocked(conn, codes, store: str | None = None
         return {(st, sk) for st, sk in cur.fetchall()}
 
 
+#: 「这一行 feed 还在途」的**唯一 SQL 口径**(2026-09-25):台账仍 submitted,**且**
+#: 它的 feed 在 ops.feed_log 里还没收口(pending / submitted)。替代各处的
+#: 「submitted 且 48 小时内」:feed 按落定期限收口(FEED_DEADLINE_MINUTES),在途的
+#: 上限由期限给,不需要第二个时钟(所有者 09-25:在途闸留,48 小时上限随期限表去掉)。
+#: feed_log 已收口而行仍 submitted 的孤儿(人工改过台账等)不算在途 —— 不会把
+#: SKU 永久挡住。用法:`IN_FLIGHT_SQL.format(t="f")`,t 是 ops.feed_items 的别名。
+#: 消费方:workflows/problem_scan._SQL_INFLIGHT、workflows/sku_migrate._SQL_INFLIGHT_OLD。
+IN_FLIGHT_SQL = ("{t}.status = 'submitted' AND EXISTS (SELECT 1 FROM ops.feed_log l"
+                 " WHERE l.feed_id = {t}.feed_id AND l.status IN ('pending', 'submitted'))")
+
 #: 明细里查无的 SKU 落账时 raw_status 记的字样(沃尔玛没给这一条,不是某个枚举值)
 _ABSENT = "明细缺席"
 

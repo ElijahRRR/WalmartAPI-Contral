@@ -1134,6 +1134,10 @@ CREATE TABLE IF NOT EXISTS ops.feed_log (
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX IF NOT EXISTS feed_log_dedupe_uidx ON ops.feed_log (feed_type, store, payload_key);
+-- 在途口径(services/feed_track.IN_FLIGHT_SQL,2026-09-25)按 feed_id 反查 feed_log 是否已收口:
+-- problem_scan / sku_migrate 每轮对成千上万行做 EXISTS,普通索引(非唯一:存量有无
+-- feed_id 的 pending 行)
+CREATE INDEX IF NOT EXISTS feed_log_feed_id_idx ON ops.feed_log (feed_id);
 -- 启动对账:凡 status='pending'/'submitted' 的行,先查 Walmart 实际 feed 状态再决定补交
 
 CREATE TABLE IF NOT EXISTS ops.feed_items (

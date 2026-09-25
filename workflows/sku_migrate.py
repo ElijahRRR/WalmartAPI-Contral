@@ -38,8 +38,12 @@
       │      (僵尸列表,docs/backlog.md §十三),而**单条** GET 是 404 —— 同 wpid
       │      说明这两个码是同一条 listing(原地换码已生效),两条证据缺一不可。
       │      定案后果与上一条**逐字相同**(不新增写动作);double 行也走这一条。
-      ├──(回执 failed ∨ 观测反证且超 OBSERVE_HOURS)─────────▶ rolled_back
+      ├──(回执 failed)────────────────────────────────────▶ rolled_back
       │                                                        (旧行复活,新码弃掉)
+      ├──(观测新鲜且超 OBSERVE_HOURS 新码仍未出现)────────────▶ stalled(交人工,不回滚)
+      │      2026-09-25 所有者定稿:feed 结果与实际结果分开,观测说"未生效"只交人看,
+      │      不再自动回滚(观测可能晚到,也可能先生效后消失 —— 回滚一个其实已生效的
+      │      改码,登记簿说旧码、沃尔玛说新码,而且不报错)
       ├──(超 STALE_HOURS 仍判不出)──────────────────────────▶ stalled(点名人工,不自动定案)
       └──(新码在架 ∧ 旧码也在架 ∧ **不是**影子)──▶ double(记台账;不拦节奏闸、
                                             不重复提交;旧码缺席后自动转 confirmed;
@@ -208,14 +212,17 @@ FEED_TYPE = "MP_ITEM_MATCH"
 #: 2026-09-05 因形态 A 作废用过它一次(那次的值写着 MP_MAINTENANCE 不支持 SkuUpdate);
 #: 2026-09-06 通道定案 MP_ITEM_MATCH 后**清空**。下次再发现通道不可用,填一句人话进来
 #: 就地停闸即可 —— 停闸要保留的理由是:定案(_settle)必须继续跑,已发出去的 pending
-#: 要靠观测反证走 rolled_back 把旧码复活,一停整条工作流就没人替那些 pending 收尾。
+#: 要靠回执 failed 走 rolled_back 把旧码复活、观测超期的交人工,一停整条工作流就没人
+#: 替那些 pending 收尾。
 SUBMIT_DISABLED = ""
 #: 只迁 amz 出身的存量码(决策 D 默认:**跟卖不迁**)。PHUMWMT 串本就不含 ASIN,
 #: 货源隐匿收益为零;而 match 行的 source_key 是匹配 GTIN,改码后 upc_pool 的
 #: (店, ASIN) 键无从对上(跟卖不用 UPC 池),实测面直接翻倍。
 SOURCE_TYPES = (listing_sources.SOURCE_AMZ,)
-#: 观测期:官方 15 分钟~4 小时生效,取 24h 留量。超过它且观测反证 ⇒ 回滚。
-OBSERVE_HOURS = 24
+#: 观测期 = 跟卖(MP_ITEM_MATCH)的落定期限,官方「Updates may take up to 24 hours」
+#: (美国站,2026-09-25 重核;唯一出处 feed_track.FEED_DEADLINE_MINUTES)。超过它、
+#: 观测新鲜而新码仍未出现 ⇒ **stalled 交人工**(2026-09-25 起不再自动回滚)。
+OBSERVE_HOURS = feed_track.deadline_hours(FEED_TYPE)
 #: 超期线:超过它仍判不出 ⇒ 落 stalled 点名人工,**不自动定案**(判不准就判活:
 #: 回滚一个其实已经生效的改码,会让登记簿说旧码、沃尔玛说新码,而且不报错)。
 STALE_HOURS = 72
@@ -236,10 +243,10 @@ STALE_HOURS = 72
 #   吃光就抱锁等下一枚令牌,这是既有行为,不在本层另写一道闸)。
 #: -p limit 的缺省值(节奏闸只会把它压得更小,压不大)。
 DEFAULT_LIMIT = 10
-#: 逐候选的在途 feed 闸回看窗口。与 problem_scan._SQL_INFLIGHT 的 48h 同源:
-#: 在途口径**有意不分 feed 类型** —— 一条刚发出去的 MP_ITEM/DELETE_ITEM 在途时改码,
-#: 会让那条 feed 打在一个即将不存在的 SKU 上。
-INFLIGHT_HOURS = 48
+#: 逐候选的在途 feed 闸:口径是 feed_track.IN_FLIGHT_SQL(feed 还没收口),与
+#: problem_scan._SQL_INFLIGHT 同一份。2026-09-25 起不再有「48 小时内」回看窗口 ——
+#: feed 按落定期限收口,在途的上限由期限给。在途口径**有意不分 feed 类型**:一条
+#: 刚发出去的 MP_ITEM/DELETE_ITEM 在途时改码,会让那条 feed 打在一个即将不存在的 SKU 上。
 #: 候选 SQL 一次取回的**取数上限**(不是本轮提交上限)。2026-09-09 A131吕灿荣
 #: 实证:`-p limit=500` 只发出 45 条 —— 候选 SQL 先按 LIMIT 500 截断,三道后置闸
 #: (在途 feed / 死档 / Product ID 撞号)再从这 500 里剔掉 455,被剔的行**白占了
@@ -432,11 +439,10 @@ _SQL_WHY = (
 
 #: 逐候选的在途 feed 闸(W2 第⑥道)。**有意不分 feed_type**,口径与
 #: workflows/problem_scan 的在途防重同源。
-_SQL_INFLIGHT_OLD = """
-SELECT DISTINCT sku FROM ops.feed_items
-WHERE store = %(store)s AND sku = ANY(%(skus)s::text[])
-  AND status = 'submitted'
-  AND submitted_at > now() - make_interval(hours => %(hours)s)
+_SQL_INFLIGHT_OLD = f"""
+SELECT DISTINCT sku FROM ops.feed_items fi
+WHERE fi.store = %(store)s AND fi.sku = ANY(%(skus)s::text[])
+  AND {feed_track.IN_FLIGHT_SQL.format(t="fi")}
 """
 
 #: 自愈链在途:retire_cooldown 的 pending 行也指着旧码。
@@ -709,7 +715,9 @@ def _verdict(row: dict, receipt: tuple[str, str] | None, now) -> tuple[str, str]
            ∧ **旧码单查 404**(row["old_probe"]) ⇒ confirmed(列表接口的影子)
       (b)  新码在架 ∧ 旧码**也**在架              ⇒ double(记台账,不定案)
       (c)  新码未现 ∧ 回执 failed                 ⇒ rolled_back(确认没成)
-      (d)  新码未现 ∧ 观测新鲜 ∧ 超 OBSERVE_HOURS ⇒ rolled_back(观测反证)
+      (d)  新码未现 ∧ 观测新鲜 ∧ 超 OBSERVE_HOURS ⇒ stalled(观测说未生效,交人工;
+           2026-09-25 起**不再自动回滚**:所有者定稿 feed 结果与实际结果分开,
+           观测未生效只给人看 —— 新码可能晚到,也可能先生效后消失)
       (e)  超 STALE_HOURS 仍判不出                ⇒ stalled(点名人工)
       (f)  其余                                    ⇒ pending
 
@@ -754,8 +762,9 @@ def _verdict(row: dict, receipt: tuple[str, str] | None, now) -> tuple[str, str]
     if status == "failed":
         return _ROLLED_BACK, f"回执 failed({code or '无错误码'}):沃尔玛拒了这次改码"
     if row["fresh"] and age > timedelta(hours=observe_h):
-        return _ROLLED_BACK, (f"提交已 {age.total_seconds() / 3600:.0f}h、观测已跑过新的一轮,"
-                              f"新码仍未出现(超观测期 {observe_h}h)")
+        return _STALLED, (f"提交已 {age.total_seconds() / 3600:.0f}h、观测已跑过新的一轮,"
+                          f"新码仍未出现(超跟卖落定期限 {observe_h:g}h)—— 实际未生效,"
+                          f"交人工,**不自动回滚**(新码可能晚到,也可能先生效后消失)")
     if age > timedelta(hours=stale_h):
         return _STALLED, (f"提交已 {age.total_seconds() / 3600:.0f}h 仍判不出"
                           f"(新码未现且观测{'不新鲜' if not row['fresh'] else '新鲜但未到反证条件'})"
@@ -1192,8 +1201,8 @@ def _pick_report(store_name: str, only_skus, only_keys, excl_skus, excl_keys,
         if bad:
             return "不满足候选条件 —— " + ";".join(bad)
         if w["old_sku"] in inflight:
-            return (f"旧码上有 {INFLIGHT_HOURS}h 内的在途 feed(改了码,那条 feed "
-                    f"就打在一个即将不存在的 SKU 上)")
+            return ("旧码上有还没收口的在途 feed(改了码,那条 feed "
+                    "就打在一个即将不存在的 SKU 上)")
         if w["old_sku"] in gone_skus:
             return ("沃尔玛回执说该 SKU 已经不在了(死档):对它发 "
                     "MP_ITEM_MATCH 会**新建一条 listing**而不是改码"
@@ -1301,8 +1310,7 @@ def _candidates(conn, store_name: str, limit: int, *,
         inflight: set = set()
         if rows:
             cur.execute(_SQL_INFLIGHT_OLD, {"store": store_name,
-                                            "skus": [r["old_sku"] for r in rows],
-                                            "hours": INFLIGHT_HOURS})
+                                            "skus": [r["old_sku"] for r in rows]})
             inflight = {r[0] for r in cur.fetchall()}
         why: list[dict] = []
         if named:                      # 点名了就必须能解释,哪怕一条候选都没选出来
@@ -1321,7 +1329,7 @@ def _candidates(conn, store_name: str, limit: int, *,
     gone = {r["old_sku"] for r in rows if (store_name, r["old_sku"]) in gone_pairs}
     notes: list[str] = []
     if inflight:
-        notes.append(f"  ⚠ 跳过 {len(inflight)} 个:旧码上有 {INFLIGHT_HOURS}h 内的在途 feed"
+        notes.append(f"  ⚠ 跳过 {len(inflight)} 个:旧码上有还没收口的在途 feed"
                      f"(改了码那条 feed 就打在一个即将不存在的 SKU 上):"
                      f"{sorted(inflight)[:5]}")
     if gone:

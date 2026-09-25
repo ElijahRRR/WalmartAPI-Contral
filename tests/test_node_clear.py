@@ -2,8 +2,9 @@
 
 2026-09-25 所有者定稿:不调接口读库存、不逐条写 —— 从库里的分仓库存
 (catalog.item_node_inventory)查出要清的「SKU × 旧仓」,按「店 × 旧仓」分批用
-分仓库存 feed(MP_INVENTORY)写 0。判断条件(所有者确认):**维护仓有这个 SKU 的
-记录(数量 0 也算),且旧仓有货**。保留:受管仓必须校验过、节点身份未知不碰。
+分仓库存 feed(MP_INVENTORY)写 0。判断条件(所有者定稿):**维护仓以外、有货就清**,
+不看维护仓里有没有这个 SKU(「只清已接管」那道闸同日去掉)。保留:受管仓必须
+校验过、维护仓永不清、节点身份未知不碰。
 """
 
 import contextlib
@@ -67,18 +68,17 @@ def _wire(monkeypatch, stores, managed, skipped=None, words=None, rows=None,
     return seen, sent
 
 
-def test_criterion_managed_row_exists_and_old_node_has_stock():
-    """判断条件就是模块头注那张表:维护仓有记录(0 也算)且旧仓有货才清;
-    维护仓没有记录 = 没接管,不清;节点身份未知(空串)不碰。"""
-    targets, per_node, untaken, unknown = nc.plan([
-        ("A", "OLD", 999, True),        # 维护仓 3 + 旧仓 999 → 清
-        ("B", "OLD", 999, True),        # 维护仓 0(维护链写的)+ 旧仓 999 → 清
-        ("C", "OLD", 999, False),       # 维护仓没有记录 → 不清(清了就断售)
-        ("D", "", 5, True),             # 同步时没给 shipNode → 不碰
+def test_criterion_old_node_with_stock_is_cleared_regardless_of_managed_row():
+    """维护仓以外、有货就清(所有者定稿 2026-09-25),维护仓里有没有记录都一样;
+    只有同步时没给 shipNode 的(空串)没有节点可写,不碰。"""
+    targets, per_node, unknown = nc.plan([
+        ("A", "OLD", 999),      # 维护仓有记录
+        ("C", "OLD", 50),       # 维护仓没有记录 —— 也清(那道「只清已接管」的闸已去掉)
+        ("D", "", 5),           # 同步时没给 shipNode → 不碰
     ])
-    assert targets == {"OLD": ["A", "B"]}
-    assert per_node == {"OLD": (2, 1998)}
-    assert untaken == {"C": 999} and unknown == 1
+    assert targets == {"OLD": ["A", "C"]}
+    assert per_node == {"OLD": (2, 1049)}
+    assert unknown == 1
 
 
 def test_reads_the_db_not_the_inventory_api():
@@ -88,35 +88,36 @@ def test_reads_the_db_not_the_inventory_api():
     assert "catalog.item_node_inventory" in sql
     assert "missing_since IS NULL" in sql                # 只清目录里还在的码
     assert "avail_qty > 0" in sql                        # 旧仓有货
-    assert "m.ship_node = %(managed)s::text" in sql      # 维护仓有无记录
     assert "n.ship_node <> %(managed)s::text" in sql     # 维护仓本身永不清
+    assert "EXISTS" not in sql                           # 不看维护仓有没有记录
 
 
 def test_one_mp_inventory_batch_per_old_node(monkeypatch):
     """按「店 × 旧仓」分批:同一个 SKU 在两个旧仓都有货时,同一个 feed 里不能重复。"""
     seen, sent = _wire(monkeypatch, [_store("T1")], {"T1": "N_NEW"}, rows={
-        "T1": [("A", "OLD1", 5, True), ("A", "OLD2", 7, True),
-               ("B", "OLD1", 2, True), ("C", "OLD1", 50, False)]})
+        "T1": [("A", "OLD1", 5), ("B", "OLD1", 2), ("C", "OLD1", 50),
+               ("A", "OLD2", 7)]})
     out = nc.run({"store": "T1"})
     assert seen[0][1] == {"store": "T1", "managed": "N_NEW"}
     assert sent == [
         ("T1", "MP_INVENTORY", [{"sku": "A", "qty": 0, "ship_node": "OLD1"},
-                                {"sku": "B", "qty": 0, "ship_node": "OLD1"}],
+                                {"sku": "B", "qty": 0, "ship_node": "OLD1"},
+                                {"sku": "C", "qty": 0, "ship_node": "OLD1"}],
          "node_clear"),
         ("T1", "MP_INVENTORY", [{"sku": "A", "qty": 0, "ship_node": "OLD2"}],
          "node_clear"),
     ]
     first = out.splitlines()[0]
-    assert first.startswith("节点清零(受管仓以外):1 店,待清 3 条 SKU×旧仓 共 14 件")
-    assert "已提交 3 条,结果由 feed_poll 回写" in first
-    assert "旧仓 OLD1 2 个/7 件" in out and "旧仓 OLD2 1 个/7 件" in out
-    assert "还没有记录、本轮不清 1 个" in out and "C" in out   # 未接管的点名
+    assert first.startswith("节点清零(受管仓以外):1 店,待清 4 条 SKU×旧仓 共 64 件")
+    assert "已提交 4 条,结果由 feed_poll 回写" in first
+    assert "旧仓 OLD1 3 个/57 件" in out and "旧仓 OLD2 1 个/7 件" in out
+    assert "本轮不清" not in out
     assert "feed:F1,F2" in out
 
 
 def test_dry_run_sends_nothing(monkeypatch):
     _, sent = _wire(monkeypatch, [_store("T1")], {"T1": "N_NEW"}, rows={
-        "T1": [("A", "OLD", 999, True), ("B", "", 3, True)]})
+        "T1": [("A", "OLD", 999), ("B", "", 3)]})
     out = nc.run({"store": "T1", "dry_run": True})
     assert sent == []
     assert out.startswith("[DRY-RUN] 节点清零(受管仓以外):1 店,待清 1 条")
@@ -129,8 +130,7 @@ def test_dedup_failed_and_unknown_outcomes_are_named(monkeypatch):
     不要手工补发;被拒 → 点名。三种都要进摘要,不能只报"已提交"。"""
     outcomes = {"OLD1": "dedup", "OLD2": "unknown", "OLD3": "failed"}
     _wire(monkeypatch, [_store("T1")], {"T1": "N_NEW"}, rows={
-        "T1": [("A", "OLD1", 5, True), ("B", "OLD2", 5, True),
-               ("C", "OLD3", 5, True)]},
+        "T1": [("A", "OLD1", 5), ("B", "OLD2", 5), ("C", "OLD3", 5)]},
         outcome=lambda entries: outcomes[entries[0]["ship_node"]])
     out = nc.run({"store": "T1"})
     first = out.splitlines()[0]
@@ -160,7 +160,7 @@ def test_fleet_mode_covers_only_validated_managed_stores(monkeypatch):
     seen, sent = _wire(
         monkeypatch, [_store("T1"), _store("T2"), _store("T3")],
         {"T1": "N1"}, skipped={"T3": "读不到"}, words={"T3": "代理波动"},
-        rows={"T1": [("A", "OLD", 6, True)], "T2": [("B", "OLD", 9, True)]})
+        rows={"T1": [("A", "OLD", 6)], "T2": [("B", "OLD", 9)]})
     out = nc.run({})
     assert [p["store"] for _, p in seen] == ["T1"]     # T2 没配、T3 校验失败:都不查
     assert [s for s, *_ in sent] == ["T1"]

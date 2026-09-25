@@ -249,7 +249,7 @@ stockzero 静默失效(P0)、库存永久重写循环 + settle 恒 ineffective(P
      受管仓拿到正确库存(全程无断售空窗);
   2. `catalog_sync -p store=<店>` 复核受管仓已经有货;
   3. `node_clear -p store=<店> --dry-run` → 人眼确认 → 真跑。旧仓编号不用填
-     (2026-09-25 所有者定稿:从库里的分仓库存查出「维护仓有记录且旧仓有货」的
+     (2026-09-25 所有者定稿:从库里的分仓库存查出维护仓以外有货的
      「SKU × 旧仓」,按「店 × 旧仓」分批用 MP_INVENTORY feed 写 0,结果由
      feed_poll 回写;不带 `-p store` = 所有填了「维护仓库」且校验通过的店一起跑)。
      ⚠ 库里是上一次 catalog_sync 的数据:第 2 步那次同步就是第 3 步的输入。
@@ -330,7 +330,7 @@ list_new(批次 3)一开始就做对了(`managed_bad` 整店 `continue`),维护�
 
 **存量处置**(本仓不自动清,所有者操作):受影响的店按 §7 runbook 第 3 步
 `node_clear -p store=<店> --dry-run` → 人眼确认 → 真跑(旧仓从库里的分仓库存得出);
-`node_clear` 只清受管仓已有记录的 SKU,还没接管的跳过。⚠ A171罗尹鸿 /
+`node_clear` 受管仓以外有货就清(2026-09-25 起不再区分受管仓是否已接管)。⚠ A171罗尹鸿 /
 A085朱丽霖 不在任何一天的「校验失败」名单里,它们的双节点有货另有出处
 (接管后未跑 node_clear 的设计内状态,或别的写入方),先查
 `ops.dispositions` 里该店 `action='inventory' AND detail->>'ship_node' IS NULL`

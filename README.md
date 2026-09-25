@@ -385,7 +385,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 | `error_reclass` | | **存量报错按新码重新归类并回填**(手动跑;所有者 2026-09-03「标准不统一,审核误差很大」)。写 `audit.walmart_error_records` 与 `catalog.asin_blacklist` 的 `taxonomy_*` 新列,**老列与判定行为一个字不动**;原文四级优先(records 全文 → events 病历 → items 当前值 → 本表 200 字符样本,都没有就留 NULL 不猜);`taxonomy_version` 天然分页,跑一半可直接重跑。⚠ 报出「依据在新码下站不住」的黑名单行,但**不放行任何一条** —— 那是另一次裁决 |
 | `blacklist_route` | ⚠ | **存量 ASIN 黑名单按新码裁决重新路由**(手动跑,**删行不可逆**;所有者 2026-09-03 逐码裁决,表在 `docs/error_taxonomy.md` §十二)。留下 = 七个永久码(PROHIBITED_FINAL/POLICY/IP/BRAND/RECALL/FLAGGED/GATED)+ `OTHER` 的 business decision / trust & safety 两个词条 + **判不出来的**(查不出理由就继续禁);其余全删,主体是 `PT_WRONG`。三道闸:只动回填过的行、删前整行落 `backups/`、`--dry-run` 一行不动。⚠ 删完要跑 `blacklist_push` 才同步飞书 |
 | `product_clear` | 危 调 | 飞书停用/删除表驱动的商品清理 |
-| `node_clear` | 危 调 | 把**受管仓以外**的节点库存清零(搬仓收尾,一次性,不进调度):切到受管仓后旧节点的存量货自动链一律不碰,等受管仓充起来再用它清空旧仓。2026-09-25 起**不调接口读库存、不逐条写**:从库里的分仓库存(`catalog.item_node_inventory`)查出要清的「SKU × 旧仓」,按「店 × 旧仓」分批用分仓库存 feed(MP_INVENTORY)写 0,结果由 feed_poll 回写。判断条件:**维护仓有这个 SKU 的记录(数量 0 也算)且旧仓有货**才清,维护仓还没接管的不清;维护仓永不清;同步时没给 shipNode 的数量不碰。不带 `-p store` = 所有填了「维护仓库」且校验通过的店;第一次真跑先只跑一家店看回执 |
+| `node_clear` | 危 调 | 把**受管仓以外**的节点库存清零(搬仓收尾,一次性,不进调度):切到受管仓后旧节点的存量货自动链一律不碰,等受管仓充起来再用它清空旧仓。2026-09-25 起**不调接口读库存、不逐条写**:从库里的分仓库存(`catalog.item_node_inventory`)查出要清的「SKU × 旧仓」,按「店 × 旧仓」分批用分仓库存 feed(MP_INVENTORY)写 0,结果由 feed_poll 回写。判断条件:**维护仓以外有货就清**(不再区分维护仓是否已接管,2026-09-25 所有者定稿;维护仓还没有记录的商品清完在所有仓都是 0,靠维护链往维护仓补货,非亚马逊来源的就此停售);维护仓永不清;同步时没给 shipNode 的数量不碰。不带 `-p store` = 所有填了「维护仓库」且校验通过的店;第一次真跑先只跑一家店看回执 |
 | `node_probe` | | 多仓实测探针(纯只读):对指定店验 `docs/multi_node_plan.md` §2.4 的四条官方文档空白(shipnodes 有无 Virtual Node / 单品库存端点真形状 / 订单行带不带 shipNode / 新节点何时出现在库存响应)。每新开一个仓的店跑一次,输出贴回给 AI 核对 |
 
 **定价口径**:落地价 =(亚马逊单价 + 运费)× 区间倍率,按**配送方式**(FBA/FBM)

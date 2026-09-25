@@ -5,8 +5,8 @@
    "category": str|None,
    "price": float|None,          # amz 单价
    "shipping": float|None,       # 运费(定价输入 = 单价 + 运费;None≠0)
-   "stock": int|None,            # amz 可见库存(<5 淘汰,MIN_INVENTORY)
-   "lead_days": int|None,        # 配送时长(>12 天上架但库存写 0)
+   "stock": int|None,            # amz 可见库存(<5 淘汰,MIN_INVENTORY;换算 store_limits.stock_for)
+   "lead_days": int|None,        # 配送时长(超本店上限不上架 / 维护写 0)
    "channel": "FBA"|"FBM"|None,  # 定价区间路由
    "is_custom": bool,            # 定制品(定制产品不上架,2026-08-28 定稿)
    "images": [url, ...],         # 已按防御性排序(来源侧 set() 去重打乱顺序)
@@ -28,8 +28,10 @@ from registry import db, resources
 
 logger = logging.getLogger("services.amz_source")
 
-MIN_INVENTORY = 5           # 库存 <5 不上架(旧 MIN_INVENTORY_THRESHOLD)
-MAX_LEAD_DAYS = 7           # 配送 >7 天:上架但库存写 0 / 维护时清零
+MIN_INVENTORY = 5           # 亚马逊库存 <5:上架不上、维护写 0(旧 MIN_INVENTORY_THRESHOLD;
+                            # 维护侧 2026-09-25 所有者定稿补回。换算唯一实现
+                            # store_limits.stock_for,门槛与「最大库存」都在那里)
+MAX_LEAD_DAYS = 7           # 配送 >7 天:上架不上(2026-08-16 起)/ 维护时清零
                             # 所有者两次收紧:12 →(08-09)8 →(08-15)7。
                             # ⚠ 改这个数会动**生产在线商品**:下一轮
                             # maintenance 会把货期超标行的库存清零。

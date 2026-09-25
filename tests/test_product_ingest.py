@@ -377,7 +377,8 @@ def test_list_new_stock_three_way(monkeypatch):
     #   此前是"上架但库存写 0";不上架就不占 UPC、不占配额,比上一个卖不动的更省)
     assert "数据过滤 3" in out
     assert f"库存数未采到按 {amz_source.IN_STOCK_QTY} 铺货 1 行" in out
-    assert "库存不足:3" in out and "库存不足:0" in out
+    # 3 与 0 两行都卡在门槛上;理由写门槛的值(所有者定稿 2026-09-25)
+    assert out.count(f"亚马逊库存不足{amz_source.MIN_INVENTORY}") == 2
     assert "库存未知(状态 unknown)" in out
     # ⚠ 2026-08-16 合并后**两条改动叠加**:全局上限 8 → 7(main),
     # 且超限从"上架但清零"改成"不上架"(走进生产批次二)。于是 8 天那行

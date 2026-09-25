@@ -690,7 +690,8 @@ def test_quota_slices_after_filters(monkeypatch):
     monkeypatch.setattr(ln.amz_source, "fetch_products", lambda a: products)
 
     out = ln.run({"execute": False})
-    assert "库存不足:1" in out
+    # 理由文案(所有者定稿 2026-09-25):写门槛的值,数字跟着常量走
+    assert f"第2行:亚马逊库存不足{ln.amz_source.MIN_INVENTORY}" in out
     assert "共 1 行将进入" in out
     assert "B0GOODONE1" in out           # 幸存者顶上配额位(旧写法这里是 0 行)
     assert "超配额 1" in out             # 超额的是第二个幸存者,不是被淘汰行
@@ -2649,3 +2650,52 @@ def test_weight_fallbacks_are_bucketed_by_reason_in_the_summary(monkeypatch):
     assert "无采集重量 1" in out and "无单位记号 1" in out and "超 11 磅 1" in out
     assert "单位不认识" not in out          # 零值那一桶不打印(排版规范规矩 2)
     assert "共 4 行将进入" in out           # 兜底不拦上架,四行全进
+
+
+def test_store_max_stock_gate(monkeypatch):
+    """门槛决定**上不上**,限额表「最大库存」N 决定**上多少**(所有者定稿
+    2026-09-25):亚马逊库存 <5 不上架(理由写门槛的值);过了门槛,上架数量
+    = min(亚马逊库存, N);没设 N 的店是亚马逊原数。"""
+    rows = [_sheet_row(2, store="T_CAP3", asin="B0CAPBIG01"),
+            _sheet_row(3, store="T_CAP3", asin="B0CAPLOW01"),
+            _sheet_row(4, store="T_CAP3", asin="B0CAPNULL1"),
+            _sheet_row(5, store="T_CAP20", asin="B0MIDLOW01"),
+            _sheet_row(6, store="T_CAP20", asin="B0MIDBIG01"),
+            _sheet_row(7, store="T_FREE", asin="B0FREENUL1"),
+            _sheet_row(8, store="T_FREE", asin="B0FREEBIG1")]
+    base = {"title": "T", "price": 20.0, "stock_state": "in_stock",
+            "lead_days": 2, "channel": "FBM", "shipping": 3.0}
+    stock = {"B0CAPBIG01": 50, "B0CAPLOW01": 4, "B0CAPNULL1": None,
+             "B0MIDLOW01": 12, "B0MIDBIG01": 25, "B0FREENUL1": None,
+             "B0FREEBIG1": 50}
+    products = {a: {**base, "asin": a, "stock": s} for a, s in stock.items()}
+    stores = ("T_CAP3", "T_CAP20", "T_FREE")
+    monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
+    monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
+    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+        set(), {}, set(), {}, set(),
+        {"banned_pts": set(), "brands": set()}, {}, {},
+        {}))
+    monkeypatch.setattr(ln, "_load_quota", lambda: {})
+    monkeypatch.setattr(ln.store_limits, "price_multipliers",
+                        lambda: {s: {"fbm_range1": "200%"} for s in stores})
+    monkeypatch.setattr(ln.store_limits, "stock_caps",
+                        lambda: {"T_CAP3": 3, "T_CAP20": 20})
+    monkeypatch.setattr(ln.stores_svc, "load_stores",
+                        lambda names=None: [{"name": s} for s in stores])
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
+    monkeypatch.setattr(ln.amz_source, "fetch_products", lambda a: products)
+
+    out = ln.run({"execute": False})
+    assert f"第3行:亚马逊库存不足{ln.amz_source.MIN_INVENTORY}" in out  # 4 件:门槛
+    fill = ln.amz_source.IN_STOCK_QTY
+    for line in ("T_CAP3 B0CAPBIG01 定价 46.0 库存 3 待提交",     # 50 → 封顶 3
+                 "T_CAP3 B0CAPNULL1 定价 46.0 库存 3 待提交",     # 保守铺货量也封顶
+                 "T_CAP20 B0MIDLOW01 定价 46.0 库存 12 待提交",   # 12 < 20:原数
+                 "T_CAP20 B0MIDBIG01 定价 46.0 库存 20 待提交",   # 25 → 封顶 20
+                 f"T_FREE B0FREENUL1 定价 46.0 库存 {fill} 待提交",
+                 "T_FREE B0FREEBIG1 定价 46.0 库存 50 待提交"):   # 没设 N:原数
+        assert line in out, line
+    assert "按本店最大库存上架 3 行" in out
+    assert "共 6 行将进入" in out
+    assert "最大库存" not in out.split("闸门:")[1].split(";")[0]  # N 不拦任何行

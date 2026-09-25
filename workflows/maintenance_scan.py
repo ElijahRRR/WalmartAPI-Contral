@@ -163,6 +163,16 @@ def _preview_lines(intents: list[dict], stockzero: list[str]) -> list[str]:
                      + ",".join(f"{c}×{n}" for c, n in sorted(codes.items())))
         lines += _used_lines(zeroing)
         lines += _channel_lines(zeroing)
+    capped_i = [i for i in intents if i["kind"] == "inventory"
+                and i.get("code") == store_limits.QTY_CAPPED]
+    if capped_i:
+        # 限额表「最大库存」(所有者定稿 2026-09-25):非 0 的改库存在别处
+        # 只有逐店总数,封顶到 N 的这批不单列就看不出上限生效了多少
+        per: dict[str, int] = {}
+        for c in capped_i:
+            per[c["store"]] = per.get(c["store"], 0) + 1
+        lines.append(f"  按本店最大库存封顶 {len(capped_i)} 条:"
+                     + ",".join(f"{s}×{n}" for s, n in sorted(per.items())))
     by_store: dict[str, dict[str, int]] = {}
     for it in intents:
         by_store.setdefault(it["store"], {})[it["kind"]] = \
@@ -247,6 +257,8 @@ def run(params: dict) -> str:
     n_kind = {k: sum(1 for i in intents if i["kind"] == k) for k in _KIND_ORDER}
     n_zero = sum(1 for i in intents
                  if i["kind"] == "inventory" and i.get("new") == 0)
+    n_capped = sum(1 for i in intents if i["kind"] == "inventory"
+                   and i.get("code") == store_limits.QTY_CAPPED)
     n_cut = sum(c["total"] - c["kept"] for c in capped)
     # ⚠ 首行 = 结论 + 最要紧的数(notify_fmt 头注),而且**只有首行能到飞书**:
     # 唯一调度路径是 product_chain 链,cli 对成功步骤只发 first_line_of。
@@ -254,8 +266,9 @@ def run(params: dict) -> str:
     # "通知看起来一切正常"就会原样复现(对抗校验 2026-08-26 实跑证实)。
     lines = [f"维护意图 {len(intents)} 条:删除 {n_kind['delete']},"
              f"标题 {n_kind['title']},价格 {n_kind['price']},"
-             f"库存 {n_kind['inventory']}(清零 {n_zero};"
-             f"stockzero 店 {len(stockzero)} 家)"
+             f"库存 {n_kind['inventory']}(清零 {n_zero}"
+             + (f",封顶 {n_capped}" if n_capped else "")
+             + f";stockzero 店 {len(stockzero)} 家)"
              + (f";⚠ 截断 {len(capped)} 组共 {n_cut} 条顺延" if capped else "")
              + (f";⚠ 缺席避让 {len(absent)} 店:{','.join(sorted(absent))}"
                 f"(目录落后船队 >{store_absence.LAG_HOURS}h,"

@@ -155,6 +155,17 @@ def test_zero_is_a_switch_on_two_columns_only():
     assert _one(F.max_online, "3000", "")["severity"] == "mid"
 
 
+def test_max_stock_set_or_unset_is_high_value_change_is_mid():
+    """「最大库存」(2026-09-25):**设上 / 撤掉**才是 high(整店库存换规则),
+    调数值是 mid。与「库存特殊要求」不同,这里 0 与空是同一个意思(不限)。"""
+    assert _one(F.max_stock, "0", "3")["severity"] == "high"
+    assert _one(F.max_stock, "3", "")["severity"] == "high"
+    assert _one(F.max_stock, "3", "0")["severity"] == "high"
+    assert _one(F.max_stock, "3", "5")["severity"] == "mid"
+    assert _one(F.max_stock, "0", "")["severity"] == "mid"     # 两边都是不限
+    assert _one(F.max_stock, "3件", "3")["severity"] == "high"  # 非数字 = 没设
+
+
 def test_registered_but_ungraded_column_is_mid_not_info():
     """登记进 registry 了、但没在 `_SEV_BY_ATTR` 分档的列(维护仓库就是一个,
     将来新加的闸同理):不知道就按 mid,当成"不值一提"会让它第一次生效时没人

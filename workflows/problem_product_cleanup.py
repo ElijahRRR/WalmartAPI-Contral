@@ -78,7 +78,8 @@ _ACTION_FEED = {
     "delete": ("DELETE_ITEM", product_events.DELETE_SUBMITTED, "删除"),
 }
 # 同一 SKU 若同时被建议 retire 与 delete(顽固双击),两条都要发:
-# 先停用后删除,能删的删,删不掉的至少已经停用
+# 先停用后删除,能删的删,删不掉的至少已经停用。⚠ 2026-09-25 起 problem_scan
+# 不再产出顽固双击(删除未生效改交人工,所有者定稿);执行面保留,只消化存量建议行
 _ACTION_ORDER = ("retire", "delete")
 
 

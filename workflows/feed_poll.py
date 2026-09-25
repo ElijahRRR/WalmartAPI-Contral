@@ -13,6 +13,9 @@
                                           # (只读,不改台账、不跑反哺器)
                                           # X 可以只给**前缀**——摘要里那串截断的
                                           # 码(头 18 位)直接粘过来就行
+  python cli.py feed_poll -p review=1     # 实际结果复核清单:feed 成功(或没给结论)
+                                          # 但线上未生效的(默认近 7 天判定,-p days= /
+                                          # -p store= 收窄;只读 ops.feed_effects)
   python cli.py feed_poll -p stats=1      # 报错排行(默认近 30 天,全 feed 类型)
   python cli.py feed_poll -p stats=1 -p days=7 -p feed_type=MP_ITEM
 
@@ -67,8 +70,8 @@ import logging
 
 from api import feeds
 from registry import db
-from services import clear_sheet, feed_track, listing_sheet, maint_sheet, \
-    match_sheet, stores as stores_svc
+from services import clear_sheet, feed_effect, feed_track, listing_sheet, \
+    maint_sheet, match_sheet, stores as stores_svc
 
 # ⚠ DANGEROUS 保持 False(本工作流不调沃尔玛写接口),于是 cli.py 恒传
 # execute=True;**本工作流的 --dry-run 靠自己读 params["dry_run"]**,不靠
@@ -168,6 +171,48 @@ def _error_stats(days: int, feed_type: str = "") -> str:
         if sample:
             lines.append(f"        {str(sample)[:150]}")
     return "\n".join(lines)
+
+
+#: 复核清单里每组列几条样例(其余给数字,-p store= 收窄)
+_REVIEW_SAMPLES = 5
+
+
+def _review_list(days: int, store: str | None = None) -> str:
+    """输入:回看天数(+店铺)→ 输出:实际结果复核清单(只读 ops.feed_effects)。
+
+    所有者 2026-09-25:「如果 feed 显示该明细是成功的,但是观测结果是未生效,这种是
+    人需要看的。」清单只列不动 —— 实际结果不挂任何自动化,处置由人定。观测与实际
+    可能错开(先生效后消失,观测只看到未生效),每条都带观测时刻。
+    """
+    with db.pg_conn() as conn:
+        rows = feed_effect.review_rows(conn, days=days, store=store)
+    if not rows:
+        return (f"实际结果复核清单:近 {days} 天没有「feed 成功(或没给结论)但未生效」的明细")
+    ok = [r for r in rows if r["feed_status"] == "success"]
+    nv = [r for r in rows if r["feed_status"] != "success"]
+    out = [f"实际结果复核清单(近 {days} 天判定):feed 成功但未生效 {len(ok)} 条;"
+           f"沃尔玛没给结论且未生效 {len(nv)} 条 —— 只列不动,处置由人定"]
+    for title, group in (("feed 成功但未生效", ok),
+                         ("没给结论(超期未完成 / 未知状态 / 无法查询)且未生效", nv)):
+        if not group:
+            continue
+        out.append(f"  {title}:")
+        by: dict[tuple, list[dict]] = {}
+        for r in group:
+            by.setdefault((r["store"], r["feed_type"], r["workflow"]), []).append(r)
+        for (st, ft, wf), rs in sorted(by.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+            out.append(f"    {st} {feed_track._FEED_LABEL.get(ft, ft)}({wf})×{len(rs)}:")
+            for r in rs[:_REVIEW_SAMPLES]:
+                want = f"目标 {r['want']} → " if r.get("want") else ""
+                seen = (r["observed_at"].strftime("%m-%d %H:%M")
+                        if r.get("observed_at") else "?")
+                out.append(f"      {r['sku']} {want}观测 {r['observed']}(观测于 {seen},"
+                           f"{feed_track.text_of(r['feed_status'])},feed {r['feed_id']})")
+            if len(rs) > _REVIEW_SAMPLES:
+                out.append(f"      …另有 {len(rs) - _REVIEW_SAMPLES} 条(-p store= 收窄)")
+    out.append("  逐条查 feed:python cli.py feed_poll -p feed_id=<码>;观测与实际可能错开"
+               "(先生效后消失),以观测时刻为准")
+    return "\n".join(out)
 
 
 #: LIKE 前缀里要转义的三个字符(feed_id 是十六进制串,理论上碰不到,
@@ -382,6 +427,8 @@ def run(params: dict) -> str:
     if params.get("stats"):
         return _error_stats(int(params.get("days", 30)),
                             str(params.get("feed_type", "")))
+    if params.get("review"):    # 实际结果复核清单(只读 ops.feed_effects,不调沃尔玛)
+        return _review_list(int(params.get("days", 7)), params.get("store") or None)
     names = [params["store"]] if params.get("store") else None
     if params.get("stuck"):     # 在途清单(完整码 + 现成命令),只读
         # -p probe=1 才需要凭证:不带它的清单纯读台账,凭证缺失也跑得动

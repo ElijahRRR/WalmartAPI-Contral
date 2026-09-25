@@ -1167,6 +1167,33 @@ ALTER TABLE ops.feed_items ADD COLUMN IF NOT EXISTS error_desc text;
 --   存量行两列为 NULL(09-25 之前落定的,不回填)
 ALTER TABLE ops.feed_items ADD COLUMN IF NOT EXISTS raw_status text;
 ALTER TABLE ops.feed_items ADD COLUMN IF NOT EXISTS settled_by text;
+-- 实际结果按提交时刻回看一周(services/feed_effect.LOOKBACK_DAYS),给它一条索引
+CREATE INDEX IF NOT EXISTS feed_items_submitted_at_idx ON ops.feed_items (submitted_at);
+
+-- feed 明细的**实际结果**(所有者 2026-09-25 定稿:feed 结果与实际结果分开)。
+-- 一行 = 某个 feed 里某个 SKU 的一次判定,只有 生效 / 未生效,**判一次不回头改**。
+-- 写入方唯一:services/feed_effect.judge(catalog_sync 刷新观测之后调)。只判过了落定
+-- 期限的明细、用期限之后的观测;同一 (店, SKU, feedType) 之后又提交过的旧明细不判。
+-- 不挂任何自动化:复核清单(feed 成功 ∧ 未生效)给人看,
+-- `python cli.py feed_poll -p review=1`。
+CREATE TABLE IF NOT EXISTS ops.feed_effects (
+    feed_id     text NOT NULL,
+    sku         text NOT NULL,
+    store       text NOT NULL,
+    feed_type   text NOT NULL,
+    workflow    text NOT NULL,
+    feed_status text NOT NULL,     -- 判定时的 feed 结果:success / missing / overdue /
+                                   -- unrecognized / unreadable(failed 不判)
+    effect      text NOT NULL,     -- effective(生效)/ not_effective(未生效)
+    want        text,              -- 目标值(改价 / 改库存 / 改标题才有,取自处置建议行)
+    observed    text,              -- 观测到的:现值 / 在架 / 缺席 / RETIRED
+    observed_at timestamptz,       -- 那次观测的时刻(观测与实际可能错开,人看时对时刻)
+    basis       text NOT NULL,     -- 判据(人话)
+    judged_at   timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (feed_id, sku)
+);
+CREATE INDEX IF NOT EXISTS feed_effects_review_idx
+    ON ops.feed_effects (judged_at) WHERE effect = 'not_effective';
 
 -- 采集推送批次台账(所有者定稿 2026-08-09)。**两条工作流共用一张表**:
 -- product_refresh 的全量重推批次(`wm-refresh-*`)与 order_audit 的按邮编

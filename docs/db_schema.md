@@ -777,6 +777,33 @@ CREATE TABLE ops.feed_items (       -- feed 的 SKU 级台账(所有 feed 操作
 -- 不是失败:消费方不许拿它们回收 UPC、不许当失败定案;处置建议按 receipt_none 关单。
 -- **首次落定即定稿**:落账 UPDATE 一律带 `AND status = 'submitted'`,落过的行不改状态、
 -- 不刷 resolved_at(每轮重写会让 problem_scan 在途闸的「待观测」永远成立)。
+CREATE INDEX feed_items_submitted_at_idx ON ops.feed_items (submitted_at);  -- 实际结果回看一周
+
+CREATE TABLE ops.feed_effects (     -- feed 明细的**实际结果**(所有者 2026-09-25 定稿)
+    feed_id     text NOT NULL,
+    sku         text NOT NULL,
+    store       text NOT NULL,
+    feed_type   text NOT NULL,
+    workflow    text NOT NULL,
+    feed_status text NOT NULL,      -- 判定时的 feed 结果(success / missing / overdue /
+                                    -- unrecognized / unreadable;failed 不判)
+    effect      text NOT NULL,      -- effective(生效)/ not_effective(未生效),只有这两个
+    want        text,               -- 目标值(改价 / 改库存 / 改标题,取自处置建议 detail.new)
+    observed    text,               -- 观测到的:现值 / 在架 / 缺席 / RETIRED / 仍在架
+    observed_at timestamptz,        -- 那次观测的时刻(观测与实际可能错开,人看时对时刻)
+    basis       text NOT NULL,      -- 判据(人话)
+    judged_at   timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (feed_id, sku)
+);
+CREATE INDEX feed_effects_review_idx ON ops.feed_effects (judged_at) WHERE effect = 'not_effective';
+-- 「feed 结果与实际结果……是两个东西,应该分开」:feed 结果在 ops.feed_items(沃尔玛说
+-- 它执行了什么),实际结果在这里(线上到底变没变)。两本账互不写对方。
+-- 写入方唯一 services/feed_effect.judge(catalog_sync 刷新观测之后调):只判过了落定
+-- 期限、提交在一周内、且没被同 (店, SKU, feedType) 后一次提交覆盖的明细;用期限之后的
+-- 观测判**一次**,之后不改(ON CONFLICT DO NOTHING)。判据复用现有:改价/库存/标题 =
+-- dispositions.maint_effective,删除 = product_events.GONE_SQL,上架/跟卖 = 目录出现,
+-- 停用 = RETIRED 或缺席。**不挂任何自动化**:复核清单(feed 成功 ∧ 未生效,另列没给结论
+-- ∧ 未生效)`python cli.py feed_poll -p review=1` 给人看。
 -- 停用/删除/设置到期日期 + 上架/改价/改库存/改标题 feed 全走这一套 —— 七种
 -- feedType 均已接线(DELETE_ITEM / RETIRE_ITEM / MP_MAINTENANCE / MP_ITEM /
 -- MP_ITEM_MATCH / price / inventory),载荷构造唯一出处 api/feeds.py。

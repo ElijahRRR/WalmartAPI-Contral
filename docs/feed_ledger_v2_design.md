@@ -1,7 +1,7 @@
 # feed 台账 v2:每种结局都落到有事实依据的终态(设计草案)
 
 > **2026-09-25 更新:方向已由所有者修正 —— feed 结果与实际结果分开。以「〇」节为准;第一至九节是 09-24 草案原文,
-> 与〇节冲突的部分作废(清单见〇.5)。〇节本身仍待拍板(〇.6),未实施。**
+> 与〇节冲突的部分作废(清单见〇.5)。〇节除 pending(Q3)外已拍板并实施(〇.6 / 〇.7)。**
 >
 > **状态:草案,未实施,待所有者拍板(2026-09-24)。** 所有者原话:「在提交 feed 后,对于每种 feed 的查询和落帐……
 > 每种可能在数据库里都要有有事实依据的终态」。
@@ -42,16 +42,18 @@ feed 的初步想法是,提交 feed,追踪 feed 直至该 feed 的最长期限(�
 
 ### 〇.2 feed 结果:按类型期限收口(提案)
 
-**期限表**(官方原句见 refdata/walmart_slas.tsv;起点 = 拿到 feedId 的时刻,即 `feed_items.submitted_at`):
+**期限表**(所有者 2026-09-25:「期限按官方值、不加余量,请实际查看官方给的期限值,不猜测,不凭记忆回答」;
+当天逐页抓官方原文重核,原句与 URL 见 refdata/walmart_slas.tsv;同一操作给了几个数时取最长;起点 = 拿到
+feedId 的时刻,即 `feed_log.updated_at`):
 
-| feedType | 官方口径 | 期限(提案,不加余量) |
+| feedType | 官方口径(2026-09-25 核) | 期限(已实施) |
 |---|---|---|
-| price(及将来的 PRICE_AND_PROMOTION) | 批量改价 SLA 15 分钟 | 15 分钟 |
-| inventory / MP_INVENTORY | 最快 15 分钟,最长 4 小时反映到前台 | 4 小时 |
-| MP_ITEM / MP_MAINTENANCE | 处理最长 4 小时;数据可查最长 6 小时;Seller Center 状态更新最长 24 小时 | 24 小时(待定:或取处理口径 4 小时) |
-| MP_ITEM_MATCH | 最长 24 小时;无法导入时文件处理最长 72 小时 | 72 小时 |
-| RETIRE_ITEM | catalog 最长 48 小时 | 48 小时 |
-| DELETE_ITEM | 48 小时内删除;最长 72 小时从 Catalog 消失 | 72 小时 |
+| price(及将来的 PRICE_AND_PROMOTION) | 批量改价 SLA 15 分钟(旧版、新版两页同句) | 15 分钟 |
+| inventory / MP_INVENTORY | Seller Center:最快 15 分钟,最长 4 小时(开发者文档无时限) | 4 小时 |
+| MP_ITEM / MP_MAINTENANCE | 处理最长 4 小时;**单条合规审核最长 24 小时**(审核期间 INPROGRESS);Seller Center 状态更新最长 24 小时。例外:危险品合规审核 3 个工作日、GTIN 豁免人工审核不给时长 | 24 小时 |
+| MP_ITEM_MATCH | 美国站最长 24 小时。**09-12 登记的「无法导入时最长 72 小时」美国站页面已无**,只剩加拿大站 | 24 小时(原提案 72) |
+| RETIRE_ITEM | catalog 最长 48 小时(开发者文档与 Seller Center 同) | 48 小时 |
+| DELETE_ITEM | 48 小时内删除;最长 72 小时从 Catalog 消失(开发者文档无时限) | 72 小时 |
 
 feed_poll 每 30 分钟一轮,实际收口发生在期限后的第一轮(改价:提交后 15~45 分钟)。期限常量只在一处出生,
 feed_poll、实际结果、各在途闸都读它。
@@ -109,7 +111,7 @@ feed_poll、实际结果、各在途闸都读它。
 |---|---|---|---|---|
 | 1 | catalog_sync.py:232 → product_events.verify_deletions + sku_codec.abandon | 删除回执成功后,观测到商品没了 → 弃码 + 烧 UPC(弃码点 1) | 生效 → 记账 | 留 |
 | 2 | problem_scan.py:273 / :352(顽固双击) | 观测到"删了没生效"(delete_not_effective)→ 每轮停用 + 删除双发(2026-08 所有者定稿) | 未生效 → 自动重做 | 停,改进复核清单(代价:人处理前这些 SKU 一直挂着) |
-| 3 | sku_migrate._verdict (d) | 提交满 24 小时(OBSERVE_HOURS)、观测新鲜、新码没出现 → rolled_back 定案 | 未生效 → 自动定案;且 24 小时短于 MATCH 官方 72 小时,晚出现的新码会被误判回滚 | 改为到 72 小时仍未出现 → stalled 交人工,不自动回滚 |
+| 3 | sku_migrate._verdict (d) | 提交满 24 小时(OBSERVE_HOURS)、观测新鲜、新码没出现 → rolled_back 定案 | 未生效 → 自动定案(新码可能晚到,也可能先生效后消失) | 到跟卖落定期限(重核后 24 小时)仍未出现 → stalled 交人工,不自动回滚 |
 | 4 | dispositions.settle / settle_maintenance / expire_executing | 处置建议按观测现值判 confirmed / ineffective;维护类 3 天没等到观测一律 ineffective | 维护链自己的闭环(没改成 → 下轮扫描重新建议),不是重发同一个 feed | 留;判据与〇.3 共用一份 |
 | 5 | listing_sheet.heal_unknown | 台账没结论时,目录里看到在架 → 上架表标 Yes + UPC 标已用 | 生效 → 记账 | 留(feed 结果都有终态后,只有超期未完成 / 无法查询会走到这条) |
 | 6 | maint_sheet.STALE_DAYS = 3 | 飞书维护记录 3 天没终态写「未查到」 | 表侧第二个时钟 | 删,改为转述 feed 结果 |
@@ -125,17 +127,35 @@ feed_poll、实际结果、各在途闸都读它。
 - **原 D1~D17 去向**:D1 → Q3;D2 被〇.2 取代;D3 / D4 → Q2;D5 / D8 / D15 / D16 并入〇.4;D7 随 lapsed 作废;
   D14 并入〇.2 第 13 条;D6、D9~D13、D17 与本次无关,暂缓。
 
-### 〇.6 待拍板
+### 〇.6 拍板结果(所有者 2026-09-25)
 
-- **Q1 期限表**:按官方值、不加余量?MP_ITEM / MP_MAINTENANCE 取 24 小时还是官方处理口径 4 小时?
-- **Q2 期限后读不到明细**:404 立即落「无法查询」,其他错误(含店铺不可调用)再宽限 24 小时?
-- **Q3 pending**:期限内只读反查,到期仍查不到落 failed「提交未确认」,不自动补交?(推翻 08-16「不做对账器」)
-- **Q4 〇.4 七条**逐条留 / 停。
-- **Q5 实际结果第一版**:覆盖哪些操作(建议改价 / 库存 / 上架 / 跟卖 / 停用 / 删除,改标题有现成判据顺带);
-  复核清单放哪(建议先 CLI 查询 + feed_poll 摘要一行计数,需要再进飞书)。
+- **Q1 期限表**:「期限按官方值、不加余量,请实际查看官方给的期限值,不猜测,不凭记忆回答」⇒ 当天逐页重核
+  (〇.2 表);跟卖因美国站页面已无 72 小时那句改为 24 小时。
+- **Q2 读不到明细**:批。404 到期后立即「无法查询」,其他错误(含店铺不可调用)再宽限 24 小时。
+- **Q3 pending**:**未定**。所有者先问「说明可能没提交上?现在的逻辑是什么样子的」,已答复:pending ≠ 没提交上
+  (POST 可能已达、只是没拿到 feedId);现行只告警、永不老化、同载荷被挡死;建议仍是〇.2 第 8 条(只读反查、
+  到期落 failed「提交未确认」、不自动补交),另需补提交条数 / SKU 列表 / 「请求已发出」标记三样。等所有者定。
+- **Q4 〇.4 七条**:「按你的建议来(你要重新调研官方的期限值,可能需要跟随调整时间)」⇒ 第 3 条时间点随跟卖
+  期限改为 24 小时。
+- **Q5 实际结果第一版**:「覆盖操作按你的建议来」⇒ 改价 / 库存 / 标题 / 上架 / 跟卖 / 停用 / 删除。复核清单
+  `feed_poll -p review=1`;新判计数放 catalog_sync 摘要(判定发生在那里、一天一次),不放 feed_poll 摘要
+  (一天 48 轮,固定计数行没人看)。
 
-**拍板后的落地顺序**:① feed 结果收口(期限表、首次定稿、新终态词、读不到的处理、pending、dry-run 零写入、
-飞书文案)② 实际结果表 + 判定 + 复核清单 ③〇.4 里定了要改的几条。每步先 dry-run 给所有者看条数,再真跑。
+### 〇.7 实施记录(2026-09-25)
+
+- **① feed 结果收口**(b4b8b67):FEED_DEADLINE_MINUTES;poll_feed 汇总终态或到期读明细,到期强制落定
+  overdue / unrecognized,首次落定即定稿(`AND status='submitted'`);到期后 404 / 宽限后读不到落 unreadable
+  (FeedQueryError 带 HTTP 码);raw_status / settled_by 两列;feed_poll --dry-run 零写入;-p store 只轮询那一家;
+  消费方:处置建议 receipt_none 关单、上架表写原词不重试不回收 UPC、sku_locked_heal 中间态当未落定。
+  真库(沙箱 PG16)验证落账 SQL。
+- **③ 七处**(9563d61):顽固双击停用改交人工(problem_scan 首行「删除未生效交人工 N」+ 点名);sku_migrate (d)
+  改 stalled;维护表 3 天时钟删除;在途口径唯一出处 feed_track.IN_FLIGHT_SQL(台账 submitted 且 feed_log 未
+  收口),去掉 48 小时上限。#1 / #4 / #5 / #7 的"待观测"闸保留。
+- **② 实际结果**:ops.feed_effects + services/feed_effect(判一次、被覆盖不判、期限后观测、回看 7 天、failed
+  不判、复用 maint_effective 与 product_events.GONE_SQL);catalog_sync 观测之后判(空跑 rollback、失败隔离);
+  `feed_poll -p review=1` 复核清单。删除核验的未生效宽限对齐删除期限 72 小时(原 48)。
+- **上线顺序**:`python cli.py db_init`(加两列、两个索引、一张表)→ `python cli.py feed_poll --dry-run`
+  看首轮会按期限收口多少存量 feed / SKU → 真跑 → `python cli.py catalog_sync --dry-run` 看实际结果将判多少。
 
 ## 一、现状:每种 feed 的查询与落账
 

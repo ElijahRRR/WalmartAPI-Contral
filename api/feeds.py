@@ -612,10 +612,25 @@ def _feed_url(feed_id: str) -> str:
     return f"{_client.base_url()}/v3/feeds/{quote(feed_id, safe='')}"
 
 
+class FeedQueryError(RuntimeError):
+    """feed 状态 / 明细 GET 没拿到 200 JSON。`status` 是 HTTP 状态码,网络未达为 None。
+
+    带码上抛是为了让调用方分得清 **404**(官方:「The feedId does not exist or is
+    not visible to your account.」,feeds-overview)与其他读取失败 —— 落定期限
+    过后两者处置不同(services/feed_track)。文案用「返回 {status}」格式,
+    store_retry.diagnose 靠它归类(沃尔玛NNN / 网络未达)。
+    """
+
+    def __init__(self, msg: str, status):
+        super().__init__(msg)
+        self.status = status
+
+
 def get_feed_status(store: dict, feed_id: str) -> dict:
     """输入:店铺 + feed_id → 输出:汇总 dict(feedStatus/itemsReceived/…)。
 
     未知 feedStatus 告警而非静默"处理中"(防官方加值导致行永久卡死,C1 实证)。
+    非 200 抛 FeedQueryError(带 HTTP 码)。
     """
     _client.rate_acquire("feeds.get", store["client_id"])
     token = _client.get_token(store["client_id"], store["client_secret"],
@@ -624,7 +639,7 @@ def get_feed_status(store: dict, feed_id: str) -> dict:
         _feed_url(feed_id), token, store["client_id"], store["proxy"],
         params={"limit": 0}, max_retries=2)
     if status != 200 or not isinstance(data, dict):
-        raise RuntimeError(f"feed 状态查询失败 HTTP {status}(feedId={feed_id})")
+        raise FeedQueryError(f"feed 状态查询返回 {status}(feedId={feed_id})", status)
     fs = data.get("feedStatus")
     if fs not in FEED_STATUSES:
         logger.warning("未知 feedStatus=%r(feedId=%s),官方枚举可能已扩,请核对",
@@ -633,7 +648,10 @@ def get_feed_status(store: dict, feed_id: str) -> dict:
 
 
 def iter_feed_items(store: dict, feed_id: str):
-    """输入:店铺 + feed_id → 输出:逐 SKU 明细生成器(itemDetails,50/页自动翻)。"""
+    """输入:店铺 + feed_id → 输出:逐 SKU 明细生成器(itemDetails,50/页自动翻)。
+
+    非 200 抛 FeedQueryError(带 HTTP 码,同 get_feed_status)。
+    """
     offset = 0
     token = _client.get_token(store["client_id"], store["client_secret"],
                               store["proxy"])
@@ -645,7 +663,8 @@ def iter_feed_items(store: dict, feed_id: str):
                     "offset": offset},
             max_retries=2)
         if status != 200 or not isinstance(data, dict):
-            raise RuntimeError(f"feed 明细查询失败 HTTP {status}(feedId={feed_id})")
+            raise FeedQueryError(
+                f"feed 明细查询返回 {status}(feedId={feed_id})", status)
         items = ((data.get("itemDetails") or {}).get("itemIngestionStatus")
                  or [])
         yield from items

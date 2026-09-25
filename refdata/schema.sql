@@ -1144,7 +1144,9 @@ CREATE TABLE IF NOT EXISTS ops.feed_items (
     workflow    text NOT NULL,
     store       text NOT NULL,
     feed_type   text NOT NULL,
-    status      text NOT NULL,     -- submitted / success / failed / missing(明细里查无此 SKU)
+    status      text NOT NULL,     -- submitted / success / failed / missing(汇总终态、明细里查无此 SKU)
+                                   -- / overdue(到落定期限仍未处理完)/ unrecognized(到期时状态值不认识)
+                                   -- / unreadable(到期后读不到明细);后三个 = 沃尔玛没给结论,不是失败
     error_code  text,
     error_desc  text,               -- 沃尔玛给的人话描述(+字段名):光有数字码
                                     -- 无法诊断(2026-08-09 首跑 DATA_ERROR 教训)
@@ -1153,6 +1155,14 @@ CREATE TABLE IF NOT EXISTS ops.feed_items (
     PRIMARY KEY (feed_id, sku)
 );
 ALTER TABLE ops.feed_items ADD COLUMN IF NOT EXISTS error_desc text;
+-- 落定的事实依据(所有者 2026-09-25:每种结局都要有有事实依据的终态;feed 按 feedType
+-- 落定期限收口,见 services/feed_track.FEED_DEADLINE_MINUTES)。首次落定即定稿,之后不改。
+--   raw_status  沃尔玛原始 ingestionStatus(SUCCESS / DATA_ERROR / INPROGRESS / 不认识的原值);
+--               明细里查无记「明细缺席」,读不到记归类(沃尔玛404 / 代理波动 / 店铺不可调用…)
+--   settled_by  head = 汇总终态时落 / deadline = 到期强制落 / unreadable = 到期后读不到
+--   存量行两列为 NULL(09-25 之前落定的,不回填)
+ALTER TABLE ops.feed_items ADD COLUMN IF NOT EXISTS raw_status text;
+ALTER TABLE ops.feed_items ADD COLUMN IF NOT EXISTS settled_by text;
 
 -- 采集推送批次台账(所有者定稿 2026-08-09)。**两条工作流共用一张表**:
 -- product_refresh 的全量重推批次(`wm-refresh-*`)与 order_audit 的按邮编

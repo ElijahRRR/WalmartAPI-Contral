@@ -22,7 +22,10 @@
   · 观测      —— delete_verified / delete_not_effective(不信回执信观测);
   · receipt_gone   —— 回执码 ∈ `resources.WALMART_ERR_ITEM_GONE`:沃尔玛说这个
                       SKU 已经不在了(删了/退役了/停用了/匹配库里查无)⇒ confirmed;
-  · receipt_failed —— 回执 failed/missing ⇒ ineffective,下轮重新建议。
+  · receipt_failed —— 回执 failed/missing ⇒ ineffective,下轮重新建议;
+  · receipt_none   —— 回执**没给结论**(feed_track.NO_VERDICT_STATUSES:到了落定
+                      期限仍在跑 / 状态不认识 / 读不到,所有者 2026-09-25 定稿的
+                      期限收口)⇒ ineffective 关单并注明,下轮扫描重新判断。
 补前两种之前**回执失败没有任何落定路径**:全船队约 800 条 delete/retire 停在
 executing 数周,部分唯一索引挡住同 SKU 再建议 ⇒ 永不重删(见 _SETTLE_RECEIPT_SQL)。
 ⚠ `receipt_gone` 是**处置账的收尾,不是身份层的结论**:本模块不弃码、不改
@@ -70,6 +73,7 @@ delete_verified / delete_not_effective ——"不信回执信观测"那套规则
 import logging
 
 from registry import resources
+from services import feed_track
 
 logger = logging.getLogger("services.dispositions")
 
@@ -244,7 +248,10 @@ SET status = CASE WHEN r.error_code = ANY(%(gone)s::text[])
     settled_at = now(),
     detail = d.detail || jsonb_build_object(
         'settled_by', CASE WHEN r.error_code = ANY(%(gone)s::text[])
-                           THEN 'receipt_gone' ELSE 'receipt_failed' END,
+                           THEN 'receipt_gone'
+                           WHEN r.status = ANY(%(no_verdict)s::text[])
+                           THEN 'receipt_none'
+                           ELSE 'receipt_failed' END,
         'receipt_status', r.status,
         'error_code', r.error_code,
         'error_desc', left(r.error_desc, 300))
@@ -258,9 +265,14 @@ WHERE d.status = 'executing'
 RETURNING d.status, d.detail->>'settled_by' AS settled_by
 """
 
-#: 「回执已经是终局」的两个台账状态。success 不在里面:那一档归观测核验
+#: 「回执已经是终局」的台账状态。success 不在里面:那一档归观测核验
 #: (48h 宽限);submitted 也不在:那一档还没轮询到,归 feed_poll。
-_RECEIPT_SETTLING = ("failed", "missing")
+#: 2026-09-25 起 feed 按 feedType 落定期限收口,台账多了三个"沃尔玛没给结论"
+#: 的终态(overdue / unrecognized / unreadable,唯一出处 feed_track)。它们也是
+#: 终局 —— 不收的话处置行永远 executing,部分唯一索引挡住同 SKU 再建议;按
+#: ineffective 关单(settled_by=receipt_none),**不当失败**:下轮扫描按观测重新
+#: 判断要不要再做,生效与否由实际结果另判。
+_RECEIPT_SETTLING = ("failed", "missing") + feed_track.NO_VERDICT_STATUSES
 
 
 def suggest_many(conn, rows: list[dict]) -> int:
@@ -679,13 +691,15 @@ def mark_executing(conn, ids: list[int], feed_id, by: str = "") -> int:
 
 
 def settle(conn) -> dict:
-    """输入:连接 → 输出:{confirmed, ineffective, receipt_gone, receipt_failed}。
+    """输入:连接 → 输出:{confirmed, ineffective, receipt_gone, receipt_failed, receipt_none}。
 
     落定有**三种来源**(2026-09-09 补第二、三种),`detail.settled_by` 区分:
       · `observed`(实际写的是事件名 delete_verified / delete_not_effective)
         —— 观测判决,catalog_sync 经 product_events.verify_deletions 落的;
       · `receipt_gone`   —— 回执说这个 SKU 已经不在了 ⇒ confirmed;
-      · `receipt_failed` —— 回执失败(含永久拒与临时失败)⇒ ineffective。
+      · `receipt_failed` —— 回执失败(含永久拒与临时失败)⇒ ineffective;
+      · `receipt_none`   —— 回执没给结论(到期仍在跑 / 状态不认识 / 读不到)
+                            ⇒ ineffective,注明不是失败。
     confirmed / ineffective 两个计数是**总数**(含回执来源),后两个是其中
     回执判的那部分 —— 摘要两行都要报,别只报总数。
 
@@ -696,7 +710,7 @@ def settle(conn) -> dict:
     本函数**只动处置账**:不弃码、不改 walmart_items、不记 product_events。
     """
     out = {"confirmed": 0, "ineffective": 0,
-           "receipt_gone": 0, "receipt_failed": 0}
+           "receipt_gone": 0, "receipt_failed": 0, "receipt_none": 0}
     with conn.cursor() as cur:
         for sql in (_SETTLE_DELETE_SQL, _SETTLE_RELIST_SQL):
             cur.execute(sql)
@@ -706,13 +720,18 @@ def settle(conn) -> dict:
         cur.execute(_SETTLE_RECEIPT_SQL, {
             "gone": sorted(resources.WALMART_ERR_ITEM_GONE),
             "actions": list(DESTRUCTIVE_ACTIONS),
-            "settling": list(_RECEIPT_SETTLING)})
+            "settling": list(_RECEIPT_SETTLING),
+            "no_verdict": list(feed_track.NO_VERDICT_STATUSES)})
         for st, by in cur.fetchall():
             out[st] = out.get(st, 0) + 1
             out[by] = out.get(by, 0) + 1
     if observed_bad:
         logger.warning("处置建议落定:%d 条**未生效**(回执成功但观测显示没动)"
                        "——下轮扫描会重新建议", observed_bad)
+    if out["receipt_none"]:
+        logger.warning("处置建议按回执落定:回执没给结论 %d 条(到了落定期限仍在跑 / "
+                       "状态不认识 / 读不到,不是失败)—— 关单,下轮扫描按观测重新判断",
+                       out["receipt_none"])
     if out["receipt_gone"] or out["receipt_failed"]:
         # 必须见人:这两档以前**根本没有落定路径**,行一路卡在 executing,
         # 而部分唯一索引挡着同 SKU 再建议(全船队实测卡了约 800 条数周)

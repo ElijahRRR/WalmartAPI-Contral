@@ -90,7 +90,7 @@ def test_poll_writes_terminal_results_and_skips_failed_rows(monkeypatch):
     written = {rng: vals[0] for rng, vals in calls["write"]}
     assert written["E2:H2"][2] == "成功"
     assert written["E3:H3"][2:] == ["失败", "ERR_X"]         # G=结果,H=报错码分列
-    assert written["E4:H4"][2] == "未查到"
+    assert written["E4:H4"][2] == "明细无此条"
 
 
 def test_slice_rows_get_matching_feed_ids(monkeypatch):

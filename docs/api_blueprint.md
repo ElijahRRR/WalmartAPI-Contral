@@ -157,28 +157,29 @@ docs/legacy_survey.md 的"共享桶"结论与 CLAUDE.md 相应表述据此**修�
 **feed 轮询官方建议节奏**:INPROGRESS 时 15 分钟 → 1 小时 → 2 小时 → 此后每 4 小时;
 价格 feed 至少等 5 分钟再查(SLA 15 分钟)。
 
-### 3.1 各操作「多久生效」的官方窗口(2026-09-12 全量核验)
+### 3.1 各操作「多久生效」的官方窗口(2026-09-12 全量核验,2026-09-25 逐页重核)
 
 **明细与官方原句在 `refdata/walmart_slas.tsv`**(一操作一行,带官方 URL 与核对日期)。
-速记:
+**落定期限**(所有者 2026-09-25 定稿:「期限按官方值、不加余量,请实际查看官方给的期限值,
+不猜测,不凭记忆回答」;唯一出处 `services/feed_track.FEED_DEADLINE_MINUTES`)速记:
 
-| 操作 | 官方值 | 判死期限(本仓) |
+| feedType | 官方口径(同一操作给了几个数时取最长) | 落定期限 |
 |---|---|---|
-| 批量建品/改品处理(MP_ITEM / MP_MAINTENANCE) | 最长 **4 小时** | 72 小时 |
-| 提交成功 → 数据可查(catalog 可见) | 最长 **6 小时** | — |
-| Hazmat 人工审核(Walmart-fulfilled) | 最长 **48 小时** | 见 MP_ITEM |
-| item setup 状态更新(Seller Center 侧) | 最长 **24 小时**;危险品合规审核最长 **3 个工作日** | 见 MP_ITEM |
-| 按匹配上架(MP_ITEM_MATCH) | 最长 **24 小时**;无法导入时文件处理最长 **72 小时** | 72 小时 |
-| 批量改价(price / PRICE_AND_PROMOTION) | SLA **15 分钟** | 8 小时 |
-| 库存更新(inventory / MP_INVENTORY) | 最快 15 分钟,最长 **4 小时** | 24 小时 |
-| 停用/退役(RETIRE_ITEM) | 通常几分钟,catalog 最长 **48 小时** | 72 小时 |
-| 删除(DELETE_ITEM) | **48 小时**内删除,最长 **72 小时**从 Catalog 消失 | 96 小时 |
+| price / PRICE_AND_PROMOTION | 批量改价 SLA **15 分钟**(旧版、新版两页同句) | 15 分钟 |
+| inventory / MP_INVENTORY | Seller Center 批量改库存:最快 15 分钟、最长 **4 小时**(开发者文档无时限) | 4 小时 |
+| MP_ITEM / MP_MAINTENANCE | 处理最长 4 小时;**单条合规审核最长 24 小时**(审核期间 INPROGRESS);Seller Center 状态更新最长 24 小时 | 24 小时 |
+| MP_ITEM_MATCH | 美国站最长 **24 小时**(09-12 登记的「无法导入时最长 72 小时」美国站页面已无,只剩加拿大站) | 24 小时 |
+| RETIRE_ITEM | catalog 最长 **48 小时**(开发者文档与 Seller Center 同) | 48 小时 |
+| DELETE_ITEM | 48 小时内删除,最长 **72 小时**从 Catalog 消失(开发者文档无时限) | 72 小时 |
 
-⚠ **官方不给 feed 级的"最长处理时间"**,也不给 feed 状态的保留窗口(四页核验均无:
-feeds-overview / list-all-feed-statuses / getallfeedstatuses / item-setup-sla)。判死期限
-是这样反推出来的:**feed 落定必然发生在业务生效之前** ⇒ 生效窗口的上限就是"还在正常
-处理"的上限;超过它 + 余量还没落定 = 不可能是慢,只能是卡死(用法见
-docs/feed_closure_audit.md §三.4)。最慢的一档是 72 小时。
+例外(官方也写了,不进期限):危险品合规审核最长 3 个工作日;GTIN 豁免人工审核不给时长、
+批准后须等 4 小时重新提交;WFS 的 Hazmat 审核最长 48 小时(本仓自发货不适用)。这几类
+到期仍 INPROGRESS 的落「超期未完成」,生效与否交实际结果。
+
+⚠ **官方不给 feed 级的"最长处理时间"**,也不给 feed 状态的保留窗口(feeds-overview /
+list-all-feed-statuses / getallfeedstatuses / item-setup-sla 均无)。期限到了按明细强制
+落定(docs/feed_ledger_v2_design.md「〇」节);GET 404 官方原文是「The feedId does not
+exist or is not visible to your account.」,到期后遇到直接落「无法查询」。
 
 ⚠ **汇总(feed 级 head)会停更,别拿它当处理进度**(2026-09-22 生产实证,所有者
 09-23 核实):A131吕灿荣 改价 feed(71 SKU)汇总 31 小时停在 `INPROGRESS / 成功 0 /
@@ -186,9 +187,9 @@ docs/feed_closure_audit.md §三.4)。最慢的一档是 72 小时。
 观测生效;同轮 16 条跨店改价 feed(1,960 SKU)同样。与官方 Legacy 改价页那句
 「Individual SKU price update success or failure is only available after the entire
 feed is processed」正好相反 —— 明细先有了,汇总没收口。⇒ 汇总未终态时它的计数不作数:
-`services/feed_track.poll_feed` 对提交超 `HEAD_STALE_HOURS`(1 小时)仍非终态的 feed
-改读明细(端点 17 的 `includeDetails=true`,50/页,吃 `feeds.get` 同一个桶,不另立桶),
-有结论的落账,台账全部有结论就按明细收口(docs/feed_closure_audit.md §三.4「缺口 ②」)。
+`services/feed_track.poll_feed` 到了 feedType 的落定期限(改价 15 分钟,见 §3.1)就不管
+汇总怎么说,读明细强制落定(端点 17 的 `includeDetails=true`,50/页,吃 `feeds.get`
+同一个桶,不另立桶)。2026-09-24 的 `HEAD_STALE_HOURS`(1 小时)闸已由它取代(09-25)。
 
 ⚠ **新建 item 发批量改价有前置条件**(官方原句在 tsv):「ensure that the Walmart Part ID
 (WPID) has been assigned and that **at least 24 hours have passed since item creation**

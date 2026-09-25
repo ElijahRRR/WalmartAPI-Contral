@@ -749,16 +749,32 @@ CREATE TABLE ops.feed_items (       -- feed 的 SKU 级台账(所有 feed 操作
     workflow    text NOT NULL,
     store       text NOT NULL,
     feed_type   text NOT NULL,
-    status      text NOT NULL,      -- submitted / success / failed / missing
+    status      text NOT NULL,      -- submitted / success / failed / missing(汇总终态、明细里查无)
+                                    -- / overdue / unrecognized / unreadable(见下)
     error_code  text,
     error_desc  text,               -- 沃尔玛给的人话描述(+字段名):光有数字码
-                                    -- 无法诊断(2026-08-09 首跑 DATA_ERROR 教训)
+                                    -- 无法诊断(2026-08-09 首跑 DATA_ERROR 教训);
+                                    -- 合规审核中的行存 pendingStatusDescription,
+                                    -- unreadable 行存读不到的原话
     submitted_at timestamptz NOT NULL DEFAULT now(),
-    resolved_at  timestamptz,
+    resolved_at  timestamptz,       -- **首次**落定时刻,之后不再刷新(2026-09-25)
+    raw_status  text,               -- 沃尔玛原始 ingestionStatus;查无记「明细缺席」,
+                                    -- 读不到记归类(沃尔玛404 / 代理波动 / 店铺不可调用…)
+    settled_by  text,               -- head = 汇总终态时落 / deadline = 到期强制落 /
+                                    -- unreadable = 到期后读不到(存量行两列为 NULL)
     PRIMARY KEY (feed_id, sku)
 );
 -- 终态由 services/feed_track 轮询回写(feed_poll 工作流全局扫,业务工作流也可
 -- 单 feed 轮询);SKU 级状态权威在此,飞书驱动表的"结果"列只是投影。
+-- **落定期限**(所有者 2026-09-25 定稿,官方值不加余量,原句见 refdata/walmart_slas.tsv;
+-- 唯一出处 feed_track.FEED_DEADLINE_MINUTES):改价 15 分钟、库存 4 小时、建品/改品/跟卖
+-- 24 小时、停用 48 小时、删除 72 小时。汇总终态就读明细落定;到期不管汇总怎么说都读明细
+-- 强制落定:仍 INPROGRESS 或(汇总没收工时)明细里查无 ⇒ overdue,状态值不认识 ⇒
+-- unrecognized;到期后读不到明细 ⇒ 404 当场、其他失败宽限 24 小时后 unreadable。
+-- overdue / unrecognized / unreadable = **沃尔玛没给结论**(feed_track.NO_VERDICT_STATUSES),
+-- 不是失败:消费方不许拿它们回收 UPC、不许当失败定案;处置建议按 receipt_none 关单。
+-- **首次落定即定稿**:落账 UPDATE 一律带 `AND status = 'submitted'`,落过的行不改状态、
+-- 不刷 resolved_at(每轮重写会让 problem_scan 在途闸的「待观测」永远成立)。
 -- 停用/删除/设置到期日期 + 上架/改价/改库存/改标题 feed 全走这一套 —— 七种
 -- feedType 均已接线(DELETE_ITEM / RETIRE_ITEM / MP_MAINTENANCE / MP_ITEM /
 -- MP_ITEM_MATCH / price / inventory),载荷构造唯一出处 api/feeds.py。
@@ -1128,7 +1144,7 @@ CREATE TABLE ops.node_validations (
 | `detail->>'ship_node'` | 这条建议要写**哪个发货节点**(多仓批次 2) | 未配置「维护仓库」的店**不带这个键**(建议行与改造前逐字节一致,执行件走 legacy 路径)。带了就决定两件事:写通道(分节点 PUT / MP_INVENTORY feed)与落定判据(按 `catalog.item_node_inventory` 而非 `walmart_items.avail_qty`) |
 | `detail->'atoms'` | 这条建议的逐原子归类 `[{code, policy_name, text}]`(2026-09-10,problem_scan 写) | 与 `problem_categorized` 事件同款;`category` 列只是主码,复合原文还带哪些原子(「End Date 过期; 禁售」)看这里。维护链的建议行不带这个键 |
 | `sources` | 每个支撑来源各一格:`{来源: {action, code, reason, at}}` | 展示用的 reason/category 由 `claim()` 按它现算(单来源逐字不变,多来源拼成「维护:… \| 审核:…」);`reason`/`category` 两列是**首次建议**的病历,不再被后写方覆盖 |
-| `detail->>'settled_by'` | **是谁判的**这条落定 | 破坏类三种来源(2026-09-09):`delete_verified`/`delete_not_effective` = 观测判;`receipt_gone` = 回执码 ∈ `registry.resources.WALMART_ERR_ITEM_GONE`(沃尔玛说这个 SKU 已经不在了 ⇒ confirmed,**不论回执 status** —— QARTH「No matching record」是 status=success 带回来的);`receipt_failed` = 回执 failed/missing(含 WFS 不许删等永久拒)⇒ ineffective。维护三类是 `observed`/`value_unchanged`,超期放行是 `expired`。同时并进 `detail` 的还有 `receipt_status`/`error_code`/`error_desc`(截 300),查账不用再回 `ops.feed_items` 翻 |
+| `detail->>'settled_by'` | **是谁判的**这条落定 | 破坏类三种来源(2026-09-09):`delete_verified`/`delete_not_effective` = 观测判;`receipt_gone` = 回执码 ∈ `registry.resources.WALMART_ERR_ITEM_GONE`(沃尔玛说这个 SKU 已经不在了 ⇒ confirmed,**不论回执 status** —— QARTH「No matching record」是 status=success 带回来的);`receipt_failed` = 回执 failed/missing(含 WFS 不许删等永久拒)⇒ ineffective;`receipt_none`(2026-09-25)= 回执**没给结论**(overdue / unrecognized / unreadable)⇒ ineffective 关单,不是失败。维护三类是 `observed`/`value_unchanged`,超期放行是 `expired`。同时并进 `detail` 的还有 `receipt_status`/`error_code`/`error_desc`(截 300),查账不用再回 `ops.feed_items` 翻 |
 
 改码(批次 3)只准经两个积木碰这张表:`dispositions.open_executing_count`
 (前置闸:改码前该店必须无 `executing` 行 —— 它等的观测判决会随身份列一起换掉,

@@ -26,22 +26,30 @@ ops.feed_items(权威台账)→ feed_log 落 done/failed;pending 行
 (提交结局不确定)告警待人工。只读沃尔玛 + 记账,非危险。
 ⚠ 但**反哺器会写 PG**(UPC 池状态、登记簿弃码,两者都不可逆),空跑必须
 用 `python cli.py feed_poll --dry-run` —— 本工作流自己认 params["dry_run"]
-并把 execute 透传给五个反哺器(见 run());漏掉那一句,--dry-run 完全失效。
-⚠ --dry-run **只拦反哺器**:台账落定(ops.feed_items / feed_log 收口 / 产品事件 /
-违禁回执入黑名单)是轮询本体,空跑照写(一直如此)。要零写入地先看一眼,用
-`-p stuck=1 [-p probe=1]`(纯读台账 + 只读 GET)。
+并把 execute 透传给轮询本体与五个反哺器(见 run());漏掉那一句,--dry-run 完全失效。
+⚠ --dry-run **零写入**(2026-09-25 起;此前台账落定照写、只拦反哺器):轮询照读
+沃尔玛、照算,ops.feed_items / feed_log 收口 / 产品事件 / 违禁入黑名单在同一事务
+里 rollback,摘要首行标 [DRY-RUN] 并说"将要落定"的那一份。上线新的落定规则前
+先跑它看条数。
 
-⚠ **feed 终态 ≠ 落定**:明细里还有 SKU 卡在 INPROGRESS/未知枚举时,行留在途
-下轮重查(摘要照实说,不写"已落定")。这种行**永不老化**,在途超
+**落定期限**(所有者 2026-09-25 定稿):feed 追到 feedType 的官方期限为止
+(`feed_track.FEED_DEADLINE_MINUTES`,原句见 refdata/walmart_slas.tsv:改价 15 分钟、
+库存 4 小时、建品/改品/跟卖 24 小时、停用 48 小时、删除 72 小时)。汇总终态就读
+明细落定;到期不管汇总怎么说都读明细**强制落定**:仍 INPROGRESS 的落「超期未完成」,
+汇总没收工而明细里查无的也落「超期未完成」,不认识的状态值落「未知状态」。到期后
+读不到明细:404 当场、其他失败宽限 `UNREADABLE_GRACE_HOURS` 后落「无法查询」。
+每条 SKU **首次落定即定稿**,之后不改状态、不刷 resolved_at。
+
+⚠ **feed 终态 ≠ 落定**:汇总终态而明细里还有 SKU 在 INPROGRESS/未知枚举(官方:
+PROCESSED 之后单条仍可能在复核,GTIN 豁免 / 合规审核期间一直是 INPROGRESS),
+这几行留在途、每轮重读,最迟到期强制落定(摘要照实说,不写"已落定")。在途超
 `feed_track.FEED_QUIET_HOURS` 的会折成一行点名、不再逐轮复读明细 ——
-一天 48 轮的固定文案没人看。放弃期限待所有者拍板,
-见 docs/feed_closure_audit.md §三.4。
+一天 48 轮的固定文案没人看。
 
 ⚠ **汇总未终态 ≠ 没处理**(2026-09-22 生产实证,所有者 09-23 核实):沃尔玛
 feed 级汇总会停更 —— A131吕灿荣 改价 feed 汇总 31 小时停在 INPROGRESS / 0 / 0 /
-71,明细 71/71 SUCCESS、价格早已生效,同轮 16 条跨店改价 feed 同样。提交超
-`feed_track.HEAD_STALE_HOURS` 仍非终态的,轮询改读明细:有结论的落账,台账里
-全部有了结论就**按明细收口**(摘要首行点名「按明细收口 N:沃尔玛汇总停更」)。
+71,明细 71/71 SUCCESS、价格早已生效。这类 feed 到了落定期限(改价 15 分钟)就按
+明细收口(摘要首行点名「到期收口 N」,明细行把"汇总仍停在…"原样摆出来)。
 
 轮询完执行**反哺器列表**(所有者定稿 2026-08-07:一切 feed 结果的表格
 回写都交给轮询,业务表状态不依赖"记得再跑一次业务工作流"):每个反哺器
@@ -263,28 +271,45 @@ def _probe_heads(stores_by_name: dict, srows: list[dict]) -> dict[str, str]:
     return got
 
 
-def _verdict(head: dict, n_open: int) -> str:
-    """输入:沃尔玛 feed 级汇总 + 台账未落定数 → 输出:这条卡在哪一档(人话)。
+def _due_note(feed_type: str, age: float | None) -> str:
+    """输入:feedType + 在途年龄 → 输出:清单里的期限一句(落定期限 X,已到期 / 还剩 Y)。"""
+    if feed_type not in feed_track.FEED_DEADLINE_MINUTES:
+        return f"⚠ {feed_type} 未登记落定期限"
+    limit = feed_track.deadline_text(feed_type)
+    if age is None:
+        return f"落定期限 {limit}"
+    left = feed_track.deadline_hours(feed_type) - age
+    if left <= 0:
+        return f"落定期限 {limit} 已到,下轮轮询按明细强制落定"
+    return f"落定期限 {limit},还剩 {left:.1f}h"
+
+
+def _verdict(head: dict, n_open: int, feed_type: str | None = None) -> str:
+    """输入:沃尔玛 feed 级汇总 + 台账未落定数(+ feedType)→ 输出:这条卡在哪一档(人话)。
 
       · 汇总终态、台账还有未落定 ⇒ **残留**:那几个 SKU 自己的
-        ingestionStatus 不是终态(INPROGRESS / 枚举没认出来),feed 因此永不收工;
+        ingestionStatus 不是终态(INPROGRESS / 枚举没认出来),留在途,最迟到了
+        落定期限按明细强制落定(所有者 2026-09-25 定稿);
       · 汇总终态、台账已全落定 ⇒ 下一轮轮询即收工;
       · 汇总**未终态** ⇒ **不拿汇总的计数下任何结论**。汇总会停更(2026-09-22
         实证:A131吕灿荣 改价 feed 汇总 31 小时停在 INPROGRESS / 0 / 0 / 71,
         明细却 71/71 SUCCESS、价格早已生效)。此前这里按汇总计数判出的
         「沃尔玛确实还在跑(全部待处理)」恰恰把人引向错误结论(2026-09-23
-        那次排查就是这样错的)。逐条真相只在明细里:轮询对提交超
-        `feed_track.HEAD_STALE_HOURS` 的已自动改读明细落账;现场要看,就跑
-        清单里这一条上面那行给的 `-p feed_id=` 命令(只读)。
+        那次排查就是这样错的)。逐条真相只在明细里:轮询到了 feedType 的落定
+        期限(`feed_track.FEED_DEADLINE_MINUTES`)就读明细强制落定;现场要看,
+        就跑清单里这一条上面那行给的 `-p feed_id=` 命令(只读)。
 
     ⚠ 收的是 head **原件**,不是 `_progress` 拼好的那句话:去反解自己刚拼的
     字符串,等于给同一份数字造第二个出处,改一处忘一处就静默错档。
     """
+    limit = (f"落定期限 {feed_track.deadline_text(feed_type)}" if feed_type
+             else "落定期限")
     if head.get("feedStatus") in feeds.FEED_TERMINAL:
-        return (f"⇒ 残留:沃尔玛已终态,{n_open} 个 SKU 的逐条状态仍非终态"
+        return (f"⇒ 残留:沃尔玛已终态,{n_open} 个 SKU 的逐条状态仍非终态,"
+                f"到{limit}按明细强制落定"
                 if n_open else "⇒ 沃尔玛已终态,下轮轮询即收工")
-    return (f"⇒ 汇总未终态,其计数不作数(汇总会停更),以明细为准:轮询对提交超 "
-            f"{feed_track.HEAD_STALE_HOURS:g}h 的已按明细落账,逐条看上一行命令")
+    return (f"⇒ 汇总未终态,其计数不作数(汇总会停更),以明细为准:到{limit}"
+            f"轮询读明细强制落定,逐条看上一行命令")
 
 
 def _inflight_list(stores_by_name: dict | None = None) -> str:
@@ -324,14 +349,14 @@ def _inflight_list(stores_by_name: dict | None = None) -> str:
         n_open = opens.get(r["feed_id"], 0)
         out.append(f"        提交于 {r.get('updated_at') or '?'}"
                    + (f",卡 {age:.1f}h" if age is not None else ",年龄未知")
-                   + f",台账未落定 {n_open}"
+                   + f",台账未落定 {n_open},{_due_note(r['feed_type'], age)}"
                    + f"  →  python cli.py feed_poll -p store={r['store']} "
                      f"-p feed_id={r['feed_id']}")
         head = heads.get(r["feed_id"])
         if isinstance(head, dict):
             out.append(f"        沃尔玛:{head.get('feedStatus')},"
                        f"{feed_track._progress(head)}  "
-                       f"{_verdict(head, n_open)}".rstrip())
+                       f"{_verdict(head, n_open, r['feed_type'])}".rstrip())
         elif head:                      # 凭证缺失 / 查询失败:原话摆出来
             out.append(f"        沃尔玛:{head}")
     if pends:
@@ -351,7 +376,8 @@ def run(params: dict) -> str:
     ⚠ execute 取的是 `not params["dry_run"]`:cli 对 DANGEROUS=False 的工作流
     恒传 execute=True(缺省即真跑),--dry-run 只体现在单独透传的 dry_run 上。
     """
-    # 反哺器的空跑闸:五个反哺器都收这个关键字,execute=False 时一行都不写
+    # 空跑闸:轮询本体(台账落定)与五个反哺器都收这个关键字,execute=False
+    # 时一行都不写
     execute = bool(params.get("execute")) and not params.get("dry_run")
     if params.get("stats"):
         return _error_stats(int(params.get("days", 30)),
@@ -380,7 +406,8 @@ def run(params: dict) -> str:
         return (_explain(store, feed_id)
                 + "\n(诊断模式:不动 ops.feed_items 台账、不回写飞书;"
                   "要落定并回写请跑不带 -p feed_id 的 python cli.py feed_poll)")
-    lines = [feed_track.poll_all(stores_by_name)]
+    lines = [feed_track.poll_all(stores_by_name, execute=execute,
+                                 only=params.get("store") or None)]
     lines.extend(_run_reflectors(execute))
     return "\n".join(lines)
 

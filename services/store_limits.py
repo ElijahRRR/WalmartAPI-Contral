@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 
 from api import feishu, settings
 from registry import db, resources
+from services import amz_source
 
 logger = logging.getLogger("services.store_limits")
 
@@ -31,9 +32,15 @@ def _int_map(field_name: str) -> dict[str, int]:
     out: dict[str, int] = {}
     for rec in recs:
         name = feishu._plain_text(rec["fields"].get(f.store)).strip()
+        raw = feishu._plain_text(rec["fields"].get(field_name))
         try:
-            v = int(float(feishu._plain_text(rec["fields"].get(field_name)) or 0))
+            v = int(float(raw or 0))
         except ValueError:
+            # 填了但不是数字(「3件」「1,000」)⇒ 按没填处理,但**要出声**:
+            # 这类格子静默当空,等于那家店的闸悄悄失效(最大库存填成「3件」
+            # = 不限),而表上看着明明填了(2026-09-25 随「最大库存」列补)
+            logger.warning("限额表「%s」%s 填的 %r 不是数字,按没填处理",
+                           field_name, name or "(无店名)", raw)
             v = 0
         if name and v > 0:
             out[name] = v
@@ -95,6 +102,58 @@ def setup_limits() -> dict[str, int]:
         logger.info("限额表「商品上限」读到 0 店,全店回落缺省 item setup limit"
                     "(表未登记/该列未建/该列为空都会走到这里)")
     return caps
+
+
+def stock_caps() -> dict[str, int]:
+    """输入:无 → 输出:{店铺: 单品最大库存 N}(限额表「最大库存」列);没设的店不在字典里。
+
+    **留空或填 0 都是"不限"**(`_int_map` 口径:只收正整数)。上架与维护各读
+    一次、同一张表同一口径;换算规则只在 `stock_for`。
+    """
+    caps = _int_map(resources.RETIRE_LIMITS.fields.max_stock)
+    if caps:
+        logger.info("最大库存:%d 家店设了上限:%s", len(caps),
+                    ",".join(f"{k}={v}" for k, v in sorted(caps.items())))
+    return caps
+
+
+#: `stock_for` 的判定码(维护链直接用作原因码,上架链按码写理由)。
+#: **只在这里出生**:两条链按码分支,不各自重判一遍。
+QTY_NO_COUNT = "no_count"        # 亚马逊库存数没采到
+QTY_BELOW_MIN = "below_min"      # 低于全局门槛 amz_source.MIN_INVENTORY
+QTY_BELOW_CAP = "below_cap"      # 过了门槛,但低于本店最大库存
+QTY_CAPPED = "store_cap"         # 按本店最大库存写 N
+
+
+def stock_for(stock, cap: int | None) -> tuple[int, str]:
+    """输入:亚马逊库存数(None = 没采到)+ 本店最大库存(None/≤0 = 没设)→ 输出:(沃尔玛该写的库存, 判定码)。
+
+    **上架与维护共用的唯一换算**(所有者定稿 2026-09-25)。先门槛、后上限:
+
+      没采到数量(None)      → (0, no_count)   不算达到门槛,也不算达到 N
+      < MIN_INVENTORY(5)    → (0, below_min)  亚马逊库存要多,少了不卖
+      设了 N 且 < N          → (0, below_cap)
+      设了 N 且 ≥ N          → (N, store_cap)
+      没设 N                 → (原数, "")      原样跟随
+
+    门槛与 N 是**两件事**,不互相替代(所有者原话:门槛是为了确保亚马逊库存
+    是多的,N 是为了确保我卖的数量不会太多)。所以 N=3 时亚马逊 3~4 件照样
+    判 0 —— 过不了门槛;N=20 时亚马逊 12 件也判 0 —— 够门槛但不够 N。
+
+    ⚠ 两条链对 0 的**动作**不同,判定是同一个:上架侧 = 不上架并写理由;
+    维护侧 = 库存写 0。上架侧「没采到数量但页面显示有货」的保守铺货
+    (`amz_source.IN_STOCK_QTY`)只在**没设 N** 的店成立,在调用方判,
+    不进这里 —— 这里的 None 恒为"没采到 = 不卖"。
+    """
+    if stock is None:
+        return 0, QTY_NO_COUNT
+    qty = int(stock)
+    if qty < amz_source.MIN_INVENTORY:
+        return 0, QTY_BELOW_MIN
+    if cap is not None and int(cap) > 0:
+        n = int(cap)
+        return (n, QTY_CAPPED) if qty >= n else (0, QTY_BELOW_CAP)
+    return qty, ""
 
 
 def stockzero_stores() -> list[str]:

@@ -100,3 +100,76 @@ def test_listing_and_maintenance_use_the_same_predicate():
         src = inspect.getsource(mod)
         assert "store_limits.over_lead_cap" in src, mod.__name__
         assert "store_limits.cap_for" in src, mod.__name__
+
+
+# ── 单品最大库存(限额表「最大库存」,所有者定稿 2026-09-25)────────────────
+
+def test_stock_for_threshold_then_cap():
+    """先门槛、后上限;门槛与 N **不互相替代**。
+
+    所有者原话:门槛(5)是为了确保亚马逊库存是多的,N 是为了确保我卖的数量
+    不会太多 —— 所以 N=3 时亚马逊 3~4 件照样 0(过不了门槛),N=20 时 12 件
+    也是 0(够门槛不够 N)。
+    """
+    from services import amz_source
+    assert amz_source.MIN_INVENTORY == 5
+    f = sl.stock_for
+    # 没设上限:门槛以下 0,门槛以上原样跟随
+    assert f(None, None) == (0, sl.QTY_NO_COUNT)
+    assert f(0, None) == (0, sl.QTY_BELOW_MIN)
+    assert f(4, None) == (0, sl.QTY_BELOW_MIN)
+    assert f(5, None) == (5, "")
+    assert f(500, None) == (500, "")
+    # N=3(比门槛小):≥5 才写 3;3~4 件卡在门槛
+    assert f(3, 3) == (0, sl.QTY_BELOW_MIN)
+    assert f(4, 3) == (0, sl.QTY_BELOW_MIN)
+    assert f(5, 3) == (3, sl.QTY_CAPPED)
+    assert f(999, 3) == (3, sl.QTY_CAPPED)
+    # N=20(比门槛大):够门槛不够 N 也是 0;恰好等于 N 写 N
+    assert f(12, 20) == (0, sl.QTY_BELOW_CAP)
+    assert f(20, 20) == (20, sl.QTY_CAPPED)
+    assert f(25, 20) == (20, sl.QTY_CAPPED)
+    # 没采到数量**不算达到 N**(所有者定稿)
+    assert f(None, 3) == (0, sl.QTY_NO_COUNT)
+    # 0 / 负数 = 没设(与 _int_map 的读列口径一致)
+    assert f(50, 0) == (50, "")
+
+
+def test_stock_caps_reads_the_new_column_blank_or_zero_means_unlimited(
+        monkeypatch, caplog):
+    """「最大库存」是新列,**不复用「库存特殊要求」**(那一格的 0 是整店停售开关)。
+
+    留空或填 0 = 不限;填了不是数字的要**出声**(按没填处理 = 那家店的上限
+    悄悄失效,而表上看着明明填了)。
+    """
+    from api import feishu
+    from registry import resources
+    f = resources.RETIRE_LIMITS.fields
+    assert f.max_stock == "最大库存"
+    assert f.max_stock != f.inventory_note
+    monkeypatch.setattr(feishu, "list_records", lambda t, field_names=None: [
+        {"fields": {"店铺": "A", "最大库存": "3"}},
+        {"fields": {"店铺": "B", "最大库存": "0"}},
+        {"fields": {"店铺": "C", "最大库存": ""}},
+        {"fields": {"店铺": "D", "最大库存": "3件"}},
+        {"fields": {"店铺": "E", "最大库存": 20}},
+    ])
+    monkeypatch.setattr(feishu, "_plain_text",
+                        lambda v: "" if v is None else str(v))
+    with caplog.at_level("WARNING", logger="services.store_limits"):
+        assert sl.stock_caps() == {"A": 3, "E": 20}
+    assert any("3件" in r.getMessage() and "最大库存" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_listing_and_maintenance_share_one_stock_rule():
+    """上架与维护共用 `stock_for` —— 各写一份迟早飘成"上架按 5 拦、维护按 3 写"。"""
+    import inspect
+
+    from services import maintenance_intents
+    from workflows import list_new
+    for mod in (list_new, maintenance_intents):
+        src = inspect.getsource(mod)
+        assert "store_limits.stock_for" in src, mod.__name__
+    # 门槛常量只在 stock_for 里被比较,两条链都不自己比
+    assert "< amz_source.MIN_INVENTORY" not in inspect.getsource(list_new)

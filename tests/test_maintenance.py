@@ -210,6 +210,71 @@ def test_inventory_intents_unknown_stock_goes_zero(monkeypatch):
                    "B0LEAD8": 0, "B0LEAD7": 50}
 
 
+def test_inventory_threshold_applies_to_every_store_and_cap_to_its_store():
+    """门槛 5 对**所有店**生效(所有者 2026-09-25「库存维护也需要门槛5,小于5个
+    库存就设置为0」—— 此前 1~4 件照写原数);限额表「最大库存」N 只管设了的店:
+    ≥N 写 N、<N 写 0;没采到数量不算达到 N。清零判据(缺货/渠道/货期…)照旧
+    排在前面,上限不改变它们。换算与上架同一个函数 `store_limits.stock_for`。"""
+    caps = {"T_CAP3": 3, "T_CAP20": 20}
+    rows = [
+        _row(store="T_FREE", sku="B0FOUR", avail_qty=4, stock_count=4),
+        _row(store="T_FREE", sku="B0FIVE", avail_qty=9, stock_count=5),
+        _row(store="T_CAP3", sku="B0BIG", avail_qty=50, stock_count=50),
+        _row(store="T_CAP3", sku="B0AT3", avail_qty=3, stock_count=99),  # 已是 3
+        _row(store="T_CAP3", sku="B0FOUR3", avail_qty=3, stock_count=4),
+        _row(store="T_CAP20", sku="B0TWELVE", avail_qty=12, stock_count=12),
+        _row(store="T_CAP20", sku="B0NULL", avail_qty=20, stock_count=None),
+        _row(store="T_CAP3", sku="B0OOS", avail_qty=3, stock_count=50,
+             stock_state="out_of_stock"),
+    ]
+    got = {i["sku"]: (i["new"], i["code"])
+           for i in mi.inventory_intents(rows, stock_caps=caps)}
+    assert got == {
+        "B0FOUR": (0, store_limits.QTY_BELOW_MIN),     # 没设 N 的店也卡门槛
+        "B0FIVE": (5, ""),                             # 没设 N:原样跟随
+        "B0BIG": (3, store_limits.QTY_CAPPED),
+        "B0FOUR3": (0, store_limits.QTY_BELOW_MIN),    # N=3 不替代门槛
+        "B0TWELVE": (0, store_limits.QTY_BELOW_CAP),   # 够门槛不够 N
+        "B0NULL": (0, store_limits.QTY_NO_COUNT),      # 没采到不算达到 N
+        "B0OOS": (0, "out_of_stock"),                  # 清零判据在前
+    }
+    reasons = {i["sku"]: i["reason"]
+               for i in mi.inventory_intents(rows, stock_caps=caps)}
+    assert reasons["B0BIG"] == "按本店最大库存 3 写(亚马逊 50)"
+    assert reasons["B0TWELVE"] == "亚马逊库存 12 低于本店最大库存 20"
+    assert reasons["B0FOUR"] == "亚马逊库存 4 低于门槛 5"
+    # 不传上限 = 不限(直接调本函数的排查不会静默拿到一份飞书读)
+    assert {i["sku"]: i["new"] for i in mi.inventory_intents(rows)}["B0AT3"] == 99
+
+
+def test_collect_all_reads_store_caps_once_for_the_amz_inventory_provider(
+        monkeypatch):
+    """「最大库存」只给跟随亚马逊的库存 provider;跟卖铺货与 stockzero 不受管
+    (所有者定稿 2026-09-25「跟卖不管」)。"""
+    conn = _Conn()
+    reads, seen = [], {}
+    monkeypatch.setattr(mi.store_limits, "stock_caps",
+                        lambda: reads.append(1) or {"T1": 3})
+    monkeypatch.setattr(mi.store_limits, "price_multipliers", lambda: {})
+    monkeypatch.setattr(st, "store_channels", lambda: {})
+    monkeypatch.setattr(mi, "_rows", lambda *a, **k: [])
+    monkeypatch.setattr(mi, "delete_intents", lambda *a, **k: [])
+    monkeypatch.setattr(mi, "title_intents", lambda rows: [])
+    monkeypatch.setattr(mi, "price_intents", lambda rows, m: [])
+
+    def inv(rows, mn=None, store_channels=None, stock_caps=None):
+        seen["caps"] = stock_caps
+        return []
+
+    monkeypatch.setattr(mi, "inventory_intents", inv)
+    monkeypatch.setattr(mi, "zero_intents", lambda c, sz, mn=None, only=None: [])
+    monkeypatch.setattr(mi, "match_inventory_intents",
+                        lambda c, sz, mn=None, only=None: [])
+    monkeypatch.setattr(mi, "drop_recent", lambda c, i: (i, 0))
+    mi.collect_all(conn, [])
+    assert reads == [1] and seen["caps"] == {"T1": 3}
+
+
 def test_channel_mismatch_zeroes_the_inventory(monkeypatch):
     """本店 FBA、货变成 FBM ⇒ 这家店卖不了 ⇒ 库存写 0(所有者定稿 2026-08-25)。
 
@@ -675,7 +740,8 @@ def test_doomed_skus_dropped_from_other_kinds(monkeypatch):
         {"store": "T1", "sku": "B0A", "kind": "price", "old": 9.9, "new": 11.0},
         {"store": "T1", "sku": "B0B", "kind": "price", "old": 9.9, "new": 11.0}])
     monkeypatch.setattr(mi, "inventory_intents",
-                        lambda rows, mn=None, store_channels=None: [
+                        lambda rows, mn=None, store_channels=None,
+                        stock_caps=None: [
                             {"store": "T1", "sku": "B0A", "kind": "inventory",
                              "old": 5, "new": 0}])
     monkeypatch.setattr(mi, "zero_intents",
@@ -977,6 +1043,26 @@ def test_scan_first_line_carries_zeroing_count(monkeypatch):
          "code": "match_restock", "reason": "跟卖铺货"}])
     out = ms.run({"preview": "1"})
     assert "清零 1" in out.splitlines()[0]     # 补货那条不算清零
+
+
+def test_scan_surfaces_store_cap_in_first_line_and_preview(monkeypatch):
+    """「最大库存」封顶的条数要进**首行**(链通知只发首行),预览里按店摊开 ——
+    非 0 的改库存在别处只有逐店总数,不单列就看不出上限生效了多少。"""
+    ms, _calls = _scan_wire(monkeypatch, [
+        {"store": "T1", "sku": "A", "kind": "inventory", "old": 50, "new": 3,
+         "code": store_limits.QTY_CAPPED, "reason": "按本店最大库存 3 写(亚马逊 50)"},
+        {"store": "T1", "sku": "B", "kind": "inventory", "old": 4, "new": 0,
+         "code": store_limits.QTY_BELOW_MIN, "reason": "亚马逊库存 4 低于门槛 5"}])
+    out = ms.run({"preview": "1"})
+    first = out.splitlines()[0]
+    assert "库存 2(清零 1,封顶 1;stockzero 店" in first
+    assert "按本店最大库存封顶 1 条:T1×1" in out
+    assert "清零合计 1 条,原因:below_min×1" in out
+    # 没有封顶时首行一个字不变(排版规范:只报真的发生了的)
+    ms, _calls = _scan_wire(monkeypatch, [
+        {"store": "T1", "sku": "B", "kind": "inventory", "old": 4, "new": 0,
+         "code": store_limits.QTY_BELOW_MIN}])
+    assert "(清零 1;stockzero 店" in ms.run({"preview": "1"}).splitlines()[0]
 
 
 def test_scan_store_filter_scopes_the_truncation_report_too(monkeypatch):
@@ -2500,71 +2586,9 @@ def test_dry_run_records_no_round_event(monkeypatch):
     got = _capture_rounds(monkeypatch)
     mw.run({"execute": False})
     assert got == []
-# ── 旧节点清零(搬仓收尾,一次性)──────────────────────────────────────────
-
-def test_node_clear_refuses_to_clear_the_managed_node(monkeypatch):
-    """⚠ 拒绝清受管仓:自动链每轮都在维护它,清了下一轮就写回来。
-
-    两条规则互相拆台,而且没人看得出是谁在跟谁较劲 —— 停售整店走 stockzero。
-    """
-    from workflows import node_clear as nc
-
-    monkeypatch.setattr(nc.stores_svc, "load_stores",
-                        lambda filter_names=None: [_store("T1")])
-    monkeypatch.setattr(nc.store_limits, "maint_nodes", lambda: {"T1": "N_NEW"})
-    monkeypatch.setattr(nc.inv_api, "list_inventory_nodes",
-                        lambda s: (_ for _ in ()).throw(
-                            AssertionError("拒绝之前不该去读库存")))
-    out = nc.run({"store": "T1", "node": "N_NEW"})
-    assert "拒绝执行" in out and "受管仓" in out and "stockzero" in out
 
 
-def test_node_clear_dry_run_writes_nothing_and_lists_the_targets(monkeypatch):
-    """--dry-run 一件都不写,但要报出规模与最大的几个(人眼闸门)。"""
-    from workflows import node_clear as nc
-
-    monkeypatch.setattr(nc.stores_svc, "load_stores",
-                        lambda filter_names=None: [_store("T1")])
-    monkeypatch.setattr(nc.store_limits, "maint_nodes", lambda: {"T1": "N_NEW"})
-    monkeypatch.setattr(nc.inv_api, "list_inventory_nodes", lambda s: {
-        "B0A": {"N_OLD": 999, "N_NEW": 3},
-        "B0B": {"N_OLD": 5},
-        "B0C": {"N_NEW": 7},            # 旧节点没货 → 不在名单里
-        "B0D": {"N_OLD": 0},            # 旧节点是 0 → 不用清
-    })
-    monkeypatch.setattr(nc.inv_api, "put_inventory",
-                        lambda *a, **k: (_ for _ in ()).throw(
-                            AssertionError("dry-run 不许写")))
-    out = nc.run({"store": "T1", "node": "N_OLD", "dry_run": True})
-    assert "该节点上有货的 2 个,合计 1004 件" in out
-    # B0B 在受管仓没有行 ⇒ 未接管 ⇒ 跳过(只有 B0A 可清)
-    assert "尚未接管** 1 个" in out and "B0B" in out
-    assert "本轮待清 1 个" in out
-    assert "dry-run" in out and "1 个 SKU" in out
-
-
-def test_node_clear_names_the_failures(monkeypatch):
-    """失败必须点名:写 0 是幂等的,重跑即补;静默的话那批货还在旧节点上卖。"""
-    from workflows import node_clear as nc
-
-    monkeypatch.setattr(nc.stores_svc, "load_stores",
-                        lambda filter_names=None: [_store("T1")])
-    monkeypatch.setattr(nc.store_limits, "maint_nodes", lambda: {"T1": "N_NEW"})
-    monkeypatch.setattr(nc.inv_api, "list_inventory_nodes", lambda s: {
-        "B0A": {"N_OLD": 9, "N_NEW": 1}, "B0B": {"N_OLD": 8, "N_NEW": 2}})
-    seen = []
-
-    def put(store, sku, qty, node=None):
-        seen.append((sku, qty, node))
-        return (False, "节点 N_OLD status=FAILURE: 库存台账没有这一行") \
-            if sku == "B0B" else (True, "")
-
-    monkeypatch.setattr(nc.inv_api, "put_inventory", put)
-    out = nc.run({"store": "T1", "node": "N_OLD"})
-    assert seen == [("B0A", 0, "N_OLD"), ("B0B", 0, "N_OLD")]   # 都写 0,带节点
-    assert "清零成功 1/2" in out
-    assert "⚠ 失败 1 个" in out and "B0B" in out and "FAILURE" in out
-
+# 旧节点清零(node_clear)的用例在 tests/test_node_clear.py
 
 def test_suppress_key_separates_nodes_but_leaves_legacy_keys_byte_identical():
     """⚠ 受管仓意图的防重键要带 node;未配置店的键**一个字节都不许变**。
@@ -2580,59 +2604,6 @@ def test_suppress_key_separates_nodes_but_leaves_legacy_keys_byte_identical():
     # 同一件事写不同节点 = 两件事
     assert mi._suppress_key({**base, "ship_node": "N1"}) != \
         mi._suppress_key({**base, "ship_node": "N2"})
-
-
-def test_node_clear_only_clears_what_the_managed_node_took_over(monkeypatch):
-    """⚠ 只清**受管仓已接管**的 SKU:受管仓有库存行 = 维护链写过它 = 清完仍可售。
-
-    谭总12 搬仓当天实见:3680 个 SKU 里 112 个受管仓还没有行、83 个旧节点
-    还有货、107 个是 PUBLISHED —— 一把清完这批在两个节点都是 0,**直接断售**。
-    两类成因都不是"等下一轮"就能好的:非 amz 出身的行维护链根本不碰;
-    amz 行没产意图的有的下轮回来、有的不会。都不该由"清空旧仓"替它们决定。
-    """
-    from workflows import node_clear as nc
-
-    monkeypatch.setattr(nc.stores_svc, "load_stores",
-                        lambda filter_names=None: [_store("T1")])
-    monkeypatch.setattr(nc.store_limits, "maint_nodes", lambda: {"T1": "N_NEW"})
-    monkeypatch.setattr(nc.inv_api, "list_inventory_nodes", lambda s: {
-        "TAKEN": {"N_OLD": 999, "N_NEW": 3},    # 已接管 → 清
-        "UNTAKEN": {"N_OLD": 50},               # 受管仓没有行 → 跳过
-    })
-    wrote = []
-    monkeypatch.setattr(nc.inv_api, "put_inventory",
-                        lambda st, sku, qty, nd=None: (
-                            wrote.append((sku, qty, nd)), (True, ""))[1])
-    out = nc.run({"store": "T1", "node": "N_OLD"})
-    assert wrote == [("TAKEN", 0, "N_OLD")]          # UNTAKEN 一个字节都没碰
-    assert "尚未接管** 1 个" in out and "UNTAKEN" in out
-    assert "sources_backfill" in out                 # 给出补救路径,不只是拒绝
-
-    # 显式要清整个节点:放行,但把"两个节点都是 0 = 断售"摆在摘要里
-    wrote.clear()
-    out = nc.run({"store": "T1", "node": "N_OLD", "include_untaken": "1"})
-    assert sorted(s for s, _, _ in wrote) == ["TAKEN", "UNTAKEN"]
-    assert "照清" in out and "断售" in out
-
-
-def test_node_clear_refuses_when_takeover_cannot_be_judged(monkeypatch):
-    """没配「维护仓库」⇒ 判不出"接管与否" ⇒ **拒绝**,除非显式 include_untaken。
-
-    判不准就判活(CLAUDE.md 开工前两问):清空一个判不出接管状态的节点,
-    等于拿全店可售性赌一个没依据的假设。
-    """
-    from workflows import node_clear as nc
-
-    monkeypatch.setattr(nc.stores_svc, "load_stores",
-                        lambda filter_names=None: [_store("T1")])
-    monkeypatch.setattr(nc.store_limits, "maint_nodes", lambda: {})
-    monkeypatch.setattr(nc.inv_api, "list_inventory_nodes",
-                        lambda s: {"B0A": {"N_OLD": 9}})
-    monkeypatch.setattr(nc.inv_api, "put_inventory",
-                        lambda *a, **k: (_ for _ in ()).throw(
-                            AssertionError("拒绝时不许写")))
-    out = nc.run({"store": "T1", "node": "N_OLD"})
-    assert "拒绝执行" in out and "include_untaken=1" in out
 
 
 # ── 一次取数 + 单店下推(2026-09-03 性能定案;**零行为变化**是硬要求)──────────

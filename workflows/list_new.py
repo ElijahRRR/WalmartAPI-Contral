@@ -50,7 +50,10 @@ UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
     用库中现值上架(维护链次日纠正),库里压根没有的照旧不写终态、次日续。
     审核链 18:10 刚刷过的品因此不会在 20:00 再采一遍,slow_hash 也就不会在
     审核与上架之间被翻成 pending
-  ⑥ 数据过滤:库存 <5 淘汰;配送超时上架但库存写 0;品牌/制造商黑名单
+  ⑥ 数据过滤:亚马逊库存 <5 淘汰(理由「亚马逊库存不足5」,数字随门槛
+    常量);限额表设了「最大库存」N 的店:亚马逊库存 ≥N 按 N 上架、<N 淘汰、
+    没采到数量也淘汰(所有者定稿 2026-09-25,换算唯一实现
+    store_limits.stock_for);配送超时不上架;品牌/制造商黑名单
     (两字段都查,brand=Generic 真品牌在 manufacturer 是常态);
     **店铺渠道闸**(限额表「配送限制」:标了 fba/fbm 就只上该渠道的货,
     **没标=不限制**;判定走 services/store_targets.channel_conflict 唯一谓词。
@@ -1361,13 +1364,14 @@ def _llm_cost_lines(items: int = 0) -> list[str]:
 
 
 class _GateCtx(NamedTuple):
-    """两道闸共用的只读上下文:库侧快照 + 三张按店配置表 + 在册凭证。"""
+    """两道闸共用的只读上下文:库侧快照 + 按店配置(限额表各列)+ 在册凭证。"""
     state: _GateState           # _load_gate_state() 的库侧快照
     stores_by_name: dict        # 店名 → 凭证(不在里面 = 凭证缺失,整店跳过)
     quota: dict                 # 店 → 限额表「上架限制」(读不到按 999 不限)
     mults: dict                 # 店 → 四区间倍率(services/store_limits)
     lead_caps: dict             # 店 → 「配送时长限制」上限天数
     store_chs: dict             # 店 → 「配送限制」渠道(没标=不限)
+    stock_caps: dict            # 店 → 「最大库存」N(没设=不在字典里)
 
 
 class _StoreGate(NamedTuple):
@@ -1493,7 +1497,7 @@ def _gate_by_store(rows: list[dict], ctx: _GateCtx) -> _StoreGate:
 def _gate_by_row(cands: list[dict], products: dict, ctx: _GateCtx) -> _RowGate:
     """输入:按店闸的候选行 + 采集数据 + 闸门上下文 → 输出:`_RowGate`(幸存行/理由/计数/回显)。
 
-    闸门链 ⑤⑥ 的按行那半边:数据源 → 定制品 → 库存三态 → 库存下限 →
+    闸门链 ⑤⑥ 的按行那半边:数据源 → 定制品 → 库存三态 → 库存门槛与本店最大库存 →
     品牌风控 → 品牌占用 → 产品渠道 → 店铺渠道 → 运费 → 落地价倍率 →
     配送时长 → 素材。
     **判据顺序即业务语义,逐条不许挪**(每道闸都假设前面那道已经拦掉了它
@@ -1533,22 +1537,39 @@ def _gate_by_row(cands: list[dict], products: dict, ctx: _GateCtx) -> _RowGate:
             reasons.append((r["rownum"], "定制品不上架"))
             continue
         # ⚠ 库存三态,**绝不能 or 0 兜底**(契约 3b:None=没采到,0=确实缺货):
-        #   有真值 → 走 MIN_INVENTORY 闸(防亚马逊只剩三两件时上架超卖)
+        #   有真值 → 走门槛与本店最大库存(换算唯一实现 store_limits.stock_for)
         #   无真值 + in_stock → 亚马逊高库存不显示具体数,按保守常量铺货
+        #     —— **只限没设「最大库存」的店**:设了 N 的店,没采到数量不算
+        #     达到 N,不上架(所有者定稿 2026-09-25)
         #   无真值 + 其余状态 → 不知道有没有货,不上架
         stock = p.get("stock")
+        cap = ctx.stock_caps.get(store_name)
         if stock is None:
-            if p.get("stock_state") == "in_stock":
-                stock = amz_source.IN_STOCK_QTY
-                counts["stock_assumed"] += 1
-            else:
+            if p.get("stock_state") != "in_stock":
                 counts["filtered"] += 1
                 reasons.append((r["rownum"],
                                 f"库存未知(状态 {p.get('stock_state') or '缺失'})"))
                 continue
-        if stock < amz_source.MIN_INVENTORY:
+            if cap:
+                counts["stock_cap"] += 1
+                reasons.append((r["rownum"],
+                                f"亚马逊库存数未采到,不算达到本店最大库存{cap}"))
+                continue
+            stock = amz_source.IN_STOCK_QTY
+            counts["stock_assumed"] += 1
+        # 门槛(MIN_INVENTORY)与本店「最大库存」N 是两件事、先后各判一次
+        # (所有者定稿 2026-09-25):门槛确保亚马逊库存是多的,N 确保卖的
+        # 数量不会太多。算出 0 ⇒ **不上架**,理由写判出 0 的那道闸的值
+        # (门槛以后可能调,理由里的数字跟着常量走,不写死)
+        qty, qty_why = store_limits.stock_for(stock, cap)
+        if qty_why == store_limits.QTY_BELOW_MIN:
             counts["filtered"] += 1
-            reasons.append((r["rownum"], f"库存不足:{stock}"))
+            reasons.append((r["rownum"],
+                            f"亚马逊库存不足{amz_source.MIN_INVENTORY}"))
+            continue
+        if qty_why == store_limits.QTY_BELOW_CAP:
+            counts["stock_cap"] += 1
+            reasons.append((r["rownum"], f"亚马逊库存不足本店最大库存{cap}"))
             continue
         # 品牌与制造商两个字段都查(所有者批复 2026-08-12):brand=Generic
         # 而真品牌在 manufacturer 是亚马逊常态,只查 brand 黑名单必漏
@@ -1611,7 +1632,7 @@ def _gate_by_row(cands: list[dict], products: dict, ctx: _GateCtx) -> _RowGate:
             continue
         # 配送时长超限 ⇒ **不上架**(所有者定稿 2026-08-16 走进生产;
         # 此前是"上架但库存写 0")。不上架就不占 UPC、不占配额,比上一个
-        # 卖不动的更省。上限按店读限额表「配送时长限制」,查不到回落 8 天。
+        # 卖不动的更省。上限按店读限额表「配送时长限制」,查不到回落 7 天。
         # **没采到(None)不算超时**——or 0 会把"未知"读成"当天达",方向反了。
         lead_cap = store_limits.cap_for(ctx.lead_caps, store_name,
                                         amz_source.MAX_LEAD_DAYS)
@@ -1629,7 +1650,11 @@ def _gate_by_row(cands: list[dict], products: dict, ctx: _GateCtx) -> _RowGate:
             counts["no_material"] += 1
             reasons.append((r["rownum"], gap))
             continue
-        qty = int(stock)
+        # 上架数量 = 上面 stock_for 的换算结果(没设上限 = 亚马逊原数,
+        # 设了 N = N)。封顶计数放在这里而不是换算处:被后面几道闸拦掉的行
+        # 不算"按上限上架了"(「按 10 铺货」那个计数就是算早了的反例)
+        if qty_why == store_limits.QTY_CAPPED:
+            counts["stock_capped"] += 1
         echo[3] = w_price               # 算出定价的行回显 L 列
         # 发货重量:**解析器说了算**,不是"有没有 attrs.weight 这个键"
         # (2026-09-06 事故后改口)。`shipping_weight_ex` 的归因分桶报进摘要 ——
@@ -1722,6 +1747,7 @@ def run(params: dict) -> str:
         mults=store_limits.price_multipliers(),
         lead_caps=store_limits.lead_day_caps(),     # 按店「配送时长限制」
         store_chs=store_targets.store_channels(),   # 按店「配送限制」(没标=不限)
+        stock_caps=store_limits.stock_caps(),       # 按店「最大库存」(没设=不限)
         stores_by_name={s["name"]: s for s in stores_svc.load_stores()})
     stores_by_name = ctx.stores_by_name
     n = {"inactive": 0, "quota": 0, "no_spec": 0, "risk": 0, "dedup": 0,
@@ -1729,6 +1755,7 @@ def run(params: dict) -> str:
          "blacklist": 0, "claimed": 0, "no_data": 0, "filtered": 0,
          "no_upc": 0, "stock_assumed": 0, "invalid": 0,
          "lead_days": 0, "no_material": 0, "channel": 0, "custom": 0,
+         "stock_cap": 0, "stock_capped": 0,
          # 重量兜底按**归因**分桶(键 = "wt_" + mp_mapper 的归因词);
          # 只报非零的那几桶,口径见 gate_line 里的重量段
          **{f"wt_{r}": 0 for r in mp_mapper.WEIGHT_REASONS if r != "parsed"}}
@@ -1816,13 +1843,17 @@ def run(params: dict) -> str:
         ("cooldown", "退役冷却中"), ("blacklist", "黑名单"),
         ("no_data", "待数据源"), ("filtered", "数据过滤"),
         ("lead_days", "配送超时"), ("no_material", "素材不足"),
-        ("channel", "渠道不符本店"), ("custom", "定制品")) if n[key]]
+        ("channel", "渠道不符本店"), ("custom", "定制品"),
+        ("stock_cap", "低于本店最大库存")) if n[key]]
     gate_line = ("闸门:" + ",".join(f"{lab} {v}" for lab, v in blocked)
                  if blocked else "闸门:一条都没拦")
     if n["stock_assumed"]:
         # 亮出来:这些行的库存不是真值,是保守常量(高库存页面不显示具体数)
         gate_line += (f";库存数未采到按 {amz_source.IN_STOCK_QTY} 铺货"
                       f" {n['stock_assumed']} 行")
+    if n["stock_capped"]:
+        # 设了「最大库存」的店:这些行的上架数量是 N,不是亚马逊原数
+        gate_line += f";按本店最大库存上架 {n['stock_capped']} 行"
     if n_var:
         gate_line += (";变体:" + ",".join(f"{k} {v}" for k, v in
                                           sorted(n_var.items())))

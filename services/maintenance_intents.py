@@ -924,11 +924,29 @@ def price_intents(rows: list[dict], multipliers: dict[str, dict]) -> list[dict]:
     return out
 
 
+def _qty_reason(code: str, stock, cap) -> str:
+    """输入:`store_limits.stock_for` 的判定码 + 亚马逊库存数 + 本店最大库存 → 输出:「原因」列正文。
+
+    码是飞书维护记录「原因」列的分组依据,正文给人看;原样跟随(码为空)没有原因。
+    """
+    from services import amz_source
+    if code == store_limits.QTY_NO_COUNT:
+        return "亚马逊库存数未采到(采不到就不卖)"
+    if code == store_limits.QTY_BELOW_MIN:
+        return f"亚马逊库存 {stock} 低于门槛 {amz_source.MIN_INVENTORY}"
+    if code == store_limits.QTY_BELOW_CAP:
+        return f"亚马逊库存 {stock} 低于本店最大库存 {cap}"
+    if code == store_limits.QTY_CAPPED:
+        return f"按本店最大库存 {cap} 写(亚马逊 {stock})"
+    return ""
+
+
 def inventory_intents(rows: list[dict],
                       managed: dict[str, str] | None = None,
-                      store_channels: dict[str, str] | None = None
+                      store_channels: dict[str, str] | None = None,
+                      stock_caps: dict[str, int] | None = None
                       ) -> list[dict]:
-    """输入:在线商品行(`_rows` 的产出)(+受管仓表 + {店铺: 限定渠道})→ 输出:改库存意图。
+    """输入:在线商品行(`_rows` 的产出)(+受管仓表 + {店铺: 限定渠道} + {店铺: 最大库存})→ 输出:改库存意图。
 
     ⚠ **行由 `collect_all` 一次取好传进来**,本函数不自己查库(见 `_rows` 头注)。
     唯一用得上 `node_qty` 那一列的 provider 就是它(比对基准 = 受管仓现值)。
@@ -937,13 +955,23 @@ def inventory_intents(rows: list[dict],
     `store_targets.store_channels()`,由 `collect_all` 取一次分发)。
     **不传 = 不限制**:直接调本函数的测试与排查不会因此静默拿到一份 Feishu 读。
 
-    库存决策(所有者定稿 2026-08-09;渠道那条 2026-08-25 加):
+    `stock_caps` = 限额表「最大库存」设了 N 的店(唯一取数口
+    `store_limits.stock_caps()`,由 `collect_all` 取一次分发)。**不传 = 不限**。
+
+    库存决策(所有者定稿 2026-08-09;渠道那条 2026-08-25 加;门槛与最大库存
+    2026-09-25 加):
       · **本店渠道 ≠ 产品渠道 → 写 0**。清零可逆、删除不可逆,所以这里只清零;
         真下架交给删除链的「渠道不符 N 天」窗口(与缺货走同一条阶梯)
-      · stock_count 有值 → 同步该值(0 就是 0)
-      · **stock_count 为 NULL(没采到)→ 也写 0**。采不到就不卖,是运营口径;
-        库里 NULL 与 0 仍然分得清(catalog.snapshots 原样存),只在决策这一层
-        把"不知道"当成"别卖"。
+      · 其余情况按亚马逊库存数换算,**唯一实现 `store_limits.stock_for`**
+        (与上架同一个函数):
+          - **没采到(NULL)→ 写 0**(原因码 no_count)。采不到就不卖,是运营
+            口径;库里 NULL 与 0 仍然分得清(catalog.snapshots 原样存),只在
+            决策这一层把"不知道"当成"别卖"。也**不算达到最大库存**
+          - **< 门槛 `amz_source.MIN_INVENTORY`(5)→ 写 0**(below_min;
+            **所有店**,所有者 2026-09-25「库存维护也需要门槛5」—— 此前 1~4
+            件照写原数,是旧系统「同步时 <5 推 0」没迁过来的漏项)
+          - 设了最大库存 N:≥ N → 写 N(store_cap),< N → 写 0(below_cap)
+          - 没设 N → 同步该值
       · 配送超上限 → 写 0。上限取限额表**本店**「配送时长限制」
         (`lead_limit`,与分配链共用同一列同一常量);该店没填就回落全局
         `MAX_LEAD_DAYS`(**7 天**,所有者两次收紧 12 →08-09→ 8 →08-15→ 7)。
@@ -957,15 +985,13 @@ def inventory_intents(rows: list[dict],
     from services import amz_source
     lead_caps = store_limits.lead_day_caps()
     chans = store_channels or {}
+    caps = stock_caps or {}
     out = []
-    n_channel = n_zeroed = n_used = 0
+    n_channel = n_zeroed = n_used = n_capped = 0
     for r in rows:
         store, sku = r["store"], r["sku"]
         # 比对基准 = 受管仓现值(配置店)/ 全店合计(未配置店),唯一出处
         avail_qty = current_qty(store, r["avail_qty"], r.get("node_qty"), managed)
-        stock_count = r["stock_count"]
-        if stock_count is None:
-            stock_count = 0             # 没采到 → 不卖(所有者定稿)
         cap = store_limits.cap_for(lead_caps, store, amz_source.MAX_LEAD_DAYS)
         over = store_limits.over_lead_cap(r["delivery_days"], cap)
         # 渠道判定走 store_targets 唯一谓词(上架/分配/对账同一处):店没标
@@ -997,9 +1023,19 @@ def inventory_intents(rows: list[dict],
             offer_condition=r["offer_condition"])
         if act == "delete":
             continue        # 删除类归 delete_intents,这里不抢
-        new_qty = 0 if act == "inventory" else int(stock_count)
+        if act == "inventory":
+            new_qty = 0
+        else:
+            # 跟随亚马逊的那一支:门槛 + 本店最大库存,换算与上架同一个函数
+            # (所有者定稿 2026-09-25)。判定码直接当原因码 —— 此前这一支写
+            # 0 时原因码为空,摘要里与"没采到"混在「-」一栏
+            cap_n = caps.get(store)
+            new_qty, code = store_limits.stock_for(r["stock_count"], cap_n)
+            why = _qty_reason(code, r["stock_count"], cap_n)
         if avail_qty is not None and int(avail_qty) == new_qty:
             continue
+        # 只数本轮真产出的封顶意图(现值已是 N 的行不算)
+        n_capped += 1 if code == store_limits.QTY_CAPPED else 0
         out.append({"store": store, "sku": sku, "kind": "inventory",
                     "old": avail_qty, "new": new_qty,
                     "code": code, "reason": why,
@@ -1016,6 +1052,9 @@ def inventory_intents(rows: list[dict],
                        "(原因码 used_offer)——我们跟卖的是全新品,二手 offer "
                        "的价与货都不是要的;持续二手会被删除链的 15 天窗口下架",
                        n_used)
+    if n_capped:
+        logger.info("库存:%d 条意图按本店「最大库存」封顶(原因码 %s)",
+                    n_capped, store_limits.QTY_CAPPED)
     if n_channel:
         # 渠道不符必须出声:它是结构性的(不像缺货会自己好),而且这批行
         # 会顺着删除链的窗口走到不可逆的删除 —— 一次大面积出现,多半是
@@ -1295,6 +1334,9 @@ def collect_all(conn, stockzero: list[str], oos_days: int = 0,
     """
     mults = store_limits.price_multipliers()
     chans = store_targets.store_channels()
+    # 「最大库存」只有跟随亚马逊的库存 provider 用(跟卖铺货、stockzero 不受管,
+    # 所有者定稿 2026-09-25);在这里取一次,与「配送限制」同款分发
+    caps = store_limits.stock_caps()
     # ⚠ 一轮**只查一次**在架行,四个 provider 共享这一份(managed 那份是超集:
     # 只多 node_qty 一列的值,行集合与不带 managed 的完全相同)。
     rows = _rows(conn, stockzero, managed, only=only)
@@ -1308,7 +1350,8 @@ def collect_all(conn, stockzero: list[str], oos_days: int = 0,
     # 标题/价格与仓库无关,不传(传了也没有用武之地,别加无意义的参数)。
     for it in (title_intents(rows)
                + price_intents(rows, mults)
-               + inventory_intents(rows, managed, store_channels=chans)
+               + inventory_intents(rows, managed, store_channels=chans,
+                                   stock_caps=caps)
                # 跟卖品铺货(所有者批复 2026-08-12):amz 三 provider 按路由
                # 铁律只碰 source_type='amz',跟卖品的库存唯一由它负责。
                # 它与 zero_intents 各有自己的取数(match 出身 / stockzero 整店),

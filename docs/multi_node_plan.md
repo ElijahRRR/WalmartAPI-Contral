@@ -248,7 +248,10 @@ stockzero 静默失效(P0)、库存永久重写循环 + settle 恒 ineffective(P
   1. `maintenance_scan -p preview=1 -p store=<店>` 看规模 → 真跑 maintenance,
      受管仓拿到正确库存(全程无断售空窗);
   2. `catalog_sync -p store=<店>` 复核受管仓已经有货;
-  3. `node_clear -p store=<店> -p node=<旧节点> --dry-run` → 人眼确认 → 真跑。
+  3. `node_clear -p store=<店> --dry-run` → 人眼确认 → 真跑。旧仓编号不用填
+     (2026-09-25 起从 `GET /v3/inventories` 的 `shipNode` 自动发现,受管仓以外
+     有货的全清;`-p node=` 只在想单清某一个旧仓时用;不带 `-p store` = 所有
+     填了「维护仓库」且校验通过的店一起跑)。
   中间那段两节点都有货、可售量翻倍,是**知情接受**的代价(999 多为名义值,
   实际敞口小);反过来先清旧仓则会出现整店短暂不可售。
   ⚠ `node_clear` **拒绝清受管仓**:那是自动链每轮在维护的节点,清了下一轮
@@ -325,7 +328,7 @@ list_new(批次 3)一开始就做对了(`managed_bad` 整店 `continue`),维护�
    避让同向:扫描件几分钟前刚按同一张表整店剔过,这道闸拦的是存量行)。
 
 **存量处置**(本仓不自动清,所有者操作):受影响的店按 §7 runbook 第 3 步
-`node_clear -p store=<店> -p node=<旧节点> --dry-run` → 人眼确认 → 真跑;
+`node_clear -p store=<店> --dry-run` → 人眼确认 → 真跑(旧仓自动发现);
 `node_clear` 只清受管仓已接管的 SKU,未接管的默认跳过。⚠ A171罗尹鸿 /
 A085朱丽霖 不在任何一天的「校验失败」名单里,它们的双节点有货另有出处
 (接管后未跑 node_clear 的设计内状态,或别的写入方),先查

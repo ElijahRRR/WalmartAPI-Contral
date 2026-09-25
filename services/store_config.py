@@ -69,6 +69,13 @@ _SEV_BY_ATTR = {
 #: 两列之间调数值(3000→2500)只是配额调整,mid。
 _ZERO_IS_A_SWITCH = {"max_online", "inventory_note"}
 
+#: 「设了 / 没设」之间才是 high 的列:**正整数 = 设了**,空 / 0 / 非数字 = 没设
+#: (与读列口径 `store_limits._int_map` 一致)。与上面那组的差别:这里 0 与空
+#: 是**同一个意思**(不限),不是开关的两档。
+#: 最大库存(所有者建列 2026-09-25):设上 = 次日起整店库存改按上限写,撤掉 =
+#: 回到跟随亚马逊原数,都是整店换行为;调数值(3→5)只是口径调整,mid。
+_POSITIVE_IS_ON = {"max_stock"}
+
 #: 在 registry 登记了、但没在上面分档的列(如 `maint_node`,或将来新加的闸)
 #: = mid。不默认 info:新列多半是新加的闸,当"不值一提"会让它第一次生效时
 #: 没人知道。**未登记列走不到这里** —— 它们压根不产逐格事件(见 `_limits_snapshot`)。
@@ -87,6 +94,19 @@ def _zero_switch_cols() -> set[str]:
     return {getattr(f, a) for a in _ZERO_IS_A_SWITCH if hasattr(f, a)}
 
 
+def _positive_on_cols() -> set[str]:
+    f = resources.RETIRE_LIMITS.fields
+    return {getattr(f, a) for a in _POSITIVE_IS_ON if hasattr(f, a)}
+
+
+def _is_on(v: str) -> bool:
+    """输入:单元格原文 → 输出:是否"设了"(正整数;与 store_limits._int_map 同口径)。"""
+    try:
+        return int(float(str(v or "").strip() or 0)) > 0
+    except ValueError:
+        return False
+
+
 def _is_zero(v: str) -> bool:
     """输入:单元格原文 → 输出:它是不是"填了 0"(空串不是 0,是没填)。"""
     s = str(v or "").strip()
@@ -102,6 +122,8 @@ def _limits_severity(col: str, old: str, new: str) -> str:
     """输入:列名 + 变化两端原文 → 输出:severity(依据见上面的分档注释)。"""
     if col in _zero_switch_cols():
         return _SEV_HIGH if _is_zero(old) != _is_zero(new) else _SEV_MID
+    if col in _positive_on_cols():
+        return _SEV_HIGH if _is_on(old) != _is_on(new) else _SEV_MID
     return _limits_sev_map().get(col, _SEV_DEFAULT)
 
 

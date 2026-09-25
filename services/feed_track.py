@@ -18,7 +18,8 @@ from datetime import datetime, timezone
 
 from api import feeds
 from registry import db, resources
-from services import blacklist, product_events, store_retry, stores as stores_svc
+from services import blacklist, product_events, runlock, store_retry, \
+    stores as stores_svc
 
 logger = logging.getLogger("services.feed_track")
 
@@ -268,7 +269,8 @@ def past_deadline(feed_type: str | None, age_h: float | None) -> bool:
 
 def past_grace(feed_type: str | None, age_h: float | None) -> bool:
     """输入:feedType + 在途年龄 → 输出:是否已过「期限 + 读不到的宽限」
-    (UNREADABLE_GRACE_HOURS)。只用于读不到明细时落 unreadable。"""
+    (UNREADABLE_GRACE_HOURS)。用于读不到明细时落 unreadable,与 pending 对账里
+    「查不动 / 核不清」的收口(reconcile_pending)。"""
     return (past_deadline(feed_type, age_h)
             and age_h >= deadline_hours(feed_type) + UNREADABLE_GRACE_HOURS)
 
@@ -603,6 +605,137 @@ def settle_unreadable(feed_id: str, cls: str, why: str, *,
     return n
 
 
+def _undecided_why(feed: dict | None) -> str:
+    """输入:反查 UNKNOWN 带回的候选(find_recent_feed)→ 输出:依据里的人话。"""
+    matched = [str(x) for x in (feed or {}).get("matched") or []]
+    unverified = [str(x) for x in (feed or {}).get("unverified") or []]
+    if not matched and not unverified:
+        return "feed 列表读取失败"
+    tail = (f"另有 {len(unverified)} 条候选明细还核对不了({'、'.join(unverified[:3])})"
+            if unverified else "")
+    if len(matched) > 1:
+        return (f"{len(matched)} 条候选条数与 SKU 集合都对得上({'、'.join(matched[:3])}),"
+                f"分不清是哪一笔" + (f";{tail}" if tail else ""))
+    if matched:
+        return f"{matched[0]} 对得上,但{tail},核清之前不收编"
+    return (f"{len(unverified)} 条候选明细还核对不了({'、'.join(unverified[:3])}):"
+            f"读不到、还是空的,或只露出本片一部分")
+
+
+def reconcile_pending(pendings: list[dict], stores_by_name: dict,
+                      execute: bool = True) -> list[dict]:
+    """输入:pending 台账行(query_pending)+ 店铺表(+ 是否真写)→ 输出:逐行的对账记录。
+
+    所有者 2026-09-25 批(推翻 2026-08-16「pending 不做对账器」):pending = POST 结局
+    不确定、没拿到 feedId —— **不等于没提交上**(请求可能已到沃尔玛、只是回包丢了)。
+    每轮 feed_poll 对每行只读反查,按落定期限收口,**绝不补交**(写操作永不自动兜底;
+    落 failed = 载荷解锁,要不要再发由原业务工作流下一轮按原方法决定):
+
+      · 原工作流还在跑(它的运行锁被占着)⇒ 一格不碰:这一笔可能正在它手里当场结算
+        (反查 / 补交),这时收编会让它的反查把收编的 feed 当"已记账"排除、判未达、
+        同一载荷补交 = 重复提交;锁探不了就等过期限 + 宽限再动;
+      · 存量行(item_count 为空,09-25 之前 claim 的,没记条数 / SKU / 发送标记)
+        ⇒ 无法反查;过了期限 + 宽限落 failed「提交未确认」;
+      · post_started_at 为空 = 请求**从没开始发**(原工作流已不在跑)⇒ 落 failed「未发出」;
+      · 店铺不可调用(不在营 / 凭证缺失)⇒ 过了期限 + 宽限落 failed「提交未确认」;
+      · 反查(api.feeds.find_recent_feed:按发送时刻开窗、翻页、条数 + **SKU 集合核对**):
+          FOUND     ⇒ 收编(feed_log 转 submitted、补落 feed_items,时刻用发送时刻),
+                      下一轮起按落定期限正常追踪;
+          NOT_FOUND ⇒ 到期仍没有 ⇒ failed「提交未确认」;没到期下轮再查;
+          UNKNOWN   ⇒ 反查本身失败 / 候选核不清(不止一条对得上,或明细还核对不了)
+                      ⇒ 期限 + 宽限后 failed「提交未确认」,依据里点名候选。
+    期限与宽限同 feed 结果(FEED_DEADLINE_MINUTES、UNREADABLE_GRACE_HOURS),起点 =
+    发送时刻(没有就用 claim 时刻)。`execute=False`:照查照判,一行不写。
+    """
+    out: list[dict] = []
+    for p in pendings:
+        ft = p["feed_type"]
+        wf = p.get("workflow") or ""
+        posted = p.get("post_started_at")
+        age = age_hours(posted or p.get("updated_at"))
+        registered = ft in FEED_DEADLINE_MINUTES
+        due = registered and past_deadline(ft, age)
+        grace_over = registered and past_grace(ft, age)
+        limit = deadline_text(ft)
+        rec = {"store": p["store"], "label": _FEED_LABEL.get(ft, ft),
+               "workflow": wf or "-", "feed_type": ft, "age_h": age,
+               "state": "open", "detail": ""}
+        out.append(rec)
+
+        def _close(basis: str, _rec=rec, _p=p) -> None:
+            ok = feeds.close_pending(_p["id"], basis) if execute else True
+            _rec.update(state="closed" if ok else "open",
+                        detail=(f"落 failed:{basis}" if ok
+                                else "行已不是 pending(别处刚处理过),不动"))
+
+        # 原工作流还在跑 ⇒ 这一行还在它手里,一格不碰:它可能正在当场结算这一笔
+        # (提交当场的 30 秒复查 / list_new 整轮跑完才做的延后结算)。
+        # 这时收编,它自己的反查就会把收编的 feed 当"已记账"排除掉 → 判未达 → 同一
+        # 载荷补交 = 重复提交。锁探不了(锁文件打不开)就等过期限 + 宽限:当场结算
+        # 没有哪一轮会拖那么久。
+        held = runlock.is_held(wf) if wf else None
+        if held or (held is None and not grace_over):
+            rec["detail"] = (
+                f"请求还没开始发送,{wf} 正在跑(可能正排队等配额),下轮再看"
+                if held and posted is None and p.get("item_count") is not None else
+                f"{wf} 正在跑,这一笔可能正在它手里当场结算(反查 / 补交),跑完再对账"
+                if held else
+                f"判不了 {wf or '原工作流'} 在不在跑(锁文件打不开),落定期限 {limit}"
+                f" + 宽限 {UNREADABLE_GRACE_HOURS}h 内先不动")
+            continue
+        if p.get("item_count") is None:
+            if grace_over:
+                _close("提交未确认:存量 pending(09-25 之前 claim,没记条数、SKU 与发送标记),"
+                       f"无法反查;过了落定期限 {limit} + 宽限 {UNREADABLE_GRACE_HOURS}h")
+            else:
+                rec["detail"] = (f"存量 pending(没记条数与 SKU,无法反查),到落定期限 {limit}"
+                                 f" + 宽限 {UNREADABLE_GRACE_HOURS}h 落 failed(提交未确认)")
+            continue
+        if posted is None:
+            _close(f"未发出:{wf} 已不在运行,请求从没开始发送(发送标记为空)" if held is False
+                   else f"未发出:请求从没开始发送(发送标记为空),claim 已过落定期限 {limit}"
+                        f" + 宽限 {UNREADABLE_GRACE_HOURS}h")
+            continue
+        store = stores_by_name.get(p["store"])
+        if store is None:
+            if grace_over:
+                _close("提交未确认:店铺不可调用(不在营或凭证缺失),落定期限 "
+                       f"{limit} + 宽限 {UNREADABLE_GRACE_HOURS}h 内一直没法反查")
+            else:
+                rec["detail"] = "店铺不可调用(不在营或凭证缺失),暂不能反查"
+            continue
+        err = ""
+        try:
+            verdict, feed = feeds.find_recent_feed(
+                store, ft, int(p["item_count"]), since=posted,
+                expect_skus=list(p.get("skus") or []), recheck=False)
+        except Exception as e:      # noqa: BLE001 —— 反查失败就是 UNKNOWN,原话留给依据
+            verdict, feed, err = "UNKNOWN", None, f"{store_retry.diagnose(e)}:{e}"
+        n = int(p.get("recon_count") or 0) + 1
+        if execute:
+            feeds.note_reconcile(p["id"])
+        if verdict == "FOUND":
+            ok = feeds.adopt_pending(p, feed["feedId"], posted) if execute else True
+            rec.update(state="adopted" if ok else "open",
+                       detail=(f"收编 feedId={feed['feedId']}(反查第 {n} 次找到,条数与"
+                               f" SKU 集合一致),下轮起按落定期限 {limit} 追踪"
+                               if ok else "行已不是 pending(别处刚处理过),不动"))
+        elif verdict == "NOT_FOUND":
+            if due:
+                _close(f"提交未确认:落定期限 {limit} 内反查 {n} 次,沃尔玛 feed 列表里"
+                       f"都没有这一笔(条数 {p['item_count']} + SKU 集合)")
+            else:
+                rec["detail"] = f"反查第 {n} 次没找到,落定期限 {limit} 前每轮再查"
+        else:
+            why = err or _undecided_why(feed)
+            if grace_over:
+                _close(f"提交未确认:落定期限 {limit} + 宽限 {UNREADABLE_GRACE_HOURS}h 内"
+                       f"反查一直没有结论({n} 次,最后:{why})"[:500])
+            else:
+                rec["detail"] = f"反查第 {n} 次没有结论({why}),下轮再查"
+    return out
+
+
 def poll_all(stores_by_name: dict, execute: bool = True,
              only: str | None = None) -> str:
     """输入:{店铺名: store dict}(+ 是否真落账、限定店铺)→ 输出:全局轮询摘要。
@@ -613,7 +746,9 @@ def poll_all(stores_by_name: dict, execute: bool = True,
       · 到期后读不到明细 ⇒ 404 当场、其他失败(含店铺已不可调用)过了
         UNREADABLE_GRACE_HOURS ⇒ `settle_unreadable` 落「无法查询」;期限前的读取
         失败一律"下轮再读"。
-    pending 行(提交结局不确定)只告警不自动补交——写操作宁停不重。
+    pending 行(提交结局不确定)先过 `reconcile_pending`:只读反查,查到收编(下一轮
+    起按期限追踪)、到期查不到落 failed「提交未确认」、确定没发出落 failed「未发出」,
+    **绝不补交** —— 写操作宁停不重(所有者 2026-09-25 批)。
 
     为什么跨店能并发:每店有自己的固定出口代理,沃尔玛配额按 `(store, endpoint)`
     计,`api/_client` 的令牌桶也按这个维度限流——店与店之间不抢同一个桶。
@@ -639,6 +774,8 @@ def poll_all(stores_by_name: dict, execute: bool = True,
     by_store: dict[str, list[dict]] = {}
     for r in submitted:
         by_store.setdefault(r["store"], []).append(r)
+    # pending 对账先做:收编的行这一轮不追(下一轮 query_pending 就是 submitted 了)
+    recon = reconcile_pending(pendings, stores_by_name, execute=execute)
 
     def _unreadable(rec: dict, feed_id: str, cls: str, why: str) -> None:
         n = settle_unreadable(feed_id, cls, why, execute=execute)
@@ -795,11 +932,6 @@ def poll_all(stores_by_name: dict, execute: bool = True,
             "    完整码 + 现成命令:`python cli.py feed_poll -p stuck=1`"
             "(只读台账,不调沃尔玛);期限见 refdata/walmart_slas.tsv")
 
-    if pendings:
-        logger.warning("feed_log 有 %d 条 pending(提交结局不确定),"
-                       "请人工核对后处理:%s", len(pendings),
-                       [(p["store"], p["feed_type"], str(p["created_at"]))
-                        for p in pendings[:10]])
     line = f"feed 轮询:{len(submitted)} 个在途,落定 {done}"
     extras = []
     if by_deadline:
@@ -817,21 +949,22 @@ def poll_all(stores_by_name: dict, execute: bool = True,
         # 首行 = 结论 + 最重要的那个数(排版规矩 1:飞书列表/手机推送/ops.runs
         # 都只显示第一行)。长期在途是**例外计数**,0 则整段消失(规矩 2)。
         line += f";⏳ 长期在途 {len(stuck)}(最久 {oldest:.1f}h)"
-    if pendings:
-        # ⚠ 只报个数**没法处理**(2026-08-16 feed 闭环审计):摘要是发去飞书的
-        # 那一份,人看到"pending 3"接下来要干什么?明细只在日志里,而 pending
-        # 行**永不老化**——不落定就永远挂着,数字只增不减,几轮之后这行警告就
-        # 成了背景噪音。把店铺/类型/时间摊开,至少能拿去 Walmart 后台对。
-        line += f";⚠ pending 待人工核对 {len(pendings)}"
-        detail_lines.append(
-            "  pending(提交结局不确定,**系统不会自动补交**——"
-            "核对后手工处理,见 docs/feed_closure_audit.md):")
-        for p in pendings[:10]:
-            detail_lines.append(
-                f"    {p['store']} {p['feed_type']}"
-                f"({p.get('workflow') or '-'}) 提交于 {p['created_at']}")
-        if len(pendings) > 10:
-            detail_lines.append(f"    …另有 {len(pendings) - 10} 条,查 "
+    if recon:
+        # pending 对账(2026-09-25):首行报三档个数(0 的整段消失),明细逐行报
+        # 依据 —— 收编 / 落 failed 是新信息(只播这一次),仍待的说清在等什么
+        n_ad = sum(1 for r in recon if r["state"] == "adopted")
+        n_cl = sum(1 for r in recon if r["state"] == "closed")
+        n_op = len(recon) - n_ad - n_cl
+        parts = [f"{w} {n}" for w, n in (("收编", n_ad), ("落 failed", n_cl),
+                                         ("仍待", n_op)) if n]
+        line += f";pending 对账 {len(recon)}:{'、'.join(parts)}"
+        detail_lines.append("  pending(提交结局不确定;每轮只读反查,**不自动补交**):")
+        shown = sorted(recon, key=lambda r: r["state"] == "open")   # 新信息在前
+        for r in shown[:10]:
+            detail_lines.append(f"    {r['store']} {r['label']}({r['workflow']}):"
+                                f"{r['detail']}")
+        if len(shown) > 10:
+            detail_lines.append(f"    …另有 {len(shown) - 10} 条,查 "
                                 f"ops.feed_log WHERE status='pending'")
     if not execute:
         # cli 只给 DANGEROUS 工作流打 [DRY-RUN] 横幅,feed_poll 不是 ⇒ 自己标在首行

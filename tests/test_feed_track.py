@@ -264,32 +264,31 @@ def test_poll_feed_not_terminal_returns_head_and_none(monkeypatch):
     assert feed_track._progress(head) == "已收 10,成功 3,失败 1,待处理 6"
 
 
-def test_poll_all_summary_and_pending_alarm(monkeypatch, caplog):
-    import logging as _logging
+def test_poll_all_summary_and_pending_reconcile(monkeypatch):
+    """摘要:逐 feed 明细照旧;pending 先过对账器,首行报三档个数,明细逐行报依据。
+
+    ⚠ pending 的明细必须进**摘要**(发去飞书的那一份),不能只在日志里(2026-08-16
+    feed 闭环审计);2026-09-25 起它们不再"永不老化":每轮只读反查,到期收口。
+    """
     monkeypatch.setattr(feeds, "query_pending", lambda: [
         {"status": "submitted", "feed_id": "F1", "store": "T1",
          "feed_type": "DELETE_ITEM", "workflow": "", "created_at": "t"},
         {"status": "submitted", "feed_id": "F2", "store": "T_GONE",
          "feed_type": "DELETE_ITEM", "workflow": "", "created_at": "t"},
         {"status": "pending", "feed_id": None, "store": "T1",
-         "feed_type": "RETIRE_ITEM", "created_at": "t"},
+         "feed_type": "RETIRE_ITEM", "workflow": "product_clear", "created_at": "t"},
     ])
     monkeypatch.setattr(feed_track, "poll_feed",
                         lambda store, fid, **_: ({"feedStatus": "PROCESSED"},
                                             {"A": ("success", "")}))
-    with caplog.at_level(_logging.WARNING, logger="services.feed_track"):
-        out = feed_track.poll_all({"T1": STORE})
+    monkeypatch.setattr(feed_track.runlock, "is_held", lambda name: False)
+    out = feed_track.poll_all({"T1": STORE})
     assert "落定 1" in out and "凭证缺失跳过 1" in out
-    assert "pending 待人工核对 1" in out
-    # 逐 feed 明细:店铺 + 业务动作名 + feed_id + 结果
+    assert "pending 对账 1:仍待 1" in out.splitlines()[0]
     assert "T1 删除(-) F1:已落定 PROCESSED,成功 1,失败 0" in out
     assert "T_GONE 删除(-) F2:店铺凭证缺失,跳过" in out
-    assert any("提交结局不确定" in m for m in caplog.messages)
-    # ⚠ pending 的明细必须进**摘要**(发去飞书的那一份),不能只在日志里:
-    # 只报个数,人看到之后无从下手;而 pending 行永不老化,数字只增不减,
-    # 几轮之后这行警告就成了背景噪音(2026-08-16 feed 闭环审计)
-    assert "系统不会自动补交" in out
-    assert "T1 RETIRE_ITEM(-) 提交于 t" in out
+    assert "每轮只读反查,**不自动补交**" in out
+    assert "T1 停用(product_clear):存量 pending(没记条数与 SKU,无法反查)" in out
 
 
 def test_save_errors_rows_shape():
@@ -1660,3 +1659,219 @@ def test_a_store_filtered_run_never_judges_other_stores(monkeypatch):
                         lambda *a, **k: pytest.fail("别的店的 feed 不许被判掉"))
     out = feed_track.poll_all({"T1": STORE}, only="T1")
     assert out.startswith("feed 轮询:1 个在途") and "F2" not in out
+
+
+# ── pending 对账(所有者 2026-09-25 批:「pending 按你的建议做」)──────────────────
+# pending ≠ 没提交上:POST 可能已到沃尔玛、只是没拿到 feedId。每轮只读反查,查到收编、
+# 到期查不到落 failed「提交未确认」、确定没发出落 failed「未发出」,**绝不补交**。
+
+def _pending(age_h=1.0, posted=True, item_count=2, ft="DELETE_ITEM", wf="product_clear",
+             store="T1", recon=0):
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    at = now - timedelta(hours=age_h)
+    return {"id": 7, "status": "pending", "feed_id": None, "store": store,
+            "feed_type": ft, "workflow": wf, "created_at": at, "updated_at": at,
+            "item_count": item_count, "skus": ["A", "B"] if item_count else None,
+            "post_started_at": at if posted else None, "recon_count": recon}
+
+
+def _recon_wired(monkeypatch, verdict=("NOT_FOUND", None), held=False):
+    calls = {"close": [], "adopt": [], "note": [], "lookup": []}
+    monkeypatch.setattr(feeds, "close_pending",
+                        lambda lid, basis: (calls["close"].append(basis), True)[1])
+    monkeypatch.setattr(feeds, "adopt_pending",
+                        lambda row, fid, at: (calls["adopt"].append((fid, at)), True)[1])
+    monkeypatch.setattr(feeds, "note_reconcile", lambda lid: calls["note"].append(lid))
+
+    def _lookup(store, ft, n, **kw):
+        calls["lookup"].append((ft, n, kw))
+        if isinstance(verdict, Exception):
+            raise verdict
+        return verdict
+
+    monkeypatch.setattr(feeds, "find_recent_feed", _lookup)
+    monkeypatch.setattr(feed_track.runlock, "is_held", lambda name: held)
+    return calls
+
+
+def test_found_is_adopted_with_the_send_time(monkeypatch):
+    calls = _recon_wired(monkeypatch, verdict=("FOUND", {"feedId": "F_OURS"}))
+    p = _pending(age_h=1.0)
+    (rec,) = feed_track.reconcile_pending([p], {"T1": STORE})
+    assert rec["state"] == "adopted" and "收编 feedId=F_OURS" in rec["detail"]
+    assert calls["adopt"] == [("F_OURS", p["post_started_at"])]
+    ft, n, kw = calls["lookup"][0]
+    assert (ft, n) == ("DELETE_ITEM", 2)
+    assert kw == {"since": p["post_started_at"], "expect_skus": ["A", "B"],
+                  "recheck": False}                      # 按发送时刻、核 SKU 集合
+    assert calls["note"] == [7]
+
+
+def test_not_found_waits_until_the_deadline_then_closes(monkeypatch):
+    calls = _recon_wired(monkeypatch)
+    (rec,) = feed_track.reconcile_pending([_pending(age_h=10.0)], {"T1": STORE})
+    assert rec["state"] == "open" and "落定期限 72 小时 前每轮再查" in rec["detail"]
+    assert calls["close"] == []
+    (rec,) = feed_track.reconcile_pending([_pending(age_h=73.0, recon=5)], {"T1": STORE})
+    assert rec["state"] == "closed"
+    assert calls["close"][0].startswith("提交未确认:落定期限 72 小时 内反查 6 次")
+
+
+def test_an_unknown_lookup_waits_out_the_grace(monkeypatch):
+    calls = _recon_wired(monkeypatch, verdict=("UNKNOWN", None))
+    (rec,) = feed_track.reconcile_pending([_pending(age_h=80.0)], {"T1": STORE})
+    assert rec["state"] == "open" and calls["close"] == []          # 72 + 24 之内
+    (rec,) = feed_track.reconcile_pending([_pending(age_h=97.0)], {"T1": STORE})
+    assert rec["state"] == "closed" and "反查一直没有结论" in calls["close"][0]
+
+
+def test_an_undecided_lookup_names_its_candidates(monkeypatch):
+    """候选核不清(不止一条对得上 / 明细还核对不了)⇒ 不收编;依据里点名候选。"""
+    calls = _recon_wired(monkeypatch, verdict=(
+        "UNKNOWN", {"matched": ["F1", "F2"], "unverified": ["F3"]}))
+    (rec,) = feed_track.reconcile_pending([_pending(age_h=10.0)], {"T1": STORE})
+    assert rec["state"] == "open" and calls["adopt"] == []
+    assert "2 条候选条数与 SKU 集合都对得上(F1、F2),分不清是哪一笔" in rec["detail"]
+    assert "另有 1 条候选明细还核对不了(F3)" in rec["detail"]
+    (rec,) = feed_track.reconcile_pending([_pending(age_h=97.0)], {"T1": STORE})
+    assert rec["state"] == "closed" and "分不清是哪一笔" in calls["close"][0]
+    calls = _recon_wired(monkeypatch, verdict=(
+        "UNKNOWN", {"matched": ["F1"], "unverified": ["F3"]}))
+    (rec,) = feed_track.reconcile_pending([_pending(age_h=10.0)], {"T1": STORE})
+    assert "F1 对得上,但另有 1 条候选明细还核对不了(F3),核清之前不收编" in rec["detail"]
+    calls = _recon_wired(monkeypatch, verdict=("UNKNOWN", None))
+    (rec,) = feed_track.reconcile_pending([_pending(age_h=10.0)], {"T1": STORE})
+    assert "feed 列表读取失败" in rec["detail"]
+
+
+def test_a_lookup_that_raises_is_unknown_with_its_class(monkeypatch):
+    calls = _recon_wired(monkeypatch, verdict=feeds.FeedQueryError(
+        "feed 状态查询返回 503(feedId=x)", 503))
+    (rec,) = feed_track.reconcile_pending([_pending(age_h=97.0)], {"T1": STORE})
+    assert rec["state"] == "closed" and "沃尔玛503" in calls["close"][0]
+
+
+def test_never_sent_closes_only_when_the_workflow_is_not_running(monkeypatch):
+    """发送标记为空 = 请求还没开始发:原工作流还在跑(可能排队等配额)就不动;
+    不在跑 ⇒ 确定没发出。判不了(锁文件打不开)期限 + 宽限内也不动。"""
+    calls = _recon_wired(monkeypatch, held=True)
+    (rec,) = feed_track.reconcile_pending([_pending(posted=False)], {"T1": STORE})
+    assert rec["state"] == "open" and "请求还没开始发送,product_clear 正在跑" in rec["detail"]
+    assert calls["close"] == []
+    calls = _recon_wired(monkeypatch, held=None)
+    (rec,) = feed_track.reconcile_pending([_pending(posted=False)], {"T1": STORE})
+    assert rec["state"] == "open" and "锁文件打不开" in rec["detail"]
+    (rec,) = feed_track.reconcile_pending([_pending(age_h=97.0, posted=False)], {"T1": STORE})
+    assert rec["state"] == "closed" and calls["close"][0].startswith(
+        "未发出:请求从没开始发送(发送标记为空),claim 已过落定期限 72 小时")
+    calls = _recon_wired(monkeypatch, held=False)
+    (rec,) = feed_track.reconcile_pending([_pending(posted=False)], {"T1": STORE})
+    assert rec["state"] == "closed" and calls["close"][0].startswith(
+        "未发出:product_clear 已不在运行")
+    assert calls["lookup"] == []                  # 没发出就不去沃尔玛那边查
+
+
+def test_a_row_whose_workflow_is_still_running_is_left_alone(monkeypatch):
+    """原工作流还在跑 ⇒ 这一笔可能正在它手里当场结算(30 秒复查 / list_new 的延后
+    结算):不反查、不收编、不收口 —— 这时收编,它自己的反查会把收编的 feed 当
+    "已记账"排除 → 判未达 → 同一载荷补交 = 重复提交。存量行同理(部署那一刻还在跑的
+    旧代码建的行也没有条数)。"""
+    calls = _recon_wired(monkeypatch, verdict=("FOUND", {"feedId": "F_OURS"}), held=True)
+    for row in (_pending(age_h=200.0), _pending(age_h=200.0, item_count=None, posted=False)):
+        (rec,) = feed_track.reconcile_pending([row], {"T1": STORE})
+        assert rec["state"] == "open"
+        assert "product_clear 正在跑,这一笔可能正在它手里当场结算" in rec["detail"]
+    assert calls == {"close": [], "adopt": [], "note": [], "lookup": []}
+    calls = _recon_wired(monkeypatch, verdict=("FOUND", {"feedId": "F_OURS"}), held=None)
+    (rec,) = feed_track.reconcile_pending([_pending(age_h=10.0)], {"T1": STORE})
+    assert rec["state"] == "open" and calls["lookup"] == []       # 探不了锁:宽限内不动
+    (rec,) = feed_track.reconcile_pending([_pending(age_h=97.0)], {"T1": STORE})
+    assert rec["state"] == "adopted"                              # 过了宽限:照常对账
+
+
+def test_legacy_pending_rows_close_after_the_grace_without_a_lookup(monkeypatch):
+    """09-25 之前 claim 的存量行没记条数 / SKU / 发送标记:没法反查,期限 + 宽限后收口。"""
+    calls = _recon_wired(monkeypatch)
+    legacy = dict(_pending(age_h=50.0, item_count=None, posted=False))
+    (rec,) = feed_track.reconcile_pending([legacy], {"T1": STORE})
+    assert rec["state"] == "open" and calls["close"] == []
+    legacy = dict(_pending(age_h=100.0, item_count=None, posted=False))
+    (rec,) = feed_track.reconcile_pending([legacy], {"T1": STORE})
+    assert rec["state"] == "closed" and calls["close"][0].startswith("提交未确认:存量 pending")
+    assert calls["lookup"] == []
+
+
+def test_an_unloadable_store_closes_after_the_grace(monkeypatch):
+    calls = _recon_wired(monkeypatch)
+    (rec,) = feed_track.reconcile_pending([_pending(age_h=90.0, store="GONE")], {"T1": STORE})
+    assert rec["state"] == "open" and "暂不能反查" in rec["detail"]
+    (rec,) = feed_track.reconcile_pending([_pending(age_h=97.0, store="GONE")], {"T1": STORE})
+    assert rec["state"] == "closed" and "店铺不可调用" in calls["close"][0]
+
+
+def test_reconcile_dry_run_decides_but_writes_nothing(monkeypatch):
+    calls = _recon_wired(monkeypatch, verdict=("FOUND", {"feedId": "F_OURS"}))
+    (rec,) = feed_track.reconcile_pending([_pending()], {"T1": STORE}, execute=False)
+    assert rec["state"] == "adopted"
+    assert calls["adopt"] == [] and calls["note"] == [] and calls["close"] == []
+
+
+def test_reconcile_never_submits_anything():
+    """对账器只读:整个函数里不许出现任何提交入口(补交由原业务工作流按原方法做)。"""
+    import inspect
+    src = inspect.getsource(feed_track.reconcile_pending)
+    for forbidden in ("submit_feed", "_post(", "_submit_one", "settle_deferred"):
+        assert forbidden not in src
+
+
+@needs_pg
+def test_pending_ledger_primitives_on_a_real_database(monkeypatch):
+    """真库:认领记条数与 SKU 数组 → 发送标记 → 收编(feed_log 转 submitted、feed_items
+    按发送时刻落)→ 另一行落 failed 带依据 → 对账计数。"""
+    monkeypatch.setenv("WALMART_PG_DSN", _PG_DSN)
+    from registry import db
+    key1, key2 = "k-recon-sandbox-1", "k-recon-sandbox-2"
+
+    def _cleanup():
+        with db.pg_conn() as conn:
+            conn.execute("DELETE FROM ops.feed_items WHERE feed_id = 'F_RECON_SANDBOX'")
+            conn.execute("DELETE FROM ops.feed_log WHERE payload_key IN (%s, %s)",
+                         (key1, key2))
+    _cleanup()
+    try:
+        lid, _ = feeds._log_claim("product_clear", _PG_STORE, "DELETE_ITEM", key1,
+                                  2, ["A", "B"])
+        lid2, _ = feeds._log_claim("product_clear", _PG_STORE, "DELETE_ITEM", key2,
+                                   1, ["C"])
+        feeds._log_posting(lid)
+        feeds.note_reconcile(lid2)
+        rows = {r["id"]: r for r in feeds.query_pending() if r["id"] in (lid, lid2)}
+        assert rows[lid]["item_count"] == 2 and rows[lid]["skus"] == ["A", "B"]
+        posted = rows[lid]["post_started_at"]
+        assert posted is not None and rows[lid2]["post_started_at"] is None
+        assert rows[lid2]["recon_count"] == 1
+        assert feeds.adopt_pending(rows[lid], "F_RECON_SANDBOX", posted) is True
+        assert feeds.adopt_pending(rows[lid], "F_RECON_SANDBOX", posted) is False
+        assert feeds.close_pending(lid2, "未发出:测试") is True
+        with db.pg_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT id, status, feed_id, updated_at = post_started_at,"
+                        " close_basis FROM ops.feed_log WHERE id IN (%s, %s)"
+                        " ORDER BY id", (lid, lid2))
+            got = cur.fetchall()
+            cur.execute("SELECT sku, status, submitted_at = %s FROM ops.feed_items"
+                        " WHERE feed_id = 'F_RECON_SANDBOX' ORDER BY sku", (posted,))
+            items = cur.fetchall()
+        assert got == [(lid, "submitted", "F_RECON_SANDBOX", True, None),
+                       (lid2, "failed", None, None, "未发出:测试")]   # 没发出:标记为空
+        assert items == [("A", "submitted", True), ("B", "submitted", True)]
+        # 重占 failed 行:上一笔的事实一并清空
+        lid3, prev = feeds._log_claim("product_clear", _PG_STORE, "DELETE_ITEM", key2,
+                                      1, ["C"])
+        assert lid3 == lid2 and prev is None
+        with db.pg_conn() as conn, conn.cursor() as cur:
+            cur.execute("SELECT status, recon_count, close_basis, post_started_at"
+                        " FROM ops.feed_log WHERE id = %s", (lid2,))
+            assert cur.fetchone() == ("pending", 0, None, None)
+    finally:
+        _cleanup()

@@ -26,7 +26,10 @@ ops.feed_item_errors(type/code/**field**/description),各业务表的报错列
 
 职责:扫 feed_log 的 submitted 行 → 查沃尔玛终态 → SKU 级结果落
 ops.feed_items(权威台账)→ feed_log 落 done/failed;pending 行
-(提交结局不确定)告警待人工。只读沃尔玛 + 记账,非危险。
+(提交结局不确定)每轮只读反查:查到收编、到期查不到落 failed「提交未确认」、确定没
+发出落 failed「未发出」;原工作流还在跑的行不碰(可能正在它手里当场结算);
+**不自动补交**(所有者 2026-09-25 批,feed_track.reconcile_pending)。
+只读沃尔玛 + 记账,非危险。
 ⚠ 但**反哺器会写 PG**(UPC 池状态、登记簿弃码,两者都不可逆),空跑必须
 用 `python cli.py feed_poll --dry-run` —— 本工作流自己认 params["dry_run"]
 并把 execute 透传给轮询本体与五个反哺器(见 run());漏掉那一句,--dry-run 完全失效。
@@ -405,13 +408,20 @@ def _inflight_list(stores_by_name: dict | None = None) -> str:
         elif head:                      # 凭证缺失 / 查询失败:原话摆出来
             out.append(f"        沃尔玛:{head}")
     if pends:
-        # pending 是另一个口子(提交结局不确定,**系统不会自动补交**),
-        # 它连 feed_id 都没有,查不了逐 SKU —— 处理两步见文档
-        out.append(f"  另有 pending {len(pends)} 条(提交结局不确定、无 feed_id,"
-                   f"系统不会自动补交,处理见 docs/feed_closure_audit.md §三.1):")
+        # pending 是另一个口子(提交结局不确定、还没有 feed_id):轮询每轮只读反查,
+        # 查到收编、到期查不到落 failed「提交未确认」,**不自动补交**
+        # (feed_track.reconcile_pending)。清单只摆事实:发没发、反查过几次
+        out.append(f"  另有 pending {len(pends)} 条(提交结局不确定、还没有 feed_id;"
+                   f"轮询每轮只读反查,到期查不到落 failed「提交未确认」,不自动补交):")
         for p in pends[:10]:
+            sent = (f"发送于 {p['post_started_at']}" if p.get("post_started_at")
+                    else ("存量行(没记发送标记与条数)" if p.get("item_count") is None
+                          else "请求还没开始发送"))
             out.append(f"      {p['store']} {p['feed_type']}"
-                       f"({p.get('workflow') or '-'}) 提交于 {p['created_at']}")
+                       f"({p.get('workflow') or '-'}) claim 于 {p.get('updated_at') or '?'},{sent},"
+                       f"条数 {p.get('item_count') if p.get('item_count') is not None else '?'},"
+                       f"已反查 {p.get('recon_count') or 0} 次,"
+                       f"{_due_note(p['feed_type'], feed_track.age_hours(p.get('post_started_at') or p.get('updated_at')))}")
     return "\n".join(out)
 
 

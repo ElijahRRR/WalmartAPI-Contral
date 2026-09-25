@@ -736,14 +736,32 @@ CREATE TABLE ops.feed_log (         -- feed 防重(核心安全表):先落 pendi
     feed_id     text,               -- 提交成功后回填
     status      text NOT NULL,      -- pending / submitted / done / failed
     created_at  timestamptz NOT NULL DEFAULT now(),
-    updated_at  timestamptz NOT NULL DEFAULT now()
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    -- 以下 5 列 2026-09-25 加(pending 对账);存量行为 NULL / 0,不回填
+    item_count  integer,            -- 本片条数:反查按沃尔玛 feed 列表的 itemsReceived 精确匹配
+    skus        text[],             -- 本片 SKU 列表:候选 feed 明细的 SKU 集合须与它完全一致
+                                    -- 才收编;收编后按它补落 ops.feed_items
+    post_started_at timestamptz,    -- 请求真正发出前落(单独提交);pending 行上为空 = 确定没发出
+    recon_count integer NOT NULL DEFAULT 0,   -- 反查过几次(收口依据里要报)
+    close_basis text                -- 落 failed 的依据:未发出 / 沃尔玛拒收 HTTP 码 /
+                                    -- 反查未达补交未果 / 提交未确认…
 );
 CREATE UNIQUE INDEX ON ops.feed_log (feed_type, store, payload_key);
 CREATE INDEX feed_log_feed_id_idx ON ops.feed_log (feed_id);   -- 2026-09-25:在途口径
 -- (feed_track.IN_FLIGHT_SQL = 台账 submitted 且 feed_log 未收口)按 feed_id 反查
--- 启动对账:凡 status='pending'/'submitted' 的行,先查 Walmart 实际 feed 状态再决定补交
 -- 防重语义(2026-08-07 定稿):唯一索引拦的是在途行(pending/submitted);
--- 终态行(done/failed)被 _log_claim 重占回 pending 后同载荷可再发(不设时间防重窗)
+-- 终态行(done/failed)被 _log_claim 重占回 pending 后同载荷可再发(不设时间防重窗);
+-- 重占时 item_count / skus 换成这一笔的,post_started_at / recon_count / close_basis 清空。
+-- **pending 对账**(所有者 2026-09-25 批,推翻 08-16「不做对账器」;
+-- services/feed_track.reconcile_pending,feed_poll 每轮先跑它):pending = POST 结局
+-- 不确定、没拿到 feedId,**不等于没提交上**。每轮**只读**反查沃尔玛 feed 列表
+-- (按发送时刻开窗 + 条数 + 候选明细的 SKU 集合核对),期限起点 = post_started_at:
+--   查到 ⇒ 收编(转 submitted、补落 feed_items,时刻用发送时刻),下轮起按落定期限追踪;
+--   发送标记为空、原工作流已不在跑(运行锁空闲)⇒ failed「未发出」;
+--   落定期限内一直查不到 ⇒ failed「提交未确认」;反查一直查不动(或店铺不可调用)
+--   过了期限 + 24 小时 ⇒ 同上;存量行没记条数无法反查 ⇒ 期限 + 24 小时后同上。
+-- **不自动补交**:落 failed 只是解锁载荷(终态行可重占),再不再发由原业务工作流
+-- 下一轮按原方法决定(写操作永不自动兜底)。
 
 CREATE TABLE ops.feed_items (       -- feed 的 SKU 级台账(所有 feed 操作共用)
     feed_id     text NOT NULL,      -- 提交时由 api/feeds 落行(status=submitted)

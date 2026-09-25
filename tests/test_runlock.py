@@ -142,3 +142,25 @@ def test_hold_waits_for_lock_release(tmp_path, monkeypatch):
     with runlock.hold("pi") as got:
         assert got is False
     fh2.close()
+
+
+def test_is_held_probes_without_taking_or_wiping_the_lock(tmp_path, monkeypatch):
+    """feed_poll 的 pending 对账要问"提交那一笔的工作流还在不在跑"(2026-09-25):
+    占着 → True、空闲 → False、锁目录不可用 → None。探一次不许截断占用者写下的
+    pid / 身份(acquire 的 "w" 会),探完也不许留着锁(否则原工作流下一轮拿不到)。"""
+    locks = tmp_path / "locks"
+    locks.mkdir()
+    monkeypatch.setattr(runlock.paths, "locks_dir", lambda: locks)
+    assert runlock.is_held("list_new") is False
+    fh = runlock.acquire("list_new", holder="cli")
+    before = (locks / "list_new.lock").read_text()
+    assert "holder=cli" in before
+    assert runlock.is_held("list_new") is True
+    assert (locks / "list_new.lock").read_text() == before        # 现场一字不动
+    fh.close()
+    assert runlock.is_held("list_new") is False
+    again = runlock.acquire("list_new")                            # 探完没占着
+    assert again is not None
+    again.close()
+    monkeypatch.setattr(runlock.paths, "locks_dir", lambda: tmp_path / "nope" / "locks")
+    assert runlock.is_held("list_new") is None

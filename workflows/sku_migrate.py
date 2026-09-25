@@ -144,8 +144,9 @@ dry-run 逐行标 `(parsed)` / `(兜底:…)`、摘要给兜底行数,台账 `de
 本工作流只做第一种,而且只在**观测确认**之后做。
 
 **与 docs/sku_plan.md / synthesis 的有意出入**(决策 F,写在这里免得下次复核当漏洞改回去):
-POST 的 outcome=unknown **不回滚、保持 pending**,留给下一轮 _settle 与 api/feeds 的
-启动对账(api/feeds.py 对 unknown 的既定处置就是保持 pending)。unknown 的语义是
+POST 的 outcome=unknown **不回滚、保持 pending**,留给下一轮 _settle 与 feed_poll 的
+pending 对账(api/feeds.py 对 unknown 的既定处置就是保持 pending;对账只读反查、不补交,
+2026-09-25)。unknown 的语义是
 「不知道到没到」——若沃尔玛其实已经改成新码而我们回滚了登记簿,新码就成了一条没有
 出身的孤儿行(sources_backfill 判 unknown ⇒ 退出全部自动化),而且不报错。
 synthesis 里「failed/未达/Unknown ⇒ rolled_back」说的是**回执**三态(_settle 的输入),
@@ -1638,7 +1639,7 @@ def _migrate(store: dict, rows: list[dict], execute: bool) -> tuple[dict, list[s
             counts["unknown"] += len(slice_rows)
             lines.append(f"  ⚠ 提交结局不确定 {len(slice_rows)} 条,"
                          f"**保持 pending 不回滚**(不知道到没到;回滚会造出"
-                         f"没有出身的孤儿码),留给启动对账与下一轮定案")
+                         f"没有出身的孤儿码),留给 feed_poll 对账与下一轮定案")
     return counts, lines
 
 

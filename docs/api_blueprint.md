@@ -272,8 +272,16 @@ MP_MAINTENANCE 官方明确限制:**COO(原产国)不可改**;必填仅 SKU+GTIN
    匹配"刚才那笔"→ FOUND/NOT_FOUND/UNKNOWN;NOT_FOUND 还要 30s 后二次确认(防索引滞后)。
    候选**排除 ops.feed_log 已占用的 feedId**(2026-08-07 审查修正:同尺寸兄弟切片
    会满足同一 (feedType, 条数) 指纹,不排除会把片 2 误收编到片 1 整片静默丢失)。
+   2026-09-25 起按店排除、**不分 feedType**:官方列表参数只有 feedId / offset / limit,
+   列表是全店各类 feed 混在一起,同一批 SKU 的别类 feed 已记账的也不可能是"刚才那笔"。
    此能力从 MP_ITEM 专用上提为全 feedType 通用。
-3. **启动对账**:进程启动时凡 feed_log 里 pending/submitted 的行,先查沃尔玛实际状态再决定补交。
+3. **pending 对账**(2026-09-25 所有者批,取代原「启动对账」提法 —— 那个从来没实现过):
+   feed_poll 每轮先对 pending 行只读反查(`find_recent_feed` 事后模式:按发送时刻开窗、
+   最多翻 20 页、条数精确 + 候选明细 SKU 集合完全一致,**恰好一条**对得上才收编),
+   查到收编转 submitted;落定期限内查不到、或期限 + 24 小时仍查不动 / 核不清 ⇒ failed
+   「提交未确认」;发送标记为空且原工作流不在跑 ⇒ failed「未发出」;原工作流还在跑的
+   行不碰。**不补交**:再发由原工作流下一轮按原方法。submitted 行由 feed_poll 按
+   落定期限轮询收口(§3.1)。判据在 `services/feed_track.reconcile_pending`。
 
 ### 5.3 状态轮询
 
@@ -352,7 +360,9 @@ api/feeds.py
   get_feed_status(store, feed_id)                         # 汇总
   iter_feed_items(store, feed_id)                         # 逐 SKU 明细(50/页自动翻)
   get_error_report(store, feed_id) -> bytes               # CSV
-  find_recent_feed(store, feed_type, items_received, window_minutes=30)   # 反查三态
+  find_recent_feed(store, feed_type, items_received, window_minutes=30,
+                   *, since=None, expect_skus=None, recheck=True)        # 反查三态;
+                   # since/expect_skus/recheck=False = pending 事后对账(只读)
   settle_deferred(store, settle)   # defer_settle=True 的延后结算:先反查后补交,最多 3 轮
 api/prices.py
   put_price(store, sku, amount)                           # 单品(100/hour,慎用)

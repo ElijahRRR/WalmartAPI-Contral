@@ -1134,11 +1134,23 @@ CREATE TABLE IF NOT EXISTS ops.feed_log (
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX IF NOT EXISTS feed_log_dedupe_uidx ON ops.feed_log (feed_type, store, payload_key);
+-- pending 对账(所有者 2026-09-25 批):POST 结局不确定的行,feed_poll 每轮只读反查,
+-- 查到收编、到期查不到落 failed「提交未确认」,**不自动补交**(services/feed_track.reconcile_pending)。
+--   item_count      本片条数(反查按沃尔玛列表的 itemsReceived 精确匹配)
+--   skus            本片 SKU 列表(候选 feed 的明细 SKU 集合必须与它完全一致才收编;收编后补落 feed_items)
+--   post_started_at 请求真正发出前落的时刻;pending 行上为空 = 确定没发出
+--   recon_count     反查过几次(收口依据里要报)
+--   close_basis     落 failed 的依据(请求没发出 / 沃尔玛拒收 HTTP 码 / 提交未确认…),重占时清空
+-- 存量行这几格为 NULL(09-25 之前 claim 的,不回填;对账器按"无法反查"处理)
+ALTER TABLE ops.feed_log ADD COLUMN IF NOT EXISTS item_count integer;
+ALTER TABLE ops.feed_log ADD COLUMN IF NOT EXISTS skus text[];
+ALTER TABLE ops.feed_log ADD COLUMN IF NOT EXISTS post_started_at timestamptz;
+ALTER TABLE ops.feed_log ADD COLUMN IF NOT EXISTS recon_count integer NOT NULL DEFAULT 0;
+ALTER TABLE ops.feed_log ADD COLUMN IF NOT EXISTS close_basis text;
 -- 在途口径(services/feed_track.IN_FLIGHT_SQL,2026-09-25)按 feed_id 反查 feed_log 是否已收口:
 -- problem_scan / sku_migrate 每轮对成千上万行做 EXISTS,普通索引(非唯一:存量有无
 -- feed_id 的 pending 行)
 CREATE INDEX IF NOT EXISTS feed_log_feed_id_idx ON ops.feed_log (feed_id);
--- 启动对账:凡 status='pending'/'submitted' 的行,先查 Walmart 实际 feed 状态再决定补交
 
 CREATE TABLE IF NOT EXISTS ops.feed_items (
     -- feed 的 SKU 级台账(所有 feed 操作共用):提交时落行,feed_poll 轮询落终态。

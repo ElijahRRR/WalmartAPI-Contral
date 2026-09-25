@@ -40,8 +40,10 @@ feed 路径的结果由 feed_poll 反哺器(sync_from_ledger)按 ops.feed_items 
 保留期(所有者定稿 2026-08-09:「一天几千条,要不了多久飞书就很难存了」——
 旧系统靠"一天一个表格"绕开):**飞书只留近 RETAIN_DAYS 天**,每轮维护提交后
 自动 prune();**删的只是展示面板**,全部流水永久在 ops.feed_items/feed_log。
-配套 STALE_DAYS 兜底:超 3 天仍未落定的行判「未查到」并推进水位,免得一行
-悬着把水位钉死、每轮重读整段(裁剪也裁不掉它)。
+(原配套的 STALE_DAYS 兜底 —— 超 3 天仍未落定判「未查到」—— 2026-09-25 删除:
+feed 按 feedType 落定期限收口(feed_track.FEED_DEADLINE_MINUTES,改品最长 24 小时,
+读不到再宽限 24 小时),台账每一行都会在期限内拿到有依据的终态;表侧再设一个
+3 天时钟就是第二个期限,而且写的「未查到」是表自己编的结论。所有者 09-25 定稿。)
 """
 
 import json
@@ -79,8 +81,7 @@ _PENDING = ("", "处理中")
 _CURSOR = "maint_sheet"
 _APPEND_BLOCK = 500     # 单次写飞书的行数上限(一次裹上千行会被 90202 拒)
 
-# 未落定行的兜底与表格保留期(所有者定稿 2026-08-09)
-STALE_DAYS = 3          # 超过这么多天还没终态 → 判「未查到」并推进水位
+# 表格保留期(所有者定稿 2026-08-09)。未落定行不再有表侧时钟(2026-09-25,见模块头注)
 RETAIN_DAYS = 7         # 飞书只留近这么多天(一天几千行,不裁很快装不下)
 
 
@@ -307,7 +308,6 @@ def sync_from_ledger(execute: bool = True) -> str | None:
                                       lo, hi - 1)
     updates, cache, descs = [], {}, {}
     new_lo, prefix_done = lo, True
-    stale_cut, n_stale = _today() - timedelta(days=STALE_DAYS), 0
     # 行号取通道给的(分块读,块尾空行会被飞书裁掉 —— 见模块头注)
     for rownum, raw in values:
         cells = ([(str(c).strip() if c is not None else "") for c in raw]
@@ -315,18 +315,8 @@ def sync_from_ledger(execute: bool = True) -> str | None:
         sku = cells[_idx("sku")]
         fid = cells[_idx("feed_id")]
         result = cells[_idx("result")]
-        # 超期兜底(所有者定稿 2026-08-09):一行永远悬着会把水位钉死,
-        # 每轮 feed_poll 都要重读整段。超 STALE_DAYS 天判「未查到」放行——
-        # **状态权威在 ops.feed_items,这里只是展示面板不再等它**。
-        row_date = _row_date(cells[_idx("op_date")])
-        if (fid and result in _PENDING and row_date
-                and row_date < stale_cut):
-            updates.append((f"{_col('result')}{rownum}:{_col('error')}{rownum}",
-                            [["未查到", f"超 {STALE_DAYS} 天未落定,不再等"]]))
-            n_stale += 1
-            if prefix_done:
-                new_lo = rownum + 1
-            continue
+        # 不再有表侧 3 天时钟(2026-09-25):台账在 feed 落定期限内必有终态
+        # (超期未完成 / 无法查询 也是终态),本表只转述,不自己编结论
         pending = fid and fid != _SYNC_MARK and result in _PENDING
         if not pending:
             if prefix_done:
@@ -355,10 +345,9 @@ def sync_from_ledger(execute: bool = True) -> str | None:
                         [[text, err]]))
         if prefix_done:
             new_lo = rownum + 1
-    tail = f",其中超 {STALE_DAYS} 天判未查到 {n_stale} 行" if n_stale else ""
     if not execute:
         return (f"[DRY-RUN] 维护记录:将回填 {len(updates)} 行(扫描区间 "
-                f"{lo}~{hi - 1}),水位将推到 {new_lo}{tail}")
+                f"{lo}~{hi - 1}),水位将推到 {new_lo}")
     n = feishu.sheet_write_ranges(resources.MAINT_SHEET, updates) if updates else 0
     if new_lo != lo:
         cur_state["unresolved_from"] = new_lo
@@ -366,7 +355,7 @@ def sync_from_ledger(execute: bool = True) -> str | None:
             _save_cursor(conn, cur_state)
     if not updates:
         return f"维护记录:未落定 {hi - lo} 行,台账尚无新终态" if hi > lo else None
-    return f"维护记录回填 {n} 行(扫描区间 {lo}~{hi - 1}){tail}"
+    return f"维护记录回填 {n} 行(扫描区间 {lo}~{hi - 1})"
 
 
 # 表头中文名:registry 定列序,这里只给每列的显示名。**按名字取,不按位置**

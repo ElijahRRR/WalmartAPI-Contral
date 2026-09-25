@@ -675,7 +675,7 @@ def test_receipt_settle_counts_both_buckets_on_top_of_the_totals():
                                  ("confirmed", "receipt_gone"),
                                  ("ineffective", "receipt_failed")]))
     assert out == {"confirmed": 2, "ineffective": 1,
-                   "receipt_gone": 2, "receipt_failed": 1}
+                   "receipt_gone": 2, "receipt_failed": 1, "receipt_none": 0}
 
 
 def test_receipt_settle_sql_shape_covers_the_four_receipt_cases():
@@ -684,11 +684,16 @@ def test_receipt_settle_sql_shape_covers_the_four_receipt_cases():
       · 码 ∈ GONE(**不论 status**)⇒ confirmed / receipt_gone
         —— QARTH 那个死档码是 status=success 带回来的,只认 failed 就收不到;
       · failed / missing ⇒ ineffective / receipt_failed;
+      · 沃尔玛没给结论(overdue / unrecognized / unreadable,2026-09-25 期限收口)
+        ⇒ ineffective / receipt_none —— 关单但**不当失败**;
       · submitted ⇒ 不动(还没轮询到,归 feed_poll);
       · success 不带死档码 ⇒ 不动(归观测核验的 48h 宽限)。
     """
     q = ds._SETTLE_RECEIPT_SQL
-    assert ds._RECEIPT_SETTLING == ("failed", "missing")     # success 不在里面
+    assert ds._RECEIPT_SETTLING == ("failed", "missing", "overdue",
+                                    "unrecognized", "unreadable")  # success 不在里面
+    assert "WHEN r.status = ANY(%(no_verdict)s::text[])" in q
+    assert "'receipt_none'" in q
     assert "r.status = ANY(%(settling)s::text[])" in q
     assert "OR r.error_code = ANY(%(gone)s::text[])" in q    # status 之外的另一支
     assert "d.status = 'executing'" in q and "d.feed_id IS NOT NULL" in q
@@ -752,6 +757,8 @@ def test_receipt_settle_on_a_real_database(pg):
         ("K_TEMP", "failed", "EXT_DATA_ERROR_69730864580258",
          "ineffective", "receipt_failed"),
         ("K_MISSING", "missing", None, "ineffective", "receipt_failed"),
+        ("K_OVERDUE", "overdue", None, "ineffective", "receipt_none"),
+        ("K_UNREAD", "unreadable", None, "ineffective", "receipt_none"),
         ("K_WAIT", "submitted", None, "executing", None),
         ("K_SUCCESS", "success", None, "executing", None),
     ]
@@ -764,6 +771,7 @@ def test_receipt_settle_on_a_real_database(pg):
 
     out = ds.settle(pg)
     assert out["receipt_gone"] == 3 and out["receipt_failed"] == 3
+    assert out["receipt_none"] == 2
     with pg.cursor() as cur:
         cur.execute("SELECT sku, status, detail ->> 'settled_by',"
                     " detail ->> 'error_code' FROM ops.dispositions"

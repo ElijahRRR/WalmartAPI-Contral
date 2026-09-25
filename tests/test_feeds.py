@@ -86,6 +86,16 @@ def _updates(logdb):
     return [(s, a) for s, a in logdb.sqls if s.strip().startswith("UPDATE")]
 
 
+def _status_updates(logdb):
+    """改 feed_log 状态的 UPDATE(不含发送标记 post_started_at 那一条)。"""
+    return [(s, a) for s, a in _updates(logdb) if "SET status" in s]
+
+
+def _posting_marks(logdb):
+    """请求真正发出前落的发送标记(pending 对账用:为空 = 确定没发出)。"""
+    return [(s, a) for s, a in _updates(logdb) if "post_started_at = now()" in s]
+
+
 # ── 载荷构造与切片 ────────────────────────────────────────────────────────────
 
 def test_build_payload_schemas():
@@ -291,8 +301,9 @@ def test_submit_success_marks_submitted(monkeypatch):
     out = feeds.submit_feed(STORE, "DELETE_ITEM", ["A"], workflow="t")
     assert out[0]["outcome"] == "submitted" and out[0]["feed_id"] == "F1@abc"
     assert seen["body"]["Item"] == [{"Deletable": {"sku": "A"}}]
-    sql, args = _updates(logdb)[0]
+    sql, args = _status_updates(logdb)[0]
     assert "'submitted'" in sql or args[0] == "submitted"
+    assert len(_posting_marks(logdb)) == 1           # 发之前落了发送标记
 
 
 def test_submit_rejected_marks_failed_no_retry(monkeypatch):
@@ -309,6 +320,9 @@ def test_submit_rejected_marks_failed_no_retry(monkeypatch):
     assert out[0]["outcome"] == "failed"
     assert calls["n"] == 1                       # 被拒绝不自动重试
     assert any(a and a[0] == "failed" for _, a in _updates(logdb))
+    # 收口依据:沃尔玛拒收 + HTTP 码(光一个 failed 分不出"没发出"与"被拒")
+    (_sql, args), = _status_updates(logdb)
+    assert args[2].startswith("沃尔玛拒收 HTTP 400")
 
 
 def test_submit_token_failure_is_definite_failed(monkeypatch):
@@ -328,6 +342,9 @@ def test_submit_token_failure_is_definite_failed(monkeypatch):
     assert out[0] == {"feed_id": None, "count": 1, "outcome": "failed",
                       "retryable": True}
     assert any(a and a[0] == "failed" for _, a in _updates(logdb))
+    assert _posting_marks(logdb) == []           # 请求没发出 ⇒ 发送标记为空
+    (_sql, args), = _status_updates(logdb)
+    assert args[2].startswith("未发出")
 
 
 def test_submit_network_error_found_adopts_feed(monkeypatch):
@@ -380,7 +397,8 @@ def test_submit_network_error_unknown_keeps_pending(monkeypatch):
     _use(monkeypatch, handler)
     out = feeds.submit_feed(STORE, "DELETE_ITEM", ["A"], workflow="t")
     assert out[0]["outcome"] == "unknown"
-    assert _updates(logdb) == []                 # 保持 pending,留给启动对账
+    assert _status_updates(logdb) == []          # 保持 pending,留给轮询的 pending 对账
+    assert len(_posting_marks(logdb)) == 1       # 发过了 ⇒ 对账器按发送时刻去反查
 
 
 # ── 状态轮询与明细 ────────────────────────────────────────────────────────────
@@ -498,8 +516,9 @@ def test_defer_settle_hands_back_a_replayable_handle_and_writes_nothing(monkeypa
     assert out[0]["outcome"] == "deferred" and out[0]["feed_id"] is None
     # 当场既不反查也不补交:反查留到第二轮,那时索引才追得上
     assert calls == {"post": 1, "get": 0}
-    # feed_log 停在 pending —— 一条 UPDATE 都不许有
-    assert _updates(logdb) == []
+    # feed_log 停在 pending —— 一条改状态的 UPDATE 都不许有(只有发送标记)
+    assert _status_updates(logdb) == []
+    assert len(_posting_marks(logdb)) == 1
     # 句柄够重放:载荷由 chunk 确定性重建,不扛几 MB 的 dict 过整轮
     h = out[0]["_settle"]
     assert h["chunk"] == ["A"] and h["feed_type"] == "DELETE_ITEM"
@@ -562,7 +581,7 @@ def test_settle_probes_before_every_resubmit(monkeypatch):
 
 
 def test_settle_unknown_never_resubmits(monkeypatch):
-    """反查自己就查不动(UNKNOWN)⇒ **绝不补交**,保持 pending 交启动对账。
+    """反查自己就查不动(UNKNOWN)⇒ **绝不补交**,保持 pending 交 feed_poll 对账。
 
     宁停不重:查不动时补交,等于在"可能已经上架了"的情况下再上一次。
     """
@@ -582,8 +601,8 @@ def test_settle_unknown_never_resubmits(monkeypatch):
     res = feeds.settle_deferred(STORE, h)
     assert res["outcome"] == "unknown" and res["feed_id"] is None
     assert calls["post"] == 1                    # 只有第一轮那次,第二轮零补交
-    # UNKNOWN 不许把 feed_log 推向终态(pending 才是启动对账的入口)
-    assert _updates(logdb) == []
+    # UNKNOWN 不许把 feed_log 推向终态(pending 才是对账器的入口)
+    assert _status_updates(logdb) == []
 
 
 def test_settle_4xx_stops_immediately(monkeypatch):
@@ -667,3 +686,198 @@ def test_match_payload_wraps_migrate_items_unchanged():
     # 切片限额已登记,本批不新增 feedType
     assert feeds._SLICE_LIMITS["MP_ITEM_MATCH"] == (1000, 24_000_000)
     assert feeds._SLICE_LIMITS["MP_MAINTENANCE"] == (1000, 24_000_000)
+
+
+# ── pending 对账(所有者 2026-09-25 批):认领记条数与 SKU、反查按发送时刻、SKU 集合核对 ──
+
+def test_claim_records_the_slice_count_and_skus(monkeypatch):
+    """事后反查按**条数**匹配、按 **SKU 集合**核对、收编后按 SKU 列表补落台账 ——
+    这两样只能在认领那一刻记下来。"""
+    logdb = _LogDB(claim=True)
+    _fake_db(monkeypatch, logdb)
+    _use(monkeypatch, lambda r: httpx.Response(200, json={"feedId": "F1"}))
+    feeds.submit_feed(STORE, "DELETE_ITEM", ["A", "B"], workflow="t")
+    sql, args = next((s, a) for s, a in logdb.sqls if "INSERT INTO ops.feed_log" in s)
+    assert "item_count, skus" in sql and args[-2:] == (2, ["A", "B"])
+
+
+def test_reclaim_clears_the_previous_attempts_facts(monkeypatch):
+    """重占终态行:发送标记 / 对账计数 / 收口依据是上一笔的事实,一并清空。"""
+    logdb = _LogDB(claim=False, prev=(9, "failed", None))
+    _fake_db(monkeypatch, logdb)
+    _use(monkeypatch, lambda r: httpx.Response(200, json={"feedId": "F2"}))
+    feeds.submit_feed(STORE, "DELETE_ITEM", ["A"], workflow="t")
+    sql, args = next((s, a) for s, a in _updates(logdb) if "'pending'" in s)
+    for frag in ("post_started_at = NULL", "recon_count = 0", "close_basis = NULL",
+                 "item_count = %s", "skus = %s"):
+        assert frag in sql
+    assert args[1:3] == (1, ["A"])
+
+
+def _list_and_details(pages: list[list[dict]], details: dict[str, list[str]],
+                      seen: dict):
+    from urllib.parse import unquote
+
+    def handler(request):
+        path = request.url.path
+        if path == "/v3/feeds":
+            off = int(request.url.params.get("offset", "0"))
+            seen.setdefault("offsets", []).append(off)
+            page = pages[off // 50] if off // 50 < len(pages) else []
+            return httpx.Response(200, json={"results": {"feed": page}})
+        fid = unquote(path.rsplit("/", 1)[1])
+        skus = details.get(fid, [])
+        return httpx.Response(200, json={"itemsReceived": len(skus), "itemDetails": {
+            "itemIngestionStatus": [{"sku": s, "ingestionStatus": "SUCCESS"}
+                                    for s in skus]}})
+    return handler
+
+
+def test_reconcile_lookup_pages_and_only_adopts_a_matching_sku_set(monkeypatch):
+    """事后对账:按发送时刻开窗、往后翻页;同条数的候选必须过 SKU 集合核对 ——
+    官方列表参数里没有 feedType,返回的 feedType 写法也核实不了,只按条数认会把
+    同店同条数的别类 feed 收编过来。"""
+    from datetime import datetime, timedelta, timezone
+    _fake_db(monkeypatch, _LogDB(claim=True))
+    since = datetime.now(timezone.utc) - timedelta(hours=3)
+    t_ms = int(since.timestamp() * 1000) + 60_000
+    pages = [[{"feedId": f"X{i}", "itemsReceived": 99, "feedDate": t_ms}
+              for i in range(50)],
+             [{"feedId": "F_OTHER", "itemsReceived": 2, "feedDate": t_ms},
+              {"feedId": "F_LATE", "itemsReceived": 2,
+               "feedDate": t_ms + 3 * 3600_000},                 # 窗口外
+              {"feedId": "F_OURS", "itemsReceived": 2, "feedDate": t_ms}]]
+    seen: dict = {}
+    _use(monkeypatch, _list_and_details(
+        pages, {"F_OTHER": ["X", "Y"], "F_LATE": ["A", "B"], "F_OURS": ["A", "B"]},
+        seen))
+    v, f = feeds.find_recent_feed(STORE, "DELETE_ITEM", 2, since=since,
+                                  expect_skus=["B", "A"], recheck=False)
+    assert (v, f["feedId"]) == ("FOUND", "F_OURS")
+    assert seen["offsets"] == [0, 50]                     # 翻了第二页
+
+
+def test_reconcile_lookup_waits_when_the_candidate_cannot_be_verified_yet(monkeypatch):
+    """候选的明细还读不到(刚受理)⇒ 这一轮核不了,UNKNOWN,下轮再核 —— 不当没找到。"""
+    from datetime import datetime, timedelta, timezone
+    _fake_db(monkeypatch, _LogDB(claim=True))
+    since = datetime.now(timezone.utc) - timedelta(minutes=40)
+    t_ms = int(since.timestamp() * 1000)
+    _use(monkeypatch, _list_and_details(
+        [[{"feedId": "F_NEW", "itemsReceived": 2, "feedDate": t_ms}]], {}, {}))
+    assert feeds.find_recent_feed(STORE, "DELETE_ITEM", 2, since=since,
+                                  expect_skus=["A", "B"], recheck=False)[0] == "UNKNOWN"
+
+
+def test_reconcile_lookup_without_a_match_is_not_found_without_the_30s_recheck(
+        monkeypatch):
+    from datetime import datetime, timedelta, timezone
+    _fake_db(monkeypatch, _LogDB(claim=True))
+    slept = []
+    monkeypatch.setattr(time, "sleep", lambda s: slept.append(s))
+    seen: dict = {}
+    _use(monkeypatch, _list_and_details([[]], {}, seen))
+    since = datetime.now(timezone.utc) - timedelta(hours=2)
+    assert feeds.find_recent_feed(STORE, "DELETE_ITEM", 2, since=since,
+                                  expect_skus=["A", "B"], recheck=False) == ("NOT_FOUND", None)
+    assert slept == [] and seen["offsets"] == [0]
+
+
+def test_reconcile_lookup_excludes_feeds_recorded_under_any_feed_type(monkeypatch):
+    """同店**别类** feed 已记账(同一批 SKU 的改库存 / 先停用后删除)⇒ 不是"刚才那笔"。
+    此前只排除同类 feedId,别类的条数与 SKU 集合都对得上,会被错收编。"""
+    from datetime import datetime, timedelta, timezone
+
+    class _DB(_LogDB):
+        def fetchall(self):
+            if "SELECT feed_id FROM ops.feed_log" in self._last:
+                return [("F_INVENTORY",)]
+            return []
+    logdb = _DB(claim=True)
+    _fake_db(monkeypatch, logdb)
+    since = datetime.now(timezone.utc) - timedelta(hours=1)
+    t_ms = int(since.timestamp() * 1000)
+    _use(monkeypatch, _list_and_details(
+        [[{"feedId": "F_INVENTORY", "itemsReceived": 2, "feedDate": t_ms}]],
+        {"F_INVENTORY": ["A", "B"]}, {}))
+    assert feeds.find_recent_feed(STORE, "price", 2, since=since, expect_skus=["A", "B"],
+                                  recheck=False) == ("NOT_FOUND", None)
+    sql, args = next((q, a) for q, a in logdb.sqls if "SELECT feed_id FROM ops.feed_log" in q)
+    assert "feed_type" not in sql and args == (STORE["name"],)   # 按店排除,不分类
+
+
+def test_reconcile_lookup_two_matching_candidates_is_undecided(monkeypatch):
+    """两条候选条数与 SKU 集合都对得上(都没记账)⇒ 分不清是哪一笔,不收编,候选带回。"""
+    from datetime import datetime, timedelta, timezone
+    _fake_db(monkeypatch, _LogDB(claim=True))
+    since = datetime.now(timezone.utc) - timedelta(hours=1)
+    t_ms = int(since.timestamp() * 1000)
+    _use(monkeypatch, _list_and_details(
+        [[{"feedId": "F1", "itemsReceived": 2, "feedDate": t_ms},
+          {"feedId": "F2", "itemsReceived": 2, "feedDate": t_ms + 60_000}]],
+        {"F1": ["A", "B"], "F2": ["B", "A"]}, {}))
+    assert feeds.find_recent_feed(STORE, "price", 2, since=since, expect_skus=["A", "B"],
+                                  recheck=False) == (
+        "UNKNOWN", {"matched": ["F1", "F2"], "unverified": []})
+
+
+def test_reconcile_lookup_partial_details_are_undecided_not_rejected(monkeypatch):
+    """候选明细只露出本片一部分(还在处理 / 沃尔玛漏条)⇒ 核不了,不当"不是这一笔"
+    (否则到期就把其实到了的 feed 判成提交未确认);有它在,另一条对得上的也先不收编。"""
+    from datetime import datetime, timedelta, timezone
+    _fake_db(monkeypatch, _LogDB(claim=True))
+    since = datetime.now(timezone.utc) - timedelta(hours=1)
+    t_ms = int(since.timestamp() * 1000)
+    page = [{"feedId": "F_PART", "itemsReceived": 2, "feedDate": t_ms}]
+    details = {"F_PART": ["A"]}
+    _use(monkeypatch, _list_and_details([page], details, {}))
+    assert feeds.find_recent_feed(STORE, "price", 2, since=since, expect_skus=["A", "B"],
+                                  recheck=False) == (
+        "UNKNOWN", {"matched": [], "unverified": ["F_PART"]})
+    # 同一个假接口(连接池会复用第一次的 transport),原地加一条完全对得上的
+    page.append({"feedId": "F_FULL", "itemsReceived": 2, "feedDate": t_ms})
+    details["F_FULL"] = ["A", "B"]
+    assert feeds.find_recent_feed(STORE, "price", 2, since=since, expect_skus=["A", "B"],
+                                  recheck=False) == (
+        "UNKNOWN", {"matched": ["F_FULL"], "unverified": ["F_PART"]})
+
+
+class _Returning(_LogDB):
+    """UPDATE … RETURNING 取回一行(行仍是 pending 时)。"""
+
+    def __init__(self, hit=True):
+        super().__init__()
+        self.hit = hit
+
+    def fetchone(self):
+        if "RETURNING id" in self._last:
+            return (7,) if self.hit else None
+        return super().fetchone()
+
+
+def test_adopt_pending_lands_both_ledgers_in_one_transaction(monkeypatch):
+    from datetime import datetime, timezone
+    db_ = _Returning()
+    _fake_db(monkeypatch, db_)
+    posted = datetime(2026, 9, 25, 3, 0, tzinfo=timezone.utc)
+    row = {"id": 7, "workflow": "t", "store": "T1", "feed_type": "DELETE_ITEM",
+           "skus": ["A", "B"]}
+    assert feeds.adopt_pending(row, "F_OURS", posted) is True
+    upd, args = next((s, a) for s, a in db_.sqls if "SET status = 'submitted'" in s)
+    assert "AND status = 'pending'" in upd and args == ("F_OURS", posted, 7)
+    ins, rows = next((s, a) for s, a in db_.sqls if "INSERT INTO ops.feed_items" in s)
+    assert rows == [("F_OURS", "A", "t", "T1", "DELETE_ITEM", posted),
+                    ("F_OURS", "B", "t", "T1", "DELETE_ITEM", posted)]
+    miss = _Returning(hit=False)
+    _fake_db(monkeypatch, miss)
+    assert feeds.adopt_pending(row, "F_OURS", posted) is False       # 已不是 pending
+    assert not any("feed_items" in s for s, _ in miss.sqls)
+
+
+def test_close_pending_only_touches_pending_rows(monkeypatch):
+    db_ = _Returning()
+    _fake_db(monkeypatch, db_)
+    assert feeds.close_pending(7, "提交未确认:…") is True
+    sql, args = db_.sqls[-1]
+    assert "status = 'failed'" in sql and "AND status = 'pending'" in sql
+    assert args == ("提交未确认:…", 7)

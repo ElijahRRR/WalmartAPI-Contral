@@ -280,31 +280,34 @@ def test_scan_tail_skips_uncategorized_items(monkeypatch):
 
 # ── DELETE 防重口径(所有者拍板 2026-08-11:滚动 48h,仅限无终态)────────────
 
-def test_inflight_sql_caps_submitted_at_48h():
+def test_inflight_sql_means_the_feed_is_not_closed_yet():
     """三个半条,只能断言 SQL 文本(时间条件在 PG 侧求值,夹具盖不住):
 
-    ① submitted 拦但 48h 封顶——超时 = feed 丢了,继续拦是永久漏删;
-    ② success 待观测拦到重扫为止,重扫仍在 = 删除没生效,直接重发不等 48h
-       (条件里**不许**出现对 success 的时间限制);
+    ① submitted **且 feed 还没收口**才拦(feed_track.IN_FLIGHT_SQL,唯一口径)。
+       2026-09-25 起不再设「48 小时封顶」:feed 按落定期限收口(所有者定稿,删除
+       最长 72 小时),在途的上限由期限给;原来封顶防的"feed 丢了、永久漏删",现在
+       由期限收口 + 「feed_log 已收口的孤儿行不算在途」两条接住;
+    ② success 待观测拦到重扫为止(条件里**不许**出现对 success 的时间限制);
     ③ failed 不拦(WHERE 里根本不出现)。
 
     ⚠ 批次 3(O6)之后这段 SQL 是**两支 UNION ALL**(本码 + 经 catalog.sku_aliases
-    继承的别名码),三个半条对**每一支**都必须成立 —— 逐支查而不是查整段:
-    整段查会被另一支的 48h 窗口误判(改前的写法就是取第一个 'success' 之后的
-    全文,加了第二支当场判红,而口径其实一字没变)。
+    继承的别名码),三个半条对**每一支**都必须成立 —— 逐支查而不是查整段。
     """
+    from services import feed_track
     from workflows import problem_scan as wf     # 批次 E:防重预筛随决策搬到扫描件
     sql = wf._SQL_INFLIGHT
     legs = sql.split("UNION ALL")
     assert len(legs) == 2                        # 本码一支 + 别名码一支
     for leg in legs:
-        assert "f.status = 'submitted'" in leg
-        assert "interval '48 hours'" in leg
-        # ② success 那一支不带时间窗:它的解除条件是"被重扫",不是"过了多久"
+        assert feed_track.IN_FLIGHT_SQL.format(t="f") in leg
+        assert "interval" not in leg             # 不再有第二个时钟
         success_leg = leg[leg.index("'success'"):]
-        assert "interval" not in success_leg
         assert "resolved_at > w.last_seen_at" in success_leg
     assert "'failed'" not in sql
+    # 口径本身:台账 submitted 且 feed_log 仍 pending / submitted
+    assert feed_track.IN_FLIGHT_SQL.format(t="f") == (
+        "f.status = 'submitted' AND EXISTS (SELECT 1 FROM ops.feed_log l"
+        " WHERE l.feed_id = f.feed_id AND l.status IN ('pending', 'submitted'))")
 
 
 def test_日常进口也盖新码章():

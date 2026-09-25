@@ -1436,14 +1436,16 @@ def test_resync_sheet_backfills_only_missing_rows(monkeypatch):
     assert appended[0][_c("old_value")] == "" and appended[0][_c("new_value")] == ""
 
 
-def test_stale_rows_stop_pinning_the_cursor(monkeypatch):
-    """超 3 天未落定判「未查到」并推进水位:一行悬着会让每轮重读整段。"""
+def test_no_sheet_side_clock_old_rows_wait_for_the_ledger(monkeypatch):
+    """表侧 3 天时钟已删(所有者 2026-09-25):feed 按落定期限收口,台账每一行都会
+    在期限内拿到有依据的终态;本表只转述,不自己编「未查到」。老行台账已落「超期
+    未完成」⇒ 写这个词;台账仍 submitted ⇒ 照等,水位停在它身上。"""
     from registry.resources import Spreadsheet
     monkeypatch.setattr(resources, "MAINT_SHEET",
                         Spreadsheet(name="维护记录", token="TOK", sheet_id="SID",
                                     columns=resources.MAINT_SHEET.columns))
     conn = _Conn()
-    conn.cursor_value = {"next_row": 4, "unresolved_from": 2}
+    conn.cursor_value = {"next_row": 5, "unresolved_from": 2}
     _fake_db(monkeypatch, conn)
     monkeypatch.setattr(maint_sheet, "_today", lambda: _date(2026, 8, 9))
     monkeypatch.setattr(
@@ -1451,18 +1453,24 @@ def test_stale_rows_stop_pinning_the_cursor(monkeypatch):
         lambda sheet, c1, c2, rf, rt, **kw: [
             (2, _sheet_row("T1", "B0OLD", "价格", "", "", "F1",
                            "2026-08-01", "处理中")),
-            (3, _sheet_row("T1", "B0NEW", "价格", "", "", "F2",
+            (3, _sheet_row("T1", "B0WAIT", "价格", "", "", "F2",
+                           "2026-08-01", "处理中")),
+            (4, _sheet_row("T1", "B0NEW", "价格", "", "", "F3",
                            "2026-08-09", "处理中")),
         ])
-    monkeypatch.setattr(feed_track, "item_results", lambda fid: {"B0NEW": ("submitted", "")})
+    ledger = {"F1": {"B0OLD": ("overdue", "")},
+              "F2": {"B0WAIT": ("submitted", "")},
+              "F3": {"B0NEW": ("success", "")}}
+    monkeypatch.setattr(feed_track, "item_results", lambda fid: ledger[fid])
     monkeypatch.setattr(feed_track, "item_errors", lambda fid: {})
     written = []
     monkeypatch.setattr(maint_sheet.feishu, "sheet_write_ranges",
                         lambda sheet, ups: (written.extend(ups), len(ups))[1])
     out = maint_sheet.sync_from_ledger()
-    assert "超 3 天判未查到 1 行" in out
-    assert written[0][1][0][0] == "未查到"
-    # 老行放行后水位推进到第 3 行(新行仍未落定,停在它身上)
+    assert "未查到" not in out and not hasattr(maint_sheet, "STALE_DAYS")
+    texts = [vals[0][0] for _rng, vals in written]
+    assert texts == ["超期未完成", "成功"]          # 转述台账原词,不编结论
+    # 第 3 行台账仍在途:水位停在它身上(不再被 3 天时钟推过去)
     saved = [a for sql, a in conn.sqls if "ops.cursors" in sql][-1]
     assert '"unresolved_from": 3' in saved[1]
 
@@ -1543,9 +1551,8 @@ def test_maint_sheet_sync_from_ledger(monkeypatch):
     conn = _Conn()
     conn.cursor_value = {"next_row": 6, "unresolved_from": 2}
     _fake_db(monkeypatch, conn)
-    # 日期必须动态生成:反哺器有"超 STALE_DAYS 天判未查到"的墙钟规则,
-    # 写死日期的夹具会在三天后悄悄变成在测另一条分支(2026-08-11 实爆:
-    # 写死的 08-07 过期,四行全走了未查到,断言在测根本不该触发的兜底)。
+    # 日期动态生成:裁剪按 RETAIN_DAYS 的墙钟判(2026-08-11 实爆:写死的日期
+    # 过几天就悄悄变成在测另一条分支;表侧 3 天时钟 2026-09-25 已删)。
     today = maint_sheet._today().isoformat()
     sheet_rows = [
         _sheet_row("T1", "S1", "库存", "5", "0", "F1", today, "处理中"),

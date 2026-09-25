@@ -357,11 +357,14 @@ plist 模板与四个坑、分三批灰度、四件必须先做的代码活(prod
 - 批次 E 真跑未执行(`problem_scan` → `problem_product_cleanup`,470 条建议)
 - 变体分组生产验收未做(`list_new` dry-run 看变体口径分布,重点看 `no_dim`
   —— `_DIM_MAP` 那 20 行映射未经生产校验)
-- feed `pending` **不做自动对账器**(所有者定稿 2026-08-16:「旧工作流生产了
-  几个月,没遇到过 pending。以后遇到了再说」)。⚠ 真遇到时它**长得像正常
-  防重**:那批 SKU 每轮都报「在途防重跳过 N」而 N 不变,实际是被堵死、
-  再也发不出去,且不报错。识别信号与人工处置见
-  `docs/feed_closure_audit.md` §三.1
+- ~~feed `pending` **不做自动对账器**(所有者定稿 2026-08-16:「旧工作流生产了
+  几个月,没遇到过 pending。以后遇到了再说」)。~~ **2026-09-25 推翻**(所有者:
+  「pending 按你的建议做」):feed_poll 每轮只读反查 pending 行,查到收编、到期查不到
+  落 failed「提交未确认」、确定没发出落 failed「未发出」,**不自动补交**
+  (`services/feed_track.reconcile_pending`;规则与识别信号见
+  `docs/feed_closure_audit.md` §三.1)。上线先 `python cli.py db_init`(feed_log 加 5 列),
+  再 `feed_poll --dry-run` 看首行「pending 对账 N:收编 a、落 failed b、仍待 c」。
+  09-25 之前留下的存量 pending 没记条数,无法反查,过了落定期限 + 24 小时落 failed。
 
 ## 九、上线验收记录(2026-08-17,所有者实测)
 

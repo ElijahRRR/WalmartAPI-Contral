@@ -208,7 +208,7 @@ def _submit_new(rows: list[dict], stores_by_name: dict, limits: dict[str, int],
                 elif res["outcome"] == "failed":
                     for r in slice_rows:
                         updates_s.append((r["rownum"], "", "", "提交被拒", ""))
-                else:   # unknown:保持 pending 待启动对账,行不动
+                else:   # unknown:保持 pending 待 feed_poll 对账,行不动
                     lines_s.append(f"⚠ {store_name} {feed_type} 一批 {res['count']} 条"
                                    f"提交结果不确定,已留 pending 待对账")
         return store_name, updates_s, lines_s, submitted_s, len(defer)

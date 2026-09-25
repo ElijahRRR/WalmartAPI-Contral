@@ -527,6 +527,15 @@ def clear_for_relist(rownums: list[int], execute: bool = True) -> int:
     return len(rownums)
 
 
+#: 三个"沃尔玛没给结论"终态在「报错」列里的一句话(台账的原话 error_desc 由
+#: 反哺器接在后面:合规审核的 pendingStatusDescription、读不到的原因)。
+_NO_VERDICT_WHY = {
+    "overdue": "到了落定期限沃尔玛仍未处理完(或明细里没有这一条)",
+    "unrecognized": "到了落定期限,沃尔玛给的逐条状态本系统不认识",
+    "unreadable": "到了落定期限后读不到 feed 明细",
+}
+
+
 def classify_receipt(status: str, error_code: str) -> tuple[str, str]:
     """输入:feed_items 的 (status, error_code) → 输出:(上架结果, 报错)。
 
@@ -556,6 +565,11 @@ def classify_receipt(status: str, error_code: str) -> tuple[str, str]:
         return "FAILED", code
     if status == "missing":
         return "MISSING", "终态明细查无此 SKU"
+    if status in feed_track.NO_VERDICT_STATUSES:
+        # 到了落定期限沃尔玛仍没给结论(所有者 2026-09-25 定稿的期限收口):
+        # 落中文原词(超期未完成 / 未知状态 / 无法查询),**不是失败** —— 不进
+        # FAILED 重试通道、不回收 UPC;在没在架归实际结果与上架表自愈(目录在架 ⇒ Yes)
+        return feed_track.RESULT_TEXT[status], _NO_VERDICT_WHY[status]
     return "处理中", ""
 
 

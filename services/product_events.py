@@ -287,6 +287,13 @@ def diff_catalog(old: dict, new_rows: list[dict], store: str,
 
 #: 事件码一律由常量拼进来(B2-32):写字面量的话 _FEED_KIND 一改取值,
 #: 这条 SQL 会静默返回空集 —— 删除核验从此不产出任何判定,而且不报错。
+#: 「这个 SKU 在沃尔玛那边已经不在了」的**唯一观测口径**(w = catalog.walmart_items
+#: 的别名;LEFT JOIN 取不到行也算):目录里没有 / 标了缺席 / 生命周期 RETIRED。
+#: 删除核验(下面 _VERIFY_SQL)与实际结果(services/feed_effect)共用这一份 ——
+#: 两处各写一条 CASE,迟早一处认 RETIRED、一处不认。
+GONE_SQL = ("(w.sku IS NULL OR w.missing_since IS NOT NULL"
+            " OR w.lifecycle_status = 'RETIRED')")
+
 _VERIFY_SQL = f"""
 WITH last_ok AS (
     SELECT DISTINCT ON (store, sku) store, sku, occurred_at
@@ -301,8 +308,7 @@ open_ok AS (
           AND v.event IN ('{DELETE_VERIFIED}', '{DELETE_NOT_EFFECTIVE}')
           AND v.occurred_at >= l.occurred_at))
 SELECT o.store, o.sku,
-       CASE WHEN w.sku IS NULL OR w.missing_since IS NOT NULL
-                 OR w.lifecycle_status = 'RETIRED' THEN 'gone'
+       CASE WHEN {GONE_SQL} THEN 'gone'
             WHEN w.last_seen_at > o.occurred_at + make_interval(hours => %s)
                  THEN 'still'
             ELSE 'wait' END AS verdict
@@ -311,15 +317,20 @@ LEFT JOIN catalog.walmart_items w ON w.store = o.store AND w.sku = o.sku
 """
 
 
-def verify_deletions(conn, grace_hours: int = 48
+def verify_deletions(conn, grace_hours: float | None = None
                      ) -> tuple[int, int, list[tuple[str, str]]]:
-    """输入:连接 + 宽限小时数 → 输出:(核验生效数, 未生效数, 生效的 (店, SKU) 列表)。
+    """输入:连接(+ 宽限小时数)→ 输出:(核验生效数, 未生效数, 生效的 (店, SKU) 列表)。
 
     删除核验(不信回执,信观测):delete_feed_success 之后,
     - 商品从目录消失/标缺席/RETIRED → delete_verified;
     - 宽限期后 catalog_sync 仍扫到它在架 → delete_not_effective + 告警
       (回执说成了但后台没删,所有者实证的真实故障模式);
     - 还没等到下一轮扫描 → 保持待核验,不落判。
+
+    宽限缺省 = 删除的落定期限(feed_track.FEED_DEADLINE_MINUTES,官方「最长 72 小时
+    从 Catalog 消失」;2026-09-25 从 48 小时对齐 —— 所有者定稿「期限按官方值」,
+    实际结果 services/feed_effect 判删除未生效用的也是这个期限,两处不许各说各的)。
+    只影响"未生效"那一支,"已不在 ⇒ 生效 ⇒ 弃码点 1"不受影响。
 
     第三元 = 本次判定为 gone 的 (店, SKU),与写进账本的 delete_verified 行
     **一一对应**,交给调用方(workflows/catalog_sync)去弃码(弃码点 1)。
@@ -328,8 +339,12 @@ def verify_deletions(conn, grace_hours: int = 48
     workflow 层组合(铁律 1 的方向 workflows → services)。返名单而不是让
     catalog_sync 另写一条同样的 SQL 去捞 —— 那是第二份判据,迟早与这份漂开。
     """
+    if grace_hours is None:
+        # 函数内导入:feed_track 在模块级 import 本模块(回执事件),反过来就是循环
+        from services import feed_track
+        grace_hours = feed_track.deadline_hours("DELETE_ITEM")
     with conn.cursor() as cur:
-        cur.execute(_VERIFY_SQL, (grace_hours,))
+        cur.execute(_VERIFY_SQL, (int(grace_hours),))
         rows = cur.fetchall()
     events = []
     gone_pairs: list[tuple[str, str]] = []

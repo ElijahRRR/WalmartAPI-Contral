@@ -130,14 +130,13 @@ WHERE w.missing_since IS NULL
 #: 破坏类 feed 的两个类型:**唯一出处在 services.feed_track**
 #: (同一份清单也是 receipt_blocked 的取数面,各写一份迟早只改一处)。
 _DISPOSAL_FEEDS = feed_track.DESTRUCTIVE_FEED_TYPES
-_SQL_INFLIGHT = """
+_SQL_INFLIGHT = f"""
 SELECT store, sku, bool_or(disposal) AS disposal FROM (
     SELECT f.store, f.sku,
            (f.feed_type = ANY(%(disposal)s::text[])) AS disposal
     FROM ops.feed_items f
     JOIN catalog.walmart_items w ON w.store = f.store AND w.sku = f.sku
-    WHERE (f.status = 'submitted'
-           AND f.submitted_at > now() - interval '48 hours')
+    WHERE ({feed_track.IN_FLIGHT_SQL.format(t="f")})
        OR (f.status = 'success' AND f.resolved_at > w.last_seen_at)
     UNION ALL
     SELECT a.store, a.sku,
@@ -145,12 +144,16 @@ SELECT store, sku, bool_or(disposal) AS disposal FROM (
     FROM catalog.sku_aliases a
     JOIN ops.feed_items f ON f.store = a.store AND f.sku = a.alias_sku
     JOIN catalog.walmart_items w ON w.store = a.store AND w.sku = a.sku
-    WHERE (f.status = 'submitted'
-           AND f.submitted_at > now() - interval '48 hours')
+    WHERE ({feed_track.IN_FLIGHT_SQL.format(t="f")})
        OR (f.status = 'success' AND f.resolved_at > w.last_seen_at)
 ) t
 GROUP BY store, sku
 """
+# ↑ 在途 = feed 还没收口(feed_track.IN_FLIGHT_SQL,唯一口径);2026-09-25 起不再
+# 另设「48 小时内」上限 —— feed 按落定期限收口(删除最长 72 小时),在途不会无限挂。
+# 「success 且 resolved_at > last_seen_at ⇒ 待观测」:feed 成功之后观测还没跟上,先
+# 不拿旧观测重判这个 SKU。它能成立的前提是 resolved_at **只在首次落定时写**
+# (feed_track._LAND_SQL),重写会让这一支永远成立(09-24 实见约 970 个 SKU)。
 # 破坏类回执的两道闸(2026-09-09 由原「WFS 件删不掉」那一道泛化而来)。
 # 判据与 SQL 都不在本文件:码集的唯一出处是 `registry.resources` 的两个
 # frozenset,查询的唯一出处是 `services.feed_track.receipt_blocked`
@@ -229,8 +232,9 @@ ORDER BY store, sku, occurred_at DESC
 # 顽固标记绑定当前上架代际(2026-08-07 审查修正):最新事件若是
 # item_appeared/item_reappeared,说明商品经历了消失→重上架,旧的
 # delete_not_effective 属上一代刊登,不再顽固——按正常归类路径走
-# (否则重上架的同 ASIN 首次出问题就被双 feed 直删——顽固加压只该给
-# 本代际已实证「删除未生效」的行)。
+# (否则重上架的同 ASIN 首次出问题就被当成"删除未生效"——这个标记只该给
+# 本代际已实证「删除未生效」的行)。2026-09-25 起这个标记不再驱动停用+删除
+# 双发,只决定"不建议、点名交人工"(所有者:feed 成功但未生效是人要看的)。
 # 店铺状态**只做摘要标注,不做闸**(所有者定稿 2026-09-10:「非 ACTIVE 店也需要在
 # 扫描范围内」)。此前非 ACTIVE 店整店跳过;现在 plan() / _audit_rejected_rows
 # 都不读它,run() 只拿它给建议行按店点名(_inactive_note)。
@@ -303,9 +307,10 @@ def plan(items, inflight, stubborn=frozenset(),
       · 其余一律删除,**不看 published_status / lifecycle**:复合原文里哪怕只有
         一个非可恢复原子(「End Date 过期; 禁售政策」)也删;OTHER 未识别的也删
         (所有者:「其他的都删除」),但逐条进摘要告警(_unknown_note)。
-    顽固双击(retire+delete 齐发)与死档/永久拒回执闸、在途预筛不变 —— 那些是
-    操作层防重,不是"该不该删"的判据。**店铺状态不再是闸**(所有者同日追加:
-    「非 ACTIVE 店也需要在扫描范围内」),非 ACTIVE 店的行与别的店一视同仁。
+    死档/永久拒回执闸、在途预筛不变 —— 那些是操作层防重,不是"该不该删"的
+    判据。删除未生效的 SKU(顽固件)2026-09-25 起不再自动双发,交人工复核。
+    **店铺状态不再是闸**(所有者 2026-09-10 追加:「非 ACTIVE 店也需要在扫描范围
+    内」),非 ACTIVE 店的行与别的店一视同仁。
     """
     out: dict[str, dict] = {}
     n = {"inflight": 0, "inflight_listing": 0,
@@ -349,9 +354,8 @@ def plan(items, inflight, stubborn=frozenset(),
         # 两道回执闸(见上面 receipt_blocked 那段注释)。**死档优先于永久拒**:
         # 一个 SKU 只可能命中其中之一(判据是同一次回执的同一个码,两个码集
         # 不相交,守门用例钉着),这里的先后只是让读的人不用猜。
-        # 顽固件(retire+delete 双发)与普通件走同一道闸:delete 注定被拒,
-        # 而 RETIRE_ITEM 对这两类行不行官方都没有明文 —— 按本仓纪律不许按推断
-        # 编码,整条跳过并**响亮报数**,不静默。
+        # 删除未生效的顽固件也先过这两道闸(闸在前):死档 / 永久拒的按闸报数,
+        # 其余才进下面"交人工"那一档。整条跳过并**响亮报数**,不静默。
         if key in gone_blocked:
             n["gone"] += 1
             continue
@@ -359,10 +363,12 @@ def plan(items, inflight, stubborn=frozenset(),
             n["permanent"] += 1
             continue
         if key in stubborn:
-            # 删除未生效的顽固 SKU(所有者定稿):
-            # 停用+删除双 feed 齐发——能删的删,删不掉的至少停用
-            bucket["retire"].append(it)
-            bucket["delete"].append(it)
+            # 删除未生效(删除回执成功、宽限期后观测仍在架,delete_not_effective)的
+            # SKU:**不再自动**停用+删除双发。所有者 2026-09-25:feed 显示成功但观测
+            # 未生效「这种是人需要看的」,为它自动再处理「目前来说没有必要」
+            # (08 月定稿的顽固双击就此停用)。不建议、不计 delete,点名交人工复核
+            # (_stubborn_note;实际结果层的复核清单同样会列出它)。
+            it["stubborn"] = True
             n["stubborn"] += 1
             continue
 
@@ -424,8 +430,9 @@ def _summarize(allrows: list[dict], audit_rows: list[dict], n: dict,
     out = [f"problem_scan:扫描 {n_items} 行(无原因 {n.get('clean', 0)},"
            f"仅可恢复原子不删 {n.get('recoverable', 0)})→ 建议 删除 "
            f"{by_act.get('delete', 0)}"
-           f"(其中审核判拒 {sum(1 for r in allrows if r.get('source') == 'audit')}),"
-           f"顽固停用 {by_act.get('retire', 0)};"
+           f"(其中审核判拒 {sum(1 for r in allrows if r.get('source') == 'audit')})"
+           + (f",停用 {by_act['retire']}" if by_act.get("retire") else "")
+           + f";删除未生效交人工 {n.get('stubborn', 0)};"
            f"已死档跳过 {n['gone']},"
            f"永久拒跳过 {n['permanent']},"
            f"处置在途/待观测跳过 {n['inflight']},"
@@ -441,7 +448,7 @@ def _summarize(allrows: list[dict], audit_rows: list[dict], n: dict,
             k = r.get("category") or "-"
             cats[k] = cats.get(k, 0) + 1
         line = (f"  {store}:删除 {len(b['delete'])}"
-                + (f",顽固停用 {len(b['retire'])}" if b["retire"] else "")
+                + (f",停用 {len(b['retire'])}" if b["retire"] else "")
                 + ",类别={" + ",".join(f"{c}:{v}" for c, v in sorted(cats.items()))
                 + "}")
         if b["delete"]:
@@ -576,6 +583,25 @@ def _k_cluster_note(items: list[dict]) -> str:
             + ",".join(f"{st}×{n}" for st, n in
                         sorted(hot.items(), key=lambda kv: -kv[1])))
 
+
+
+def _stubborn_note(items: list[dict]) -> str:
+    """输入:plan() 走过的 item → 输出:「删除未生效交人工」点名行(无则空串)。
+
+    这批以前每轮自动停用+删除双发(顽固双击),2026-09-25 所有者定稿停掉:不再
+    建议,就必须**点名** —— 静默不删等于让它们从摘要里消失,人不知道还挂着。
+    """
+    hit = [it for it in items if it.get("stubborn")]
+    if not hit:
+        return ""
+    by_store: dict[str, int] = {}
+    for it in hit:
+        by_store[it["store"]] = by_store.get(it["store"], 0) + 1
+    return (f"  删除未生效 {len(hit)} 个(删除回执成功、宽限期后观测仍在架):不再自动"
+            f"停用+删除双发,交人工复核(所有者 2026-09-25);按店 "
+            + ",".join(f"{st}×{c}" for st, c in sorted(by_store.items(),
+                                                       key=lambda kv: -kv[1]))
+            + f";样本={[(it['store'], it['sku']) for it in hit[:5]]}")
 
 
 def _recoverable_note(items: list[dict]) -> str:
@@ -812,6 +838,8 @@ def run(params: dict) -> str:
         if (note := _inactive_note(allrows, inactive)):
             lines.append(note)
         # 观察面用 items_all(缺席不连坐,见上)
+        if (note := _stubborn_note(items)):
+            lines.append(note)
         for note in (_recoverable_note(items_all), _unknown_note(items_all),
                      _k_cluster_note(items_all), _policy_gap_note(conn, items_all)):
             if note:

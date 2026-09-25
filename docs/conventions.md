@@ -147,12 +147,19 @@ DROP TABLE/COLUMN/VIEW 不可回滚,**未连库核对 `pg_stat_user_tables` /
   补交。换方法重试 = 重复提交制造机。
 
 - **POST 的 `outcome=unknown` 一律保持 pending**(SKU 改造批次 3 补,2026-09-02):
-  不回滚、也不补交,留给 `api/feeds` 的启动对账与下一轮的观测定案。unknown 的语义
+  不回滚、也不补交,留给 feed_poll 的 pending 对账与下一轮的观测定案。unknown 的语义
   是「不知道到没到」——「写操作永不自动兜底」管的是**不许换姿势重发**,这一条管的
   是**不许把不确定当成失败去撤销自己这边的状态**:沃尔玛若其实已经受理,回滚就造出
   一条我们这边没有记录的孤儿状态,而且全程不报错。**人不在环时宁停不重。**
   (与"确认未达"要分清:4xx 与 token/代理阶段失败是 `api/feeds` 已经判定的确认未达,
   那种可以安全回滚;`_PRE_FAIL` 与 4xx 都落 `outcome='failed'`,unknown 是第三态。)
+- **pending 对账只读、不补交**(所有者 2026-09-25 批,推翻 08-16「不做对账器」):
+  `services/feed_track.reconcile_pending` 在 feed_poll 每轮先跑 —— 反查沃尔玛 feed 列表
+  (条数 + 发送时刻窗 + SKU 集合,唯一对得上才收编),查到收编、落定期限内查不到或期限
+  + 24 小时仍查不动落 failed「提交未确认」、发送标记为空落 failed「未发出」;
+  **原工作流还在跑的行不碰**(它可能正在当场结算,这时收编会让它的反查判未达去补交)。
+  落 failed 只是解锁载荷,补不补交由原业务工作流下一轮按原方法决定 —— 对账器里出现
+  任何提交入口都是违规(守门:`test_reconcile_never_submits_anything`)。
 - **`abandoned_at IS NULL` 的允许出现处**:规则正文在 §九②(消费方 .py 四处:
   `sku_codec.mint` / `list_new` 去重闸 / `alloc_push._SQL_ONLINE` / 批次 3 起的
   `sku_migrate._SQL_CANDIDATES`;`refdata/schema.sql` 的部分索引条件是 DDL 不计入)。

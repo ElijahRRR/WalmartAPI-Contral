@@ -2,8 +2,20 @@
 
 用法:
   python cli.py feed_poll                 # 轮询 ops.feed_log 全部在途 feed
+  python cli.py feed_poll -p stuck=1      # 在途清单:**完整 feed_id** + 卡了多久
+                                          # + 卡了多少 SKU + 现成的诊断命令(只读台账)
+  python cli.py feed_poll -p stuck=1 -p probe=1
+                                          # 同上,再去沃尔玛问一次 feed 级状态:汇总
+                                          # 终态的当场判残留;未终态的**不按汇总计数
+                                          # 下结论**(汇总会停更,见 _verdict);
+                                          # 一 feed 一次 GET,零明细翻页,只读
   python cli.py feed_poll -p feed_id=X    # 诊断:打印该 feed 逐 SKU 完整报错
                                           # (只读,不改台账、不跑反哺器)
+                                          # X 可以只给**前缀**——摘要里那串截断的
+                                          # 码(头 18 位)直接粘过来就行
+  python cli.py feed_poll -p review=1     # 实际结果复核清单:feed 成功(或没给结论)
+                                          # 但线上未生效的(默认近 7 天判定,-p days= /
+                                          # -p store= 收窄;只读 ops.feed_effects)
   python cli.py feed_poll -p stats=1      # 报错排行(默认近 30 天,全 feed 类型)
   python cli.py feed_poll -p stats=1 -p days=7 -p feed_type=MP_ITEM
 
@@ -14,10 +26,36 @@ ops.feed_item_errors(type/code/**field**/description),各业务表的报错列
 
 职责:扫 feed_log 的 submitted 行 → 查沃尔玛终态 → SKU 级结果落
 ops.feed_items(权威台账)→ feed_log 落 done/failed;pending 行
-(提交结局不确定)告警待人工。只读沃尔玛 + 记账,非危险。
+(提交结局不确定)每轮只读反查:查到收编、到期查不到落 failed「提交未确认」、确定没
+发出落 failed「未发出」;原工作流还在跑的行不碰(可能正在它手里当场结算);
+**不自动补交**(所有者 2026-09-25 批,feed_track.reconcile_pending)。
+只读沃尔玛 + 记账,非危险。
 ⚠ 但**反哺器会写 PG**(UPC 池状态、登记簿弃码,两者都不可逆),空跑必须
 用 `python cli.py feed_poll --dry-run` —— 本工作流自己认 params["dry_run"]
-并把 execute 透传给五个反哺器(见 run());漏掉那一句,--dry-run 完全失效。
+并把 execute 透传给轮询本体与五个反哺器(见 run());漏掉那一句,--dry-run 完全失效。
+⚠ --dry-run **零写入**(2026-09-25 起;此前台账落定照写、只拦反哺器):轮询照读
+沃尔玛、照算,ops.feed_items / feed_log 收口 / 产品事件 / 违禁入黑名单在同一事务
+里 rollback,摘要首行标 [DRY-RUN] 并说"将要落定"的那一份。上线新的落定规则前
+先跑它看条数。
+
+**落定期限**(所有者 2026-09-25 定稿):feed 追到 feedType 的官方期限为止
+(`feed_track.FEED_DEADLINE_MINUTES`,原句见 refdata/walmart_slas.tsv:改价 15 分钟、
+库存 4 小时、建品/改品/跟卖 24 小时、停用 48 小时、删除 72 小时)。汇总终态就读
+明细落定;到期不管汇总怎么说都读明细**强制落定**:仍 INPROGRESS 的落「超期未完成」,
+汇总没收工而明细里查无的也落「超期未完成」,不认识的状态值落「未知状态」。到期后
+读不到明细:404 当场、其他失败宽限 `UNREADABLE_GRACE_HOURS` 后落「无法查询」。
+每条 SKU **首次落定即定稿**,之后不改状态、不刷 resolved_at。
+
+⚠ **feed 终态 ≠ 落定**:汇总终态而明细里还有 SKU 在 INPROGRESS/未知枚举(官方:
+PROCESSED 之后单条仍可能在复核,GTIN 豁免 / 合规审核期间一直是 INPROGRESS),
+这几行留在途、每轮重读,最迟到期强制落定(摘要照实说,不写"已落定")。在途超
+`feed_track.FEED_QUIET_HOURS` 的会折成一行点名、不再逐轮复读明细 ——
+一天 48 轮的固定文案没人看。
+
+⚠ **汇总未终态 ≠ 没处理**(2026-09-22 生产实证,所有者 09-23 核实):沃尔玛
+feed 级汇总会停更 —— A131吕灿荣 改价 feed 汇总 31 小时停在 INPROGRESS / 0 / 0 /
+71,明细 71/71 SUCCESS、价格早已生效。这类 feed 到了落定期限(改价 15 分钟)就按
+明细收口(摘要首行点名「到期收口 N」,明细行把"汇总仍停在…"原样摆出来)。
 
 轮询完执行**反哺器列表**(所有者定稿 2026-08-07:一切 feed 结果的表格
 回写都交给轮询,业务表状态不依赖"记得再跑一次业务工作流"):每个反哺器
@@ -35,8 +73,8 @@ import logging
 
 from api import feeds
 from registry import db
-from services import clear_sheet, feed_track, listing_sheet, maint_sheet, \
-    match_sheet, stores as stores_svc
+from services import clear_sheet, feed_effect, feed_track, listing_sheet, \
+    maint_sheet, match_sheet, stores as stores_svc
 
 # ⚠ DANGEROUS 保持 False(本工作流不调沃尔玛写接口),于是 cli.py 恒传
 # execute=True;**本工作流的 --dry-run 靠自己读 params["dry_run"]**,不靠
@@ -138,39 +176,295 @@ def _error_stats(days: int, feed_type: str = "") -> str:
     return "\n".join(lines)
 
 
+#: 复核清单里每组列几条样例(其余给数字,-p store= 收窄)
+_REVIEW_SAMPLES = 5
+
+
+def _review_list(days: int, store: str | None = None) -> str:
+    """输入:回看天数(+店铺)→ 输出:实际结果复核清单(只读 ops.feed_effects)。
+
+    所有者 2026-09-25:「如果 feed 显示该明细是成功的,但是观测结果是未生效,这种是
+    人需要看的。」清单只列不动 —— 实际结果不挂任何自动化,处置由人定。观测与实际
+    可能错开(先生效后消失,观测只看到未生效),每条都带观测时刻。
+    """
+    with db.pg_conn() as conn:
+        rows = feed_effect.review_rows(conn, days=days, store=store)
+    if not rows:
+        return (f"实际结果复核清单:近 {days} 天没有「feed 成功(或没给结论)但未生效」的明细")
+    ok = [r for r in rows if r["feed_status"] == "success"]
+    nv = [r for r in rows if r["feed_status"] != "success"]
+    out = [f"实际结果复核清单(近 {days} 天判定):feed 成功但未生效 {len(ok)} 条;"
+           f"沃尔玛没给结论且未生效 {len(nv)} 条 —— 只列不动,处置由人定"]
+    for title, group in (("feed 成功但未生效", ok),
+                         ("没给结论(超期未完成 / 未知状态 / 无法查询)且未生效", nv)):
+        if not group:
+            continue
+        out.append(f"  {title}:")
+        by: dict[tuple, list[dict]] = {}
+        for r in group:
+            by.setdefault((r["store"], r["feed_type"], r["workflow"]), []).append(r)
+        for (st, ft, wf), rs in sorted(by.items(), key=lambda kv: (-len(kv[1]), kv[0])):
+            out.append(f"    {st} {feed_track._FEED_LABEL.get(ft, ft)}({wf})×{len(rs)}:")
+            for r in rs[:_REVIEW_SAMPLES]:
+                want = f"目标 {r['want']} → " if r.get("want") else ""
+                seen = (r["observed_at"].strftime("%m-%d %H:%M")
+                        if r.get("observed_at") else "?")
+                out.append(f"      {r['sku']} {want}观测 {r['observed']}(观测于 {seen},"
+                           f"{feed_track.text_of(r['feed_status'])},feed {r['feed_id']})")
+            if len(rs) > _REVIEW_SAMPLES:
+                out.append(f"      …另有 {len(rs) - _REVIEW_SAMPLES} 条(-p store= 收窄)")
+    out.append("  逐条查 feed:python cli.py feed_poll -p feed_id=<码>;观测与实际可能错开"
+               "(先生效后消失),以观测时刻为准")
+    return "\n".join(out)
+
+
+#: LIKE 前缀里要转义的三个字符(feed_id 是十六进制串,理论上碰不到,
+#: 但拼 LIKE 时不转义就是注入式的通配符行为——便宜的正确)
+_LIKE_ESCAPE = str.maketrans({"\\": "\\\\", "%": "\\%", "_": "\\_"})
+
+
+def _resolve_feed(typed: str, store_hint: str = "") -> tuple[str, str] | str:
+    """输入:完整 feed_id **或它的前缀**(+ 可选店铺)→ 输出:(完整 feed_id, 店铺)
+    / 人话错误串。只读 ops.feed_log。
+
+    摘要里的码是**截断**的(头 18 位 + …),飞书里复制到的就是那一段 ——
+    不认前缀的话,人拿着通知里那串来跑诊断只会得到"不在台账中",而完整码
+    一直在库里(2026-09-11 所有者实见「我找不到这些 feed 的完整的码了」)。
+    末尾的省略号(中文「…」与三个点)顺手吃掉:粘贴多半会带上。
+
+    三条决定:
+      ① **精确匹配优先于前缀匹配**:一个完整码恰好是另一个码的前缀时,人打的
+         是哪个就查哪个。
+      ② **前缀撞上多条 ⇒ 摊开候选让人挑,绝不回退到"按原样查"** —— 那串是
+         截断的,拿去问沃尔玛只会查无,而且查无长得像"这个 feed 不存在"。
+      ③ 店铺**以台账为准**(它是事实),`-p store` 只在台账查无时兜底 ——
+         诊断旧系统或 Seller Center 手发的 feed 仍走得通(那些 feed 我们的
+         feed_log 里本来就没有行)。
+    """
+    q = str(typed).strip().rstrip("….")
+    if not q:
+        return "feed_id 是空的"
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT feed_id, store, status, updated_at FROM ops.feed_log "
+            "WHERE feed_id LIKE %s ESCAPE '\\' ORDER BY updated_at DESC LIMIT 20",
+            (q.translate(_LIKE_ESCAPE) + "%",))
+        rows = cur.fetchall()
+    exact = [r for r in rows if r[0] == q]
+    if exact:
+        return exact[0][0], exact[0][1]
+    if len(rows) == 1:
+        return rows[0][0], rows[0][1]
+    if rows:
+        lines = [f"前缀 {q} 匹配到 {len(rows)} 条,补几位再查(或 "
+                 f"`python cli.py feed_poll -p stuck=1` 看完整码):"]
+        lines.extend(f"  {st} {fid}({stat},{up})" for fid, st, stat, up in rows)
+        return "\n".join(lines)
+    if store_hint:              # 台账查无 + 人指名了店铺 ⇒ 按原样直查
+        return q, store_hint
+    return (f"feed {q} 不在 ops.feed_log 台账中(按前缀也没匹配到)。"
+            f"在途清单:`python cli.py feed_poll -p stuck=1`;"
+            f"要直查台账外的 feed 请补 -p store=<店铺名>")
+
+
+def _ledger_open(feed_ids: list[str]) -> dict[str, int]:
+    """输入:feed_id 列表 → 输出:{feed_id: 台账里仍 submitted 的 SKU 数}。只读。
+
+    「这条 feed 卡住了多少货」——清单里最该有的那一列。一次查询查全部,
+    不逐条问(20 条 feed 就是 20 个来回)。
+    """
+    ids = [f for f in dict.fromkeys(feed_ids) if f]
+    if not ids:
+        return {}
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute("SELECT feed_id, count(*) FROM ops.feed_items "
+                    "WHERE feed_id = ANY(%s) AND status = 'submitted' "
+                    "GROUP BY 1", (ids,))
+        return {fid: n for fid, n in cur.fetchall()}
+
+
+def _probe_heads(stores_by_name: dict, srows: list[dict]) -> dict[str, str]:
+    """输入:店铺表 + 在途行 → 输出:{feed_id: 沃尔玛 feed 级状态一句话}。
+
+    **feed 级 GET(`limit=0`),零明细翻页**,一个 feed 一次请求 —— 它只回答
+    「沃尔玛那边到底怎么说」。跨店并发、店内串行,理由与 `poll_all` 同一条:
+    配额按 `(店, 端点)` 计,店内并发只会让自己排队等退避。
+    只读,不写任何台账。
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    by_store: dict[str, list[dict]] = {}
+    for r in srows:
+        by_store.setdefault(r["store"], []).append(r)
+
+    def _one(store_name: str, rows: list[dict]) -> dict[str, object]:
+        store = stores_by_name.get(store_name)
+        out: dict[str, object] = {}
+        for r in rows:
+            if store is None:
+                out[r["feed_id"]] = "店铺凭证缺失,没问"
+                continue
+            try:
+                out[r["feed_id"]] = feeds.get_feed_status(store, r["feed_id"])
+            except Exception as e:
+                out[r["feed_id"]] = f"查询失败({e})"
+        return out
+
+    got: dict[str, object] = {}
+    if by_store:
+        with ThreadPoolExecutor(
+                max_workers=min(stores_svc.STORE_WORKERS, len(by_store))) as pool:
+            for d in pool.map(lambda kv: _one(*kv), list(by_store.items())):
+                got.update(d)
+    return got
+
+
+def _due_note(feed_type: str, age: float | None) -> str:
+    """输入:feedType + 在途年龄 → 输出:清单里的期限一句(落定期限 X,已到期 / 还剩 Y)。"""
+    if feed_type not in feed_track.FEED_DEADLINE_MINUTES:
+        return f"⚠ {feed_type} 未登记落定期限"
+    limit = feed_track.deadline_text(feed_type)
+    if age is None:
+        return f"落定期限 {limit}"
+    left = feed_track.deadline_hours(feed_type) - age
+    if left <= 0:
+        return f"落定期限 {limit} 已到,下轮轮询按明细强制落定"
+    return f"落定期限 {limit},还剩 {left:.1f}h"
+
+
+def _verdict(head: dict, n_open: int, feed_type: str | None = None) -> str:
+    """输入:沃尔玛 feed 级汇总 + 台账未落定数(+ feedType)→ 输出:这条卡在哪一档(人话)。
+
+      · 汇总终态、台账还有未落定 ⇒ **残留**:那几个 SKU 自己的
+        ingestionStatus 不是终态(INPROGRESS / 枚举没认出来),留在途,最迟到了
+        落定期限按明细强制落定(所有者 2026-09-25 定稿);
+      · 汇总终态、台账已全落定 ⇒ 下一轮轮询即收工;
+      · 汇总**未终态** ⇒ **不拿汇总的计数下任何结论**。汇总会停更(2026-09-22
+        实证:A131吕灿荣 改价 feed 汇总 31 小时停在 INPROGRESS / 0 / 0 / 71,
+        明细却 71/71 SUCCESS、价格早已生效)。此前这里按汇总计数判出的
+        「沃尔玛确实还在跑(全部待处理)」恰恰把人引向错误结论(2026-09-23
+        那次排查就是这样错的)。逐条真相只在明细里:轮询到了 feedType 的落定
+        期限(`feed_track.FEED_DEADLINE_MINUTES`)就读明细强制落定;现场要看,
+        就跑清单里这一条上面那行给的 `-p feed_id=` 命令(只读)。
+
+    ⚠ 收的是 head **原件**,不是 `_progress` 拼好的那句话:去反解自己刚拼的
+    字符串,等于给同一份数字造第二个出处,改一处忘一处就静默错档。
+    """
+    limit = (f"落定期限 {feed_track.deadline_text(feed_type)}" if feed_type
+             else "落定期限")
+    if head.get("feedStatus") in feeds.FEED_TERMINAL:
+        return (f"⇒ 残留:沃尔玛已终态,{n_open} 个 SKU 的逐条状态仍非终态,"
+                f"到{limit}按明细强制落定"
+                if n_open else "⇒ 沃尔玛已终态,下轮轮询即收工")
+    return (f"⇒ 汇总未终态,其计数不作数(汇总会停更),以明细为准:到{limit}"
+            f"轮询读明细强制落定,逐条看上一行命令")
+
+
+def _inflight_list(stores_by_name: dict | None = None) -> str:
+    """输入:(可选)店铺表 → 输出:在途 feed 清单(完整 feed_id + 卡了多久 + 现成命令)。
+
+    纯读 ops.feed_log(`feeds.query_pending`),**一个沃尔玛接口都不调**。
+    存在的理由:轮询摘要里的码是截断的,而截断的码拼不回完整码;卡住的 feed
+    要人工处置,第一步就是"到底是哪几条"。卡多久的口径与摘要折叠同一处
+    (`feed_track.is_stuck`)。
+
+    给了 `stores_by_name`(`-p probe=1`)就**再去沃尔玛问一次 feed 级状态**
+    并当场分档(见 `_verdict`):台账说"未落定"有三种完全不同的原因,
+    不并排看就分不出来。仍然只读 —— 一个字都不写台账。
+    """
+    rows = feeds.query_pending()
+    subs = [r for r in rows if r["status"] == "submitted" and r["feed_id"]]
+    pends = [r for r in rows if r["status"] == "pending"]
+    if not subs and not pends:
+        return "ops.feed_log 里没有在途 feed(全部已落定)"
+
+    heads = _probe_heads(stores_by_name, subs) if stores_by_name else {}
+    opens = _ledger_open([r["feed_id"] for r in subs])
+    ages = {id(r): feed_track.age_hours(r.get("updated_at")) for r in subs}
+    # 老的在前;年龄未知的排最后(不知道多久 ≠ 刚提交,但也不能冒充最老)
+    subs.sort(key=lambda r: (ages[id(r)] is None, -(ages[id(r)] or 0.0)))
+    n_stuck = sum(1 for r in subs if feed_track.is_stuck(ages[id(r)]))
+
+    out = [f"在途 feed {len(subs)} 条(老的在前),其中卡超过 "
+           f"{feed_track.FEED_QUIET_HOURS:g}h 的 {n_stuck} 条;"
+           f"台账里共 {sum(opens.values()):,} 个 SKU 卡在「处理中」"]
+    for r in subs:
+        age = ages[id(r)]
+        mark = "⏳ " if feed_track.is_stuck(age) else "   "
+        label = feed_track._FEED_LABEL.get(r["feed_type"], r["feed_type"])
+        out.append(f"  {mark}{r['store']} {label} {r['feed_type']}"
+                   f"({r['workflow'] or '-'})  {r['feed_id']}")
+        n_open = opens.get(r["feed_id"], 0)
+        out.append(f"        提交于 {r.get('updated_at') or '?'}"
+                   + (f",卡 {age:.1f}h" if age is not None else ",年龄未知")
+                   + f",台账未落定 {n_open},{_due_note(r['feed_type'], age)}"
+                   + f"  →  python cli.py feed_poll -p store={r['store']} "
+                     f"-p feed_id={r['feed_id']}")
+        head = heads.get(r["feed_id"])
+        if isinstance(head, dict):
+            out.append(f"        沃尔玛:{head.get('feedStatus')},"
+                       f"{feed_track._progress(head)}  "
+                       f"{_verdict(head, n_open, r['feed_type'])}".rstrip())
+        elif head:                      # 凭证缺失 / 查询失败:原话摆出来
+            out.append(f"        沃尔玛:{head}")
+    if pends:
+        # pending 是另一个口子(提交结局不确定、还没有 feed_id):轮询每轮只读反查,
+        # 查到收编、到期查不到落 failed「提交未确认」,**不自动补交**
+        # (feed_track.reconcile_pending)。清单只摆事实:发没发、反查过几次
+        out.append(f"  另有 pending {len(pends)} 条(提交结局不确定、还没有 feed_id;"
+                   f"轮询每轮只读反查,到期查不到落 failed「提交未确认」,不自动补交):")
+        for p in pends[:10]:
+            sent = (f"发送于 {p['post_started_at']}" if p.get("post_started_at")
+                    else ("存量行(没记发送标记与条数)" if p.get("item_count") is None
+                          else "请求还没开始发送"))
+            out.append(f"      {p['store']} {p['feed_type']}"
+                       f"({p.get('workflow') or '-'}) claim 于 {p.get('updated_at') or '?'},{sent},"
+                       f"条数 {p.get('item_count') if p.get('item_count') is not None else '?'},"
+                       f"已反查 {p.get('recon_count') or 0} 次,"
+                       f"{_due_note(p['feed_type'], feed_track.age_hours(p.get('post_started_at') or p.get('updated_at')))}")
+    return "\n".join(out)
+
+
 def run(params: dict) -> str:
-    """输入:params(store / feed_id 诊断 / stats 排行 / dry_run)→ 输出:摘要。
+    """输入:params(store / stuck 清单 / feed_id 诊断 / stats 排行 / dry_run)→ 输出:摘要。
 
     ⚠ execute 取的是 `not params["dry_run"]`:cli 对 DANGEROUS=False 的工作流
     恒传 execute=True(缺省即真跑),--dry-run 只体现在单独透传的 dry_run 上。
     """
-    # 反哺器的空跑闸:五个反哺器都收这个关键字,execute=False 时一行都不写
+    # 空跑闸:轮询本体(台账落定)与五个反哺器都收这个关键字,execute=False
+    # 时一行都不写
     execute = bool(params.get("execute")) and not params.get("dry_run")
     if params.get("stats"):
         return _error_stats(int(params.get("days", 30)),
                             str(params.get("feed_type", "")))
+    if params.get("review"):    # 实际结果复核清单(只读 ops.feed_effects,不调沃尔玛)
+        return _review_list(int(params.get("days", 7)), params.get("store") or None)
     names = [params["store"]] if params.get("store") else None
+    if params.get("stuck"):     # 在途清单(完整码 + 现成命令),只读
+        # -p probe=1 才需要凭证:不带它的清单纯读台账,凭证缺失也跑得动
+        return _inflight_list(
+            {s["name"]: s for s in stores_svc.load_stores(names)}
+            if params.get("probe") else None)
     store_list = stores_svc.load_stores(names)
     stores_by_name = {s["name"]: s for s in store_list}
 
     if params.get("feed_id"):       # 诊断模式:只打印详情,不动台账不跑反哺器
-        feed_id = str(params["feed_id"])
-        store = stores_by_name.get(str(params.get("store") or ""))
+        found = _resolve_feed(str(params["feed_id"]),
+                              str(params.get("store") or ""))
+        if isinstance(found, str):          # 查无 / 前缀撞多条:原话回给人
+            return found
+        feed_id, owner = found
+        store = stores_by_name.get(owner)
         if store is None:
-            with db.pg_conn() as conn, conn.cursor() as cur:
-                cur.execute("SELECT store FROM ops.feed_log WHERE feed_id = %s",
-                            (feed_id,))
-                row = cur.fetchone()
-            if not row or row[0] not in stores_by_name:
-                return (f"feed {feed_id} 不在台账中或店铺未加载:"
-                        f"请补 -p store=<店铺名>")
-            store = stores_by_name[row[0]]
+            return (f"feed {feed_id} 在台账里属于店铺 {owner},但该店未加载"
+                    f"(不在营或凭证缺失):补 -p store={owner} 再试")
         # 明说这一模式不写任何东西:所有者 2026-08-09 用它查了维护 feed,
         # 看到结果却发现飞书没变——两条路径长得太像,不说就会被当成故障
         return (_explain(store, feed_id)
                 + "\n(诊断模式:不动 ops.feed_items 台账、不回写飞书;"
                   "要落定并回写请跑不带 -p feed_id 的 python cli.py feed_poll)")
-    lines = [feed_track.poll_all(stores_by_name)]
+    lines = [feed_track.poll_all(stores_by_name, execute=execute,
+                                 only=params.get("store") or None)]
     lines.extend(_run_reflectors(execute))
     return "\n".join(lines)
 

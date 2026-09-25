@@ -877,8 +877,22 @@ def test_failed_receipt_rolls_back():
     assert v == "rolled_back" and "ERR_1" in why
 
 
-def test_timeout_after_a_fresh_sweep_rolls_back():
-    v, _ = sm._verdict(_obs(False, False, fresh=True, hours=25), None, NOW)
+def test_timeout_after_a_fresh_sweep_goes_to_a_human_not_a_rollback():
+    """过了跟卖落定期限、观测新鲜、新码仍未出现 ⇒ stalled 交人工,**不自动回滚**
+    (所有者 2026-09-25:feed 结果与实际结果分开,观测未生效只给人看)。"""
+    v, why = sm._verdict(_obs(False, False, fresh=True, hours=25), None, NOW)
+    assert v == "stalled" and "不自动回滚" in why and "24h" in why
+
+
+def test_the_observe_window_is_the_match_deadline():
+    """观测期只有一个出处:跟卖的落定期限(官方美国站最长 24 小时)。"""
+    from services import feed_track
+    assert sm.OBSERVE_HOURS == feed_track.deadline_hours("MP_ITEM_MATCH") == 24
+
+
+def test_a_failed_receipt_still_rolls_back():
+    """回执 failed 是 **feed 结果**(沃尔玛拒了这次改码),不是观测 —— 照旧回滚。"""
+    v, _ = sm._verdict(_obs(False, False, fresh=True, hours=1), ("failed", "E1"), NOW)
     assert v == "rolled_back"
 
 
@@ -896,7 +910,7 @@ def test_stalled_is_named_for_humans_and_never_auto_settled():
 def test_observe_and_stale_hours_are_overridable_per_run():
     row = _obs(False, False, fresh=True, hours=5)
     row["_observe_hours"], row["_stale_hours"] = 4, 72
-    assert sm._verdict(row, None, NOW)[0] == "rolled_back"
+    assert sm._verdict(row, None, NOW)[0] == "stalled"
 
 
 # ══════════════════════════════════════════════════════════════════════════════

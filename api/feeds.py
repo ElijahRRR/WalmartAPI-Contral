@@ -5,6 +5,8 @@
   get_feed_status(store, feed_id) -> 汇总 dict
   iter_feed_items(store, feed_id) -> 逐 SKU 明细生成器(50/页自动翻)
   find_recent_feed(store, feed_type, items_received) -> 反查三态
+  adopt_pending / close_pending / note_reconcile  pending 对账的落账原语
+      (判据在 services/feed_track.reconcile_pending,feed_poll 每轮调)
 
 旧系统之乱(本文件的存在理由):6 套 header schema 散落、DELETE_ITEM 3 处
 裸 httpx 提交、防重语义七零八落。收口后:
@@ -17,8 +19,9 @@
   提交同载荷是新一轮合法操作,顽固 SKU 每日双 feed 重发即依赖此语义);
   ②POST 网络异常后 find_recent_feed 反查三态(候选排除 feed_log 已占用的
   feedId,防同尺寸兄弟切片误收编),FOUND 收编、NOT_FOUND(30s 双确认)按
-  同一方法补交一次、UNKNOWN 保持 pending 留给启动对账;③工作流启动时对账
-  pending/submitted 行(query_pending 供工作流用)。
+  同一方法补交一次、UNKNOWN 保持 pending;③pending 行由 feed_poll 每轮对账
+  (2026-09-25 所有者批,services/feed_track.reconcile_pending):只读反查,查到
+  收编、到期查不到落 failed「提交未确认」,**不补交**;本层只供台账原语。
 - 写操作永不跨方法兜底(CLAUDE.md):补交只用同一 feedType 同一载荷。
 
 本层只做接口适配:哪些 SKU 该删该停是 services/workflows 的事。
@@ -209,21 +212,29 @@ def payload_key(feed_type: str, entries: list) -> str:
 
 # ── ops.feed_log(三层防重的第①层)──────────────────────────────────────────
 
-def _log_claim(workflow: str, store_name: str, feed_type: str, key: str):
-    """输入:防重四元组 → 输出:(log_id, None) 抢占成功 / (None, 既有行 dict)。
+def _log_claim(workflow: str, store_name: str, feed_type: str, key: str,
+               count: int | None = None, skus: list[str] | None = None):
+    """输入:防重四元组(+ 本片条数与 SKU 列表)→ 输出:(log_id, None) 抢占成功 /
+    (None, 既有行 dict)。
 
     防重只拦**在途行**:pending(结局不确定,宁停不重)/submitted(feed 处理中)
     拒绝重复提交;终态行 failed(确认未达)与 done(上一笔已完结)允许重占回
     pending——所有者定稿:不设时间防重窗,同载荷在上一笔完结后重发是合法新
     操作(顽固 SKU 每日停用+删除重发、反补第 2 次尝试都依赖此语义;2026-08-07
     审查修正:此前 done 永久拒绝,导致同载荷第二次反补/顽固重发永远发不出去)。
+
+    条数与 SKU 列表(2026-09-25,pending 对账):POST 结局不确定时,feed_poll 事后按
+    **条数**去沃尔玛 feed 列表反查、按 **SKU 集合**核对候选、收编后按 SKU 列表补落
+    ops.feed_items —— 不在这里记下,事后就没有任何东西能认出"刚才那一笔"。
+    重占时连同发送标记 / 对账计数 / 收口依据一并清空(那是上一笔的事实)。
     """
     with db.pg_conn() as conn, conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO ops.feed_log (workflow, store, feed_type, payload_key, status) "
-            "VALUES (%s, %s, %s, %s, 'pending') "
+            "INSERT INTO ops.feed_log (workflow, store, feed_type, payload_key, status,"
+            " item_count, skus) "
+            "VALUES (%s, %s, %s, %s, 'pending', %s, %s) "
             "ON CONFLICT (feed_type, store, payload_key) DO NOTHING RETURNING id",
-            (workflow, store_name, feed_type, key))
+            (workflow, store_name, feed_type, key, count, skus))
         row = cur.fetchone()
         if row:
             return row[0], None
@@ -233,26 +244,61 @@ def _log_claim(workflow: str, store_name: str, feed_type: str, key: str):
         prev = cur.fetchone()
         if prev and prev[1] in ("failed", "done"):
             cur.execute("UPDATE ops.feed_log SET status = 'pending', "
-                        "feed_id = NULL, workflow = %s, updated_at = now() "
-                        "WHERE id = %s", (workflow, prev[0]))
+                        "feed_id = NULL, workflow = %s, updated_at = now(), "
+                        "item_count = %s, skus = %s, post_started_at = NULL, "
+                        "recon_count = 0, close_basis = NULL "
+                        "WHERE id = %s", (workflow, count, skus, prev[0]))
             logger.info("feed 防重:%s 行重占为 pending(%s %s)",
                         prev[1], store_name, feed_type)
             return prev[0], None
     return None, {"id": prev[0], "status": prev[1], "feed_id": prev[2]}
 
 
-def _log_update(log_id, status: str, feed_id: str | None = None) -> None:
+def _log_update(log_id, status: str, feed_id: str | None = None,
+                basis: str | None = None) -> None:
+    """输入:台账行 + 新状态(+ feedId、收口依据)→ 输出:无。
+
+    `basis` 落 close_basis:这一行**为什么**是 failed(请求没发出 / 沃尔玛拒收 HTTP
+    码 / 反查未达补交未果 / 提交未确认…)—— 所有者 2026-09-25:每种结局在库里都要有
+    有事实依据的终态,光一个 failed 分不出"确定没发"与"沃尔玛拒了"。
+    """
     with db.pg_conn() as conn:
         conn.execute(
             "UPDATE ops.feed_log SET status = %s, "
-            "feed_id = COALESCE(%s, feed_id), updated_at = now() WHERE id = %s",
-            (status, feed_id, log_id))
+            "feed_id = COALESCE(%s, feed_id), close_basis = %s, updated_at = now() "
+            "WHERE id = %s",
+            (status, feed_id, (basis or "")[:500] or None, log_id))
+
+
+def _log_posting(log_id) -> None:
+    """输入:台账行 → 输出:无(post_started_at 落当下,**单独提交**)。
+
+    在 rate_acquire 与取 token 之后、请求真正发出之前写(2026-09-25,pending 对账):
+    pending 行上这一格为空 = 请求**确定没发出**(进程死在发之前、取 token 阶段就抛了);
+    有值 = 发了(或正在发),结局要去沃尔玛那边反查,反查的时间窗也按它开。
+    补交(同一方法)会再写一次 —— 窗口跟着最近一次发送走。
+    """
+    with db.pg_conn() as conn:
+        conn.execute("UPDATE ops.feed_log SET post_started_at = now() WHERE id = %s",
+                     (log_id,))
 
 
 def query_pending() -> list[dict]:
-    """输入:无 → 输出:pending/submitted 的 feed_log 行(启动对账用)。"""
+    """输入:无 → 输出:pending/submitted 的 feed_log 行(feed_poll 轮询与 pending 对账、
+    sku_migrate 闸⑤用)。
+
+    带 `updated_at` 是给 feed_poll 算**在途年龄**用的(摘要折叠,见
+    `services/feed_track.FEED_QUIET_HOURS`)。⚠ 年龄别拿 `created_at` 算:
+    `_log_claim` 重占终态行时只改 status/feed_id/workflow/updated_at,
+    created_at 留的是这个 payload_key **第一次**提交的时刻(可能是几个月前);
+    submitted 行的 updated_at 才是这个 feedId 自己的提交时刻(`_log_update` 写的)。
+
+    pending 对账(2026-09-25)要的几格一并带出:item_count / skus(反查与收编用)、
+    post_started_at(请求发没发、反查窗口从哪开)、recon_count(反查过几次)。
+    """
     sql = ("SELECT id, workflow, store, feed_type, payload_key, feed_id, status, "
-           "created_at FROM ops.feed_log WHERE status IN ('pending', 'submitted')")
+           "created_at, updated_at, item_count, skus, post_started_at, recon_count "
+           "FROM ops.feed_log WHERE status IN ('pending', 'submitted')")
     with db.pg_conn() as conn, conn.cursor() as cur:
         cur.execute(sql)
         cols = [d.name for d in cur.description]
@@ -281,16 +327,28 @@ def _chunk_skus(feed_type: str, chunk: list) -> list[str]:
     return [str(s) for s in chunk]
 
 
+_ITEMS_SQL = ("INSERT INTO ops.feed_items (feed_id, sku, workflow, store, feed_type, "
+              "status, submitted_at) VALUES (%s, %s, %s, %s, %s, 'submitted', "
+              "coalesce(%s::timestamptz, now())) "
+              "ON CONFLICT (feed_id, sku) DO NOTHING")
+
+
+def _items_rows(feed_id: str, workflow: str, store_name: str, feed_type: str,
+                skus: list[str], submitted_at=None) -> list[tuple]:
+    return [(feed_id, s, workflow, store_name, feed_type, submitted_at)
+            for s in skus if s]
+
+
 def _items_record(feed_id: str, workflow: str, store_name: str,
-                  feed_type: str, skus: list[str]) -> None:
+                  feed_type: str, skus: list[str], submitted_at=None) -> None:
     """提交成功即落 SKU 级台账(ops.feed_items,status=submitted);
-    终态由 services/feed_track 轮询回写。SKU 级状态权威在库,飞书只是投影。"""
+    终态由 services/feed_track 轮询回写。SKU 级状态权威在库,飞书只是投影。
+
+    `submitted_at` 只有事后收编(pending 对账,`adopt_pending`)给:那一笔真正发出的
+    时刻是 post_started_at,不是收编这一刻 —— 落定期限与实际结果都从它起算。"""
     with db.pg_conn() as conn, conn.cursor() as cur:
-        cur.executemany(
-            "INSERT INTO ops.feed_items (feed_id, sku, workflow, store, feed_type, "
-            "status) VALUES (%s, %s, %s, %s, %s, 'submitted') "
-            "ON CONFLICT (feed_id, sku) DO NOTHING",
-            [(feed_id, s, workflow, store_name, feed_type) for s in skus if s])
+        cur.executemany(_ITEMS_SQL, _items_rows(feed_id, workflow, store_name,
+                                                feed_type, skus, submitted_at))
 
 
 # ── 提交(唯一入口)────────────────────────────────────────────────────────────
@@ -315,7 +373,8 @@ def submit_feed(store: dict, feed_type: str, entries: list, *,
     results = []
     for chunk in _slices(feed_type, entries):
         key = payload_key(feed_type, chunk)
-        log_id, prev = _log_claim(workflow, store["name"], feed_type, key)
+        log_id, prev = _log_claim(workflow, store["name"], feed_type, key,
+                                  len(chunk), _chunk_skus(feed_type, chunk))
         if log_id is None:
             logger.warning("feed 防重命中:%s %s 同载荷已存在(status=%s feed_id=%s),"
                            "拒绝重复提交", store["name"], feed_type,
@@ -355,7 +414,10 @@ def iter_result_slices(results: list[dict], entries: list):
 _PRE_FAIL = object()    # token/代理阶段失败的哨兵:feed 请求尚未发出,确定未达
 
 
-def _post(store: dict, feed_type: str, payload: dict):
+def _post(store: dict, feed_type: str, payload: dict, log_id=None):
+    """输入:店铺 + feedType + 载荷(+ 台账行)→ 输出:(HTTP 码, 头, 响应体) /
+    `_PRE_FAIL`(请求没发出)。给了台账行就在**真正发出之前**落 post_started_at
+    (`_log_posting`)—— pending 行上它为空 = 确定没发出。"""
     _client.rate_acquire(f"feeds.post.{feed_type}", store["client_id"])
     try:
         token = _client.get_token(store["client_id"], store["client_secret"],
@@ -369,6 +431,8 @@ def _post(store: dict, feed_type: str, payload: dict):
         logger.error("feed 提交前置失败(token/代理,请求未发出):%s %s: %s",
                      store["name"], feed_type, e)
         return _PRE_FAIL, None, None
+    if log_id is not None:
+        _log_posting(log_id)
     return _client.safe_post_ex(
         f"{_client.base_url()}/v3/feeds", token, store["client_id"],
         store["proxy"], json_body=payload, params={"feedType": feed_type},
@@ -397,13 +461,13 @@ def _submit_one(store: dict, feed_type: str, chunk: list, log_id,
         return _ok_result(log_id, feed_id, workflow, store["name"],
                           feed_type, skus, len(chunk))
 
-    status, _, data = _post(store, feed_type, payload)
+    status, _, data = _post(store, feed_type, payload, log_id)
     n = len(chunk)
 
     if status is _PRE_FAIL:
         # retryable:请求未发出的确定性失败(区别于 4xx 被拒——那个重试也没用),
         # 调用方可安全地对同一载荷做二轮重提(failed 行可重占)
-        _log_update(log_id, "failed")
+        _log_update(log_id, "failed", basis="未发出:取 token / 代理阶段失败,请求没发出")
         return {"feed_id": None, "count": n, "outcome": "failed",
                 "retryable": True}
 
@@ -414,7 +478,7 @@ def _submit_one(store: dict, feed_type: str, chunk: list, log_id,
 
     if status is not None and status < 500:
         # 4xx 明确拒绝:载荷/权限问题,没提交上,落 failed,绝不自动换姿势重试
-        _log_update(log_id, "failed")
+        _log_update(log_id, "failed", basis=f"沃尔玛拒收 HTTP {status}:{str(data)[:300]}")
         logger.error("feed 提交被拒:%s %s HTTP %s 响应=%s",
                      store["name"], feed_type, status, str(data)[:300])
         return {"feed_id": None, "count": n, "outcome": "failed"}
@@ -452,13 +516,15 @@ def _submit_one(store: dict, feed_type: str, chunk: list, log_id,
     if verdict == "NOT_FOUND":
         logger.warning("feed 网络异常且双确认未达:%s %s,按同一载荷补交一次",
                        store["name"], feed_type)
-        status2, _, data2 = _post(store, feed_type, payload)
+        status2, _, data2 = _post(store, feed_type, payload, log_id)
         if status2 == 200 and data2 and data2.get("feedId"):
             return _ok(data2["feedId"])
-        _log_update(log_id, "failed")
+        _log_update(log_id, "failed",
+                    basis=f"反查双确认未达,同一载荷补交一次仍未成(HTTP {status2})")
         return {"feed_id": None, "count": n, "outcome": "failed"}
-    # UNKNOWN:保持 pending,留给启动对账(query_pending),人不在环时宁停不重
-    logger.error("feed 网络异常且反查不确定:%s %s 保持 pending 待启动对账",
+    # UNKNOWN:保持 pending,交 feed_poll 的 pending 对账(只读反查、不补交),
+    # 人不在环时宁停不重
+    logger.error("feed 网络异常且反查不确定:%s %s 保持 pending 待 feed_poll 对账",
                  store["name"], feed_type)
     return {"feed_id": None, "count": n, "outcome": "unknown"}
 
@@ -483,7 +549,7 @@ def settle_deferred(store: dict, settle: dict) -> dict:
 
     退避走官方阶梯 + 抖动(见 `_backoff`)。全部尝试用尽仍未确认:
       · 最后一次是 NOT_FOUND ⇒ failed(调用方可回收 UPC,次日重试通道接手)
-      · 最后一次是 UNKNOWN   ⇒ unknown(feed_log 保持 pending,交启动对账)
+      · 最后一次是 UNKNOWN   ⇒ unknown(feed_log 保持 pending,交 feed_poll 对账)
     """
     log_id = settle["log_id"]
     feed_type, chunk = settle["feed_type"], settle["chunk"]
@@ -502,13 +568,14 @@ def settle_deferred(store: dict, settle: dict) -> dict:
                            store["name"], feed_type, attempt + 1,
                            SETTLE_ATTEMPTS)
             status, _, data = _post(store, feed_type,
-                                    build_payload(feed_type, chunk))
+                                    build_payload(feed_type, chunk), log_id)
             if status == 200 and data and data.get("feedId"):
                 return _ok_result(log_id, data["feedId"], workflow,
                                   store["name"], feed_type, skus, n)
             if status is not None and status is not _PRE_FAIL and status < 500:
                 # 4xx:载荷/权限问题,再补多少次都是同一个拒 —— 立刻收手
-                _log_update(log_id, "failed")
+                _log_update(log_id, "failed",
+                            basis=f"延后结算补交被拒 HTTP {status}:{str(data)[:300]}")
                 logger.error("延后结算:%s %s 补交被拒 HTTP %s 响应=%s",
                              store["name"], feed_type, status, str(data)[:300])
                 return {"feed_id": None, "count": n, "outcome": "failed"}
@@ -520,33 +587,64 @@ def settle_deferred(store: dict, settle: dict) -> dict:
             time.sleep(wait)
 
     if verdict == "NOT_FOUND":
-        _log_update(log_id, "failed")
+        _log_update(log_id, "failed",
+                    basis=f"延后结算:反查未达,{SETTLE_ATTEMPTS} 次补交全未果")
         logger.error("延后结算:%s %s %d 次补交全未果,判未达(UPC 可回收,"
                      "次日重试通道接手)", store["name"], feed_type,
                      SETTLE_ATTEMPTS)
         return {"feed_id": None, "count": n, "outcome": "failed"}
-    logger.error("延后结算:%s %s 反查始终不确定,保持 pending 待启动对账",
+    logger.error("延后结算:%s %s 反查始终不确定,保持 pending 待 feed_poll 对账",
                  store["name"], feed_type)
     return {"feed_id": None, "count": n, "outcome": "unknown"}
 
 
 # ── 反查三态(蓝图 §5.2 ②)──────────────────────────────────────────────────
 
-def find_recent_feed(store: dict, feed_type: str, items_received: int,
-                     window_minutes: int = 30) -> tuple[str, dict | None]:
-    """输入:店铺 + feedType + 精确条数 → 输出:(FOUND/NOT_FOUND/UNKNOWN, feed)。
+#: 事后对账(since 模式)的时间窗下沿余量:我们记的发送时刻与沃尔玛的 feedDate
+#: 之间有时钟差,往前放 2 分钟
+_SINCE_SLACK_MS = 2 * 60_000
+#: since 模式最多往后翻几页(官方 limit 上限 50/页):列表**不按 feedType 过滤**
+#: (官方参数只有 feedId / offset / limit),全店各类 feed 混在一起,20 页 = 最近
+#: 1000 条,够覆盖任何落定期限内的那一笔
+_PROBE_PAGES = 20
 
-    按 (feedType, itemsReceived 精确数, feedDate 时间窗) 匹配"刚才那笔";
+
+def find_recent_feed(store: dict, feed_type: str, items_received: int,
+                     window_minutes: int = 30, *, since=None,
+                     expect_skus: list[str] | None = None,
+                     recheck: bool = True) -> tuple[str, dict | None]:
+    """输入:店铺 + feedType + 精确条数(+ 事后对账参数)→ 输出:(FOUND/NOT_FOUND/UNKNOWN, feed)。
+
+    按 (itemsReceived 精确数, feedDate 时间窗) 匹配"刚才那笔";
     **候选排除 ops.feed_log 已占用的 feedId**——同尺寸兄弟切片(如 5000 条
     删除切成 2500+2500)会满足同样的 (feedType, 条数) 指纹,不排除会把片 2
     误收编到片 1 的 feed 上,整片静默丢失(2026-08-07 审查修正)。
     NOT_FOUND 需 30s 后二次确认(防沃尔玛索引滞后)。查询自身失败 → UNKNOWN。
+
+    **事后对账**(pending 对账,2026-09-25,由 services/feed_track 调):
+      · `since`(post_started_at)给了 ⇒ 时间窗按「since 前 2 分钟 ~ since 后
+        window 分钟」开,往后翻页(最多 _PROBE_PAGES 页);不给 ⇒ 老行为(此刻往回
+        window 分钟,只看第一页);
+      · `expect_skus` 给了 ⇒ 候选必须过 **SKU 集合核对**:读它的明细,SKU 集合与本片
+        完全一致才算对得上。⚠ 官方列表参数里**没有 feedType**(只有 feedId / offset /
+        limit),返回的 feedType 写法也没法核实("item" 还是 "MP_ITEM"),只按条数 +
+        时间窗认,会把同店同条数的别类 feed 收编过来;SKU 集合是决定性的证据。
+        扫完整个窗口,**恰好一条对得上、且没有核不了的候选**才 FOUND;不止一条对得上
+        (同一批 SKU 的别类 feed 也还没记账),或有候选明细读不到 / 还是空的 / 只露出
+        本片一部分 ⇒ 这一轮分不清,返回 ("UNKNOWN", {"matched": […], "unverified": […]})
+        交调用方写进依据,下轮再核;
+      · `recheck=False` ⇒ 不做 30 秒二次确认(事后对账离发送已久,不存在索引滞后)。
+    候选一律排除本店 feed_log 上已记账的 feedId(**不分 feedType**,见 `_claimed_ids`)。
+    本函数**只读**:一个 feed 都不发,补交与否由调用方按原规则决定。
     """
     def _claimed_ids() -> set:
+        # 按店排除、**不分 feedType**(2026-09-25):列表是全店各类 feed 混在一起
+        # (官方参数里没有 feedType),同店同条数、甚至同一批 SKU 的别类 feed(同一批
+        # SKU 先停用后删除、同时改价又改库存)只要已记在 feed_log 上,就不可能是
+        # "刚才那笔" —— 此前只排除同类,别类的会被 SKU 集合核对放行、错收编过来
         with db.pg_conn() as conn, conn.cursor() as cur:
             cur.execute("SELECT feed_id FROM ops.feed_log WHERE store = %s "
-                        "AND feed_type = %s AND feed_id IS NOT NULL",
-                        (store["name"], feed_type))
+                        "AND feed_id IS NOT NULL", (store["name"],))
             return {r[0] for r in cur.fetchall()}
 
     def _feed_date_ms(fd):
@@ -560,41 +658,125 @@ def find_recent_feed(store: dict, feed_type: str, items_received: int,
                 return None
         return None
 
-    def _probe():
+    since_ms = since.timestamp() * 1000 if since is not None else None
+
+    def _in_window(fd_ms) -> bool:
+        if since_ms is None:
+            return fd_ms is None or fd_ms >= time.time() * 1000 - window_minutes * 60_000
+        if fd_ms is None:
+            # 时刻解析不了:只有 SKU 集合核对兜底时才认它当候选
+            return expect_skus is not None
+        return since_ms - _SINCE_SLACK_MS <= fd_ms <= since_ms + window_minutes * 60_000
+
+    def _page(offset: int):
         _client.rate_acquire("feeds.get", store["client_id"])
         token = _client.get_token(store["client_id"], store["client_secret"],
                                   store["proxy"])
         status, _, data = _client.safe_get_ex(
             f"{_client.base_url()}/v3/feeds", token, store["client_id"],
-            store["proxy"], params={"feedType": feed_type, "limit": 50},
+            store["proxy"], params={"feedType": feed_type, "limit": 50,
+                                    "offset": offset},
             max_retries=2)
         if status != 200 or not isinstance(data, dict):
             return None
-        feeds = ((data.get("results") or {}).get("feed")
-                 or data.get("feed") or [])
-        claimed = _claimed_ids()
-        cutoff = time.time() * 1000 - window_minutes * 60_000
-        for f in feeds:
-            if f.get("feedId") in claimed:
-                continue        # 已被本系统其他提交占用,不是"刚才那笔"
-            fd_ms = _feed_date_ms(f.get("feedDate"))
-            if (f.get("itemsReceived") == items_received
-                    and (fd_ms is None or fd_ms >= cutoff)):
-                return f
-        return {}
+        return ((data.get("results") or {}).get("feed")
+                or data.get("feed") or [])
 
-    first = _probe()
-    if first is None:
-        return "UNKNOWN", None
-    if first:
-        return "FOUND", first
-    time.sleep(_RECHECK_SLEEP)
-    second = _probe()
-    if second is None:
-        return "UNKNOWN", None
-    if second:
-        return "FOUND", second
-    return "NOT_FOUND", None
+    def _verified(f) -> bool | None:
+        """SKU 集合核对:True 完全一致 / False 有本片之外的 SKU(不是这一笔)/
+        None 这一轮核不了 —— 明细读不到、还是空的,或**只露出本片的一部分**(可能还在
+        处理,也可能沃尔玛明细漏条;两头都不拿它下结论,等它核得清)。"""
+        try:
+            got = {str(it.get("sku") or "") for it in iter_feed_items(store, f["feedId"])}
+        except FeedQueryError:
+            return None
+        got.discard("")
+        want = {str(s) for s in expect_skus}
+        if not got or got < want:
+            return None
+        return got == want
+
+    def _probe() -> tuple[str, dict | None]:
+        claimed = _claimed_ids()
+        matched: list[dict] = []
+        unverified: list[dict] = []
+        for n in range(1 if since_ms is None else _PROBE_PAGES):
+            page = _page(n * 50)
+            if page is None:
+                return "UNKNOWN", None
+            for f in page:
+                if f.get("feedId") in claimed:
+                    continue        # 已被本系统其他提交占用,不是"刚才那笔"
+                if f.get("itemsReceived") != items_received:
+                    continue
+                if not _in_window(_feed_date_ms(f.get("feedDate"))):
+                    continue
+                if expect_skus is None:
+                    return "FOUND", f
+                ok = _verified(f)
+                if ok:
+                    matched.append(f)
+                elif ok is None:
+                    unverified.append(f)
+            if len(page) < 50:
+                break
+        if len(matched) == 1 and not unverified:
+            return "FOUND", matched[0]
+        if matched or unverified:
+            # 不止一条对得上,或还有核不了的:分不清是哪一笔,不收编,候选带回去写进依据
+            return "UNKNOWN", {"matched": [f.get("feedId") for f in matched],
+                               "unverified": [f.get("feedId") for f in unverified]}
+        return "NOT_FOUND", None
+
+    verdict, feed = _probe()
+    if verdict == "NOT_FOUND" and recheck:
+        time.sleep(_RECHECK_SLEEP)
+        verdict, feed = _probe()
+    return verdict, feed
+
+
+# ── pending 对账的落账原语(2026-09-25;判据在 services/feed_track.reconcile_pending)──
+
+def adopt_pending(row: dict, feed_id: str, posted_at) -> bool:
+    """输入:pending 台账行(query_pending 的 dict)+ 核对过的 feedId + 发送时刻
+    → 输出:是否收编成功(行已不是 pending 就不动)。
+
+    与提交当场收编(`_ok_result`)落同样两张账 —— feed_log 转 submitted、
+    ops.feed_items 按本片 SKU 列表落 submitted —— **同一个事务**:分两次提交会留下
+    "feed_log 说在途、台账一行没有"的半截状态,轮询到期只能空收口,SKU 结论全丢。
+    时刻一律用发送时刻(落定期限与实际结果从它起算),不是收编这一刻。
+    """
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE ops.feed_log SET status = 'submitted', feed_id = %s, "
+                    "updated_at = %s, close_basis = NULL "
+                    "WHERE id = %s AND status = 'pending' RETURNING id",
+                    (feed_id, posted_at, row["id"]))
+        if cur.fetchone() is None:
+            return False
+        cur.executemany(_ITEMS_SQL, _items_rows(
+            feed_id, row["workflow"], row["store"], row["feed_type"],
+            list(row.get("skus") or []), posted_at))
+    return True
+
+
+def close_pending(log_id, basis: str) -> bool:
+    """输入:pending 台账行 + 收口依据 → 输出:是否落了 failed(行已不是 pending 就不动)。
+
+    落 failed = 这个载荷**解锁**(终态行可重占):要不要再发由原业务工作流下一轮按原
+    方法决定 —— 本函数与对账器都**不补交**(写操作永不自动兜底)。
+    """
+    with db.pg_conn() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE ops.feed_log SET status = 'failed', close_basis = %s, "
+                    "updated_at = now() WHERE id = %s AND status = 'pending' "
+                    "RETURNING id", ((basis or "")[:500], log_id))
+        return cur.fetchone() is not None
+
+
+def note_reconcile(log_id) -> None:
+    """输入:pending 台账行 → 输出:无(反查次数 +1,收口依据里要报"查了几次")。"""
+    with db.pg_conn() as conn:
+        conn.execute("UPDATE ops.feed_log SET recon_count = recon_count + 1 "
+                     "WHERE id = %s", (log_id,))
 
 
 # ── 状态轮询 ──────────────────────────────────────────────────────────────────
@@ -604,10 +786,25 @@ def _feed_url(feed_id: str) -> str:
     return f"{_client.base_url()}/v3/feeds/{quote(feed_id, safe='')}"
 
 
+class FeedQueryError(RuntimeError):
+    """feed 状态 / 明细 GET 没拿到 200 JSON。`status` 是 HTTP 状态码,网络未达为 None。
+
+    带码上抛是为了让调用方分得清 **404**(官方:「The feedId does not exist or is
+    not visible to your account.」,feeds-overview)与其他读取失败 —— 落定期限
+    过后两者处置不同(services/feed_track)。文案用「返回 {status}」格式,
+    store_retry.diagnose 靠它归类(沃尔玛NNN / 网络未达)。
+    """
+
+    def __init__(self, msg: str, status):
+        super().__init__(msg)
+        self.status = status
+
+
 def get_feed_status(store: dict, feed_id: str) -> dict:
     """输入:店铺 + feed_id → 输出:汇总 dict(feedStatus/itemsReceived/…)。
 
     未知 feedStatus 告警而非静默"处理中"(防官方加值导致行永久卡死,C1 实证)。
+    非 200 抛 FeedQueryError(带 HTTP 码)。
     """
     _client.rate_acquire("feeds.get", store["client_id"])
     token = _client.get_token(store["client_id"], store["client_secret"],
@@ -616,7 +813,7 @@ def get_feed_status(store: dict, feed_id: str) -> dict:
         _feed_url(feed_id), token, store["client_id"], store["proxy"],
         params={"limit": 0}, max_retries=2)
     if status != 200 or not isinstance(data, dict):
-        raise RuntimeError(f"feed 状态查询失败 HTTP {status}(feedId={feed_id})")
+        raise FeedQueryError(f"feed 状态查询返回 {status}(feedId={feed_id})", status)
     fs = data.get("feedStatus")
     if fs not in FEED_STATUSES:
         logger.warning("未知 feedStatus=%r(feedId=%s),官方枚举可能已扩,请核对",
@@ -625,7 +822,10 @@ def get_feed_status(store: dict, feed_id: str) -> dict:
 
 
 def iter_feed_items(store: dict, feed_id: str):
-    """输入:店铺 + feed_id → 输出:逐 SKU 明细生成器(itemDetails,50/页自动翻)。"""
+    """输入:店铺 + feed_id → 输出:逐 SKU 明细生成器(itemDetails,50/页自动翻)。
+
+    非 200 抛 FeedQueryError(带 HTTP 码,同 get_feed_status)。
+    """
     offset = 0
     token = _client.get_token(store["client_id"], store["client_secret"],
                               store["proxy"])
@@ -637,7 +837,8 @@ def iter_feed_items(store: dict, feed_id: str):
                     "offset": offset},
             max_retries=2)
         if status != 200 or not isinstance(data, dict):
-            raise RuntimeError(f"feed 明细查询失败 HTTP {status}(feedId={feed_id})")
+            raise FeedQueryError(
+                f"feed 明细查询返回 {status}(feedId={feed_id})", status)
         items = ((data.get("itemDetails") or {}).get("itemIngestionStatus")
                  or [])
         yield from items

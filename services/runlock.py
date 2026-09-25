@@ -158,6 +158,28 @@ def acquire(name: str, holder: str = ""):
     return fh
 
 
+def is_held(name: str) -> bool | None:
+    """输入:锁名(=工作流名)→ 输出:True 正被占着 / False 空闲 / None 锁目录不可用。
+
+    **只探不占**(2026-09-25,feed_poll 的 pending 对账要问"提交这一笔的工作流还在不在
+    跑"):`acquire` 用 "w" 打开会**截断**锁文件,占着锁的那个进程写的 pid / 占用者
+    身份就被抹了 —— 探一次就毁一次现场。这里用 "a" 打开、试锁、立刻放,文件内容一字不动。
+    """
+    target = paths.locks_dir() / f"{name}.lock"
+    try:
+        fh = open(target, "a")
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        return True
+    fcntl.flock(fh, fcntl.LOCK_UN)
+    fh.close()
+    return False
+
+
 @contextlib.contextmanager
 def hold(name: str, wait_secs: float = 0, holder: str = ""):
     """输入:锁名(+最长等待秒数/占用者身份)→ 输出:上下文里 True=拿到 / False=没拿到。

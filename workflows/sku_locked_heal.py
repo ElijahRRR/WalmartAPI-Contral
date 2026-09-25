@@ -199,7 +199,9 @@ def _relist(ripe: list[tuple], locked_by_pair: dict, stores_by_name: dict,
                         logger.warning("RETIRE feed %s 轮询失败,本轮跳过: %s",
                                        feed_id, e)
         st = receipts[feed_id].get(sku)
-        if st is None or st[0] == "submitted":
+        # 未落定:台账 submitted,或即时轮询给的中间态(processing / unknown ——
+        # 汇总终态而这一条还在跑)。此前中间态会掉进下面的 else 被当成失败关掉
+        if st is None or st[0] in ("submitted", "processing", "unknown"):
             waiting += 1
             continue
         row = locked_by_pair.get((store_name, sku))
@@ -223,7 +225,9 @@ def _relist(ripe: list[tuple], locked_by_pair: dict, stores_by_name: dict,
         else:
             with db.pg_conn() as conn:
                 conn.execute(_SQL_CLOSE, ("failed", store_name, sku))
-            failed.append(f"{store_name}/{sku}({st[1]})")
+            # 失败之外的终态(明细无此条 / 超期未完成 / 无法查询…)没有错误码,
+            # 报状态原词,点名时分得清"被拒"与"没给结论"
+            failed.append(f"{store_name}/{sku}({st[1] or feed_track.text_of(st[0])})")
     if abandon_pairs:
         with db.pg_conn() as conn:
             n_ab = sum(sku_codec.abandon(conn, s, k,

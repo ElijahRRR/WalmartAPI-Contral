@@ -1134,7 +1134,23 @@ CREATE TABLE IF NOT EXISTS ops.feed_log (
     updated_at  timestamptz NOT NULL DEFAULT now()
 );
 CREATE UNIQUE INDEX IF NOT EXISTS feed_log_dedupe_uidx ON ops.feed_log (feed_type, store, payload_key);
--- 启动对账:凡 status='pending'/'submitted' 的行,先查 Walmart 实际 feed 状态再决定补交
+-- pending 对账(所有者 2026-09-25 批):POST 结局不确定的行,feed_poll 每轮只读反查,
+-- 查到收编、到期查不到落 failed「提交未确认」,**不自动补交**(services/feed_track.reconcile_pending)。
+--   item_count      本片条数(反查按沃尔玛列表的 itemsReceived 精确匹配)
+--   skus            本片 SKU 列表(候选 feed 的明细 SKU 集合必须与它完全一致才收编;收编后补落 feed_items)
+--   post_started_at 请求真正发出前落的时刻;pending 行上为空 = 确定没发出
+--   recon_count     反查过几次(收口依据里要报)
+--   close_basis     落 failed 的依据(请求没发出 / 沃尔玛拒收 HTTP 码 / 提交未确认…),重占时清空
+-- 存量行这几格为 NULL(09-25 之前 claim 的,不回填;对账器按"无法反查"处理)
+ALTER TABLE ops.feed_log ADD COLUMN IF NOT EXISTS item_count integer;
+ALTER TABLE ops.feed_log ADD COLUMN IF NOT EXISTS skus text[];
+ALTER TABLE ops.feed_log ADD COLUMN IF NOT EXISTS post_started_at timestamptz;
+ALTER TABLE ops.feed_log ADD COLUMN IF NOT EXISTS recon_count integer NOT NULL DEFAULT 0;
+ALTER TABLE ops.feed_log ADD COLUMN IF NOT EXISTS close_basis text;
+-- 在途口径(services/feed_track.IN_FLIGHT_SQL,2026-09-25)按 feed_id 反查 feed_log 是否已收口:
+-- problem_scan / sku_migrate 每轮对成千上万行做 EXISTS,普通索引(非唯一:存量有无
+-- feed_id 的 pending 行)
+CREATE INDEX IF NOT EXISTS feed_log_feed_id_idx ON ops.feed_log (feed_id);
 
 CREATE TABLE IF NOT EXISTS ops.feed_items (
     -- feed 的 SKU 级台账(所有 feed 操作共用):提交时落行,feed_poll 轮询落终态。
@@ -1144,7 +1160,9 @@ CREATE TABLE IF NOT EXISTS ops.feed_items (
     workflow    text NOT NULL,
     store       text NOT NULL,
     feed_type   text NOT NULL,
-    status      text NOT NULL,     -- submitted / success / failed / missing(明细里查无此 SKU)
+    status      text NOT NULL,     -- submitted / success / failed / missing(汇总终态、明细里查无此 SKU)
+                                   -- / overdue(到落定期限仍未处理完)/ unrecognized(到期时状态值不认识)
+                                   -- / unreadable(到期后读不到明细);后三个 = 沃尔玛没给结论,不是失败
     error_code  text,
     error_desc  text,               -- 沃尔玛给的人话描述(+字段名):光有数字码
                                     -- 无法诊断(2026-08-09 首跑 DATA_ERROR 教训)
@@ -1153,6 +1171,41 @@ CREATE TABLE IF NOT EXISTS ops.feed_items (
     PRIMARY KEY (feed_id, sku)
 );
 ALTER TABLE ops.feed_items ADD COLUMN IF NOT EXISTS error_desc text;
+-- 落定的事实依据(所有者 2026-09-25:每种结局都要有有事实依据的终态;feed 按 feedType
+-- 落定期限收口,见 services/feed_track.FEED_DEADLINE_MINUTES)。首次落定即定稿,之后不改。
+--   raw_status  沃尔玛原始 ingestionStatus(SUCCESS / DATA_ERROR / INPROGRESS / 不认识的原值);
+--               明细里查无记「明细缺席」,读不到记归类(沃尔玛404 / 代理波动 / 店铺不可调用…)
+--   settled_by  head = 汇总终态时落 / deadline = 到期强制落 / unreadable = 到期后读不到
+--   存量行两列为 NULL(09-25 之前落定的,不回填)
+ALTER TABLE ops.feed_items ADD COLUMN IF NOT EXISTS raw_status text;
+ALTER TABLE ops.feed_items ADD COLUMN IF NOT EXISTS settled_by text;
+-- 实际结果按提交时刻回看一周(services/feed_effect.LOOKBACK_DAYS),给它一条索引
+CREATE INDEX IF NOT EXISTS feed_items_submitted_at_idx ON ops.feed_items (submitted_at);
+
+-- feed 明细的**实际结果**(所有者 2026-09-25 定稿:feed 结果与实际结果分开)。
+-- 一行 = 某个 feed 里某个 SKU 的一次判定,只有 生效 / 未生效,**判一次不回头改**。
+-- 写入方唯一:services/feed_effect.judge(catalog_sync 刷新观测之后调)。只判过了落定
+-- 期限的明细、用期限之后的观测;同一 (店, SKU, feedType) 之后又提交过的旧明细不判。
+-- 不挂任何自动化:复核清单(feed 成功 ∧ 未生效)给人看,
+-- `python cli.py feed_poll -p review=1`。
+CREATE TABLE IF NOT EXISTS ops.feed_effects (
+    feed_id     text NOT NULL,
+    sku         text NOT NULL,
+    store       text NOT NULL,
+    feed_type   text NOT NULL,
+    workflow    text NOT NULL,
+    feed_status text NOT NULL,     -- 判定时的 feed 结果:success / missing / overdue /
+                                   -- unrecognized / unreadable(failed 不判)
+    effect      text NOT NULL,     -- effective(生效)/ not_effective(未生效)
+    want        text,              -- 目标值(改价 / 改库存 / 改标题才有,取自处置建议行)
+    observed    text,              -- 观测到的:现值 / 在架 / 缺席 / RETIRED
+    observed_at timestamptz,       -- 那次观测的时刻(观测与实际可能错开,人看时对时刻)
+    basis       text NOT NULL,     -- 判据(人话)
+    judged_at   timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (feed_id, sku)
+);
+CREATE INDEX IF NOT EXISTS feed_effects_review_idx
+    ON ops.feed_effects (judged_at) WHERE effect = 'not_effective';
 
 -- 采集推送批次台账(所有者定稿 2026-08-09)。**两条工作流共用一张表**:
 -- product_refresh 的全量重推批次(`wm-refresh-*`)与 order_audit 的按邮编

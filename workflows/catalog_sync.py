@@ -32,6 +32,13 @@ cli 恒给 `execute=True`,但 `dry_run` 单独透传进 params。**目录同步�
 弃码点 1(`sku_codec.abandon` 弃码 + 烧 UPC)以及给它封口的删除核验事件
 (`delete_verified` / `delete_not_effective`,写下去下一轮就不再产出这一对)。
 空跑时该段只报数,摘要第二行打「🧪 [DRY-RUN] 弃码点跳过:将弃码 N 个」。
+
+**实际结果**(所有者 2026-09-25 定稿:feed 结果与实际结果分开):本轮观测刷新之后,
+给过了落定期限的 feed 明细判一次 生效 / 未生效,落 ops.feed_effects
+(services/feed_effect;改价/库存/标题复用维护链的现值比对,删除复用删除核验的
+"已不在"口径)。只给人看、不挂自动化:摘要一行报新判数,「feed 成功但未生效」的
+指到 `python cli.py feed_poll -p review=1`。判一次不回头改 ⇒ 空跑同事务 rollback。
+这一步炸了只报一行,不拖垮已完成的同步。
 """
 
 import logging
@@ -41,7 +48,7 @@ from datetime import datetime, timezone
 
 from api import _client, feishu, inventory as inv_api, items
 from registry import db, resources
-from services import notify_fmt as nf, product_events, sku_codec, \
+from services import feed_effect, notify_fmt as nf, product_events, sku_codec, \
     store_limits, store_retry, stores as stores_svc, walmart_catalog
 
 DANGEROUS = False
@@ -51,6 +58,35 @@ logger = logging.getLogger("workflows.catalog_sync")
 
 _BACKSTOP_WORKERS = 8      # 报表兜底单查并发上限(items.get 桶 800/min,蓝图定稿 ≤8 并发)
 REPORT_MAX_AGE_HOURS = 48  # 报表兜底只认这么新的 ITEM 报表(05:00 一轮,06:40 / 13:00 用)
+
+
+def _judge_effects(store: str | None, dry_run: bool) -> str:
+    """输入:限定店铺 + 是否空跑 → 输出:实际结果一行摘要(无新判时空串)。
+
+    **失败隔离**:这一步只读观测、只写 ops.feed_effects,是目录同步之后的附属判定;
+    它炸了(库表未建、SQL 故障)只报一行、记日志,不拖垮已完成的同步 —— 与 feed_poll
+    反哺器"单个失败只吃掉它自己那一行"同一纪律。下轮 catalog_sync 自然再判。
+    """
+    try:
+        with db.pg_conn() as conn:
+            out = feed_effect.judge(conn, store=store)
+            if dry_run:
+                conn.rollback()
+    except Exception as e:      # noqa: BLE001 —— 附属步骤隔离,原话进摘要,不是吞
+        logger.warning("实际结果判定失败(不影响目录同步,下轮再判): %s", e)
+        return f"⚠ 实际结果判定失败(不影响目录同步,下轮再判):{e}"
+    if not any(out.values()):
+        return ""
+    line = ("实际结果(空跑未落库):将判 " if dry_run else "实际结果:新判 ") + (
+        f"生效 {out['effective']},未生效 {out['not_effective']}")
+    if out["review"]:
+        line += (f";⚠ 其中 feed 成功但未生效 {out['review']} 条,要人看 → "
+                 f"`python cli.py feed_poll -p review=1`")
+    if out["waiting"]:
+        line += f";已到期、等期限后的观测 {out['waiting']}"
+    if out["no_target"]:
+        line += f";目标值不在库里判不了 {out['no_target']}"
+    return line
 
 
 def _sync_one_store(store: dict, run_at, skip_inventory: bool, mode: str) -> dict:
@@ -245,6 +281,11 @@ def run(params: dict) -> str:
                          + (f",弃码 {n_ab}" if n_ab else "")
                          + (f",⚠ 未生效 {not_eff}(回执成功但仍在架,查日志)"
                             if not_eff else ""))
+        # 实际结果(所有者 2026-09-25 定稿:feed 结果与实际结果分开):本轮观测刷新
+        # 之后,给过了落定期限的 feed 明细判一次生效 / 未生效(services/feed_effect)。
+        # 只给人看、不挂自动化;判一次不回头改 ⇒ 空跑必须 rollback,不许留下判决。
+        if (line := _judge_effects(params.get("store") or None, dry_run)):
+            lines.append(line)
 
     if results and str(params.get("skip_feishu", "")) not in ("1", "true", "yes"):
         lines.append(_write_projection())   # 全部店铺失败时不动飞书表

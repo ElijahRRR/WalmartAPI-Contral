@@ -157,6 +157,47 @@ docs/legacy_survey.md 的"共享桶"结论与 CLAUDE.md 相应表述据此**修�
 **feed 轮询官方建议节奏**:INPROGRESS 时 15 分钟 → 1 小时 → 2 小时 → 此后每 4 小时;
 价格 feed 至少等 5 分钟再查(SLA 15 分钟)。
 
+### 3.1 各操作「多久生效」的官方窗口(2026-09-12 全量核验,2026-09-25 逐页重核)
+
+**明细与官方原句在 `refdata/walmart_slas.tsv`**(一操作一行,带官方 URL 与核对日期)。
+**落定期限**(所有者 2026-09-25 定稿:「期限按官方值、不加余量,请实际查看官方给的期限值,
+不猜测,不凭记忆回答」;唯一出处 `services/feed_track.FEED_DEADLINE_MINUTES`)速记:
+
+| feedType | 官方口径(同一操作给了几个数时取最长) | 落定期限 |
+|---|---|---|
+| price / PRICE_AND_PROMOTION | 批量改价 SLA **15 分钟**(旧版、新版两页同句) | 15 分钟 |
+| inventory / MP_INVENTORY | Seller Center 批量改库存:最快 15 分钟、最长 **4 小时**(开发者文档无时限) | 4 小时 |
+| MP_ITEM / MP_MAINTENANCE | 处理最长 4 小时;**单条合规审核最长 24 小时**(审核期间 INPROGRESS);Seller Center 状态更新最长 24 小时 | 24 小时 |
+| MP_ITEM_MATCH | 美国站最长 **24 小时**(09-12 登记的「无法导入时最长 72 小时」美国站页面已无,只剩加拿大站) | 24 小时 |
+| RETIRE_ITEM | catalog 最长 **48 小时**(开发者文档与 Seller Center 同) | 48 小时 |
+| DELETE_ITEM | 48 小时内删除,最长 **72 小时**从 Catalog 消失(开发者文档无时限) | 72 小时 |
+
+例外(官方也写了,不进期限):危险品合规审核最长 3 个工作日;GTIN 豁免人工审核不给时长、
+批准后须等 4 小时重新提交;WFS 的 Hazmat 审核最长 48 小时(本仓自发货不适用)。这几类
+到期仍 INPROGRESS 的落「超期未完成」,生效与否交实际结果。
+
+⚠ **官方不给 feed 级的"最长处理时间"**,也不给 feed 状态的保留窗口(feeds-overview /
+list-all-feed-statuses / getallfeedstatuses / item-setup-sla 均无)。期限到了按明细强制
+落定(docs/feed_ledger_v2_design.md「〇」节);GET 404 官方原文是「The feedId does not
+exist or is not visible to your account.」,到期后遇到直接落「无法查询」。
+
+⚠ **汇总(feed 级 head)会停更,别拿它当处理进度**(2026-09-22 生产实证,所有者
+09-23 核实):A131吕灿荣 改价 feed(71 SKU)汇总 31 小时停在 `INPROGRESS / 成功 0 /
+失败 0 / 处理中 71`、`modifiedDtm` 自提交后不动,**明细却 71/71 SUCCESS**、价格已
+观测生效;同轮 16 条跨店改价 feed(1,960 SKU)同样。与官方 Legacy 改价页那句
+「Individual SKU price update success or failure is only available after the entire
+feed is processed」正好相反 —— 明细先有了,汇总没收口。⇒ 汇总未终态时它的计数不作数:
+`services/feed_track.poll_feed` 到了 feedType 的落定期限(改价 15 分钟,见 §3.1)就不管
+汇总怎么说,读明细强制落定(端点 17 的 `includeDetails=true`,50/页,吃 `feeds.get`
+同一个桶,不另立桶)。2026-09-24 的 `HEAD_STALE_HOURS`(1 小时)闸已由它取代(09-25)。
+
+⚠ **新建 item 发批量改价有前置条件**(官方原句在 tsv):「ensure that the Walmart Part ID
+(WPID) has been assigned and that **at least 24 hours have passed since item creation**
+before submitting a bulk price update feed」。本仓调度是 list_new 20:00、product_chain
+(含 maintenance 改价)次日 13:00 = **相隔 17 小时 < 24 小时**;改价选品链路里未见按
+item 年龄过滤(`services/maintenance_intents` 只有观测窗口过滤)——**待核**:昨夜新上架的
+品今天会不会被改价 feed 扫到。见 docs/backlog.md。
+
 ## 4. 分页模型(4 种,互不兼容,api 层各自封装)
 
 旧系统 7 个 GET /v3/items 实现里 4 套翻页写法并存,其中 1 套是 bug(fetch_my_walmart_items
@@ -231,8 +272,16 @@ MP_MAINTENANCE 官方明确限制:**COO(原产国)不可改**;必填仅 SKU+GTIN
    匹配"刚才那笔"→ FOUND/NOT_FOUND/UNKNOWN;NOT_FOUND 还要 30s 后二次确认(防索引滞后)。
    候选**排除 ops.feed_log 已占用的 feedId**(2026-08-07 审查修正:同尺寸兄弟切片
    会满足同一 (feedType, 条数) 指纹,不排除会把片 2 误收编到片 1 整片静默丢失)。
+   2026-09-25 起按店排除、**不分 feedType**:官方列表参数只有 feedId / offset / limit,
+   列表是全店各类 feed 混在一起,同一批 SKU 的别类 feed 已记账的也不可能是"刚才那笔"。
    此能力从 MP_ITEM 专用上提为全 feedType 通用。
-3. **启动对账**:进程启动时凡 feed_log 里 pending/submitted 的行,先查沃尔玛实际状态再决定补交。
+3. **pending 对账**(2026-09-25 所有者批,取代原「启动对账」提法 —— 那个从来没实现过):
+   feed_poll 每轮先对 pending 行只读反查(`find_recent_feed` 事后模式:按发送时刻开窗、
+   最多翻 20 页、条数精确 + 候选明细 SKU 集合完全一致,**恰好一条**对得上才收编),
+   查到收编转 submitted;落定期限内查不到、或期限 + 24 小时仍查不动 / 核不清 ⇒ failed
+   「提交未确认」;发送标记为空且原工作流不在跑 ⇒ failed「未发出」;原工作流还在跑的
+   行不碰。**不补交**:再发由原工作流下一轮按原方法。submitted 行由 feed_poll 按
+   落定期限轮询收口(§3.1)。判据在 `services/feed_track.reconcile_pending`。
 
 ### 5.3 状态轮询
 
@@ -311,7 +360,9 @@ api/feeds.py
   get_feed_status(store, feed_id)                         # 汇总
   iter_feed_items(store, feed_id)                         # 逐 SKU 明细(50/页自动翻)
   get_error_report(store, feed_id) -> bytes               # CSV
-  find_recent_feed(store, feed_type, items_received, window_minutes=30)   # 反查三态
+  find_recent_feed(store, feed_type, items_received, window_minutes=30,
+                   *, since=None, expect_skus=None, recheck=True)        # 反查三态;
+                   # since/expect_skus/recheck=False = pending 事后对账(只读)
   settle_deferred(store, settle)   # defer_settle=True 的延后结算:先反查后补交,最多 3 轮
 api/prices.py
   put_price(store, sku, amount)                           # 单品(100/hour,慎用)

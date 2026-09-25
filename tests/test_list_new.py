@@ -866,7 +866,8 @@ def _wire_feed_poll(monkeypatch):
     monkeypatch.setattr(feed_poll, "_REFLECTOR_CHAINS", [
         [("上架表", listing_sheet.sync_from_ledger),
          ("上架表自愈", listing_sheet.heal_unknown)]])
-    monkeypatch.setattr(feed_poll.feed_track, "poll_all", lambda by: "轮询完毕")
+    monkeypatch.setattr(feed_poll.feed_track, "poll_all",
+                        lambda by, execute=True, **_: "轮询完毕")
     monkeypatch.setattr(feed_poll.stores_svc, "load_stores",
                         lambda names=None: [])
     rows = [_sheet_row(2, feed_id="F1", listed="Yes", list_result="处理中",
@@ -925,9 +926,14 @@ def test_feed_poll_dry_run_writes_nothing_anywhere(monkeypatch):
     `feed_poll --dry-run` 会真的烧号,批次 2 还要往这条路上加不可逆的弃码。
     """
     feed_poll, calls = _wire_feed_poll(monkeypatch)
+    polled = []
+    monkeypatch.setattr(feed_poll.feed_track, "poll_all", lambda by, execute=True, **_: (
+        polled.append(execute), "轮询完毕")[1])
     out = feed_poll.run({"execute": True, "dry_run": True})
     assert calls == {"sheet": [], "abandon": [], "used": [], "released": []}
     assert "[DRY-RUN]" in out and "将弃码 1 个" in out
+    # 2026-09-25 起空跑连台账也不落:轮询本体收到 execute=False
+    assert polled == [False]
 
 
 def test_feed_poll_real_run_still_writes(monkeypatch):

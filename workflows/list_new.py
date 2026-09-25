@@ -232,7 +232,7 @@ def _settle_round(deferred: list, stores_by_name: dict, gate, today: str,
             return store_name, res["outcome"], len(batch)
         except Exception as e:                                  # noqa: BLE001
             # 结算炸了**不写终态**:UPC 留在「已领」、表上还是空,
-            # feed_log 保持 pending —— 启动对账是它的下一站,不是丢掉
+            # feed_log 保持 pending —— feed_poll 的 pending 对账是它的下一站,不是丢掉
             logger.exception("延后结算异常(保持 pending):%s: %s", store_name, e)
             return store_name, "unknown", len(batch)
 
@@ -247,7 +247,7 @@ def _settle_round(deferred: list, stores_by_name: dict, gate, today: str,
                 c = cnt_by_store.setdefault(sn, {})
                 c[outcome] = c.get(outcome, 0) + n
     label = {"submitted": "✅ 补上", "failed": "❌ 判未达(UPC 已回收,次日重试)",
-             "unknown": "⚠ 仍不确定(保持 pending,交启动对账)"}
+             "unknown": "⚠ 仍不确定(保持 pending,交 feed_poll 对账)"}
     for outcome in ("submitted", "failed", "unknown"):
         by = tally.get(outcome)
         if by:

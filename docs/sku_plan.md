@@ -603,8 +603,8 @@ feedType 与两个桶都已收录,只补注释与测试)。
   |---|---|---|
   | `confirmed` | 新码在架 ∧ 旧码缺席 | 旧行 `abandon('sku_update')`(**不烧 UPC**)+ 新码记 `sku_replaced` + `upc_pool.retag_sku` + `dispositions.rekey_open` + `drop_node_rows` + 台账 confirmed |
   | `confirmed`(影子) | 新码在架 ∧ 旧码**也**在架 ∧ **两码 wpid 相同** ∧ **旧码单查 404**(`api.items.get_item`)| 判词 (a′)「影子双挂」(2026-09-08 所有者实证,见 §9.15):列表接口把已删档案照旧吐回(僵尸列表,backlog §十三),同 wpid 说明这两个码是同一条 listing、原地换码已生效。**后果与上一行逐字相同,不新增写动作**;两条证据缺一不可,探不出来(凭证/GET 失败)一律 fail-closed 判 `double` |
-  | `rolled_back` | 回执 `failed`;或**观测新鲜**且新码超 `OBSERVE_HOURS`(24h)仍未出现;或 POST 当场判 failed | 旧行 `replaced_by` 清空(复活)+ 新码 `abandon('sku_update_failed')` + 台账 rolled_back。**不自动补交**(写操作永不自动兜底);下一轮重来会抽新码 |
-  | `stalled` | 超 `STALE_HOURS`(72h)仍判不出 | 只落台账 + 摘要点名人工,**不自动定案**(判不准就判活:回滚一个其实已生效的改码 = 登记簿说旧码、沃尔玛说新码,而且不报错) |
+  | `rolled_back` | 回执 `failed`;或 POST 当场判 failed | 旧行 `replaced_by` 清空(复活)+ 新码 `abandon('sku_update_failed')` + 台账 rolled_back。**不自动补交**(写操作永不自动兜底);下一轮重来会抽新码 |
+  | `stalled` | **观测新鲜**且新码超 `OBSERVE_HOURS` 仍未出现(= 跟卖落定期限 24h,官方美国站「最长 24 小时」);或超 `STALE_HOURS`(72h)仍判不出 | 只落台账 + 摘要点名人工,**不自动定案**(判不准就判活:回滚一个其实已生效的改码 = 登记簿说旧码、沃尔玛说新码,而且不报错)。**2026-09-25 所有者定稿**:观测说"未生效"以前直接回滚,现在一律交人工 —— feed 结果与实际结果分开,观测未生效只给人看(新码可能晚到,也可能先生效后消失) |
   | `double` | 新码在架 ∧ 旧码**也**在架 | **同店双挂**:台账落持久状态 `double`(2026-09-07 所有者定稿,见 §9.14;此前是「留 pending 只告警」),摘要逐条 + **首行**点名,**不自动处置**。它**不进节奏闸的 open**(后续改码照发)、**不许再开第二条台账**(候选判据含 `'double'`),但每轮仍参与定案 —— 旧码哪天缺席就自动转 `confirmed`。身份层不动 |
   | (不定案) | POST `outcome=unknown` | **保持 pending 不回滚**(决策 F) |
   | (不定案) | pending 但 `submitted_at` 为空(**落库未提交**) | 进程死在 POST 前后、或提交当场抛异常。**只点名不自动定案**:从台账上分不出「确定没发」与「不知道到没到」。人工核:先 `feed_poll` 让 `ops.feed_log` 那条落定,再去后台看这个 Product ID 现在挂的是哪个 SKU |
@@ -1142,9 +1142,10 @@ MP_ITEM),具体哪一种由 `GET /v3/feeds` 列出那条 Seller Center feed 的 
 定案 —— **定了再改 `sku_migrate.FEED_TYPE` 与 `_build_items`**。
 
 **已做的止损**:`workflows/sku_migrate.SUBMIT_DISABLED` 非空 ⇒ 本工作流只定案不提交,
-dry-run 也不列候选(列了就是"将改码 N 个"的误导);定案留着,两条 pending 靠
+dry-run 也不列候选(列了就是"将改码 N 个"的误导);定案留着,两条 pending 当时靠
 `_verdict` 的观测反证(新码不在架 ∧ 旧码在架,超 OBSERVE_HOURS=24)走 `rolled_back`
-把旧码复活、新码弃掉。守门测试钉住"缺省停用"。
+把旧码复活、新码弃掉(**2026-09-25 起这一支改判 `stalled` 交人工**,不再自动回滚)。
+守门测试钉住"缺省停用"。
 
 **对抗验证顺带排除的**(三名反驳者各自独立驳倒,免得再走弯路):
 · H3「我们把回执 SUCCESS 当生效」—— 官方 item 级 ingestionError 只有

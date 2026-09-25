@@ -593,8 +593,8 @@ CREATE TABLE listing.sku_migrations (   -- 改码过程台账(2026-09-02,SKU 改
 -- 只有一个工作流看的过程列。两者的状态迁移必须**同一事务**完成(与
 -- retire_cooldown 之于 catalog.upc_pool 同款分工)。
 -- 状态(2026-09-07 起五个):pending(已落库,可能已发 feed)→ confirmed(catalog_sync
--- 观测到"新码在架且旧码缺席")/ rolled_back(回执失败或观测反证)/ stalled(超期判不准,
--- 点名人工)/ **double**(同店双挂:新码与旧码同时在架 —— 2026-09-07 所有者定稿,原话
+-- 观测到"新码在架且旧码缺席")/ rolled_back(回执失败)/ stalled(观测过了跟卖落定期限
+-- 新码仍未出现 —— 2026-09-25 起交人工不再自动回滚;或超期判不准,点名人工)/ **double**(同店双挂:新码与旧码同时在架 —— 2026-09-07 所有者定稿,原话
 -- 「双挂的就让他继续挂着,等到我其他的处理完了,我再回头处理他,中途不重复提交这种双挂
 -- 的就可以」)。double **不是终态**(不写 settled_at):它不进节奏闸的 open(`_SQL_STAGE`
 -- 只数 pending/stalled)⇒ 后续改码照发;不许再开第二条台账(候选判据「无未了结改码台账」
@@ -736,12 +736,32 @@ CREATE TABLE ops.feed_log (         -- feed 防重(核心安全表):先落 pendi
     feed_id     text,               -- 提交成功后回填
     status      text NOT NULL,      -- pending / submitted / done / failed
     created_at  timestamptz NOT NULL DEFAULT now(),
-    updated_at  timestamptz NOT NULL DEFAULT now()
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    -- 以下 5 列 2026-09-25 加(pending 对账);存量行为 NULL / 0,不回填
+    item_count  integer,            -- 本片条数:反查按沃尔玛 feed 列表的 itemsReceived 精确匹配
+    skus        text[],             -- 本片 SKU 列表:候选 feed 明细的 SKU 集合须与它完全一致
+                                    -- 才收编;收编后按它补落 ops.feed_items
+    post_started_at timestamptz,    -- 请求真正发出前落(单独提交);pending 行上为空 = 确定没发出
+    recon_count integer NOT NULL DEFAULT 0,   -- 反查过几次(收口依据里要报)
+    close_basis text                -- 落 failed 的依据:未发出 / 沃尔玛拒收 HTTP 码 /
+                                    -- 反查未达补交未果 / 提交未确认…
 );
 CREATE UNIQUE INDEX ON ops.feed_log (feed_type, store, payload_key);
--- 启动对账:凡 status='pending'/'submitted' 的行,先查 Walmart 实际 feed 状态再决定补交
+CREATE INDEX feed_log_feed_id_idx ON ops.feed_log (feed_id);   -- 2026-09-25:在途口径
+-- (feed_track.IN_FLIGHT_SQL = 台账 submitted 且 feed_log 未收口)按 feed_id 反查
 -- 防重语义(2026-08-07 定稿):唯一索引拦的是在途行(pending/submitted);
--- 终态行(done/failed)被 _log_claim 重占回 pending 后同载荷可再发(不设时间防重窗)
+-- 终态行(done/failed)被 _log_claim 重占回 pending 后同载荷可再发(不设时间防重窗);
+-- 重占时 item_count / skus 换成这一笔的,post_started_at / recon_count / close_basis 清空。
+-- **pending 对账**(所有者 2026-09-25 批,推翻 08-16「不做对账器」;
+-- services/feed_track.reconcile_pending,feed_poll 每轮先跑它):pending = POST 结局
+-- 不确定、没拿到 feedId,**不等于没提交上**。每轮**只读**反查沃尔玛 feed 列表
+-- (按发送时刻开窗 + 条数 + 候选明细的 SKU 集合核对),期限起点 = post_started_at:
+--   查到 ⇒ 收编(转 submitted、补落 feed_items,时刻用发送时刻),下轮起按落定期限追踪;
+--   发送标记为空、原工作流已不在跑(运行锁空闲)⇒ failed「未发出」;
+--   落定期限内一直查不到 ⇒ failed「提交未确认」;反查一直查不动(或店铺不可调用)
+--   过了期限 + 24 小时 ⇒ 同上;存量行没记条数无法反查 ⇒ 期限 + 24 小时后同上。
+-- **不自动补交**:落 failed 只是解锁载荷(终态行可重占),再不再发由原业务工作流
+-- 下一轮按原方法决定(写操作永不自动兜底)。
 
 CREATE TABLE ops.feed_items (       -- feed 的 SKU 级台账(所有 feed 操作共用)
     feed_id     text NOT NULL,      -- 提交时由 api/feeds 落行(status=submitted)
@@ -749,16 +769,59 @@ CREATE TABLE ops.feed_items (       -- feed 的 SKU 级台账(所有 feed 操作
     workflow    text NOT NULL,
     store       text NOT NULL,
     feed_type   text NOT NULL,
-    status      text NOT NULL,      -- submitted / success / failed / missing
+    status      text NOT NULL,      -- submitted / success / failed / missing(汇总终态、明细里查无)
+                                    -- / overdue / unrecognized / unreadable(见下)
     error_code  text,
     error_desc  text,               -- 沃尔玛给的人话描述(+字段名):光有数字码
-                                    -- 无法诊断(2026-08-09 首跑 DATA_ERROR 教训)
+                                    -- 无法诊断(2026-08-09 首跑 DATA_ERROR 教训);
+                                    -- 合规审核中的行存 pendingStatusDescription,
+                                    -- unreadable 行存读不到的原话
     submitted_at timestamptz NOT NULL DEFAULT now(),
-    resolved_at  timestamptz,
+    resolved_at  timestamptz,       -- **首次**落定时刻,之后不再刷新(2026-09-25)
+    raw_status  text,               -- 沃尔玛原始 ingestionStatus;查无记「明细缺席」,
+                                    -- 读不到记归类(沃尔玛404 / 代理波动 / 店铺不可调用…)
+    settled_by  text,               -- head = 汇总终态时落 / deadline = 到期强制落 /
+                                    -- unreadable = 到期后读不到(存量行两列为 NULL)
     PRIMARY KEY (feed_id, sku)
 );
 -- 终态由 services/feed_track 轮询回写(feed_poll 工作流全局扫,业务工作流也可
 -- 单 feed 轮询);SKU 级状态权威在此,飞书驱动表的"结果"列只是投影。
+-- **落定期限**(所有者 2026-09-25 定稿,官方值不加余量,原句见 refdata/walmart_slas.tsv;
+-- 唯一出处 feed_track.FEED_DEADLINE_MINUTES):改价 15 分钟、库存 4 小时、建品/改品/跟卖
+-- 24 小时、停用 48 小时、删除 72 小时。汇总终态就读明细落定;到期不管汇总怎么说都读明细
+-- 强制落定:仍 INPROGRESS 或(汇总没收工时)明细里查无 ⇒ overdue,状态值不认识 ⇒
+-- unrecognized;到期后读不到明细 ⇒ 404 当场、其他失败宽限 24 小时后 unreadable。
+-- overdue / unrecognized / unreadable = **沃尔玛没给结论**(feed_track.NO_VERDICT_STATUSES),
+-- 不是失败:消费方不许拿它们回收 UPC、不许当失败定案;处置建议按 receipt_none 关单。
+-- **首次落定即定稿**:落账 UPDATE 一律带 `AND status = 'submitted'`,落过的行不改状态、
+-- 不刷 resolved_at(每轮重写会让 problem_scan 在途闸的「待观测」永远成立)。
+CREATE INDEX feed_items_submitted_at_idx ON ops.feed_items (submitted_at);  -- 实际结果回看一周
+
+CREATE TABLE ops.feed_effects (     -- feed 明细的**实际结果**(所有者 2026-09-25 定稿)
+    feed_id     text NOT NULL,
+    sku         text NOT NULL,
+    store       text NOT NULL,
+    feed_type   text NOT NULL,
+    workflow    text NOT NULL,
+    feed_status text NOT NULL,      -- 判定时的 feed 结果(success / missing / overdue /
+                                    -- unrecognized / unreadable;failed 不判)
+    effect      text NOT NULL,      -- effective(生效)/ not_effective(未生效),只有这两个
+    want        text,               -- 目标值(改价 / 改库存 / 改标题,取自处置建议 detail.new)
+    observed    text,               -- 观测到的:现值 / 在架 / 缺席 / RETIRED / 仍在架
+    observed_at timestamptz,        -- 那次观测的时刻(观测与实际可能错开,人看时对时刻)
+    basis       text NOT NULL,      -- 判据(人话)
+    judged_at   timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (feed_id, sku)
+);
+CREATE INDEX feed_effects_review_idx ON ops.feed_effects (judged_at) WHERE effect = 'not_effective';
+-- 「feed 结果与实际结果……是两个东西,应该分开」:feed 结果在 ops.feed_items(沃尔玛说
+-- 它执行了什么),实际结果在这里(线上到底变没变)。两本账互不写对方。
+-- 写入方唯一 services/feed_effect.judge(catalog_sync 刷新观测之后调):只判过了落定
+-- 期限、提交在一周内、且没被同 (店, SKU, feedType) 后一次提交覆盖的明细;用期限之后的
+-- 观测判**一次**,之后不改(ON CONFLICT DO NOTHING)。判据复用现有:改价/库存/标题 =
+-- dispositions.maint_effective,删除 = product_events.GONE_SQL,上架/跟卖 = 目录出现,
+-- 停用 = RETIRED 或缺席。**不挂任何自动化**:复核清单(feed 成功 ∧ 未生效,另列没给结论
+-- ∧ 未生效)`python cli.py feed_poll -p review=1` 给人看。
 -- 停用/删除/设置到期日期 + 上架/改价/改库存/改标题 feed 全走这一套 —— 七种
 -- feedType 均已接线(DELETE_ITEM / RETIRE_ITEM / MP_MAINTENANCE / MP_ITEM /
 -- MP_ITEM_MATCH / price / inventory),载荷构造唯一出处 api/feeds.py。
@@ -1128,7 +1191,7 @@ CREATE TABLE ops.node_validations (
 | `detail->>'ship_node'` | 这条建议要写**哪个发货节点**(多仓批次 2) | 未配置「维护仓库」的店**不带这个键**(建议行与改造前逐字节一致,执行件走 legacy 路径)。带了就决定两件事:写通道(分节点 PUT / MP_INVENTORY feed)与落定判据(按 `catalog.item_node_inventory` 而非 `walmart_items.avail_qty`) |
 | `detail->'atoms'` | 这条建议的逐原子归类 `[{code, policy_name, text}]`(2026-09-10,problem_scan 写) | 与 `problem_categorized` 事件同款;`category` 列只是主码,复合原文还带哪些原子(「End Date 过期; 禁售」)看这里。维护链的建议行不带这个键 |
 | `sources` | 每个支撑来源各一格:`{来源: {action, code, reason, at}}` | 展示用的 reason/category 由 `claim()` 按它现算(单来源逐字不变,多来源拼成「维护:… \| 审核:…」);`reason`/`category` 两列是**首次建议**的病历,不再被后写方覆盖 |
-| `detail->>'settled_by'` | **是谁判的**这条落定 | 破坏类三种来源(2026-09-09):`delete_verified`/`delete_not_effective` = 观测判;`receipt_gone` = 回执码 ∈ `registry.resources.WALMART_ERR_ITEM_GONE`(沃尔玛说这个 SKU 已经不在了 ⇒ confirmed,**不论回执 status** —— QARTH「No matching record」是 status=success 带回来的);`receipt_failed` = 回执 failed/missing(含 WFS 不许删等永久拒)⇒ ineffective。维护三类是 `observed`/`value_unchanged`,超期放行是 `expired`。同时并进 `detail` 的还有 `receipt_status`/`error_code`/`error_desc`(截 300),查账不用再回 `ops.feed_items` 翻 |
+| `detail->>'settled_by'` | **是谁判的**这条落定 | 破坏类三种来源(2026-09-09):`delete_verified`/`delete_not_effective` = 观测判;`receipt_gone` = 回执码 ∈ `registry.resources.WALMART_ERR_ITEM_GONE`(沃尔玛说这个 SKU 已经不在了 ⇒ confirmed,**不论回执 status** —— QARTH「No matching record」是 status=success 带回来的);`receipt_failed` = 回执 failed/missing(含 WFS 不许删等永久拒)⇒ ineffective;`receipt_none`(2026-09-25)= 回执**没给结论**(overdue / unrecognized / unreadable)⇒ ineffective 关单,不是失败。维护三类是 `observed`/`value_unchanged`,超期放行是 `expired`。同时并进 `detail` 的还有 `receipt_status`/`error_code`/`error_desc`(截 300),查账不用再回 `ops.feed_items` 翻 |
 
 改码(批次 3)只准经两个积木碰这张表:`dispositions.open_executing_count`
 (前置闸:改码前该店必须无 `executing` 行 —— 它等的观测判决会随身份列一起换掉,

@@ -97,6 +97,8 @@ maintenance/list_new)→ 按域停旧切换。
    `IN_STOCK_QTY`(10)铺货,不上架;没设 N 的店照旧按 10。维护侧本来就写 0。
 6. 跟卖品铺货不管。7. 非 amz 来源 / 未发布的在架行不管。8. 低于上限被写 0 的
    商品先不删(长期缺货删除窗口不变)。
+9. **改码不封顶**:`sku_migrate` 给新码带的仍是旧码最后观测的沃尔玛库存,
+   超过 N 的由下一轮维护纠正(所有者定稿,不是漏做)。
 
 **实现**:换算唯一实现 `store_limits.stock_for(stock, cap)`(先门槛、后上限,
 判定码 no_count / below_min / below_cap / store_cap),上架 `list_new` 与维护

@@ -1,10 +1,12 @@
 """node_clear:受管仓以外的节点库存清零(搬仓收尾,一次性)。
 
-2026-09-25 所有者定稿:「api 应该可以拿到仓库编号,如果有设置维护仓的,运行
-脚本时直接把非维护仓的库存清零」—— 旧仓编号从 GET /v3/inventories 的
-`nodes[].shipNode` 自动发现,不再要求人工 `-p node=`。保留的四道闸:
-受管仓必须校验过、拒绝清受管仓、只清受管仓已接管的 SKU、节点身份未知不碰。
+2026-09-25 所有者定稿:不调接口读库存、不逐条写 —— 从库里的分仓库存
+(catalog.item_node_inventory)查出要清的「SKU × 旧仓」,按「店 × 旧仓」分批用
+分仓库存 feed(MP_INVENTORY)写 0。判断条件(所有者确认):**维护仓有这个 SKU 的
+记录(数量 0 也算),且旧仓有货**。保留:受管仓必须校验过、节点身份未知不碰。
 """
+
+import contextlib
 
 from workflows import node_clear as nc
 
@@ -14,8 +16,24 @@ def _store(name="T1"):
             "proxy": None}
 
 
-def _wire(monkeypatch, stores, managed, skipped=None, words=None, nodes=None):
-    """把店铺表、受管仓校验结果与库存读数接好;返回写入记录列表。"""
+class _Cur:
+    def __init__(self, rows_by_store, seen, boom):
+        self._rows_by_store, self._seen, self._boom = rows_by_store, seen, boom
+        self._rows = []
+
+    def execute(self, sql, params):
+        if self._boom:
+            raise self._boom
+        self._seen.append((sql, dict(params)))
+        self._rows = self._rows_by_store.get(params["store"], [])
+
+    def fetchall(self):
+        return list(self._rows)
+
+
+def _wire(monkeypatch, stores, managed, skipped=None, words=None, rows=None,
+          outcome="submitted", boom=None):
+    """接好店铺表、受管仓校验结果、库里的分仓库存与 feed 提交;返回 (查询记录, 提交记录)。"""
     monkeypatch.setattr(nc.stores_svc, "load_stores",
                         lambda filter_names=None: [
                             s for s in stores
@@ -27,175 +45,154 @@ def _wire(monkeypatch, stores, managed, skipped=None, words=None, nodes=None):
         return dict(managed), dict(skipped or {})
 
     monkeypatch.setattr(nc.store_limits, "managed_nodes", managed_nodes)
-    read = []
+    seen: list = []
 
-    def list_nodes(store):
-        read.append(store["name"])
-        return (nodes or {}).get(store["name"], {})
+    @contextlib.contextmanager
+    def pg_conn():
+        class _Conn:
+            @contextlib.contextmanager
+            def cursor(self):
+                yield _Cur(rows or {}, seen, boom)
+        yield _Conn()
 
-    monkeypatch.setattr(nc.inv_api, "list_inventory_nodes", list_nodes)
-    wrote = []
+    monkeypatch.setattr(nc.db, "pg_conn", pg_conn)
+    sent: list = []
 
-    def put(store, sku, qty, node=None):
-        wrote.append((store["name"], sku, qty, node))
-        return True, ""
+    def submit_feed(store, feed_type, entries, *, workflow="", defer_settle=False):
+        sent.append((store["name"], feed_type, list(entries), workflow))
+        o = outcome(entries) if callable(outcome) else outcome
+        return [{"feed_id": f"F{len(sent)}", "count": len(entries), "outcome": o}]
 
-    monkeypatch.setattr(nc.inv_api, "put_inventory", put)
-    return read, wrote
+    monkeypatch.setattr(nc.feeds, "submit_feed", submit_feed)
+    return seen, sent
 
 
-def test_old_nodes_are_discovered_from_the_api_not_typed_in(monkeypatch):
-    """不传 node:凡不是受管仓的节点、有货就清 —— 一个 SKU 挂几个旧仓就清几个。"""
-    read, wrote = _wire(monkeypatch, [_store("T1")], {"T1": "N_NEW"}, nodes={
-        "T1": {"A": {"N_NEW": 3, "N_OLD1": 5, "N_OLD2": 7},
-               "B": {"N_NEW": 0, "N_OLD1": 2},     # 受管仓有行(0 也算接管)
-               "C": {"N_NEW": 9}}})                # 旧仓没货 → 不在名单里
+def test_criterion_managed_row_exists_and_old_node_has_stock():
+    """判断条件就是模块头注那张表:维护仓有记录(0 也算)且旧仓有货才清;
+    维护仓没有记录 = 没接管,不清;节点身份未知(空串)不碰。"""
+    targets, per_node, untaken, unknown = nc.plan([
+        ("A", "OLD", 999, True),        # 维护仓 3 + 旧仓 999 → 清
+        ("B", "OLD", 999, True),        # 维护仓 0(维护链写的)+ 旧仓 999 → 清
+        ("C", "OLD", 999, False),       # 维护仓没有记录 → 不清(清了就断售)
+        ("D", "", 5, True),             # 同步时没给 shipNode → 不碰
+    ])
+    assert targets == {"OLD": ["A", "B"]}
+    assert per_node == {"OLD": (2, 1998)}
+    assert untaken == {"C": 999} and unknown == 1
+
+
+def test_reads_the_db_not_the_inventory_api():
+    """所有者定稿:库里就有分仓库存,不再单独调接口读库存、也不逐条写。"""
+    assert not hasattr(nc, "inv_api")
+    sql = nc._SQL_OLD_NODE_STOCK
+    assert "catalog.item_node_inventory" in sql
+    assert "missing_since IS NULL" in sql                # 只清目录里还在的码
+    assert "avail_qty > 0" in sql                        # 旧仓有货
+    assert "m.ship_node = %(managed)s::text" in sql      # 维护仓有无记录
+    assert "n.ship_node <> %(managed)s::text" in sql     # 维护仓本身永不清
+
+
+def test_one_mp_inventory_batch_per_old_node(monkeypatch):
+    """按「店 × 旧仓」分批:同一个 SKU 在两个旧仓都有货时,同一个 feed 里不能重复。"""
+    seen, sent = _wire(monkeypatch, [_store("T1")], {"T1": "N_NEW"}, rows={
+        "T1": [("A", "OLD1", 5, True), ("A", "OLD2", 7, True),
+               ("B", "OLD1", 2, True), ("C", "OLD1", 50, False)]})
     out = nc.run({"store": "T1"})
-    assert sorted(wrote) == [("T1", "A", 0, "N_OLD1"), ("T1", "A", 0, "N_OLD2"),
-                             ("T1", "B", 0, "N_OLD1")]
-    assert all(node != "N_NEW" for _, _, _, node in wrote)     # 受管仓一格不碰
-    assert "N_OLD1 2 个/7 件" in out and "N_OLD2 1 个/7 件" in out
-    assert "清零成功 3/3" in out
-    assert out.splitlines()[0].startswith("节点清零(受管仓以外):1 店,待清 3 条")
+    assert seen[0][1] == {"store": "T1", "managed": "N_NEW"}
+    assert sent == [
+        ("T1", "MP_INVENTORY", [{"sku": "A", "qty": 0, "ship_node": "OLD1"},
+                                {"sku": "B", "qty": 0, "ship_node": "OLD1"}],
+         "node_clear"),
+        ("T1", "MP_INVENTORY", [{"sku": "A", "qty": 0, "ship_node": "OLD2"}],
+         "node_clear"),
+    ]
+    first = out.splitlines()[0]
+    assert first.startswith("节点清零(受管仓以外):1 店,待清 3 条 SKU×旧仓 共 14 件")
+    assert "已提交 3 条,结果由 feed_poll 回写" in first
+    assert "旧仓 OLD1 2 个/7 件" in out and "旧仓 OLD2 1 个/7 件" in out
+    assert "还没有记录、本轮不清 1 个" in out and "C" in out   # 未接管的点名
+    assert "feed:F1,F2" in out
 
 
-def test_node_param_narrows_to_one_old_node(monkeypatch):
-    _, wrote = _wire(monkeypatch, [_store("T1")], {"T1": "N_NEW"}, nodes={
-        "T1": {"A": {"N_NEW": 3, "N_OLD1": 5, "N_OLD2": 7}}})
-    nc.run({"store": "T1", "node": "N_OLD2"})
-    assert wrote == [("T1", "A", 0, "N_OLD2")]
-
-
-def test_unknown_node_identity_is_never_written(monkeypatch):
-    """⚠ 接口没给 shipNode(键为空串或 `?序号`)的数量**不碰**:不带节点只能
-    走旧接口写默认节点,可能正是受管仓 —— 只点名。"""
-    _, wrote = _wire(monkeypatch, [_store("T1")], {"T1": "N_NEW"}, nodes={
-        "T1": {"A": {"N_NEW": 3, "?0": 4, "": 2, "N_OLD": 1}}})
-    out = nc.run({"store": "T1"})
-    assert wrote == [("T1", "A", 0, "N_OLD")]
-    assert "节点身份未知" in out and "2 份" in out
-
-
-def test_refuses_to_clear_the_managed_node(monkeypatch):
-    """⚠ 拒绝清受管仓:自动链每轮都在维护它,清了下一轮就写回来。"""
-    read, wrote = _wire(monkeypatch, [_store("T1")], {"T1": "N_NEW"})
-    out = nc.run({"store": "T1", "node": "N_NEW"})
-    assert "拒绝执行" in out and "受管仓" in out and "stockzero" in out
-    assert read == [] and wrote == []                 # 拒绝之前不去读库存
-
-
-def test_dry_run_writes_nothing_and_lists_the_targets(monkeypatch):
-    """--dry-run 一件都不写,但要报出规模与最大的几条(人眼闸门)。"""
-    _, wrote = _wire(monkeypatch, [_store("T1")], {"T1": "N_NEW"}, nodes={
-        "T1": {"B0A": {"N_OLD": 999, "N_NEW": 3},
-               "B0B": {"N_OLD": 5},              # 受管仓没有行 ⇒ 未接管 ⇒ 跳过
-               "B0C": {"N_NEW": 7},
-               "B0D": {"N_OLD": 0}}})            # 旧节点是 0 → 不用清
+def test_dry_run_sends_nothing(monkeypatch):
+    _, sent = _wire(monkeypatch, [_store("T1")], {"T1": "N_NEW"}, rows={
+        "T1": [("A", "OLD", 999, True), ("B", "", 3, True)]})
     out = nc.run({"store": "T1", "dry_run": True})
-    assert wrote == []
-    assert "N_OLD 2 个/1004 件" in out
-    assert "尚未接管** 1 个" in out and "B0B" in out
-    assert "待清 1 条(SKU×节点),合计 999 件" in out
-    assert out.startswith("[DRY-RUN] 节点清零") and "一件都没写" in out
+    assert sent == []
+    assert out.startswith("[DRY-RUN] 节点清零(受管仓以外):1 店,待清 1 条")
+    assert "一条都没发" in out
+    assert "节点身份未知" in out and "1 份" in out
 
 
-def test_only_clears_what_the_managed_node_took_over(monkeypatch):
-    """⚠ 只清**受管仓已接管**的 SKU(谭总12 搬仓实见:一把清完 = 断售)。"""
-    _, wrote = _wire(monkeypatch, [_store("T1")], {"T1": "N_NEW"}, nodes={
-        "T1": {"TAKEN": {"N_OLD": 999, "N_NEW": 3},
-               "UNTAKEN": {"N_OLD": 50}}})
+def test_dedup_failed_and_unknown_outcomes_are_named(monkeypatch):
+    """同一批还在处理中 → 防重拦下(不重复提交);结局不确定 → 交 feed_poll 对账,
+    不要手工补发;被拒 → 点名。三种都要进摘要,不能只报"已提交"。"""
+    outcomes = {"OLD1": "dedup", "OLD2": "unknown", "OLD3": "failed"}
+    _wire(monkeypatch, [_store("T1")], {"T1": "N_NEW"}, rows={
+        "T1": [("A", "OLD1", 5, True), ("B", "OLD2", 5, True),
+               ("C", "OLD3", 5, True)]},
+        outcome=lambda entries: outcomes[entries[0]["ship_node"]])
     out = nc.run({"store": "T1"})
-    assert wrote == [("T1", "TAKEN", 0, "N_OLD")]     # UNTAKEN 一个字节都没碰
-    assert "尚未接管** 1 个" in out and "UNTAKEN" in out
-    assert "sources_backfill" in out                 # 给出补救路径,不只是拒绝
-
-    wrote.clear()
-    nc.run({"store": "T1", "include_untaken": "1"})
-    assert sorted(s for _, s, _, _ in wrote) == ["TAKEN", "UNTAKEN"]
+    first = out.splitlines()[0]
+    assert "已提交 0 条" in first and "防重拦下 1" in first
+    assert "⚠ 被拒 1" in first and "⚠ 结局不确定 1" in first
+    assert "pending 对账会接手" in out
 
 
-def test_names_the_failures(monkeypatch):
-    """失败必须点名:写 0 是幂等的,重跑即补;静默的话那批货还在旧节点上卖。"""
-    _wire(monkeypatch, [_store("T1")], {"T1": "N_NEW"}, nodes={
-        "T1": {"B0A": {"N_OLD": 9, "N_NEW": 1}, "B0B": {"N_OLD": 8, "N_NEW": 2}}})
-    seen = []
-
-    def put(store, sku, qty, node=None):
-        seen.append((sku, qty, node))
-        return (False, "节点 N_OLD status=FAILURE: 库存台账没有这一行") \
-            if sku == "B0B" else (True, "")
-
-    monkeypatch.setattr(nc.inv_api, "put_inventory", put)
+def test_unconfigured_store_is_refused(monkeypatch):
+    seen, sent = _wire(monkeypatch, [_store("T1")], {})
     out = nc.run({"store": "T1"})
-    assert seen == [("B0A", 0, "N_OLD"), ("B0B", 0, "N_OLD")]  # 数量降序,都带节点
-    assert "清零成功 1/2" in out
-    assert "⚠ 失败 1 条" in out and "B0B@N_OLD" in out and "FAILURE" in out
-    assert "⚠ 失败 1" in out.splitlines()[0]
+    assert "没配「维护仓库」" in out
+    assert seen == [] and sent == []
 
 
-def test_unconfigured_store_is_refused_unless_explicit(monkeypatch):
-    """没配「维护仓库」⇒ 判不出哪个是旧仓、接管与否 ⇒ **拒绝**;显式给旧仓并
-    include_untaken=1 才整节点清空(判不准就判活)。"""
-    read, wrote = _wire(monkeypatch, [_store("T1")], {}, nodes={
-        "T1": {"B0A": {"N_OLD": 9, "N_OTHER": 4}}})
-    for params in ({"store": "T1"}, {"store": "T1", "node": "N_OLD"}):
-        out = nc.run(params)
-        assert "拒绝执行" in out and "include_untaken=1" in out
-    assert read == [] and wrote == []
-    nc.run({"store": "T1", "node": "N_OLD", "include_untaken": "1"})
-    assert wrote == [("T1", "B0A", 0, "N_OLD")]       # 只清点名的那个节点
-
-
-def test_validation_failure_skips_the_store_without_reading(monkeypatch):
-    """受管仓校验不过(填错/读不到)⇒ 不清:"受管仓以外全清"建在错编号上 = 清空真仓。"""
-    read, wrote = _wire(monkeypatch, [_store("T1")], {},
-                        skipped={"T1": "T1:「维护仓库」填的 N_TYPO 不在该店发货节点列表里"})
+def test_validation_failure_skips_the_store(monkeypatch):
+    """受管仓校验不过(填错/读不到)⇒ 不清:判据建在错编号上 = 把真仓当旧仓清空。"""
+    seen, sent = _wire(monkeypatch, [_store("T1")], {},
+                       skipped={"T1": "T1:「维护仓库」填的 N_TYPO 不在该店发货节点列表里"})
     out = nc.run({"store": "T1"})
     assert "受管仓校验失败" in out and "N_TYPO" in out
-    assert read == [] and wrote == []
+    assert seen == [] and sent == []
 
 
 def test_fleet_mode_covers_only_validated_managed_stores(monkeypatch):
-    """不传 store:只处理填了「维护仓库」且校验通过的店;没配的店不碰,校验失败的首行点名。"""
-    read, wrote = _wire(
+    """不传 store:只处理填了「维护仓库」且校验通过的店;没配的不碰,校验失败的首行点名。"""
+    seen, sent = _wire(
         monkeypatch, [_store("T1"), _store("T2"), _store("T3")],
         {"T1": "N1"}, skipped={"T3": "读不到"}, words={"T3": "代理波动"},
-        nodes={"T1": {"A": {"N1": 1, "OLD": 6}},
-               "T2": {"B": {"OLD": 9}}})
+        rows={"T1": [("A", "OLD", 6, True)], "T2": [("B", "OLD", 9, True)]})
     out = nc.run({})
-    assert read == ["T1"]                               # T2 没配、T3 校验失败:都不读
-    assert wrote == [("T1", "A", 0, "OLD")]
+    assert [p["store"] for _, p in seen] == ["T1"]     # T2 没配、T3 校验失败:都不查
+    assert [s for s, *_ in sent] == ["T1"]
     first = out.splitlines()[0]
     assert "1 店" in first and "受管仓校验失败整店跳过 1 店:T3(代理波动)" in first
 
 
 def test_fleet_mode_with_nothing_configured_says_so(monkeypatch):
-    read, _ = _wire(monkeypatch, [_store("T1")], {})
+    seen, _ = _wire(monkeypatch, [_store("T1")], {})
     out = nc.run({})
-    assert "没有填了「维护仓库」且校验通过的店" in out and read == []
+    assert "没有填了「维护仓库」且校验通过的店" in out and seen == []
 
 
-def test_read_failure_is_retried_once_then_named(monkeypatch):
-    """读库存失败按店维标准:串行补试一遍,仍失败首行点名归类词(写 0 幂等,重跑即补)。"""
+def test_store_failure_is_retried_once_then_named(monkeypatch):
+    """店级失败按店维标准:串行补试一遍,仍失败首行点名归类词(重跑即补)。"""
     monkeypatch.setattr(nc.store_retry.time, "sleep", lambda s: None)
-    _, wrote = _wire(monkeypatch, [_store("T1")], {"T1": "N_NEW"})
     calls = []
 
-    def boom(store):
-        calls.append(store["name"])
-        raise RuntimeError("GET /v3/inventories 返回 500(店铺 T1): {}")
+    class _Boom(RuntimeError):
+        def __init__(self):
+            calls.append(1)
+            super().__init__("GET /v3/inventories 返回 500(店铺 T1): {}")
 
-    monkeypatch.setattr(nc.inv_api, "list_inventory_nodes", boom)
+    _, sent = _wire(monkeypatch, [_store("T1")], {"T1": "N_NEW"})
+
+    @contextlib.contextmanager
+    def pg_conn():
+        raise _Boom()
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(nc.db, "pg_conn", pg_conn)
     out = nc.run({"store": "T1"})
-    assert calls == ["T1", "T1"]                        # 首轮 + 串行补试一次
-    assert wrote == []
-    assert "读库存失败 1 店:T1(沃尔玛500)" in out.splitlines()[0]
-
-
-def test_plan_is_pure_and_orders_by_quantity():
-    targets, per_node, untaken, unknown = nc.plan(
-        {"A": {"M": 1, "X": 3}, "B": {"M": 1, "X": 8, "Y": 2}, "C": {"X": 5}},
-        "M")
-    assert targets == [("B", "X", 8), ("A", "X", 3), ("B", "Y", 2)]
-    assert per_node == {"X": (3, 16), "Y": (1, 2)}
-    assert untaken == {"C": 5} and unknown == 0
+    assert len(calls) == 2                                # 首轮 + 串行补试一次
+    assert sent == []
+    assert "失败 1 店:T1(沃尔玛500)" in out.splitlines()[0]

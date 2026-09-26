@@ -345,8 +345,12 @@ LEFT JOIN catalog.listing_sources ls
   ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
 WHERE w.missing_since IS NULL AND ls.abandoned_at IS NULL
 """
+# ⚠ 只问本轮待上架的 ASIN(2026-09-26 全仓慢查询排查):不带这个条件就是每轮把整本
+#   事件账本(几百万行)按身份键聚合一遍,只为给几百行打提示。asin 是视图的分组键,
+#   条件会被压进视图、走 product_events_identity_idx(表达式与视图逐字一致)。
 _SQL_UNEXPLAINED = """
-SELECT asin FROM catalog.product_risk WHERE unexplained_missing
+SELECT asin FROM catalog.product_risk
+WHERE unexplained_missing AND asin = ANY(%(asins)s::text[])
 """
 # 审核结论与 PT 的**权威在 PG**(所有者定稿 2026-08-16:「上架链应该以数据库
 # 的数据为准,因为我把审核接进来了,要上架就肯定要过审核,读取速度也更快」)。
@@ -426,8 +430,11 @@ class _GateState(NamedTuple):
     cooling: dict               # (店, ASIN) → 最近一次退役回执成功时刻
 
 
-def _load_gate_state() -> _GateState:
-    """输入:无(读 PG)→ 输出:`_GateState`,闸门链要的九份库侧快照。"""
+def _load_gate_state(asins: list[str]) -> _GateState:
+    """输入:本轮待上架行的 ASIN(读 PG)→ 输出:`_GateState`,闸门链要的九份库侧快照。
+
+    `asins` 只用来限定「不明原因消失」那一份(提示只打在本轮的行上,不必聚合整本账)。
+    """
     with db.pg_conn() as conn, conn.cursor() as cur:
         cur.execute(_SQL_INACTIVE)
         inactive = {s for s, st in cur.fetchall()
@@ -442,7 +449,7 @@ def _load_gate_state() -> _GateState:
         # 第二列是**身份键**(见 _SQL_LISTED_ASINS 头注),闸判那头拿的是
         # r["asin"],两边同一个口径。
         listed_pairs = {(store, key) for store, key in cur.fetchall()}
-        cur.execute(_SQL_UNEXPLAINED)
+        cur.execute(_SQL_UNEXPLAINED, {"asins": sorted({a for a in asins if a})})
         unexplained = {r[0] for r in cur.fetchall()}
         banned = blacklist.load_banned_asins(conn)
         gate = risk_gate.load_gate(conn)
@@ -825,7 +832,7 @@ MAX_LIST_ATTEMPTS = 3       # 同 (店铺,身份键) 自动重上次数上限(�
 # psycopg3 不支持 `(a,b) IN %s` 传元组序列(psycopg2 老写法),用 unnest 配对。
 # 计数键是 (店铺, **身份键**):切码后按裸 SKU 数每次新码 count 恒 0 ⇒ FAILED
 # 无限重试(烧 UPC、烧 MP_ITEM 配额,不报错)。
-# **代际口径**(LATERAL 那段):
+# **代际口径**(g 那段):
 #   · 无弃码事件 ⇒ g.since IS NULL ⇒ 谓词恒真 ⇒ 退化成今天的**跨码累计**;
 #   · 有弃码事件 ⇒ 只数最近一次弃码之后的提交(换了码就重新给三次)。
 # 认弃码事件读的是 abandon 自己写进 detail 的 source_key,**不是
@@ -833,20 +840,27 @@ MAX_LIST_ATTEMPTS = 3       # 同 (店铺,身份键) 自动重上次数上限(�
 # 0b 未合」的窗口里恒为 NULL ⇒ 代际过滤永不命中)。
 # 代际**上限**(同 (store, source_type, source_key) 弃码行数 ≥ 阈值即拦)属批次 2。
 # ⚠ 参数全部具名:psycopg3 不许位置占位符与具名占位符混用。
+# ⚠ 最近一次弃码**整批聚合一次**(g CTE,走 product_events_event_idx),不许写回逐候选
+#   的 LATERAL:那版每个 (feed 行 × 候选) 都按 store 把该店整段事件史(几百万行的账本里
+#   该店那一截)扫一遍 —— 与 2026-09-26 实际结果卡死日报链、2026-08-14
+#   audit_listing_conflicts 挂死是同一个形状。FAILED 行只增不减,候选越积越多。
 _SQL_ATTEMPTS = """
+WITH t AS (
+    SELECT * FROM unnest(%(stores)s::text[], %(asins)s::text[]) AS t(store, asin)
+),
+g AS (
+    SELECT e.store, e.detail ->> 'source_key' AS asin, max(occurred_at) AS since
+    FROM catalog.product_events e
+    WHERE e.event = %(abandoned)s
+      AND e.store = ANY(%(stores)s::text[])
+    GROUP BY 1, 2
+)
 SELECT t.store, t.asin, count(*)
 FROM ops.feed_items f
 LEFT JOIN catalog.listing_sources ls
   ON ls.store = f.store AND ls.sku = f.sku AND ls.source_type = 'amz'
-JOIN unnest(%(stores)s::text[], %(asins)s::text[]) AS t(store, asin)
-  ON f.store = t.store AND coalesce(ls.source_key, f.sku) = t.asin
-LEFT JOIN LATERAL (
-    SELECT max(occurred_at) AS since
-    FROM catalog.product_events e
-    WHERE e.store = t.store
-      AND e.event = %(abandoned)s
-      AND e.detail ->> 'source_key' = t.asin
-) g ON true
+JOIN t ON f.store = t.store AND coalesce(ls.source_key, f.sku) = t.asin
+LEFT JOIN g ON g.store = t.store AND g.asin = t.asin
 WHERE f.feed_type = 'MP_ITEM'
   AND (g.since IS NULL OR f.submitted_at > g.since)
 GROUP BY t.store, t.asin
@@ -1729,7 +1743,7 @@ def run(params: dict) -> str:
 
     # 读取次序与拆函数之前一字不差(闸门状态 → 配额 → 三张按店表 → 凭证)
     ctx = _GateCtx(
-        state=_load_gate_state(),
+        state=_load_gate_state([r["asin"] for r in pending]),
         quota=_load_quota(),
         # 四个区间倍率列与维护链**同一份读取**(services/store_limits):上架价与
         # 维护价两套口径会自己跟自己打架 —— 本链此前另抄了一份 _load_multipliers

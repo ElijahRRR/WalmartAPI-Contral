@@ -221,17 +221,24 @@ WHERE order_date >= now() - make_interval(days => %(days)s)
 """
 
 # 按 (asin, 邮编) 取最新快照:scrape_params 里的邮编参与"最新值"分组,
-# 故同一 ASIN 不同邮编互不覆盖(catalog.latest_snapshot 的设计初衷)。
+# 故同一 ASIN 不同邮编互不覆盖(catalog.latest_snapshot 的设计初衷,这里就地
+# 按同一个分组键 DISTINCT ON)。
 # 标题在身份层(products),两层 JOIN 才拿得到——商品一致性要用它。
+# ⚠ 不读 latest_snapshot 视图(2026-09-26 全仓慢查询排查;本条每小时跑一到两次):
+#   视图的新鲜度条件压不进去,每个 ASIN 都把全部历史快照读出来排序再扔掉 24 小时
+#   以外的。窗口放进 DISTINCT ON 之内结果逐行相同 —— 一组的最新一条落在窗口里,当且
+#   仅当这一组在窗口里有观测 —— 且走 snapshots_mkt_asin_scraped_idx 的区间扫描。
 _SNAP_SQL = """
-SELECT s.asin, s.price, s.stock_count, s.stock_state, s.delivery_days,
+SELECT DISTINCT ON (s.asin, s.scrape_params)
+       s.asin, s.price, s.stock_count, s.stock_state, s.delivery_days,
        s.shipping, s.shipping_raw, s.buybox,
        s.scrape_params, s.raw, s.outcome, s.scraped_at, p.title
-FROM catalog.latest_snapshot s
+FROM catalog.snapshots s
 LEFT JOIN catalog.products p
        ON p.marketplace = s.marketplace AND p.asin = s.asin
 WHERE s.marketplace = 'US' AND s.asin = ANY(%(asins)s)
   AND s.scraped_at >= now() - make_interval(hours => %(fresh)s)
+ORDER BY s.asin, s.scrape_params, s.scraped_at DESC
 """
 
 # ── 采集台账 ──────────────────────────────────────────────────────────────────

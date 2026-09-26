@@ -22,6 +22,17 @@ def pg_dsn() -> str:
 STATEMENT_TIMEOUT_S = 30 * 60
 
 
+#: 连接的 application_name:`pg_stat_activity` 里一眼看出是哪个工作流的查询(2026-09-26
+#: 卡死那次只能按 SQL 文本去认)。cli 每跑一步调 set_workflow 换成工作流名。
+_APP_NAME = "walmartapi"
+
+
+def set_workflow(name: str) -> None:
+    """输入:工作流名 → 输出:无(此后新开的连接 application_name = walmartapi:<名>)。"""
+    global _APP_NAME
+    _APP_NAME = f"walmartapi:{name}"[:63]      # PG 截断到 63 字节
+
+
 def _options(dsn: str, timeout_s: float) -> str:
     """输入:DSN + 超时秒数 → 输出:libpq options(保留 DSN 里原有的 options,追加超时)。"""
     from psycopg.conninfo import conninfo_to_dict
@@ -51,7 +62,8 @@ def pg_conn(autocommit: bool = False, statement_timeout: float | None = None):
     dsn = pg_dsn()
     timeout_s = STATEMENT_TIMEOUT_S if statement_timeout is None else statement_timeout
     conn = psycopg.connect(dsn, autocommit=autocommit,
-                           options=_options(dsn, timeout_s))
+                           options=_options(dsn, timeout_s),
+                           application_name=_APP_NAME)
     try:
         yield conn
         if not autocommit:

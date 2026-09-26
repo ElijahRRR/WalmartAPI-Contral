@@ -384,7 +384,7 @@ def test_list_new_injects_upc_before_the_gate_chain(monkeypatch):
 
     from workflows import list_new
     src = inspect.getsource(list_new.run)
-    assert src.index("_sync_upc(") < src.index("_load_gate_state()")
+    assert src.index("_sync_upc(") < src.index("_load_gate_state(")
 
 
 def test_list_new_upc_injection_failure_never_blocks_listing(monkeypatch):
@@ -455,8 +455,8 @@ def test_upc_writeback_runs_after_listing_not_beside_injection():
 
     from workflows import list_new
     src = inspect.getsource(list_new.run)
-    assert src.index("_sync_upc(") < src.index("_load_gate_state()")
-    assert src.index("_writeback_upc(") > src.index("_load_gate_state()")
+    assert src.index("_sync_upc(") < src.index("_load_gate_state(")
+    assert src.index("_writeback_upc(") > src.index("_load_gate_state(")
 
 
 def test_upc_writeback_is_skipped_on_dry_run_and_never_blocks(monkeypatch):

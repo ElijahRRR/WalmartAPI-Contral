@@ -357,7 +357,7 @@ def test_list_new_stock_three_way(monkeypatch):
     monkeypatch.setattr(ln.amz_source, "latest_seen", lambda asins: {
         a: ln.amz_source.Seen(None, None, False) for a in asins})
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+    monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
         {}))

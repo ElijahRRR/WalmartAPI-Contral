@@ -234,7 +234,12 @@ LEFT JOIN LATERAL (
            -- buybox offer 的品相(二手/翻新)。同款:契约未列为一等字段、
            -- 随 raw 落库;键名唯一出处在 registry(错键 = 闸恒放行)
            raw ->> '{resources.AMZ_OFFER_CONDITION_KEY}' AS offer_condition
-    FROM catalog.latest_snapshot l
+    -- ⚠ 直接读 catalog.snapshots,不读 latest_snapshot 视图(2026-09-26 全仓慢查询排查):
+    --   视图是全表 DISTINCT ON,LATERAL 每探一次都把该 ASIN 全部历史快照读出来排序;
+    --   直接读走 snapshots_mkt_asin_scraped_idx,从最新往回摸到第一条非 mismatch 即停。
+    --   结果逐行相同:mismatch 只看 scrape_params(视图的分组键),全体非 mismatch
+    --   观测里最新那条必是它那一组的最新一条。
+    FROM catalog.snapshots l
     WHERE l.marketplace = 'US' AND l.asin = coalesce(ls.source_key, w.sku)
       AND coalesce(l.scrape_params ->> 'zip_verify', '') <> 'mismatch'
     ORDER BY l.scraped_at DESC LIMIT 1

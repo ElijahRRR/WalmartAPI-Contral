@@ -1329,3 +1329,28 @@ has passed…」两条互相矛盾的理由(实见 B0FHPSYT8N)。收窄后已下
 
 顺带一个**语义收紧**:只看**当前**结论是 reject 的。曾经拒过、现在已经过了的
 不是冲突(那是审核改判,正常)——首版把它们捞进来既慢又答非所问。
+
+### ⚠ 同款第二次:日报链卡 44 分钟(2026-09-26 生产实遇,已修)+ 全仓排查
+
+`services/feed_effect` 的候选查询对 1.88 万个候选逐个 `LATERAL (… FROM ops.dispositions WHERE feed_id = …
+ORDER BY id DESC LIMIT 1)`,`feed_id` 上没有索引 ⇒ 每个候选把 65.8 万行扫一遍;库里没设查询超时,
+44 分钟不报错。与上面 08-14 那次**同一个形状**:逐行 / 逐候选去探一张大表,而探的列没有索引。
+当天全仓四路排查,按同一形状补修(沙箱按生产量级造数实测):
+
+| 位置 | 问题 | 修法 |
+|---|---|---|
+| `services/feed_effect`(catalog_sync) | 逐候选全表扫 `ops.dispositions` | 整批一次 join + `dispositions_feed_sku_idx (feed_id, sku)`;单店 5.0 秒 → 全部 100 店 0.6 秒 |
+| `list_new._SQL_ATTEMPTS`(每天) | 逐候选 LATERAL 按 store 扫该店整段事件史(event、detail 都没索引) | 最近一次弃码整批聚合一次(g CTE)+ `product_events_event_idx (event, occurred_at DESC)` |
+| `upc_pool.burn / retag_sku / claim`、撞库探查(catalog_sync、feed_poll、sku_migrate) | 按 (店, ASIN) 找号没有索引,烧号**逐对**调 ⇒ 一批几千次整池扫描 | `upc_pool_store_asin_idx (store, asin) WHERE status IN ('claimed','used')`;单次 35 ms → 0.3 ms |
+| 维护链 `_SQL_AMZ_JOIN`、上架链 `amz_source`、分配两处(product_pool / alloc_survey) | 逐行 LATERAL 读 `latest_snapshot` 视图 = 每行把该 ASIN 全部历史快照读出来排序(维护链 09-03 实测单条 2 分半) | 直接读 `catalog.snapshots` 走 `snapshots_mkt_asin_scraped_idx`,结果逐行相同 |
+| `order_audit._SNAP_SQL`(每小时) | 视图的新鲜度条件压不进去,每 ASIN 读全部历史 | 窗口放进 DISTINCT ON 之内直接读表,结果逐行相同 |
+| 维护链「连续 N 天缺货」(近 15 天全部观测) | 按时间窗扫快照没有可用索引 ⇒ 每天整表扫 | `snapshots_scraped_at_brin`(BRIN,几十 KB) |
+| `list_new._SQL_UNEXPLAINED`(每天) | 为几百行提示把整本事件账本按身份键聚合一遍 | 只问本轮待上架 ASIN,条件压进视图走 `product_events_identity_idx` |
+| `problem_scan._SQL_LAST_CAT`(每天) | 对全部历史归类事件逐条拆 atoms 再挑最新 | 先挑最新再拆;200 万事件 3.2 秒 → 0.8 秒 |
+| `sku_migrate._SQL_OBSERVE` | 逐行 EXISTS 按 store 扫目录(last_seen_at 无索引) | 整店最新观测时刻只算一次 |
+| `dispositions.destructive_executed_today`(每次清理) | 近 20 小时按 executed_at 取,无索引整表扫 | `dispositions_executed_at_idx` |
+
+兜底(防"不报错的慢"再次无声卡死):`registry/db` 每条连接带单条 SQL 超时 30 分钟、连接名
+`walmartapi:<工作流>`(`pg_stat_activity` 里认得出是谁的查询);附属步骤自带更紧的 `SET LOCAL`;
+`db_init` 不限语句时长但等锁 30 秒即退。**写逐行 / 逐候选关联之前,先确认被探的列有索引**;
+不许在 LATERAL 里读 `latest_snapshot` 视图(直接读 `catalog.snapshots`)。

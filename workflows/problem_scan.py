@@ -188,30 +188,29 @@ GROUP BY store, sku
 # 逗号拼),没有的(存量)退回 detail.category。单原子行的签名与主码相同,换判据
 # 不会让整库在第一轮重记一遍;复合行会补记一次 —— 那正是此前缺的账。
 # jsonb_typeof 护一层:atoms 不是数组(NULL/缺键/写坏)时不炸,退回主码。
+# ⚠ 先 DISTINCT ON 取每个 (店, SKU) 最近一条的 detail,**再**算签名(2026-09-26 全仓慢查询
+#   排查):此前对全部历史归类事件逐条拆 atoms 再挑最新,账本越长越慢(沙箱 200 万事件
+#   3.2 秒 → 0.8 秒,结果逐行相同)。
 _SQL_LAST_CAT = """
-SELECT DISTINCT ON (store, sku) store, sku, cat FROM (
-    SELECT e.store, e.sku,
-           coalesce((SELECT string_agg(DISTINCT x->>'code', ',' ORDER BY x->>'code')
-                     FROM jsonb_array_elements(
-                          CASE WHEN jsonb_typeof(e.detail->'atoms') = 'array'
-                               THEN e.detail->'atoms' END) x),
-                    e.detail->>'category') AS cat,
-           e.occurred_at
-    FROM catalog.product_events e WHERE e.event = %(ev)s::text
-    UNION ALL
-    SELECT a.store, a.sku,
-           coalesce((SELECT string_agg(DISTINCT x->>'code', ',' ORDER BY x->>'code')
-                     FROM jsonb_array_elements(
-                          CASE WHEN jsonb_typeof(e.detail->'atoms') = 'array'
-                               THEN e.detail->'atoms' END) x),
-                    e.detail->>'category'),
-           e.occurred_at
-    FROM catalog.sku_aliases a
-    JOIN catalog.product_events e
-      ON e.store = a.store AND e.sku = a.alias_sku
-    WHERE e.event = %(ev)s::text
-) t
-ORDER BY store, sku, occurred_at DESC
+SELECT store, sku,
+       coalesce((SELECT string_agg(DISTINCT x->>'code', ',' ORDER BY x->>'code')
+                 FROM jsonb_array_elements(
+                      CASE WHEN jsonb_typeof(detail->'atoms') = 'array'
+                           THEN detail->'atoms' END) x),
+                detail->>'category') AS cat
+FROM (
+    SELECT DISTINCT ON (store, sku) store, sku, detail FROM (
+        SELECT e.store, e.sku, e.detail, e.occurred_at
+        FROM catalog.product_events e WHERE e.event = %(ev)s::text
+        UNION ALL
+        SELECT a.store, a.sku, e.detail, e.occurred_at
+        FROM catalog.sku_aliases a
+        JOIN catalog.product_events e
+          ON e.store = a.store AND e.sku = a.alias_sku
+        WHERE e.event = %(ev)s::text
+    ) t
+    ORDER BY store, sku, occurred_at DESC
+) last
 """
 _SQL_STUBBORN = """
 SELECT DISTINCT ON (store, sku) store, sku, event FROM (

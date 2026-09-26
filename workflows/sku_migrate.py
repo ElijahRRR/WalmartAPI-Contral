@@ -469,8 +469,11 @@ SELECT m.id, m.old_sku, m.new_sku, m.source_type, m.source_key, m.feed_id,
        nw.wpid AS new_wpid, ow.wpid AS old_wpid,
        (nw.sku IS NOT NULL AND nw.missing_since IS NULL)          AS new_present,
        (ow.sku IS NULL OR ow.missing_since IS NOT NULL)           AS old_gone,
-       EXISTS (SELECT 1 FROM catalog.walmart_items s
-               WHERE s.store = m.store AND s.last_seen_at > m.submitted_at) AS fresh
+       -- 提交之后该店被扫过没有:整店最新观测时刻只算一次(与逐行 EXISTS 同义;空店 = false)。
+       -- ⚠ 别写回逐行 `EXISTS (… s.store = m.store AND s.last_seen_at > m.submitted_at)`:
+       --   last_seen_at 没有索引,「还没扫过」时每一行都把整店目录走一遍(2026-09-26 排查)
+       coalesce((SELECT max(s.last_seen_at) FROM catalog.walmart_items s
+                 WHERE s.store = %(store)s) > m.submitted_at, false) AS fresh
 FROM listing.sku_migrations m
 LEFT JOIN catalog.walmart_items nw ON nw.store = m.store AND nw.sku = m.new_sku
 LEFT JOIN catalog.walmart_items ow ON ow.store = m.store AND ow.sku = m.old_sku

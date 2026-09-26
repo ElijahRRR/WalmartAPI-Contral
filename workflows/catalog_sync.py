@@ -64,9 +64,13 @@ def _judge_effects(store: str | None, dry_run: bool) -> str:
     """输入:限定店铺 + 是否空跑 → 输出:实际结果一行摘要(无新判时空串)。
 
     **失败隔离**:这一步只读观测、只写 ops.feed_effects,是目录同步之后的附属判定;
-    它炸了(库表未建、SQL 故障)只报一行、记日志,不拖垮已完成的同步 —— 与 feed_poll
-    反哺器"单个失败只吃掉它自己那一行"同一纪律。下轮 catalog_sync 自然再判。
+    它炸了(库表未建、SQL 故障、超时)只报一行、记日志,不拖垮已完成的同步 —— 与
+    feed_poll 反哺器"单个失败只吃掉它自己那一行"同一纪律。下轮 catalog_sync 自然再判。
+    ⚠ 失败隔离接不住"不报错的慢":judge 自带本事务超时(feed_effect.STATEMENT_TIMEOUT_S)。
+    暂停中(feed_effect.PAUSED 非空)只报那一行,不连库。
     """
+    if feed_effect.PAUSED:
+        return feed_effect.PAUSED
     try:
         with db.pg_conn() as conn:
             out = feed_effect.judge(conn, store=store)

@@ -4,6 +4,9 @@
 > 本文档是唯一的表结构事实来源:任何 AI 建表/改表必须同步更新这里。
 > 可执行同步产物是 `refdata/schema.sql`(幂等),执行走 `python cli.py db_init`。
 > 连接只准通过 `registry/db.py`;Metabase/NocoDB/MCP 用只读角色 `readonly`。
+> **每条连接带单条 SQL 超时**(2026-09-26,`registry/db.STATEMENT_TIMEOUT_S` = 30 分钟;`db_init`
+> 传 0 关掉):此前库里没设超时,一条缺索引的查询逐条全表扫了 44 分钟不报错。超时 = 那条 SQL 报错、
+> 工作流失败、cli 通知 —— 响亮失败好过无声卡死。附属步骤要更紧的在事务里自己 `SET LOCAL statement_timeout`。
 
 ## Schema 总览
 
@@ -1211,6 +1214,12 @@ CREATE TABLE ops.node_validations (
 `receipt_gone` 只是**处置账的收尾,不是身份层的结论**:那条 SQL 不弃码、不改
 `catalog.walmart_items`、不记 `catalog.product_events`。「还建不建议」是另一个问题,
 由 `problem_scan` 按**最近一次**回执码判(`services/feed_track.receipt_blocked`)。
+
+索引(2026-09-26 补 `dispositions_feed_sku_idx`):主键 `id`;`dispositions_open_uidx (store, sku, action)`
+部分唯一(未落定);`dispositions_status_idx (status, suggested_at)`;`dispositions_feed_sku_idx (feed_id, sku)
+WHERE feed_id IS NOT NULL` —— 按 feed 反查处置行(实际结果取目标值等)。⚠ 没有它时每次反查都把整张表扫一遍:
+当天生产实见 1.88 万个候选逐条全表扫 65.8 万行,日报链卡 44 分钟不报错。**这张表只增不删,凡是逐行 / 逐候选
+反查它的 SQL,先确认过滤列有索引。**
 
 未落定唯一性是 `(store, sku, action)` 的部分唯一索引 —— **动作在键里不能去掉**:
 `problem_scan` 对顽固件同时建议 retire 与 delete(双 feed 齐发),合成一条会让

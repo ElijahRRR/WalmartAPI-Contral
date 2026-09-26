@@ -37,7 +37,8 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA catalog, listing, orders, ops, audit
 def run(params: dict) -> str:
     """输入:params(无参数)→ 输出:建库结果摘要(schema 数、readonly 角色是否配置)。"""
     sql = _SCHEMA_SQL.read_text(encoding="utf-8")
-    with db.pg_conn() as conn:
+    # 不限单条 SQL 时长:大表上首次建索引 / 回填可能超过连接缺省超时(registry/db)
+    with db.pg_conn(statement_timeout=0) as conn:
         conn.execute(sql)
 
         readonly_note = "readonly 角色:跳过(READONLY_DB_PASSWORD 未设)"

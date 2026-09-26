@@ -1757,6 +1757,12 @@ ALTER TABLE catalog.walmart_items ADD COLUMN IF NOT EXISTS node_count smallint;
 
 CREATE INDEX IF NOT EXISTS dispositions_status_idx
     ON ops.dispositions (status, suggested_at);
+-- 按 (feed_id, sku) 找处置行(2026-09-26):实际结果取值比对的目标值(services/feed_effect)
+-- 等按 feed 反查处置的地方。没有它时每次反查都把整张表(生产 65.8 万行)扫一遍 ——
+-- 当天生产实见 1.88 万个候选逐条全表扫,日报链卡 44 分钟。部分索引:只有执行过的行
+-- 才有 feed_id(PUT 路由记 'sync')。
+CREATE INDEX IF NOT EXISTS dispositions_feed_sku_idx
+    ON ops.dispositions (feed_id, sku) WHERE feed_id IS NOT NULL;
 
 -- ── audit:产品审核域(2026-08-13 批次 A,迁自 walmart-audit-system
 --    db/schema.sql@a565d95;批次 A 只建表搬数据,判定引擎批次 B/C 接线)──

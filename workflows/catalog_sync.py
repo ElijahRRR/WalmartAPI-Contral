@@ -33,12 +33,13 @@ cli 恒给 `execute=True`,但 `dry_run` 单独透传进 params。**目录同步�
 (`delete_verified` / `delete_not_effective`,写下去下一轮就不再产出这一对)。
 空跑时该段只报数,摘要第二行打「🧪 [DRY-RUN] 弃码点跳过:将弃码 N 个」。
 
-**实际结果**(所有者 2026-09-25 定稿:feed 结果与实际结果分开):本轮观测刷新之后,
-给过了落定期限的 feed 明细判一次 生效 / 未生效,落 ops.feed_effects
-(services/feed_effect;改价/库存/标题复用维护链的现值比对,删除复用删除核验的
-"已不在"口径)。只给人看、不挂自动化:摘要一行报新判数,「feed 成功但未生效」的
-指到 `python cli.py feed_poll -p review=1`。判一次不回头改 ⇒ 空跑同事务 rollback。
-这一步炸了只报一行,不拖垮已完成的同步。
+**实际结果**(所有者 2026-09-25 定稿:feed 结果与实际结果分开;2026-09-26 改口径):本轮
+观测刷新之后,给**落定期限落在该店上一次观测与这一次观测之间**的 feed 明细判一次 生效 /
+未生效,落 ops.feed_effects(services/feed_effect;改价/标题复用维护链的现值比对,删除
+复用删除核验的"已不在"口径;观测前同一参数又改过的不判;**库存不判**)。只给人看、不挂
+自动化:摘要一行报新判数,「feed 成功但未生效」的指到 `python cli.py feed_poll -p review=1`。
+判一次不回头改 ⇒ 空跑同事务 rollback(每店观测台账一起回滚)。这一步炸了只报一行,
+不拖垮已完成的同步。
 """
 
 import logging
@@ -67,10 +68,8 @@ def _judge_effects(store: str | None, dry_run: bool) -> str:
     它炸了(库表未建、SQL 故障、超时)只报一行、记日志,不拖垮已完成的同步 —— 与
     feed_poll 反哺器"单个失败只吃掉它自己那一行"同一纪律。下轮 catalog_sync 自然再判。
     ⚠ 失败隔离接不住"不报错的慢":judge 自带本事务超时(feed_effect.STATEMENT_TIMEOUT_S)。
-    暂停中(feed_effect.PAUSED 非空)只报那一行,不连库。
+    口径(所有者 2026-09-26):只在期限后的第一次观测判、观测前同一参数又改过不判、库存不判。
     """
-    if feed_effect.PAUSED:
-        return feed_effect.PAUSED
     try:
         with db.pg_conn() as conn:
             out = feed_effect.judge(conn, store=store)
@@ -86,10 +85,14 @@ def _judge_effects(store: str | None, dry_run: bool) -> str:
     if out["review"]:
         line += (f";⚠ 其中 feed 成功但未生效 {out['review']} 条,要人看 → "
                  f"`python cli.py feed_poll -p review=1`")
-    if out["waiting"]:
-        line += f";已到期、等期限后的观测 {out['waiting']}"
+    if out["overridden"]:
+        line += f";观测前同一参数又改过、不判 {out['overridden']}"
+    if out["missed"]:
+        line += f";期限后这一轮没观测到、不再补判 {out['missed']}"
     if out["no_target"]:
         line += f";目标值不在库里判不了 {out['no_target']}"
+    if out["baseline"]:
+        line += f";首次记观测基线 {out['baseline']} 店(下一轮起判)"
     return line
 
 

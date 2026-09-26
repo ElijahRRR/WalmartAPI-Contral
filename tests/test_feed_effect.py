@@ -2,9 +2,11 @@
 
 所有者 2026-09-25 定稿:feed 结果与实际结果分开;实际结果只有生效 / 未生效,
 「feed 显示成功、观测未生效」给人看,不挂任何自动化。
+2026-09-26 改口径:只在期限后的第一次观测判、观测前同一参数又改过不判、库存不判。
 """
 
 import contextlib
+import json
 import os
 import socket
 from datetime import datetime, timedelta, timezone
@@ -24,11 +26,10 @@ def _row(feed_type="price", **kw):
     due = sub + limit
     base = {"feed_id": "F1", "sku": "S1", "store": "T1", "feed_type": feed_type,
             "workflow": "maintenance", "feed_status": "success",
-            "submitted_at": sub, "due_at": due, "scanned_at": NOW,
+            "submitted_at": sub, "due_at": due, "scanned_at": NOW, "overridden": False,
             "seen": True, "missing_since": None, "lifecycle_status": "ACTIVE",
-            "last_seen_at": NOW, "price": 12.99, "avail_qty": 5,
-            "product_name": "T", "gone": False, "action": None, "want": None,
-            "ship_node": None, "node_qty": None}
+            "last_seen_at": NOW, "price": 12.99, "product_name": "T", "gone": False,
+            "action": None, "want": None}
     base.update(kw)
     return base
 
@@ -50,12 +51,14 @@ def test_not_effective_needs_an_observation_after_the_deadline():
     assert fe.verdict(r) is None
 
 
-def test_inventory_on_a_managed_node_compares_that_node():
-    """受管仓:看**该节点**的现值;节点期限后还没扫到 ⇒ 判不了(拿合计比就是错比)。"""
-    r = _row("inventory", action="inventory", want="3", ship_node="FC1",
-             node_qty=3, avail_qty=9)
-    assert fe.verdict(r)[0] == fe.EFFECTIVE
-    assert fe.verdict(dict(r, node_qty=None)) is None
+def test_inventory_is_not_judged():
+    """所有者 2026-09-26:「库存不观测结果」—— 订单随时在扣库存,快照对不上目标说明不了
+    是 feed 没生效还是卖掉了。两种库存 feed 都不进候选,库存动作的目标值也不取。"""
+    assert "inventory" not in fe._JUDGED_FEEDS and "MP_INVENTORY" not in fe._JUDGED_FEEDS
+    assert "inventory" not in fe._VALUE_ACTIONS
+    assert fe.verdict(_row("inventory", action="inventory", want="3")) is None
+    assert all("inventory" not in g and "MP_INVENTORY" not in g
+               for g in fe._SAME_PARAM.values())
 
 
 def test_title_compares_the_product_name():
@@ -82,6 +85,20 @@ def test_retire_and_delete():
     assert fe.verdict(still)[0] == fe.NOT_EFFECTIVE
     early = dict(still, last_seen_at=still["due_at"] - timedelta(hours=1))
     assert fe.verdict(early) is None                                # 72 小时内不判未生效
+
+
+def test_same_param_groups():
+    """「观测前同一参数又改过就不判」的对照表:整条重写商品的上架 / 跟卖 / 改码算动过价格、
+    标题与在不在架;单品 PUT 只有改价会盖掉 feed 的判定。"""
+    assert set(fe._SAME_PARAM["price"]) == {"price", "PRICE_AND_PROMOTION", "MP_ITEM",
+                                            "MP_ITEM_MATCH"}
+    assert set(fe._SAME_PARAM["MP_MAINTENANCE"]) == {"MP_MAINTENANCE", "MP_ITEM",
+                                                     "MP_ITEM_MATCH"}
+    for ft in ("MP_ITEM", "MP_ITEM_MATCH", "RETIRE_ITEM", "DELETE_ITEM"):
+        assert set(fe._SAME_PARAM[ft]) == {"MP_ITEM", "MP_ITEM_MATCH", "RETIRE_ITEM",
+                                           "DELETE_ITEM"}
+    assert set(fe._SAME_PARAM) == set(fe._JUDGED_FEEDS)             # 每种判的 feed 都在表里
+    assert fe._PUT_PRICE_FEEDS == ("price", "PRICE_AND_PROMOTION")
 
 
 def test_the_delete_gone_rule_is_the_one_delete_verification_uses():
@@ -117,11 +134,15 @@ def test_delete_verification_grace_is_the_delete_deadline(monkeypatch):
     assert c.args == (72,)
 
 
-# ── judge():计数与落库 ─────────────────────────────────────────────────────────
+# ── judge():窗口、计数与落库(假连接)──────────────────────────────────────────
 
 class _Conn:
-    def __init__(self, rows):
-        self.rows, self.sqls = rows, []
+    """按 SQL 分派的假连接:观测水位 / 观测台账 / 候选 / 落库 / 写台账。"""
+
+    def __init__(self, observed, cursor=None, rows=()):
+        self.observed, self.cursor_value, self.rows = observed, cursor, list(rows)
+        self.sqls: list = []
+        self._last = ""
 
     def cursor(self):
         return self
@@ -134,59 +155,123 @@ class _Conn:
 
     def execute(self, sql, args=None):
         self.sqls.append((sql, args))
+        self._last = sql
 
     def executemany(self, sql, rows):
         self.sqls.append((sql, list(rows)))
 
+    def fetchone(self):
+        if self._last == fe._CURSOR_GET_SQL:
+            return None if self.cursor_value is None else (self.cursor_value,)
+        return None
+
     def fetchall(self):
-        return [tuple(r[c] for c in fe._COLS) for r in self.rows]
+        if self._last == fe._OBSERVED_SQL:
+            return list(self.observed)
+        if self._last == fe._CANDIDATES_SQL:
+            return [tuple(r[c] for c in fe._COLS) for r in self.rows]
+        return []
+
+    def saved(self):
+        """最后写进观测台账的值(没写过就是 None)。"""
+        got = [a for s, a in self.sqls if s == fe._CURSOR_PUT_SQL]
+        return json.loads(got[-1][1]) if got else None
+
+    def ran_candidates(self):
+        return [a for s, a in self.sqls if s == fe._CANDIDATES_SQL]
+
+
+def test_first_observation_of_a_store_only_records_the_baseline():
+    """某店第一次出现:只把这一次观测记成基线,一条都不判(不补判上线前的存量)。"""
+    conn = _Conn(observed=[("T1", NOW)], cursor=None)
+    out = fe.judge(conn)
+    assert out["baseline"] == 1 and out[fe.EFFECTIVE] == out[fe.NOT_EFFECTIVE] == 0
+    assert conn.ran_candidates() == []                          # 没有窗口就不查候选
+    assert conn.saved() == {"T1": NOW.isoformat()}
+    timeout, _ = conn.sqls[0]
+    assert timeout == f"SET LOCAL statement_timeout = {fe.STATEMENT_TIMEOUT_S * 1000}"
+
+
+def test_a_store_whose_observation_did_not_move_is_not_judged():
+    """本轮没扫成的店水位停在上一轮 ⇒ 窗口是空的,不判;台账也不往回写。"""
+    prev = NOW - timedelta(hours=18)
+    conn = _Conn(observed=[("T1", prev)], cursor={"T1": prev.isoformat(),
+                                                  "T2": prev.isoformat()})
+    out = fe.judge(conn)
+    assert conn.ran_candidates() == [] and not any(out.values())
+    assert conn.saved() == {"T1": prev.isoformat(), "T2": prev.isoformat()}
 
 
 def test_judge_counts_and_writes_each_verdict_once():
+    """窗口 = (上一次观测, 这一次观测];盖掉的、错过的、没目标值的各自计数,判出来的各落一行。"""
+    prev = NOW - timedelta(days=1)
     rows = [_row(action="price", want="12.99", sku="OK"),
             _row(action="price", want="10.00", sku="BAD"),
             _row(action="price", want="10.00", sku="BAD2", feed_status="overdue"),
             _row(action=None, sku="NOTARGET"),                      # 目标值不在库里
-            _row("DELETE_ITEM", sku="WAIT",
-                 last_seen_at=NOW - timedelta(days=2))]              # 期限后还没观测
-    conn = _Conn(rows)
+            _row(action="price", want="10.00", sku="OVER", overridden=True),
+            _row("DELETE_ITEM", sku="MISSED",
+                 last_seen_at=NOW - timedelta(days=4))]              # 这一轮没观测到
+    conn = _Conn(observed=[("T1", NOW)], cursor={"T1": prev.isoformat()}, rows=rows)
     out = fe.judge(conn)
-    assert out == {"effective": 1, "not_effective": 2, "review": 1,
-                   "waiting": 1, "no_target": 1}
-    timeout, _ = conn.sqls[0]
-    assert timeout == f"SET LOCAL statement_timeout = {fe.STATEMENT_TIMEOUT_S * 1000}"
-    sql, args = conn.sqls[1]
-    assert args["days"] == fe.LOOKBACK_DAYS and "failed" not in args["judgeable"]
+    assert out == {"effective": 1, "not_effective": 2, "review": 1, "overridden": 1,
+                   "missed": 1, "no_target": 1, "baseline": 0}
+    (args,) = conn.ran_candidates()
+    assert (args["stores"], args["prev_at"], args["this_at"]) == (["T1"], [prev], [NOW])
+    assert args["since"] == prev - timedelta(minutes=max(
+        feed_track.FEED_DEADLINE_MINUTES.values()))               # 最早窗口 − 最长期限
+    assert "failed" not in args["judgeable"]
     assert args["value_feeds"] == list(fe._VALUE_FEEDS)
-    ins, params = conn.sqls[-1]
+    assert args["maint_actions"] == ["price", "title"]
+    assert set(zip(args["same_ft"], args["same_other"])) == {
+        (ft, o) for ft, g in fe._SAME_PARAM.items() for o in g}
+    ins, params = next((s, a) for s, a in conn.sqls if s == fe._INSERT_SQL)
     assert "ON CONFLICT (feed_id, sku) DO NOTHING" in ins           # 判一次,不回头改
     assert sorted(p["sku"] for p in params) == ["BAD", "BAD2", "OK"]
     bad = next(p for p in params if p["sku"] == "BAD")
     assert (bad["effect"], bad["want"], bad["observed"]) == ("not_effective", "10.00", "12.99")
+    assert conn.saved() == {"T1": NOW.isoformat()}                  # 下一轮从这里接着判
+
+
+def test_candidates_sql_judges_only_the_first_observation_after_the_deadline():
+    """口径钉在 SQL 上:落定期限落在 (上一次观测, 这一次观测] 才是候选;观测前同一参数又改过
+    (后续 feed / 单品 PUT 改价)要标出来;不再有「回看 N 天」。"""
+    q = " ".join(fe._CANDIDATES_SQL.split())
+    assert "(%(deadlines)s::jsonb ->> f.feed_type)::int) > w.prev_at" in q
+    assert "(%(deadlines)s::jsonb ->> f.feed_type)::int) <= w.this_at" in q
+    assert "WHERE n.submitted_at > d.submitted_at AND n.submitted_at <= d.this_at" in q
+    assert "x.feed_id = 'sync' AND x.action = 'price'" in q
+    assert "p.executed_at > d.submitted_at AND p.executed_at <= d.this_at" in q
+    assert "(o.feed_id IS NOT NULL) AS overridden" in q
+    assert not hasattr(fe, "LOOKBACK_DAYS") and "days =>" not in q
 
 
 def test_targets_are_joined_in_one_batch_not_probed_per_candidate():
     """2026-09-26 生产事故:目标值是逐候选 LATERAL `ORDER BY id DESC LIMIT 1` 去捞的,
     ops.dispositions 的 feed_id 上没有索引,1.88 万个候选各把 65.8 万行扫一遍,日报链卡
-    44 分钟。目标值只许整批 join(disp CTE),且只给值比对类候选取;索引必须在 schema 里。"""
+    44 分钟。目标值只许整批 join(disp CTE),且只给值比对类候选取;索引必须在 schema 里。
+    后续提交与单品 PUT 也先按 since 截在窗口期内,走各自的时间索引。"""
     import pathlib
     sql = " ".join(fe._CANDIDATES_SQL.split())
     assert "LATERAL" not in sql and "LIMIT" not in sql
     assert ("SELECT DISTINCT ON (x.feed_id, x.sku) x.feed_id, x.sku, x.action, x.detail"
             " FROM due d JOIN ops.dispositions x") in sql
     assert "WHERE d.feed_type = ANY(%(value_feeds)s::text[])" in sql
+    assert sql.count("> %(since)s::timestamptz") == 3             # 候选 / 后续 feed / PUT
     schema = (pathlib.Path(__file__).resolve().parent.parent
               / "refdata" / "schema.sql").read_text(encoding="utf-8")
     assert ("CREATE INDEX IF NOT EXISTS dispositions_feed_sku_idx\n"
             "    ON ops.dispositions (feed_id, sku) WHERE feed_id IS NOT NULL;") in schema
+    assert "CREATE INDEX IF NOT EXISTS dispositions_executed_at_idx" in schema
 
 
 def test_judge_only_reads_the_feed_ledger_and_writes_its_own_table():
-    """两本账互不写对方:本模块不改 ops.feed_items,只写 ops.feed_effects。"""
+    """两本账互不写对方:本模块不改 ops.feed_items,只写 ops.feed_effects(+自己的观测台账)。"""
     import inspect
     src = inspect.getsource(fe)
     assert "UPDATE ops.feed_items" not in src and "INSERT INTO ops.feed_items" not in src
     assert "INSERT INTO ops.feed_effects" in src
+    assert "UPDATE ops.dispositions" not in src
 
 
 # ── 真库 ─────────────────────────────────────────────────────────────────────────
@@ -232,50 +317,87 @@ def _seen(cur, sku, price=None, lifecycle="ACTIVE", missing=False):
                 " CASE WHEN %s THEN now() END)", (_ST, sku, price, lifecycle, missing))
 
 
+def _price_disp(cur, sku, fid, new, status, hours_ago=None):
+    cur.execute("INSERT INTO ops.dispositions (store, sku, source, action, status, feed_id,"
+                " executed_at, detail) VALUES (%s, %s, 'maint', 'price', %s, %s,"
+                " now() - make_interval(hours => %s), jsonb_build_object('new', %s::text))",
+                (_ST, sku, status, fid, hours_ago or 0, new))
+
+
+def _set_prev(cur, hours_ago):
+    """观测台账里本店的"上一次观测"= now() − hours_ago(与事务内 now() 同一时钟)。"""
+    cur.execute("SELECT now() - make_interval(hours => %s)", (hours_ago,))
+    at = cur.fetchone()[0]
+    cur.execute(fe._CURSOR_PUT_SQL, (fe.CURSOR, json.dumps({_ST: at.isoformat()})))
+
+
+def _effects(cur):
+    cur.execute("SELECT feed_id, effect, feed_status, want, observed"
+                " FROM ops.feed_effects WHERE store = %s ORDER BY feed_id", (_ST,))
+    return {r[0]: r[1:] for r in cur.fetchall()}
+
+
 @needs_pg
 def test_effects_on_a_real_database(pg):
-    """真库一轮:判得出的各落一行;失败回执不判;被覆盖的旧明细不判;期限未到不判;
-    第二轮一行都不重复(判一次不回头改);复核清单只出「成功 ∧ 未生效」与"没给结论"。"""
+    """真库一轮(上一次观测 = 30 小时前,这一次 = 现在):
+    判得出的各落一行;失败回执不判;观测前被同参数后续 feed / 单品 PUT 盖掉的不判;库存不判;
+    期限落在窗口外的(还没到期 / 上一轮就该判)不判;第二轮窗口为空一行都不重判;
+    复核清单只出「成功 ∧ 未生效」。"""
     with pg.cursor() as cur:
-        _item(cur, "FE_P1", "P_OK", "price", "success", 30)
-        _item(cur, "FE_P2", "P_BAD", "price", "success", 30)
-        _item(cur, "FE_P3", "P_FAIL", "price", "failed", 30)          # 沃尔玛拒了:不判
-        _item(cur, "FE_OLD", "P_SUP", "price", "success", 50)         # 被下一条覆盖
-        _item(cur, "FE_NEW", "P_SUP", "price", "success", 30)
+        _set_prev(cur, 30)
+        _item(cur, "FE_P1", "P_OK", "price", "success", 20)
+        _item(cur, "FE_P2", "P_BAD", "price", "success", 20)
+        _item(cur, "FE_P3", "P_FAIL", "price", "failed", 20)          # 沃尔玛拒了:不判
+        _item(cur, "FE_OLD", "P_SUP", "price", "success", 25)         # 被下一条覆盖
+        _item(cur, "FE_NEW", "P_SUP", "price", "success", 22)
+        _item(cur, "FE_PUT", "P_PUT", "price", "success", 20)         # 被单品 PUT 覆盖
+        _item(cur, "FE_I1", "I_1", "inventory", "success", 20)        # 库存:不判
         _item(cur, "FE_D1", "D_STILL", "DELETE_ITEM", "success", 100, "product_clear")
         _item(cur, "FE_D2", "D_YOUNG", "DELETE_ITEM", "success", 10, "product_clear")
+        _item(cur, "FE_D3", "D_EARLY", "DELETE_ITEM", "success", 110, "product_clear")
         _item(cur, "FE_L1", "L_NEW", "MP_ITEM", "overdue", 30, "list_new")
-        # 同 (店, SKU, 动作) 只许一条未落定(dispositions_open_uidx):被覆盖那次已落定
-        for fid, sku, new, st in (("FE_P1", "P_OK", "9.99", "executing"),
-                                  ("FE_P2", "P_BAD", "8.00", "executing"),
-                                  ("FE_OLD", "P_SUP", "7.00", "confirmed"),
-                                  ("FE_NEW", "P_SUP", "6.00", "executing")):
-            cur.execute("INSERT INTO ops.dispositions (store, sku, source, action,"
-                        " status, feed_id, detail) VALUES (%s, %s, 'maint', 'price',"
-                        " %s, %s, jsonb_build_object('new', %s::text))",
-                        (_ST, sku, st, fid, new))
-        _seen(cur, "P_OK", 9.99)
-        _seen(cur, "P_BAD", 9.99)
-        _seen(cur, "P_SUP", 6.00)
-        _seen(cur, "D_STILL")
-        _seen(cur, "D_YOUNG")
-        _seen(cur, "L_NEW")
+        # 同 (店, SKU, 动作) 只许一条未落定(dispositions_open_uidx):盖掉的那条已落定
+        _price_disp(cur, "P_OK", "FE_P1", "9.99", "executing", 20)
+        _price_disp(cur, "P_BAD", "FE_P2", "8.00", "executing", 20)
+        _price_disp(cur, "P_SUP", "FE_OLD", "7.00", "confirmed", 25)
+        _price_disp(cur, "P_SUP", "FE_NEW", "6.00", "executing", 22)
+        _price_disp(cur, "P_PUT", "FE_PUT", "5.00", "confirmed", 20)
+        _price_disp(cur, "P_PUT", "sync", "4.00", "executing", 10)    # 之后又走了一次 PUT
+        for sku, price in (("P_OK", 9.99), ("P_BAD", 9.99), ("P_SUP", 6.00),
+                           ("P_PUT", 4.00), ("I_1", None), ("D_STILL", None),
+                           ("D_YOUNG", None), ("D_EARLY", None), ("L_NEW", None)):
+            _seen(cur, sku, price)
     out = fe.judge(pg, store=_ST)
     with pg.cursor() as cur:
-        cur.execute("SELECT feed_id, effect, feed_status, want, observed"
-                    " FROM ops.feed_effects WHERE store = %s ORDER BY feed_id", (_ST,))
-        got = {r[0]: r[1:] for r in cur.fetchall()}
+        got = _effects(cur)
     assert got == {
         "FE_D1": ("not_effective", "success", None, "仍在架"),
         "FE_L1": ("effective", "overdue", None, "在架"),
         "FE_NEW": ("effective", "success", "6.00", "6.00"),
         "FE_P1": ("effective", "success", "9.99", "9.99"),
         "FE_P2": ("not_effective", "success", "8.00", "9.99"),
-    }                                   # FE_P3 失败不判,FE_OLD 被覆盖,FE_D2 未到 72h
-    assert out["review"] == 2 and out["not_effective"] == 2
-    assert fe.judge(pg, store=_ST)[fe.EFFECTIVE] == 0        # 第二轮:一行都不重判
+    }   # FE_P3 失败不判;FE_OLD / FE_PUT 被盖;FE_I1 库存;FE_D2 未到期;FE_D3 上一轮就该判
+    assert (out["review"], out["not_effective"], out["overridden"], out["baseline"]) == (
+        2, 2, 2, 0)
+    again = fe.judge(pg, store=_ST)                     # 第二轮:窗口为空,一行都不重判
+    assert not any(again.values())
     review = fe.review_rows(pg, days=7, store=_ST)
     assert sorted(r["feed_id"] for r in review) == ["FE_D1", "FE_P2"]
+
+
+@needs_pg
+def test_a_new_store_is_baselined_on_a_real_database(pg):
+    """台账里没有这家店:这一轮只记基线,一条都不判;下一轮才从基线往后判。"""
+    with pg.cursor() as cur:
+        cur.execute("DELETE FROM ops.cursors WHERE name = %s", (fe.CURSOR,))
+        _item(cur, "FE_B1", "B_OK", "DELETE_ITEM", "success", 100, "product_clear")
+        _seen(cur, "B_OK")
+    out = fe.judge(pg, store=_ST)
+    assert out["baseline"] == 1 and out[fe.NOT_EFFECTIVE] == 0
+    with pg.cursor() as cur:
+        assert _effects(cur) == {}
+        cur.execute(fe._CURSOR_GET_SQL, (fe.CURSOR,))
+        assert list(cur.fetchone()[0]) == [_ST]
 
 
 def test_review_list_formatting(monkeypatch):
@@ -306,23 +428,9 @@ def test_review_list_formatting(monkeypatch):
     assert "没有" in feed_poll.run({"review": "1", "execute": True})
 
 
-def test_catalog_sync_skips_the_judgment_while_paused(monkeypatch):
-    """暂停中(2026-09-26,「回看 7 天」口径待定):catalog_sync 不连库、不调 judge,只报一行。"""
-    from workflows import catalog_sync
-
-    def _no_db(*a, **k):
-        raise AssertionError("暂停中不许连库")
-
-    monkeypatch.setattr(catalog_sync.db, "pg_conn", _no_db)
-    monkeypatch.setattr(catalog_sync.feed_effect, "judge", _no_db)
-    assert fe.PAUSED
-    assert catalog_sync._judge_effects(None, dry_run=False) == fe.PAUSED
-
-
 def test_catalog_sync_effect_step_is_isolated_and_dry_run_rolls_back(monkeypatch):
-    """附属步骤:炸了只报一行不拖垮同步;空跑同事务 rollback(判一次不回头改)。"""
+    """附属步骤:炸了只报一行不拖垮同步;空跑同事务 rollback(判决与观测台账一起回滚)。"""
     from workflows import catalog_sync
-    monkeypatch.setattr(catalog_sync.feed_effect, "PAUSED", "")
 
     class _C:
         rolled = False
@@ -333,10 +441,17 @@ def test_catalog_sync_effect_step_is_isolated_and_dry_run_rolls_back(monkeypatch
     monkeypatch.setattr(catalog_sync.db, "pg_conn",
                         lambda *a, **k: contextlib.nullcontext(_C()))
     monkeypatch.setattr(catalog_sync.feed_effect, "judge", lambda conn, store=None: {
-        "effective": 3, "not_effective": 2, "review": 1, "waiting": 4, "no_target": 0})
+        "effective": 3, "not_effective": 2, "review": 1, "overridden": 4, "missed": 5,
+        "no_target": 0, "baseline": 0})
     line = catalog_sync._judge_effects(None, dry_run=True)
     assert _C.rolled and line.startswith("实际结果(空跑未落库):将判 生效 3,未生效 2")
     assert "feed 成功但未生效 1 条" in line and "feed_poll -p review=1" in line
+    assert "观测前同一参数又改过、不判 4" in line
+    assert "期限后这一轮没观测到、不再补判 5" in line
+    monkeypatch.setattr(catalog_sync.feed_effect, "judge", lambda conn, store=None: {
+        "effective": 0, "not_effective": 0, "review": 0, "overridden": 0, "missed": 0,
+        "no_target": 0, "baseline": 7})
+    assert "首次记观测基线 7 店(下一轮起判)" in catalog_sync._judge_effects(None, False)
 
     def _boom(conn, store=None):
         raise RuntimeError("relation ops.feed_effects does not exist")

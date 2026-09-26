@@ -69,6 +69,21 @@
 > §2.3 补 🔴 库存换算唯一出生地 `store_limits.stock_for`(门槛
 > `amz_source.MIN_INVENTORY=5` 管卖不卖、每店 N 管卖多少,eBay 复用函数只换
 > cap 来源)。§4.1 补 feed 两表新列的 eBay 填法。
+> **2026-09-26 对齐 main #138 + #139**(全仓慢查询排查;实际结果新口径):
+> 🔴 §2.2 补 **`upc_usage` 必须建对位部分索引**(#138 给 upc_pool 补的
+> `(store,asin) WHERE status IN ('claimed','used')` 实测 35ms→0.3ms,用量搬表
+> 后对那四处查询失效,新表没有对位索引 = 优化整个回退,而 burn 是逐对调、
+> 同事务里的);旧索引照"五死列"口径先留不删但在 db_schema 标注无消费方。
+> 🔴 §2.3 改读法:`catalog.latest_snapshot` **不许被 LATERAL 逐行调**(等于每行
+> 读该 ASIN 全部历史快照),#138 已把四处改成直读 `catalog.snapshots`,eBay
+> 复用 `amz_source`/`product_pool` 的 loader,别新种一株同形状。
+> §4.1 记 `product_events_event_idx`(不含 platform,靠事件码零重合保行为不变);
+> 🔴 §4.5 补 **`db_init` 现在 `lock_timeout 30s`**——本批三处热表强锁 DDL 会
+> 在 30 秒后失败而非排队,挑窗口执行 + 失败重跑 + 验收记录是否踩到;
+> §3.4 补"连接不许自己开"的新理由(`application_name=walmartapi:<工作流>`)。
+> §6.5 的实际结果口径按 #139 更新:**只判期限后第一次观测**(窗口
+> `(上次观测, 这次观测]`、错过不补判)、**观测前同参数又改过不判**、
+> **库存一律不判**,判据复用现有不另写。
 > ⚠ 本文引用的仓库行号以 **2026-09-23 的 main(06140c3)** 为快照(§2.1/§2.2/
 > §3.2 已按它重定位;其余节仍是 09-07 快照),批次实施时现场重定位。
 
@@ -175,6 +190,22 @@ SKU↔offerId/listingId 权威在 `ops.feed_items`)。
   used_at/released_at。存量回填自 upc_pool 裸列(platform=walmart 常量)。
   ⚠ 不建 `(platform,store,asin)` 唯一索引——同店同 ASIN 历史上合法地有过
   多个号,建了回填当场炸。
+  🔴 **但必须建一条与 `upc_pool_store_asin_idx` 对位的部分索引(2026-09-26
+  对齐 main #138,blocker 级)**:#138 刚给 `catalog.upc_pool` 补了
+  `(store, asin) WHERE status IN ('claimed','used')`,头注逐字写着「部分索引
+  的条件与四处查询的 status 条件**逐字一致**才会被用上」,实测单次
+  **35ms → 0.3ms**;而 `burn` 在 catalog_sync / feed_poll / sku_migrate 里是
+  **逐对调、在同一个事务里**的(删除核验一批几千对 = 几千次整池扫描)。
+  用量一旦搬到 `upc_usage`,那四处查询**不再查 upc_pool 的 store/asin**——
+  刚修好的索引对它们失效,而新表上如果没有对位索引,这次优化在 eBay 批次里
+  **整个回退**。定稿:`upc_usage` 建
+  `(platform, store, asin) WHERE status IN ('claimed','used')`,**条件与改造后
+  四处查询的 status 条件逐字一致**;P1-2 验收把"单次取号/烧号 EXPLAIN 走
+  该索引"写成硬项(不是"跑得动就行")。
+  ⚠ `upc_pool_store_asin_idx` 在那之后就**没有消费方了**——照本节末尾"五个
+  领用列先留列不删"的同一口径,**索引也先留不删**(删索引与删列同批),但要
+  在 `docs/db_schema.md` 标注它已无消费方,免得下次有人照它的存在反推
+  "用量还在主表上"。
 - `claim()` 三级取号:**L1** 本平台本店该 asin 活跃用量取最早(保住
   2026-08-19 `ERR_EXT_DATA_0101211` 实证语义)→ **L2** 全平台该 asin 活跃
   用量取最早,复用同号并为本平台 INSERT 新用量行(拍板 ③,**双向**)→
@@ -220,8 +251,18 @@ SKU↔offerId/listingId 权威在 `ops.feed_items`)。
 
 ### 2.3 拍板 ②⑤ → 入料与库存口径
 
-- 库存:上架时 `availableQuantity` 来自 `catalog.latest_snapshot` 三态
-  (NULL≠0 铁律沿用),缺货/未采到不上。持续同步是二期维护链。
+- 库存:上架时 `availableQuantity` 来自快照三态(NULL≠0 铁律沿用),
+  缺货/未采到不上。持续同步是二期维护链。
+  🔴 **读法变了,别照旧稿写"读 `catalog.latest_snapshot` 视图"(2026-09-26
+  对齐 main #138)**:那个视图是 `DISTINCT ON (marketplace, asin,
+  scrape_params) *`,**被 LATERAL 逐行调用时等于每行把该 ASIN 的全部历史
+  快照读出来排序**——#138 把维护链 `_SQL_AMZ_JOIN`、上架链 `amz_source`、
+  `product_pool`、`alloc_survey` 四处**全改成直读 `catalog.snapshots`**
+  (把新鲜度窗口压进 `DISTINCT ON`,沙箱实证结果逐行相同),并补了
+  `snapshots_scraped_at_brin` 给按时间窗扫快照用。eBay 侧**复用
+  `amz_source` / `product_pool` 已改好的 loader**,**严禁**为了"省事"新写
+  一段 LATERAL 读视图——那是这一轮刚被逐个拔掉的形状,新链再种一株没人会
+  发现(视图本身保留,只是不该被逐行调)。
   🔴 **但"写多少件"的换算只有一个出生地(2026-09-25 对齐 main #137 所有者
   定稿)**:`services/store_limits.stock_for(stock, cap) -> (数量, 判定码)`。
   门槛与上限**各管一件事**:全局门槛 `amz_source.MIN_INVENTORY = 5` 决定
@@ -410,6 +451,11 @@ SKU↔offerId/listingId 权威在 `ops.feed_items`)。
   没读到映射表"拦下动作相同,但**归类与计数必须分开**,否则一次读故障会在
   摘要里伪装成"这批品没有类目映射",查都没处查;**§3.4 账号/令牌读取**同理
   (refresh_token 读不到 ≠ 账号未授权,后者才该停链)。
+- ⚠ **连接不许自己开(2026-09-26 对齐 main #138 补一条理由)**:铁律本来就
+  写着"数据库连接唯一入口 `registry/db.py`",#138 起又多了一层——连接会带
+  `application_name = walmartapi:<工作流>`(cli 每步设置),`pg_stat_activity`
+  据此认出是哪条链在跑。自己开的连接不带这个名字,慢查询排查时会变成一条
+  查不出主人的语句;八条新 workflow 走 cli.py 自动就有,**不用也不许自己做**。
 - 摘要与参数标准件:`-p` 布尔一律 `from services.params import flag`
   (⚠ 按名导入,模块名会被 run(params) 形参遮住);摘要一律
   `notify_fmt.head/summary`。八条新 workflow 统一,不许各自手搓。
@@ -424,7 +470,7 @@ SKU↔offerId/listingId 权威在 `ops.feed_items`)。
 | `catalog.upc_usage` | 新表(§2.2)+ 存量回填 + 三条索引 |
 | `ops.feed_log` | + `platform`;`feed_log_dedupe_uidx` → `feed_log_dedupe_v2_uidx (platform, feed_type, store, payload_key)` 原地替换。⚠ **#131 给本表加了 5 列,eBay 行必须一起填**:`item_count` / `skus`(对账收编的精确匹配依据 —— eBay 三步链每步的 SKU 集合)、**`post_started_at`**(请求真正发出前落;为空 = 确定没发出,是 §6.5 里唯一能证明「可安全重发」的格子)、`recon_count`、`close_basis`。索引 `feed_log_feed_id_idx` 已存在,eBay 行直接受益 |
 | `ops.feed_items` / `feed_item_errors` | + `platform` 标注列;⚠ **#131 起 status 七档**(+ overdue/unrecognized/unreadable,见 §6.5)且新增 `raw_status` / `settled_by` 两列 —— eBay 落定同样要留事实依据,别只写一个折算过的结论。主键不动——**该论证只覆盖 offer/publish 两阶段**:eBay 台账 `feed_items` 只落这两阶段的行,`feed_id` 分别存 offerId/listingId,`(feed_id, sku)` 不撞;**ebay_item 阶段不落 feed_items**,由 `feed_log` pending/submitted 承接——PUT 幂等可重放、204 无 id 可记,硬造 feed_id=sku 会在换账号重上时撞主键静默丢行) |
-| `catalog.product_events` | + `platform` + 5 视图 DROP 重建(`audit_listing_conflicts` 的 EXPLAIN 必须仍走 `product_events_identity_idx`);**按事件码过滤的非视图消费方(blacklist/_LATEST_CTE、problem_scan 三条、sku_normalize、audit_history_fold、cleanup_history_import、dispositions._SETTLE_DELETE_SQL)一期不改,依据=eBay 事件码与沃尔玛零重合(逐条列名进实现注释);二期给沃尔玛加任何同名事件码前必须先补谓词**。🔴 **例外:`services/risk_trace` 不按事件码过滤,必须补平台谓词——见 §4.4** |
+| `catalog.product_events` | + `platform` + 5 视图 DROP 重建(`audit_listing_conflicts` 的 EXPLAIN 必须仍走 `product_events_identity_idx`;⚠ **#138 又补了 `product_events_event_idx (event, occurred_at DESC)`** —— 它不含 platform 列,eBay 行进表后会一起长在索引里,但因为**事件码零重合**,按沃尔玛事件码过滤的查询扫不到 eBay 行,行为不变;这也是下面那条「二期给沃尔玛加同名事件码前必须先补谓词」现在同时护着的第二个索引);**按事件码过滤的非视图消费方(blacklist/_LATEST_CTE、problem_scan 三条、sku_normalize、audit_history_fold、cleanup_history_import、dispositions._SETTLE_DELETE_SQL)一期不改,依据=eBay 事件码与沃尔玛零重合(逐条列名进实现注释);二期给沃尔玛加任何同名事件码前必须先补谓词**。🔴 **例外:`services/risk_trace` 不按事件码过滤,必须补平台谓词——见 §4.4** |
 | `catalog.listing_sources` | + `platform` 标注列(**不进 PK**:`sku_codec.mint` 发的 12 位随机码全局唯一,`(store, sku)` 天然不撞);schema.sql 存量回填 INSERT 显式补 walmart。⚠ 两条已被 main 推翻的原稿表述:① "三处消费方都锚在 walmart_items 上,JOIN 即天然谓词"被 #99 推翻(`risk_trace` 按 `source_key` 反查、不 JOIN 任何平台表——见 §4.4);② 本表在 2026-09-07 后**已是 SKU 身份的唯一登记簿**(+`abandoned_at/abandoned_reason/replaced_by/replaces/replaced_at` 五列),eBay 行由 `mint` 在抽码同一事务里登记(§3.3),**不许另建 eBay 专用登记表** |
 | `catalog.ebay_items` | 新表(一期空表;状态列 **text 不加 CHECK**——沙箱 C3 卡的是 submit_poll 的 withdraw 后判据与状态字面量首次落 SQL,**不卡建表**) |
 | `catalog.ebay_accounts` | 新表:account, marketplace_id, 三 policyId, merchant_location_key, opted_in_at, privileges_json, sampled_at,PK (account, marketplace_id) |
@@ -484,6 +530,16 @@ CHAINS`),同表串行纪律照抄。
 `risk_trace` 展开结果必须一行不含该 eBay 账号」。
 
 ### 4.5 迁移块纪律(订正 ebay_plan §3.6)
+
+🔴 **先说一条 2026-09-26 才出现的硬约束(对齐 main #138)**:`db_init` 现在
+`SET LOCAL lock_timeout 30s`(头注:「不限语句时长,但不许排队等锁把整库挡住」)。
+本批的 DDL 里有三处是**对热表拿强锁**的——`catalog.claims` 索引换名重建、
+`catalog.product_events` 5 视图 DROP 重建、`ops.feed_log` 唯一索引原地替换——
+生产有流量时它们会**在 30 秒后直接失败**,而不是像以前那样排队等到手。
+这不是要去改那个 30s(它挡的正是"一条 ALTER 把整库堵死"),而是:① 这几处
+**挑窗口执行**(沃尔玛链全停的间隙),② `db_init` 幂等,失败就重跑,
+③ P1-2 验收的"db_init 两跑"要**明确记录是否踩到过 lock_timeout**——踩到而
+没记录,下次有人会以为 DDL 本身写错了。
 
 schema.sql 现有**四处** `DO $$`(:66/:579/:608/:1300),**:579-589 是嵌套 IF
 范例**,注释逐字:"平铺 AND 会在计划期解析表名,重跑必炸 UndefinedTable
@@ -756,6 +812,16 @@ gated_by_asin=None)` 现在能回收**逐 ASIN 的完整淘汰原因**:eBay 入�
   `services/feed_effect.judge`——feed 结果(沃尔玛收没收)与**实际结果**
   (生效 / 未生效)分表、**判一次不回头改**,复核清单 `feed_poll -p review=1`
   给人看,**不挂任何自动化**(同批把"观测驱动的自动重做"改成人工)。
+  ⚠ **口径 2026-09-26 又改过一次(#139),按新的记**:原来的"回看 7 天"被
+  推翻(拿今天的快照比一周前的提交,中间同一参数可能又改过好几次,判不准),
+  改成**只在期限后的第一次观测判**——每店窗口 `(上一次观测, 这一次观测]`,
+  上一次记在 `ops.cursors`、与判决同事务(空跑一起回滚),**错过这一次的不再
+  补判**,某店第一次出现只记基线;**观测前同一参数又改过的不判**(计
+  overridden);**库存一律不判**(所有者原话「库存不观测结果」——订单随时在
+  扣库存,快照对不上目标说明不了是没生效还是卖掉了),目标值只取改价 / 改
+  标题两种。还有一条形状值得照抄:**判据只有一份、复用现有、不另写**
+  (改价改标题用 `dispositions.maint_effective`、删除用
+  `product_events.GONE_SQL`)。
   eBay 侧这条**一样成立而且更明显**:`publishOffer` 回了 listingId 只说明
   eBay 收下了,listing 是否真的在售(政策下架 / 搜索不可见 / 站点不投放)是
   另一回事,§6.4 拿 `status=='PUBLISHED'` 判的是**前者**。一期定稿:
@@ -806,7 +872,7 @@ api 留签名。要做=+4~5 人日,四项前置:①UPC 结构裁决落地(本文
 | 批次 | 内容 | 人日 | 验收要点 |
 |---|---|---|---|
 | P1-1 | _http 抽取+registry(含 platforms.py/飞书两表)+ebay_accounts+_client+tokens+authorize+runbook+文档勘误回改 | 7 | 沃尔玛 pytest 全绿(18 处 monkeypatch 例外清单)/sandbox 与 production 各铸令牌+getRateLimits/进程超时 90.0 冒烟/账号互斥断言单测(含停用店名反例)/state 不符抛错单测 |
-| P1-2 | 全部 DDL+claims/upc 改造+台账谓词补全+**risk_trace 四证据源谓词(§4.4)**+events 契约 | 7 | db_init 两跑+六格对拍+读 SQL count·md5 对拍/沃尔玛上架与分配链 --dry-run 摘要逐字一致(claims 11 读+3 写+3 事件桥、upc 7 写+6 读投影,**含 `alloc_plan -p from_sheet=1` 点名分配那条路径**——预期红清单按 §2.1/§2.2 的现场重核数,别按旧稿的 9+2)/UPC 三级取号+烧号保护+「烧后重上领新号」单测/飞书 UPC 表投影逐行对拍/browse_node_id 空行占比落数/**risk_trace 展开结果不含 eBay 账号**(造 claims+listing_sources+product_events 三条 eBay 行) |
+| P1-2 | 全部 DDL(**含 `upc_usage` 对位部分索引,§2.2**)+claims/upc 改造+台账谓词补全+**risk_trace 四证据源谓词(§4.4)**+events 契约 | 7 | db_init 两跑(**记录是否踩到 `lock_timeout 30s`,§4.5**)+六格对拍+读 SQL count·md5 对拍+**取号/烧号 EXPLAIN 走 `upc_usage` 部分索引**/沃尔玛上架与分配链 --dry-run 摘要逐字一致(claims 11 读+3 写+3 事件桥、upc 7 写+6 读投影,**含 `alloc_plan -p from_sheet=1` 点名分配那条路径**——预期红清单按 §2.1/§2.2 的现场重核数,别按旧稿的 9+2)/UPC 三级取号+烧号保护+「烧后重上领新号」单测/飞书 UPC 表投影逐行对拍/browse_node_id 空行占比落数/**risk_trace 展开结果不含 eBay 账号**(造 claims+listing_sources+product_events 三条 eBay 行) |
 | P1-3 | bootstrap+taxonomy+catmap 测试链+account_health | 6 | sandbox 户口链重入两遍/生产拉真树+版本哨兵/aspects 解耦拉取(新 promote 类目当日拿到 aspects)/promote 三格(缺省中、入料只吃高、置高路径逐条点名)/refresh 探活停链 |
 | P1-4 | 中立抽取(3)+admission/conform/pricing+api 两文件+list_new+submit_poll+**`refdata/ebay_slas.tsv`(官方期限登记表,§6.5)**+飞书投影 | 15 | 沙箱清单 13 项完成/sandbox 端到端 3 SKU PUBLISHED/防重三态+熔断+双闸+重试闸单测/**抽码即登记单测**(eBay 行落 `listing_sources` 且 `abandoned_at IS NULL`、码形符 `OPAQUE_SQL_PREDICATE`、`-p dry_run` 走 `DRYRUN_PLACEHOLDER` 不落码)/**残局单测:造一条「`feed_log` pending 但无 `feed_items` 行」,断言 `list_new` 下一轮不选中该 SKU、`submit_poll` 的选行面选得中它**/--dry-run 人眼确认/中立抽取后沃尔玛输出逐字不变 |
 | P1-5 | 生产单账号试点 | 2+观察 | 首批 ≤10 条人工放行类目/真实 PUBLISHED/错误账收官/两周观察后再谈放量。**界定:试点 ≠ ebay_plan 批次 10;试点期不拉订单、库内无买家数据,不触发合规订阅义务;放量、拉订单、提额之前批次 11 仍是硬门槛** |

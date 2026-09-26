@@ -989,7 +989,9 @@ def test_four_history_sqls_are_unchanged_when_sku_aliases_is_empty(pg):
         cur.execute("SELECT count(*) FROM catalog.sku_aliases")
         assert cur.fetchone()[0] == 0              # 改码前恒空集
     surface, stubborn, last_cat, perm, inflight = _read(pg)
-    assert surface == {_OLD}
+    # 2026-09-10 起扫描面不按状态筛:没有改码指针时新码(PUBLISHED)也在扫描面里
+    # (与 test_rows_being_replaced_are_out_of_the_scan_surface 同口径)
+    assert surface == {_OLD, _NEW}
     assert stubborn == {(_STORE, _OLD)}
     assert last_cat == {(_STORE, _OLD): "L"}
     assert perm == {(_STORE, _OLD)}
@@ -1180,10 +1182,15 @@ def test_last_cat_sql_signs_by_atoms_with_category_fallback():
     """_SQL_LAST_CAT 与 cat_sig 同一口径:原子码去重、字典序、逗号拼;
     没有 atoms 的存量事件退回 detail.category;atoms 不是数组时不炸。"""
     q = scan._SQL_LAST_CAT
-    assert q.count("jsonb_array_elements(") == 2               # 两个 UNION 分支同款
-    assert q.count("string_agg(DISTINCT x->>'code', ',' ORDER BY x->>'code')") == 2
-    assert q.count("jsonb_typeof(e.detail->'atoms') = 'array'") == 2
-    assert q.count("e.detail->>'category'") == 2
+    # 签名只算一次:先 DISTINCT ON 取每个 (店, SKU) 最近一条的 detail(两个 UNION 分支都只
+    # 带 detail 出来),再拆 atoms —— 不再对全部历史事件逐条拆(2026-09-26 全仓慢查询排查)
+    assert q.count("jsonb_array_elements(") == 1
+    assert q.count("string_agg(DISTINCT x->>'code', ',' ORDER BY x->>'code')") == 1
+    assert q.count("jsonb_typeof(detail->'atoms') = 'array'") == 1
+    assert q.count("detail->>'category'") == 1
+    assert q.count("SELECT e.store, e.sku, e.detail, e.occurred_at") == 1
+    assert q.count("SELECT a.store, a.sku, e.detail, e.occurred_at") == 1
+    assert q.index("DISTINCT ON (store, sku)") < q.index("FROM catalog.product_events e")
     # Python 侧签名生成器与 SQL 同一口径:去重 + 排序 + 逗号
     it = _item("T1", "S", "prohibited product policy; end date has passed; prohibited product policy")
     scan.plan([it], inflight=set())

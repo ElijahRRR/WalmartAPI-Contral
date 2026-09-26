@@ -2648,13 +2648,13 @@ class _ScanConn(_Conn):
         class _D:
             def __init__(self, name):
                 self.name = name
-        if "catalog.latest_snapshot" in self._last and self.amz:
+        if "FROM catalog.snapshots l" in self._last and self.amz:
             return [_D(k) for k in self.amz[0]]
         return []
 
     def fetchall(self):
         q = self._last
-        if "catalog.latest_snapshot" in q:              # _SQL_AMZ_JOIN
+        if "FROM catalog.snapshots l" in q:              # _SQL_AMZ_JOIN
             self.n_amz += 1
             cols = list(self.amz[0]) if self.amz else []
             return [tuple(r[c] for c in cols)

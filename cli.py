@@ -329,6 +329,8 @@ def _run_step(name: str, module, params: dict, dry_run: bool, operator: str,
             return "locked", f"{name}:已有实例在运行{extra},未执行"
         with _log_to(name, logs_dir):
             run_id = _record_start(name, params, operator)
+            from registry import db as _db
+            _db.set_workflow(name)      # 连接带工作流名:pg_stat_activity 里认得出是谁的查询
             try:
                 summary = module.run(params)
                 summary = str(summary) if summary is not None else "(无摘要)"

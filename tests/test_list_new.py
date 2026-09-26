@@ -247,7 +247,7 @@ def test_list_new_dry_run_gate_chain(monkeypatch):
     ]
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+    monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         {"T_OFF"}, {}, {("T1", "B0LISTED01")},
         {"B0BANNED01": ("E", "沃尔玛-知产")},
         {"B0ASIN0002"},                # 不明消失史:放行但报警(第 2 行)
@@ -467,7 +467,7 @@ def test_list_new_skips_when_shipping_missing(monkeypatch):
     }
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+    monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
         {}))
@@ -500,7 +500,7 @@ def test_lead_cap_uses_this_rows_store_not_the_last_one(monkeypatch):
                 "B0SLOWISH2": {**base, "asin": "B0SLOWISH2", "lead_days": 10}}
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+    monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
         {}))
@@ -545,7 +545,7 @@ def test_store_channel_gate(monkeypatch):
     }
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+    monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
         {}))
@@ -581,7 +581,7 @@ def test_silent_buckets_now_write_reasons(monkeypatch):
             _sheet_row(5, store="T_OFF")]                    # 非 ACTIVE 店
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+    monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         {"T_OFF"}, {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
         {}))
@@ -614,7 +614,7 @@ def test_custom_product_gate(monkeypatch):
     }
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+    monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
         {}))
@@ -643,7 +643,7 @@ def test_other_stores_presence_no_longer_blocks_listing(monkeypatch):
     products = {"B0FREE0001": {**base, "asin": "B0FREE0001"}}
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+    monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, {("A109", "B0FREE0001"), ("A102", "B0FREE0001")},
         {}, set(), {"banned_pts": set(), "brands": set()}, {}, {},
         {}))
@@ -677,7 +677,7 @@ def test_quota_slices_after_filters(monkeypatch):
                 "B0GOODONE2": {**base, "asin": "B0GOODONE2", "stock": 50}}
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+    monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
         {}))
@@ -727,7 +727,7 @@ def test_material_gate_drops_before_llm_and_quota(monkeypatch):
                            "productSecondaryImageURL": {"minItems": 2}}}
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+    monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
         {}))
@@ -978,7 +978,7 @@ def test_fresh_filter_excludes_prohibited(monkeypatch):
             _sheet_row(3)]
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+    monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
         {}))
@@ -1006,7 +1006,7 @@ def test_claim_gates_block_other_stores_only(monkeypatch):
     ]
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+    monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()},
         {"B0OWNED001": "OTHER", "B0MINE0001": "T1"},        # 产品占用
@@ -1073,7 +1073,7 @@ def test_listed_pairs_cover_every_store_for_self_dedup(monkeypatch):
                         lambda c: {"banned_pts": set(), "brands": set()})
     monkeypatch.setattr(ln.claims, "load_active", lambda c, k: {})
 
-    pairs = ln._load_gate_state().listed_pairs
+    pairs = ln._load_gate_state([]).listed_pairs
     assert ("A085", "B0MINE0001") in pairs
     assert ("谭总4", "B0TANZONG1") in pairs   # 规划外店也进:自己拦自己
     # 集合是对,不是裸 ASIN:别的店在架不构成任何拦截依据
@@ -1156,7 +1156,7 @@ def test_attempts_are_counted_per_store_and_identity_key():
 
 
 def test_attempts_fall_back_to_cross_code_counting_without_an_abandon_event():
-    """没有弃码事件 ⇒ LATERAL 返 NULL ⇒ 谓词恒真 ⇒ 退化成今天的跨码累计。
+    """没有弃码事件 ⇒ g 里没有这一对 ⇒ LEFT JOIN 落 NULL ⇒ 谓词恒真 ⇒ 退化成今天的跨码累计。
 
     这就是本批"零行为变化"在这一处的落点:全库此刻没有任何 sku_abandoned
     事件(abandon 零接线),所以代际过滤一行都不筛。
@@ -1169,7 +1169,17 @@ def test_attempts_only_count_after_the_last_abandon_event():
     q = ln._SQL_ATTEMPTS
     assert "max(occurred_at) AS since" in q
     assert "FROM catalog.product_events e" in q
-    assert "e.store = t.store" in q
+    assert "LEFT JOIN g ON g.store = t.store AND g.asin = t.asin" in q   # 按 (店, 身份键)
+
+
+def test_attempts_aggregate_the_abandon_events_once_not_per_candidate():
+    """最近一次弃码整批聚合一次(g CTE),不许逐候选 LATERAL 探事件账本:
+    逐候选探 = 每行把该店整段事件史扫一遍(2026-09-26 日报链卡死同一个形状)。"""
+    q = " ".join(ln._SQL_ATTEMPTS.split())
+    assert "LATERAL" not in q
+    assert ("g AS ( SELECT e.store, e.detail ->> 'source_key' AS asin, max(occurred_at) AS since"
+            " FROM catalog.product_events e WHERE e.event = %(abandoned)s"
+            " AND e.store = ANY(%(stores)s::text[]) GROUP BY 1, 2 )") in q
 
 
 def test_attempts_generation_filter_reads_the_event_detail_not_the_asin_column():
@@ -1181,7 +1191,7 @@ def test_attempts_generation_filter_reads_the_event_detail_not_the_asin_column()
     事件名走 product_events 常量,不写字面量(registry / 常量唯一出处纪律)。
     """
     q = ln._SQL_ATTEMPTS
-    assert "e.detail ->> 'source_key' = t.asin" in q
+    assert "e.detail ->> 'source_key' AS asin" in q
     assert "coalesce(e.asin, e.sku)" not in q
     assert "%(abandoned)s" in q
     assert ln.product_events.SKU_ABANDONED == "sku_abandoned"
@@ -1333,7 +1343,7 @@ def test_submit_loop_is_cross_store_concurrent(monkeypatch):
 
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+    monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
         {}))
@@ -1433,7 +1443,7 @@ def _wire_execute_env(monkeypatch, rows, products):
     monkeypatch.setattr(ln, "SUBMIT_JITTER_MS", 0)
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+    monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
         {}))
@@ -1824,7 +1834,7 @@ def test_out_of_scope_store_skips_claim_gates(monkeypatch):
                                "brand": "SomeBrand"}}
     seen = _wire_execute_env(monkeypatch, rows, products)
     # 该 ASIN 已在**别店**在架(不构成拦截)+ 产品/品牌都被别店占用(拦 T1)
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+    monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, {("A085", "B0AAAAAOK1")}, {}, set(),
         {"banned_pts": set(), "brands": set()},
         {"B0AAAAAOK1": "A085"},
@@ -1874,7 +1884,7 @@ def test_out_of_scope_holders_do_not_block_others(monkeypatch):
         lambda c, kind: ({"B0TANZHELD1": "谭总4", "B0NORMAL01": "A085"}
                          if kind == ln.claims.PRODUCT
                          else {"somebrand": "谭总4"}))
-    gs = ln._load_gate_state()
+    gs = ln._load_gate_state([])
     assert gs.owned_asin == {"B0NORMAL01": "A085"}   # 谭总持有的不拦别人
     assert gs.owned_brand == {}
 
@@ -2052,7 +2062,7 @@ def _wire_dry_env(monkeypatch, rows, *, listed=(), cooling=None):
     stores = sorted({r["store"] for r in rows})
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+    monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(listed), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
         dict(cooling or {})))
@@ -2633,7 +2643,7 @@ def test_weight_fallbacks_are_bucketed_by_reason_in_the_summary(monkeypatch):
     }
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+    monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
         {}))
@@ -2672,7 +2682,7 @@ def test_store_max_stock_gate(monkeypatch):
     stores = ("T_CAP3", "T_CAP20", "T_FREE")
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
-    monkeypatch.setattr(ln, "_load_gate_state", lambda: ln._GateState(
+    monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()}, {}, {},
         {}))

@@ -576,7 +576,7 @@ def test_run_end_to_end_pass(wired, monkeypatch):
 
             PICK_COLS, [("PO1|SKU1", "店A", "B0TEST0001", "Acme Widget Pro 12 inch Blue",
                          1, 100, 0, "10001", "Shipped", None, None)]),
-        "FROM catalog.latest_snapshot": (
+        "FROM catalog.snapshots s": (
             ["asin", "price", "stock_count", "delivery_days", "shipping",
              "shipping_raw", "buybox", "scrape_params", "raw", "outcome",
              "scraped_at", "title"],
@@ -932,7 +932,7 @@ def test_snapshots_picks_newest_when_params_differ(wired, monkeypatch):
            "parse_engine": "selectolax"}, {"is_fba": "FBA"}, "ok",
            datetime(2026, 8, 10, 1, 0, tzinfo=timezone.utc), "T")
     for order in ([old, new], [new, old]):        # 两种返回顺序结果必须一致
-        conn = FakeConn({"FROM catalog.latest_snapshot": (cols, order)})
+        conn = FakeConn({"FROM catalog.snapshots s": (cols, order)})
         snaps = wf._snapshots(conn, [{"sku": "B0TEST0001"}])
         assert snaps[("B0TEST0001", "10001")]["amz_price"] == 99
 
@@ -948,7 +948,7 @@ def test_snapshots_keyed_by_line_asin(wired, monkeypatch):
     row = ("B0TEST0001", 10, 1, 1, 0.0, "FREE", {}, {"zipcode": "10001"},
            {"is_fba": "FBA"}, "ok",
            datetime(2026, 8, 9, 1, 0, tzinfo=timezone.utc), "T")
-    conn = FakeConn({"FROM catalog.latest_snapshot": (cols, [row])})
+    conn = FakeConn({"FROM catalog.snapshots s": (cols, [row])})
     line = {"sku": "AK7QM2X9RT4W", "asin": "B0TEST0001"}
     snaps = wf._snapshots(conn, [line])
     assert snaps[("B0TEST0001", "10001")]["amz_price"] == 10

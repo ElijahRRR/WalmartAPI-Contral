@@ -14,13 +14,44 @@ def pg_dsn() -> str:
     return os.environ.get("WALMART_PG_DSN", "dbname=walmart_data")
 
 
+#: 单条 SQL 的缺省超时(秒),每条连接都带(2026-09-26)。库里原本没设超时:当天一条缺
+#: 索引的查询逐条全表扫了 44 分钟,不报错、日报链整条卡住,没人知道。超时 = 那条 SQL
+#: 报错 → 工作流失败 → cli 通知,**响亮失败好过无声卡死**。给得宽:本仓正常查询都在秒级;
+#: 建大索引这类一次性操作(db_init)显式传 statement_timeout=0 关掉。附属步骤要更紧的
+#: 自己在事务里 `SET LOCAL statement_timeout`(如 services/feed_effect)。
+STATEMENT_TIMEOUT_S = 30 * 60
+
+
+#: 连接的 application_name:`pg_stat_activity` 里一眼看出是哪个工作流的查询(2026-09-26
+#: 卡死那次只能按 SQL 文本去认)。cli 每跑一步调 set_workflow 换成工作流名。
+_APP_NAME = "walmartapi"
+
+
+def set_workflow(name: str) -> None:
+    """输入:工作流名 → 输出:无(此后新开的连接 application_name = walmartapi:<名>)。"""
+    global _APP_NAME
+    _APP_NAME = f"walmartapi:{name}"[:63]      # PG 截断到 63 字节
+
+
+def _options(dsn: str, timeout_s: float) -> str:
+    """输入:DSN + 超时秒数 → 输出:libpq options(保留 DSN 里原有的 options,追加超时)。"""
+    from psycopg.conninfo import conninfo_to_dict
+
+    base = str(conninfo_to_dict(dsn).get("options") or "").strip()
+    return f"{base} -c statement_timeout={int(timeout_s * 1000)}".strip()
+
+
 @contextlib.contextmanager
-def pg_conn(autocommit: bool = False):
-    """输入:(可选 autocommit)→ 输出:psycopg 连接上下文;总是 close。
+def pg_conn(autocommit: bool = False, statement_timeout: float | None = None):
+    """输入:(可选 autocommit、单条 SQL 超时秒数)→ 输出:psycopg 连接上下文;总是 close。
 
     默认事务模式:正常退出 commit,异常 rollback。autocommit=True 给并发
     worker 的只读+幂等缓存写用(product_audit workers>1:每 worker 一条
     连接,写路径仍归主线程的事务连接)。
+
+    statement_timeout:缺省 STATEMENT_TIMEOUT_S;0 = 不限(只给 db_init 这类一次性
+    重操作用)。走连接参数(libpq options)而不是连上之后 SET:事务模式下 SET 会随
+    第一个事务回滚而失效。
 
     用法:
         with db.pg_conn() as conn:
@@ -28,7 +59,11 @@ def pg_conn(autocommit: bool = False):
     """
     import psycopg  # 惰性导入:让不碰 PG 的 workflow 在缺 psycopg 的环境也能运行
 
-    conn = psycopg.connect(pg_dsn(), autocommit=autocommit)
+    dsn = pg_dsn()
+    timeout_s = STATEMENT_TIMEOUT_S if statement_timeout is None else statement_timeout
+    conn = psycopg.connect(dsn, autocommit=autocommit,
+                           options=_options(dsn, timeout_s),
+                           application_name=_APP_NAME)
     try:
         yield conn
         if not autocommit:

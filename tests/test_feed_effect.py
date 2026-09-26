@@ -153,13 +153,32 @@ def test_judge_counts_and_writes_each_verdict_once():
     out = fe.judge(conn)
     assert out == {"effective": 1, "not_effective": 2, "review": 1,
                    "waiting": 1, "no_target": 1}
-    sql, args = conn.sqls[0]
+    timeout, _ = conn.sqls[0]
+    assert timeout == f"SET LOCAL statement_timeout = {fe.STATEMENT_TIMEOUT_S * 1000}"
+    sql, args = conn.sqls[1]
     assert args["days"] == fe.LOOKBACK_DAYS and "failed" not in args["judgeable"]
+    assert args["value_feeds"] == list(fe._VALUE_FEEDS)
     ins, params = conn.sqls[-1]
     assert "ON CONFLICT (feed_id, sku) DO NOTHING" in ins           # 判一次,不回头改
     assert sorted(p["sku"] for p in params) == ["BAD", "BAD2", "OK"]
     bad = next(p for p in params if p["sku"] == "BAD")
     assert (bad["effect"], bad["want"], bad["observed"]) == ("not_effective", "10.00", "12.99")
+
+
+def test_targets_are_joined_in_one_batch_not_probed_per_candidate():
+    """2026-09-26 生产事故:目标值是逐候选 LATERAL `ORDER BY id DESC LIMIT 1` 去捞的,
+    ops.dispositions 的 feed_id 上没有索引,1.88 万个候选各把 65.8 万行扫一遍,日报链卡
+    44 分钟。目标值只许整批 join(disp CTE),且只给值比对类候选取;索引必须在 schema 里。"""
+    import pathlib
+    sql = " ".join(fe._CANDIDATES_SQL.split())
+    assert "LATERAL" not in sql and "LIMIT" not in sql
+    assert ("SELECT DISTINCT ON (x.feed_id, x.sku) x.feed_id, x.sku, x.action, x.detail"
+            " FROM due d JOIN ops.dispositions x") in sql
+    assert "WHERE d.feed_type = ANY(%(value_feeds)s::text[])" in sql
+    schema = (pathlib.Path(__file__).resolve().parent.parent
+              / "refdata" / "schema.sql").read_text(encoding="utf-8")
+    assert ("CREATE INDEX IF NOT EXISTS dispositions_feed_sku_idx\n"
+            "    ON ops.dispositions (feed_id, sku) WHERE feed_id IS NOT NULL;") in schema
 
 
 def test_judge_only_reads_the_feed_ledger_and_writes_its_own_table():
@@ -287,9 +306,23 @@ def test_review_list_formatting(monkeypatch):
     assert "没有" in feed_poll.run({"review": "1", "execute": True})
 
 
+def test_catalog_sync_skips_the_judgment_while_paused(monkeypatch):
+    """暂停中(2026-09-26,「回看 7 天」口径待定):catalog_sync 不连库、不调 judge,只报一行。"""
+    from workflows import catalog_sync
+
+    def _no_db(*a, **k):
+        raise AssertionError("暂停中不许连库")
+
+    monkeypatch.setattr(catalog_sync.db, "pg_conn", _no_db)
+    monkeypatch.setattr(catalog_sync.feed_effect, "judge", _no_db)
+    assert fe.PAUSED
+    assert catalog_sync._judge_effects(None, dry_run=False) == fe.PAUSED
+
+
 def test_catalog_sync_effect_step_is_isolated_and_dry_run_rolls_back(monkeypatch):
     """附属步骤:炸了只报一行不拖垮同步;空跑同事务 rollback(判一次不回头改)。"""
     from workflows import catalog_sync
+    monkeypatch.setattr(catalog_sync.feed_effect, "PAUSED", "")
 
     class _C:
         rolled = False

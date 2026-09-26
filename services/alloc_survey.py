@@ -214,7 +214,12 @@ SELECT p.asin, p.brand, p.slow ->> 'manufacturer', p.walmart_pt, p.pt_source,
 FROM catalog.products p
 LEFT JOIN LATERAL (
     SELECT raw ->> 'is_fba' AS fulfillment
-    FROM catalog.latest_snapshot ls
+    -- ⚠ 直接读 catalog.snapshots,不读 latest_snapshot 视图(2026-09-26 全仓慢查询排查):
+    --   视图是全表 DISTINCT ON,LATERAL 每探一次都把该 ASIN 全部历史快照读出来排序;
+    --   直接读走 snapshots_mkt_asin_scraped_idx,从最新往回摸到第一条非 mismatch 即停。
+    --   结果逐行相同:mismatch 只看 scrape_params(视图的分组键),全体非 mismatch
+    --   观测里最新那条必是它那一组的最新一条。
+    FROM catalog.snapshots ls
     WHERE ls.marketplace = p.marketplace AND ls.asin = p.asin
       AND coalesce(ls.scrape_params ->> 'zip_verify', '') <> 'mismatch'
     ORDER BY ls.scraped_at DESC LIMIT 1

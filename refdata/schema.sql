@@ -113,6 +113,10 @@ CREATE INDEX IF NOT EXISTS snapshots_outcome_idx
     ON catalog.snapshots (outcome, scraped_at DESC) WHERE outcome <> 'ok';
 
 CREATE INDEX IF NOT EXISTS snapshots_mkt_asin_scraped_idx ON catalog.snapshots (marketplace, asin, scraped_at DESC);
+-- 按时间窗扫快照(2026-09-26 全仓慢查询排查补):维护链「连续 N 天缺货」要近 15 天的全部观测、
+-- 分配链抽样等按 scraped_at 取一段,上面那个索引以 (marketplace, asin) 打头用不上 ⇒ 每天整表扫
+-- (全库最大最宽的表)。快照按采集时间追加写入,BRIN 几十 KB 就能把扫描缩到窗口内的数据块。
+CREATE INDEX IF NOT EXISTS snapshots_scraped_at_brin ON catalog.snapshots USING brin (scraped_at);
 
 CREATE OR REPLACE VIEW catalog.latest_snapshot AS
   SELECT DISTINCT ON (marketplace, asin, scrape_params) *
@@ -203,6 +207,11 @@ ALTER TABLE catalog.product_events ADD COLUMN IF NOT EXISTS asin text;
 -- 首次建索引在几百万行的表上要跑一会儿,db_init 会慢一次,之后不再。
 CREATE INDEX IF NOT EXISTS product_events_identity_idx
     ON catalog.product_events ((coalesce(asin, sku)), occurred_at DESC);
+-- 按事件类型取数(2026-09-26 全仓慢查询排查补):上架链的「最近一次弃码」「退役冷却 24h」、
+-- problem_scan 的归类 / 顽固史、删除核验、报错重分类都是 `WHERE event = …`,上面三个索引
+-- 都用不上 ⇒ 每轮把几百万行的账本整张扫一遍,list_new 的弃码查询更是逐候选扫。
+CREATE INDEX IF NOT EXISTS product_events_event_idx
+    ON catalog.product_events (event, occurred_at DESC);
 
 -- 类目 browse_node(所有者定稿 2026-08-14;采集契约 v1 纯追加
 -- slow.category_id_chain,与 stock_count/delivery_days 同款先例)。
@@ -405,6 +414,13 @@ CREATE TABLE IF NOT EXISTS catalog.upc_pool (
     created_at  timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS upc_pool_status_idx ON catalog.upc_pool (status);
+-- 按 (店, ASIN) 找号(2026-09-26 全仓慢查询排查补):领号复用、烧号(burn,弃码一对烧一次)、
+-- 改码改标(retag_sku)、撞库探查全是 `store = … AND asin = … AND status IN ('claimed','used')`,
+-- 此前只有主键 upc 与 status 两个索引 ⇒ 每次都整池扫描,而 burn 在 catalog_sync / feed_poll /
+-- sku_migrate 里是**逐对**调的(删除核验一批几千对 = 几千次整池扫描,还在同一个事务里)。
+-- 部分索引的条件与四处查询的 status 条件逐字一致才会被用上。
+CREATE INDEX IF NOT EXISTS upc_pool_store_asin_idx
+    ON catalog.upc_pool (store, asin) WHERE status IN ('claimed', 'used');
 
 -- ── LLM 缓存(L2c;旧 llm_cache.sqlite 462MB 的 PG 化,旧数据不迁——
 -- key 含 model 名,换模型即失效)────────────────────────────────────────────
@@ -1757,6 +1773,16 @@ ALTER TABLE catalog.walmart_items ADD COLUMN IF NOT EXISTS node_count smallint;
 
 CREATE INDEX IF NOT EXISTS dispositions_status_idx
     ON ops.dispositions (status, suggested_at);
+-- 按 (feed_id, sku) 找处置行(2026-09-26):实际结果取值比对的目标值(services/feed_effect)
+-- 等按 feed 反查处置的地方。没有它时每次反查都把整张表(生产 65.8 万行)扫一遍 ——
+-- 当天生产实见 1.88 万个候选逐条全表扫,日报链卡 44 分钟。部分索引:只有执行过的行
+-- 才有 feed_id(PUT 路由记 'sync')。
+CREATE INDEX IF NOT EXISTS dispositions_feed_sku_idx
+    ON ops.dispositions (feed_id, sku) WHERE feed_id IS NOT NULL;
+-- 按执行时刻取一段(2026-09-26):problem_product_cleanup 每次执行前数「近 20 小时已放行的
+-- 破坏类」(destructive_executed_today,下架限制按天),没有它就整表扫。
+CREATE INDEX IF NOT EXISTS dispositions_executed_at_idx
+    ON ops.dispositions (executed_at) WHERE executed_at IS NOT NULL;
 
 -- ── audit:产品审核域(2026-08-13 批次 A,迁自 walmart-audit-system
 --    db/schema.sql@a565d95;批次 A 只建表搬数据,判定引擎批次 B/C 接线)──

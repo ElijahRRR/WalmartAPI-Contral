@@ -38,7 +38,7 @@
 | 22 | GET /v3/inventories/{sku} | inventory | 单品库存(bulk 漏数据兜底,**全节点合计**) | safe_get_ex | sync_online_products |
 | 23 | GET /v3/orders | orders | 订单增量拉取/销量统计 | **裸 httpx(async)** | 订单审核/店铺日报 |
 | 24 | GET /v3/returns | returns | 售后单全量拉取 | safe_get_ex | 售后同步 |
-| 25 | GET /v3/report/payment/statement | reports | 结算摘要/店铺状态/sellerId | 混合(裸×1) | 3 个模块 |
+| 25 | GET /v3/report/payment/statement | reports | 结算摘要/店铺状态/sellerId(响应形状与「回款」口径见 §3.3) | 混合(裸×1) | 3 个模块 |
 | 26 | GET /v3/report/reconreport/availableReconFiles | reports | 可下载对账账期列表 | 混合 | 2 个模块 |
 | 27 | GET /v3/report/reconreport/reconFileJson | reports | 对账明细 JSON | 混合 | 2 个模块 |
 | 28 | GET /v3/insights/performance/{8 项}/summary | insights | 绩效比率(8 端点) | safe_get_ex | 店铺日报 |
@@ -197,6 +197,45 @@ before submitting a bulk price update feed」。本仓调度是 list_new 20:00�
 (含 maintenance 改价)次日 13:00 = **相隔 17 小时 < 24 小时**;改价选品链路里未见按
 item 年龄过滤(`services/maintenance_intents` 只有观测窗口过滤)——**待核**:昨夜新上架的
 品今天会不会被改价 feed 扫到。见 docs/backlog.md。
+
+### 3.3 结算摘要 `/v3/report/payment/statement` 的响应形状与「回款」口径
+
+**2026-10-06 实证**(所有者提供两家店的真实响应 + 同一天卖家中心账单页 PDF,逐项对完)。
+响应是 **JSON**(`Accept: application/json`,`safe_get_ex` 直接 `resp.json()`),
+不是文件 —— 同族的 `reconFile`(ZIP 裹 CSV)和 insights 的 `/report`(xlsx)才是。
+
+`payload.accountSummary` 线上实回 15 个键:`openingBalance` `orderActivity`
+`walmartFulfillmentServices` `otherActivities` `reserve` `paidToYou`
+`closingBalance` `scheduledSettlementDate` `paymentProcessor` `settleCycle`
+`reserveToDate` `lastUpdatedDate` **`holdAmount`** `holdDates`
+(+ `payload.outstandingMCABalance`)。`payload.transactionDetails` 下
+`saleAggregate` / `refundDetails` / `adjustmentAggregate` / `wfs` 四组各带
+`netPayable`,线上还比文档多回 `pricingAdjustment` `totalSFAmt` `totalWfAmt`
+`dutyFees` `failedReturnFee` `totalWFSDiscount`。
+
+三条结论,都是对着账单页算出来的,别凭直觉改:
+
+1. **账单阶梯恒等式**:`期初余额 + 备用金 + 销售额 + 退款 + 服务费 + 调整
+   − 付款给您的金额 = 期末余额`。两家店都严丝合缝(A090:`0 − 571.56 + 6667.28
+   − 3731.46 − 78.04 = 2286.22`;A152:`0 + 0 + 6649.79 − 1197.29 − 7.50 = 5445.00`)
+   ⇒ **`closingBalance` 已经扣过 `reserve`**。而接口回的 `reserve` 是**负数**,
+   旧口径 `closing − reserve − hold` 的 `− reserve` 实际是**加回来**,有备用金的
+   店一律虚高(A090 多报 571.56)。
+2. **`closingBalance` 没有扣押款**:账单页「回款等待」那一行不参与上面的求和
+   ⇒ `回款 = closingBalance − holdAmount`(现行口径,`services/kpi.extract_settlement`)。
+3. **字段名以线上返回为准**:官方文档页样例写的是 `holdAmt`,**线上两家店回的
+   都是 `holdAmount`**(A090 为 null、A152 为 3928.69)。同一个坑在模型名那次也踩过。
+
+⚠ **「待付款金额」接口不给,也算不出来**:A152 账单页右栏明写 `待付款金额 $2,398.36`,
+而 `5445.00 − 3928.69 = 1516.31`,差 882.05。押款是**按单逐笔释放**的(发货满 7 天),
+接口只给押款**总额**、不给"其中多少已到期",用响应里任何字段组合都凑不出那个数。
+现行口径因此是**保守值**(宁可少报不虚高);要精确值只能抓卖家中心页面。
+没有押款的店,本式 = 账单页「账户余额」,分毫不差(A090 实证)。
+
+同族另两个端点**不解决这个问题**,别再去试:`GET /v3/report/payment/performance`
+只有 OTD/VTR/退款率/取消率的 7/14/30/60/90 天数值,**一分钱都没有**;on-request
+`reportType=SETTLEMENT&reportVersion=v1` 只有 WFS 与多渠道(MCS)的费用明细,
+自发货店用不上。
 
 ## 4. 分页模型(4 种,互不兼容,api 层各自封装)
 

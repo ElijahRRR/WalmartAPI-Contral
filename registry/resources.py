@@ -605,7 +605,7 @@ KPI_SHEET = Spreadsheet(
 
 # 店铺KPI看板(新表格,所有者 2026-08-08 定稿):人看的投影全在这里,
 # 旧「店铺KPI」表 72 张分页停更归档。两个工作表同一 workbook:
-# 「总览」= 每店最新一行(全 32 列)、「历史」= 全店合一近 N 天窗口。
+# 「总览」= 每店最新一行(全 34 列)、「历史」= 全店合一近 N 天窗口。
 # 列序 = _KPI_BOARD_COLUMNS(与 ops.store_kpi_daily 字段一一对应,
 # 表头沿用旧表真实中文名,运营零学习成本)。整表重写,PG 权威可随时重建。
 #
@@ -620,6 +620,11 @@ _KPI_BOARD_COLUMNS = (
     "negative_rate", "return_rate", "inr_rate", "period_sales", "commission",
     "refund_amount", "closing_balance", "reserve_to_date", "payout",
     "payout_date", "payment_processor", "settle_cycle", "no_hold",
+    # 押款两列 2026-10-11 插在「无Hold」之后:回款/回款日/收款方/结算周期/无Hold/
+    # 等待回款/回款等待期 是同一组财务语义,放一起才读得懂;位移只影响末列
+    # 「累计回款」(AF→AH)。期末余额**不含**押款 ⇒ 回款 = 期末余额 − 等待回款,
+    # 推导见 services/kpi.extract_settlement 头注
+    "hold_amount", "hold_dates",
     # 末列 2026-08-31 由 prev_payout(上期回款)换成 total_payout(累计回款,
     # 所有者:「我需要累计回款,就沃尔玛总共已经付给我的钱」)。旧列在 PG 里
     # 保留不删(历史行的值仍是当时的真实观测),只是不再投影到看板

@@ -20,7 +20,7 @@ report 端点,xlsx)+ 订单中心 perf_events 归 `workflows/perf_problems.py`,
 与旧系统的关键差异(设计决策见 docs/legacy_survey.md #daily_report 迁移建议):
 - PG 是权威(ops.store_kpi_daily / ops.perf_problem_orders),飞书降级为展示层
   ——消掉旧系统「清空飞书全表再重写,中途崩溃=历史全丢」的最大风险
-- KPI 看板(所有者定稿 2026-08-08):新表格两页——总览(每店最新一行全 32 列)
+- KPI 看板(所有者定稿 2026-08-08):新表格两页——总览(每店最新一行全 34 列)
   + 历史(全店合一近 90 天),整表重写可随时重建;旧「店铺KPI」表 72 张
   每店分页**停更归档**(仅剩两个角色:kpi_history_import 的只读导入源、
   yingdao=1 的影刀输入 A:H——影刀 RPA 内部读旧表,切换需先改 RPA 再换 env)
@@ -70,7 +70,8 @@ INSERT INTO ops.store_kpi_daily (
     orders_count, sales_amount, otd_rate, cancel_rate, vtr_rate, srr_rate,
     refund_rate, negative_rate, return_rate, inr_rate, period_sales, commission,
     refund_amount, closing_balance, reserve_to_date, payout, payout_date,
-    payment_processor, settle_cycle, no_hold, total_payout, updated_at)
+    payment_processor, settle_cycle, no_hold, hold_amount, hold_dates,
+    total_payout, updated_at)
 VALUES (%(store)s, %(data_date)s, %(seller_name)s, %(partner_id)s, %(seller_id)s,
         %(store_status)s, %(payment_status)s, %(sales_status)s, %(items_online)s,
         %(items_in_stock)s, %(items_out_stock)s, %(orders_count)s, %(sales_amount)s,
@@ -78,7 +79,7 @@ VALUES (%(store)s, %(data_date)s, %(seller_name)s, %(partner_id)s, %(seller_id)s
         %(negative_rate)s, %(return_rate)s, %(inr_rate)s, %(period_sales)s,
         %(commission)s, %(refund_amount)s, %(closing_balance)s, %(reserve_to_date)s,
         %(payout)s, %(payout_date)s, %(payment_processor)s, %(settle_cycle)s,
-        %(no_hold)s, %(total_payout)s, now())
+        %(no_hold)s, %(hold_amount)s, %(hold_dates)s, %(total_payout)s, now())
 ON CONFLICT (store, data_date) DO UPDATE SET
     -- 影刀两列:本轮为空不覆盖旧值(旧系统 A-H 保护语义的 PG 等价)
     seller_name = COALESCE(EXCLUDED.seller_name, ops.store_kpi_daily.seller_name),
@@ -98,6 +99,7 @@ ON CONFLICT (store, data_date) DO UPDATE SET
     payout_date = EXCLUDED.payout_date,
     payment_processor = EXCLUDED.payment_processor,
     settle_cycle = EXCLUDED.settle_cycle, no_hold = EXCLUDED.no_hold,
+    hold_amount = EXCLUDED.hold_amount, hold_dates = EXCLUDED.hold_dates,
     total_payout = EXCLUDED.total_payout, updated_at = now()
 """
 
@@ -258,6 +260,7 @@ def _collect_store_kpi(store: dict, data_date, win_start: str, win_end: str,
         "payout_date": settle["payout_date"],
         "payment_processor": settle["payment_processor"],
         "settle_cycle": settle["settle_cycle"], "no_hold": settle["no_hold"],
+        "hold_amount": settle["hold_amount"], "hold_dates": settle["hold_dates"],
         # 累计回款 = 结算台账各账期之和(settlement_sync 维护)。
         # ⚠ 台账里没有这家店 ⇒ **留空,不写 0**:那是"还没同步过账期",
         # 与"确实一分钱没回"是两件事,写 0 会让人以为查过了。
@@ -417,7 +420,11 @@ _BOARD_HEADER = ["店铺", "日期", "卖家名称", "partnerId", "sellerId", "�
                  "昨日销售额($)", "准时送达(90%)", "取消率", "有效追踪(99%)",
                  "卖家回复率(95%)", "退款率", "差评率", "退货率", "未收到",
                  "账期销售额($)", "佣金", "退款金额", "期末余额", "迄今备用金($)",
-                 "回款", "回款日", "收款方", "结算周期", "无Hold", "累计回款"]
+                 "回款", "回款日", "收款方", "结算周期", "无Hold",
+                 # 押款两列(2026-10-11):期末余额里**没扣**押款,所以「回款」
+                 # 少掉的那笔就在这里;「回款等待期」是 "2026-09-13 to 2026-10-03"
+                 # 这样的区间原文,是文本不是日期,别给它配日期格式
+                 "等待回款($)", "回款等待期", "累计回款"]
 
 
 _DATE_EPOCH = datetime(1899, 12, 30).date()     # 飞书/Excel 日期序列起点
@@ -486,7 +493,7 @@ def _board_formats(n_rows: int) -> list[tuple[str, str]]:
                    "srr_rate", "refund_rate", "negative_rate", "return_rate",
                    "inr_rate", "period_sales", "commission", "refund_amount",
                    "closing_balance", "reserve_to_date", "payout",
-                   "total_payout"):
+                   "hold_amount", "total_payout"):
             items.append((f"{letter}2:{letter}{end}", "#,##0.00"))
     return items
 

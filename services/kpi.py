@@ -138,11 +138,19 @@ def _find_all(node, key, path="$"):
     return out
 
 
-# 结算响应里要盯的键(settle_debug 全量打点;回款字段以旧表反推修正时看这里)
+# 结算响应里要盯的键(settle_debug 全量打点;回款字段以账单页反推修正时看这里)。
+# 2026-10-06 按两家店的真实响应 + 卖家中心账单页 PDF 逐项对完后补全:账单阶梯的
+# 六项(期初/订单活动/WFS/其他/已付给你/押款期)此前一项都没盯,而"期末余额到底
+# 扣没扣备用金"正是靠它们才算得清(推导见 extract_settlement 头注)。
+# ⚠ 前三个键**线上并不返回**,故意留着:它们是当年猜字段时的候选,打点输出里
+#   那三行"(无)"就是"别再猜它们"的记录。
 _SETTLE_DEBUG_KEYS = (
     "storeFrontUrl", "scheduledSettlementAmount", "totalPayable",
-    "payableAmount", "closingBalance", "reserve", "reserveToDate",
-    "holdAmount", "scheduledSettlementDate", "paymentStatus", "partnerId",
+    "payableAmount", "openingBalance", "orderActivity",
+    "walmartFulfillmentServices", "otherActivities", "paidToYou",
+    "closingBalance", "reserve", "reserveToDate", "holdAmount", "holdDates",
+    "netPayable", "lastUpdatedDate", "outstandingMCABalance",
+    "scheduledSettlementDate", "paymentStatus", "partnerId",
     "sellerStatus", "paymentProcessor", "settleCycle")
 
 
@@ -176,8 +184,26 @@ def extract_settlement(statement: dict) -> dict:
     accountSummary, transactionDetails.{saleAggregate,refundDetails}};
     sellerId = sellerInfo.storeFrontUrl **先 URL 解码**再正则 /seller/(\\d+)
     (URL 是百分号编码的,不解码永远匹配不上——2026-08-08 全店空白事故);
-    **本期回款 = closingBalance − reserve − holdAmount**;
     paymentStatus 在 sellerInfo 里。递归查找仅作路径兜底。
+
+    **本期回款 = closingBalance − holdAmount**(2026-10-06 改,证据在下面)。
+    所有者提供两家店的真实响应 + 同一天卖家中心账单页 PDF,逐项对完得出:
+      · 账单页的阶梯是
+        期初余额 + 备用金 + 销售额 + 退款 + 服务费 + 调整 − 付款给您的金额
+        = 期末余额,两家店都严丝合缝(A090:0 − 571.56 + 6667.28 − 3731.46
+        − 78.04 = 2286.22;A152:0 + 0 + 6649.79 − 1197.29 − 7.50 = 5445.00)
+        ⇒ **期末余额已经扣过备用金**,旧公式再减一次是重复扣;而接口返回的
+        reserve 是**负数**,`− reserve` 实际是把押着的钱**加回来**——A090 因此
+        多报 571.56,把沃尔玛扣着的备用金算成了能回的钱。
+      · A152 的「回款等待 3,928.69」**不参与**上面的求和,只是账单外的一行
+        ⇒ **期末余额没扣押款**,所以押款这一项该减,字段就是 holdAmount。
+      · ⚠ 字段名以**线上返回**为准:官方文档页样例写的是 `holdAmt`,线上两家店
+        回的都是 `holdAmount`(A090 为 null、A152 为 3928.69)。
+      · ⚠ 本式算出的是**保守值**:A152 账单页右栏的「待付款金额」是 2,398.36,
+        而 5445.00 − 3928.69 = 1516.31,少报 882.05。原因是押款按单逐笔释放
+        (发货满 7 天),接口只给押款**总额**、不给"其中多少已到期",用接口字段
+        的任何组合都凑不出那个数。宁可少报也不虚高 —— 要精确值只能抓卖家中心。
+      · 没有押款的店,本式 = 账单页的「账户余额」,分毫不差(A090 实证)。
     """
     payload = (statement.get("payload") if isinstance(statement, dict) else None) \
         or _find_key(statement, "payload") or {}
@@ -200,9 +226,8 @@ def extract_settlement(statement: dict) -> dict:
                 break
 
     closing = _num(acct.get("closingBalance"))
-    reserve = _num(acct.get("reserve"))
     hold = _num(acct.get("holdAmount"))
-    payout = closing - reserve - hold
+    payout = closing - hold         # ⚠ 不减 reserve:期末余额里已经扣过(见头注)
     reserve_to_date = abs(_num(acct.get("reserveToDate")))
 
     payment_status = str(seller_info.get("paymentStatus")
@@ -228,6 +253,11 @@ def extract_settlement(statement: dict) -> dict:
         "payment_processor": str(acct.get("paymentProcessor") or ""),
         "settle_cycle": str(acct.get("settleCycle") or ""),
         "no_hold": no_hold,
+        # 押款两列(2026-10-11):接口本来就在同一个响应里返回,过去整个丢掉了 ——
+        # 于是"这家店被压着 3,928 美元、压到 10/03"在日报上一个字都看不见,
+        # 只有「回款」那一列一个数字在那儿,谁也看不出少的那笔去哪了
+        "hold_amount": round(hold, 2),
+        "hold_dates": str(acct.get("holdDates") or "").strip(),
     }
 
 
@@ -414,6 +444,10 @@ _HIST_HEADER_MAP: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("refund_amount", ("退款",)),
     ("closing_balance", ("期末余额", "余额")),
     ("reserve_to_date", ("备用金", "预留")),
+    # ⚠ 这两行**必须在 ("payout", ("回款",)) 之前**:两个表头都含「回款」二字,
+    #   放到后面会被静默认成「回款」列(顺序即优先级,本表的老规矩)
+    ("hold_amount", ("等待回款", "押款金额")),
+    ("hold_dates", ("回款等待期", "押款期")),
     ("payout", ("回款",)),
     ("payment_processor", ("收款方", "支付处理", "processor")),
     ("settle_cycle", ("结算周期",)),
@@ -426,7 +460,7 @@ _HIST_NUM_FIELDS = {"sales_amount", "otd_rate", "cancel_rate", "vtr_rate",
                     "srr_rate", "refund_rate", "negative_rate", "return_rate",
                     "inr_rate", "period_sales", "commission", "refund_amount",
                     "closing_balance", "reserve_to_date", "payout",
-                    "prev_payout", "total_payout"}
+                    "hold_amount", "prev_payout", "total_payout"}
 
 _HIST_FIELDS = tuple(f for f, _ in _HIST_HEADER_MAP if f not in ("data_date", "store"))
 

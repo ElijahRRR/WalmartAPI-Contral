@@ -71,17 +71,106 @@ def test_settlement_rules_non_active_payout_zero():
 
 
 def test_settlement_active_no_hold_flag():
+    """回款 = 期末余额 − **押款额**(2026-10-06 改口径:不再减 reserve)。"""
     st = {"paymentStatus": "ACTIVE", "storeFrontUrl": "",
-          "accountSummary": {"closingBalance": 100.0, "reserve": 0,
+          "accountSummary": {"closingBalance": 100.0, "holdAmount": 0,
                              "scheduledSettlementDate": ""}}
     out = kpi.extract_settlement(st)
     assert out["payout"] == 100.0 and out["no_hold"] is True
 
     st2 = {"paymentStatus": "ACTIVE", "storeFrontUrl": "",
-           "accountSummary": {"closingBalance": 100.0, "reserve": 40,
+           "accountSummary": {"closingBalance": 100.0, "holdAmount": 40,
                               "scheduledSettlementDate": ""}}
     out2 = kpi.extract_settlement(st2)
     assert out2["payout"] == 60.0 and out2["no_hold"] is False
+    # ⚠ reserve **不参与**:期末余额里已经扣过它,再减一次就是重复扣;而且
+    #   接口返回的 reserve 是负数,减负数 = 加回来(A090 曾因此多报 571.56)
+    st3 = {"paymentStatus": "ACTIVE", "storeFrontUrl": "",
+           "accountSummary": {"closingBalance": 100.0, "reserve": -40,
+                              "scheduledSettlementDate": ""}}
+    assert kpi.extract_settlement(st3)["payout"] == 100.0
+
+
+# ── 结算口径回归:两家店的真实响应 ⇄ 同日卖家中心账单页(所有者 2026-10-06 提供)──
+# 账单页的阶梯 = 期初余额 + 备用金 + 销售额 + 退款 + 服务费 + 调整 − 付款给您的金额
+# = 期末余额,两家店都严丝合缝 ⇒ **期末余额已经扣过备用金**;而 A152 账单页上的
+# 「回款等待 3,928.69」**不参与**这个求和 ⇒ **期末余额没扣押款**。
+# 故 回款 = 期末余额 − 押款额。partnerId 已脱敏,其余数字一字未改。
+_A090 = {        # 无押款店:本式 = 账单页「账户余额」,分毫不差
+    "statusCode": 200, "partnerId": "P-A090",
+    "payload": {
+        "outstandingMCABalance": 0,
+        "sellerInfo": {
+            "storeFrontUrl": "https%3A%2F%2Fwww.walmart.com%2Fseller%2F102747154",
+            "sellerStatus": "ACTIVE", "paymentStatus": "ACTIVE", "tenure": 573},
+        "accountSummary": {
+            "openingBalance": 0.0, "orderActivity": 2857.78,
+            "walmartFulfillmentServices": 0, "otherActivities": 0.00,
+            "reserve": -571.56, "paidToYou": 0, "closingBalance": 2286.22,
+            "scheduledSettlementDate": "2026-10-06", "paymentProcessor": "PingPong",
+            "settleCycle": "Bi-weekly", "reserveToDate": -571.56,
+            "lastUpdatedDate": "2026-10-04", "holdAmount": None, "holdDates": None},
+        "transactionDetails": {
+            "saleAggregate": {"productPrice": 7518.84, "netComm": -851.56,
+                              "netPayable": 6667.28},
+            "refundDetails": {"productPrice": -4186.4, "netPayable": -3731.46},
+            "adjustmentAggregate": {"netPayable": -78.04},
+            "wfs": {"netPayable": 0}}}}
+
+_A152 = {        # 有押款店:本式偏保守,见下方断言里的说明
+    "statusCode": 200, "partnerId": "P-A152",
+    "payload": {
+        "outstandingMCABalance": 0,
+        "sellerInfo": {
+            "storeFrontUrl": "https%3A%2F%2Fwww.walmart.com%2Fseller%2F103077162",
+            "sellerStatus": "ACTIVE", "paymentStatus": "ACTIVE", "tenure": 242},
+        "accountSummary": {
+            "openingBalance": 0.0, "orderActivity": 5445.0,
+            "walmartFulfillmentServices": 0, "otherActivities": 0.00,
+            "reserve": 0.0, "paidToYou": 0, "closingBalance": 5445.0,
+            "scheduledSettlementDate": "2026-10-06", "paymentProcessor": "PingPong",
+            "settleCycle": "Bi-weekly", "reserveToDate": 0.0,
+            "lastUpdatedDate": "2026-10-04", "holdAmount": 3928.69,
+            "holdDates": "2026-09-13 to 2026-10-03"},
+        "transactionDetails": {
+            "saleAggregate": {"productPrice": 7420.75, "netComm": -770.96,
+                              "netPayable": 6649.79},
+            "refundDetails": {"productPrice": -1335.88, "netPayable": -1197.29},
+            "adjustmentAggregate": {"netPayable": -7.5},
+            "wfs": {"netPayable": 0}}}}
+
+
+def test_settlement_matches_seller_center_statement():
+    """两份真实响应对账单页逐项钉死 —— 这是"别再把 reserve 减回去"的守门人。"""
+    a = kpi.extract_settlement(_A090)
+    # 账单页:账户余额/期末余额 $2,286.22、备用金 −$571.56、回款等待 $0.00
+    assert a["closing_balance"] == 2286.22
+    assert a["reserve_to_date"] == 571.56        # 展示取绝对值(旧业务规则)
+    assert a["hold_amount"] == 0.0 and a["hold_dates"] == ""
+    assert a["payout"] == 2286.22                # == 账单页「账户余额」,分毫不差
+    assert a["no_hold"] is True
+    assert a["period_sales"] == 7518.84 and a["commission"] == -851.56
+    assert a["refund_amount"] == -4186.4
+    assert a["seller_id"] == "102747154"         # storeFrontUrl 先解码再正则
+    # 账单阶梯自洽:期初 + 备用金 + 销售 + 退款 + 服务费 + 调整 = 期末余额
+    s = _A090["payload"]
+    assert round(s["accountSummary"]["openingBalance"]
+                 + s["accountSummary"]["reserve"]
+                 + s["transactionDetails"]["saleAggregate"]["netPayable"]
+                 + s["transactionDetails"]["refundDetails"]["netPayable"]
+                 + s["transactionDetails"]["adjustmentAggregate"]["netPayable"]
+                 + s["transactionDetails"]["wfs"]["netPayable"], 2) == 2286.22
+
+    b = kpi.extract_settlement(_A152)
+    assert b["closing_balance"] == 5445.0 and b["reserve_to_date"] == 0.0
+    assert b["hold_amount"] == 3928.69
+    assert b["hold_dates"] == "2026-09-13 to 2026-10-03"
+    assert b["payout"] == 1516.31                # 5445.00 − 3928.69
+    assert b["no_hold"] is False
+    # ⚠ 账单页右栏的「待付款金额」是 $2,398.36,本式少报 882.05:押款按单逐笔
+    #   释放(发货满 7 天),接口只给押款**总额**,不给"其中多少已到期" ——
+    #   用接口字段的任何组合都凑不出 2,398.36。宁可少报也不虚高。
+    assert b["payout"] < 2398.36
 
 
 def test_prev_recon_strict_minus_14_days():

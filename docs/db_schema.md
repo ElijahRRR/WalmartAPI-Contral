@@ -868,7 +868,8 @@ CREATE TABLE ops.cursors (          -- 各同步任务的增量游标(替代旧�
 --   消费它,改了系统行为一个字节都不变 ⇒ 不产逐格事件;只在**首次出现/整体
 --   消失**时产一条 store_limits_columns_changed(store=NULL,表结构级)
 
--- 店铺日报域(daily_report 工作流;字段语义对齐旧飞书「店铺KPI」32 列)
+-- 店铺日报域(daily_report 工作流;字段语义对齐旧飞书「店铺KPI」32 列,
+--             2026-10-11 另加押款两列 ⇒ 看板 34 列)
 CREATE TABLE ops.rate_events (           -- 跨进程限速事件(api/_client 稀缺桶)
     client_id  text NOT NULL,            -- 店铺维度
     bucket     text NOT NULL,            -- 桶名(唯一出处 _client._RATE_BUCKETS)
@@ -904,6 +905,19 @@ CREATE TABLE ops.store_kpi_daily (
     payout_date      text,
     payment_processor text, settle_cycle text,
     no_hold          boolean,        -- 仅 ACTIVE 且 payout>=closing 时 true
+    hold_amount      numeric,        -- **押款额**(accountSummary.holdAmount)
+    hold_dates       text,           -- 押款区间**原文**,如 "2026-09-13 to
+                                     -- 2026-10-03" —— 是区间不是日期,故 text
+    -- ⚠ 三个余额列的关系(2026-10-06 拿两家店真实响应对卖家中心账单页实证,
+    --   推导全文见 services/kpi.extract_settlement 头注):
+    --     closing_balance **已经扣过**备用金(账单阶梯:期初 + 备用金 + 销售 +
+    --       退款 + 服务费 + 调整 − 已付给你 = 期末余额,两店都严丝合缝)
+    --     closing_balance **没有扣**押款(账单页「回款等待」那行不参与求和)
+    --   ⇒ payout = closing_balance − hold_amount。旧口径多减一次 reserve,而
+    --     接口回的 reserve 是**负数**,减负数=加回来,有备用金的店一律虚高。
+    --   ⚠ payout 是**保守值**:押款按单逐笔释放(发货满 7 天),接口只给总额、
+    --     不给"其中多少已到期",所以有押款的店会低于卖家中心的「待付款金额」
+    --     (A152 实测:本式 1516.31,账单页 2398.36)。宁可少报不虚高。
     prev_payout      numeric,        -- **已停用**(所有者 2026-08-31「这个字段
                                      -- 不需要」)。原口径 = 严格 -14 天那一期。
                                      -- 列不删(历史行的值是当时的真实观测),

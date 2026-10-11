@@ -1426,6 +1426,14 @@ CREATE TABLE IF NOT EXISTS ops.store_kpi_daily (
     updated_at       timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (store, data_date)
 );
+-- 押款两列(2026-10-11):沃尔玛压着不放的钱 + 压款区间原文。
+-- ⚠ 与两个余额列的关系(卖家中心账单页实证,推导见 services/kpi.extract_settlement):
+--   期末余额 closing_balance **已经扣过**备用金,**没有扣**押款
+--   ⇒ payout(回款)= closing_balance − hold_amount。
+-- hold_dates 是 "2026-09-13 to 2026-10-03" 这样的**区间原文**,不是单个日期,
+-- 所以是 text 不是 date,看板也不按日期格式化。
+ALTER TABLE ops.store_kpi_daily ADD COLUMN IF NOT EXISTS hold_amount numeric;
+ALTER TABLE ops.store_kpi_daily ADD COLUMN IF NOT EXISTS hold_dates  text;
 
 -- ── On-request 报表请求台账(2026-09-07,item_id_sync)────────────────────────
 -- 「先落台账再调接口」:POST /v3/reports/reportRequests 每店每种报表**每小时一次**

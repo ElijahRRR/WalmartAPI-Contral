@@ -69,9 +69,11 @@ def test_parse_history_rows():
 def test_board_header_columns_aligned():
     from registry import resources
     from workflows import daily_report as dr
-    # 看板中文表头与 registry 列序一一对应(32 列),且与导入映射对称:
-    # 每个表头都能被 _HIST_HEADER_MAP 映射回同一个字段
-    assert len(dr._BOARD_HEADER) == len(resources.KPI_BOARD_OVERVIEW.columns) == 32
+    # 看板中文表头与 registry 列序一一对应(34 列,2026-10-11 加押款两列),
+    # 且与导入映射对称:每个表头都能被 _HIST_HEADER_MAP 映射回同一个字段。
+    # ⚠ 「等待回款($)」「回款等待期」都含「回款」二字,映射表里必须排在
+    #   ("payout", ("回款",)) 之前,否则这里的 columns[i] == field 当场红
+    assert len(dr._BOARD_HEADER) == len(resources.KPI_BOARD_OVERVIEW.columns) == 34
     mapping, unmapped = kpi.map_history_header(dr._BOARD_HEADER)
     assert unmapped == []
     for i, field in mapping.items():
@@ -204,7 +206,12 @@ def test_board_pages_both_sort_by_store(monkeypatch):
 
 
 def test_extract_settlement_legacy_shape():
-    """旧代码实证结构(2026-08-08 定稿):payload 嵌套 + URL 编码 + 回款公式。"""
+    """旧代码实证结构(2026-08-08 定稿):payload 嵌套 + URL 编码 + 回款公式。
+
+    ⚠ 回款公式 2026-10-06 改口径:`期末余额 − 押款额`,**不再减 reserve**
+    (期末余额里已经扣过备用金,实证见 test_daily_report 的两店对账用例)。
+    本用例只负责结构与解码,金额断言跟着新口径走。
+    """
     stmt = {
         "partnerId": "P1",
         "payload": {
@@ -221,8 +228,9 @@ def test_extract_settlement_legacy_shape():
     }
     out = kpi.extract_settlement(stmt)
     assert out["seller_id"] == "12345"          # URL 解码后才匹配得上
-    assert out["payout"] == 75.0                # closing − reserve − hold
-    assert out["no_hold"] is False              # 75 < 100
+    assert out["payout"] == 95.0                # closing − hold(reserve 不参与)
+    assert out["no_hold"] is False              # 95 < 100
+    assert out["hold_amount"] == 5.0            # 押款额单独成列(2026-10-11)
     assert out["reserve_to_date"] == 10.5 and out["payment_status"] == "ACTIVE"
     # 非 ACTIVE → 回款强制 0
     stmt["payload"]["sellerInfo"]["paymentStatus"] = "HOLD"

@@ -592,14 +592,23 @@ def sheet_list(sheet: Spreadsheet) -> list[tuple[str, str]]:
             for m in data.get("sheets") or []]
 
 
-def sheet_row_count(sheet: Spreadsheet) -> int:
-    """输入:电子表格登记条目 → 输出:网格总行数(grid_properties.row_count)。"""
-    s = sheet.require()
+def _grid_prop(s: Spreadsheet, key: str) -> int:
+    """输入:已 require 的登记条目 + grid_properties 键 → 输出:网格行数或列数。"""
     data = _call("GET", f"/open-apis/sheets/v3/spreadsheets/{_sheet_token(s)}/sheets/query")
     for meta in data.get("sheets") or []:
         if meta.get("sheet_id") == s.sheet_id:
-            return int((meta.get("grid_properties") or {}).get("row_count") or 0)
+            return int((meta.get("grid_properties") or {}).get(key) or 0)
     raise FeishuError(None, f"电子表格「{s.name}」中找不到 sheet_id={s.sheet_id}")
+
+
+def sheet_row_count(sheet: Spreadsheet) -> int:
+    """输入:电子表格登记条目 → 输出:网格总行数(grid_properties.row_count)。"""
+    return _grid_prop(sheet.require(), "row_count")
+
+
+def sheet_col_count(sheet: Spreadsheet) -> int:
+    """输入:电子表格登记条目 → 输出:网格总列数(grid_properties.column_count)。"""
+    return _grid_prop(sheet.require(), "column_count")
 
 
 def sheet_ensure_rows(sheet: Spreadsheet, need_rows: int) -> int:
@@ -620,6 +629,33 @@ def sheet_ensure_rows(sheet: Spreadsheet, need_rows: int) -> int:
             if remaining > 0:
                 time.sleep(_SHEET_WRITE_THROTTLE_SECS)
         logger.info("电子表格「%s」扩行 %d(%d → %d)", s.name, add, current, need_rows)
+        return add
+
+
+def sheet_ensure_cols(sheet: Spreadsheet, need_cols: int) -> int:
+    """输入:登记条目 + 需要的总列数 → 输出:本次扩充的列数(网格不足时 add-dimension)。
+
+    与 sheet_ensure_rows 同一套路,维度换成 COLUMNS。⚠ 缺了它的后果不是"少写两列"
+    而是**整页一行都不更新**:整表重写是按 A1:<末列><行数> 一次性 put 的,范围超出
+    网格宽度会被飞书整个拒掉。2026-10-11 看板由 32 列加到 34 列时补上 —— 此前
+    扩行有、扩列没有,加列这件事全靠人记得先去飞书手动拖宽。
+    """
+    s = sheet.require()
+    with _sheet_lock(s.token):
+        current = sheet_col_count(s)
+        if current >= need_cols:
+            return 0
+        add = need_cols - current
+        remaining = add
+        while remaining > 0:      # 单次上限同扩行,分块扩
+            step = min(remaining, _SHEET_DIMENSION_MAX)
+            _call("POST", f"/open-apis/sheets/v2/spreadsheets/{_sheet_token(s)}/dimension_range",
+                  json_body={"dimension": {"sheetId": s.sheet_id,
+                                           "majorDimension": "COLUMNS", "length": step}})
+            remaining -= step
+            if remaining > 0:
+                time.sleep(_SHEET_WRITE_THROTTLE_SECS)
+        logger.info("电子表格「%s」扩列 %d(%d → %d)", s.name, add, current, need_cols)
         return add
 
 
@@ -1027,6 +1063,7 @@ def sheet_overwrite(sheet: Spreadsheet, rows: list[list]) -> int:
     # 删尾部那一步会按**自己**算的 len(rows) 去删,把人家刚写的行删掉。
     with _sheet_lock(s.token):
         sheet_ensure_rows(s, len(rows))
+        sheet_ensure_cols(s, n_cols)        # 加列的那天不至于整页写不进去
 
         written = _sheet_put(s, _split_rows(rng, rows), total_rows=len(rows))
 

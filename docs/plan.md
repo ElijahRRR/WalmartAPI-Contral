@@ -79,6 +79,18 @@ TRO 跨仓边界(暂放)。
 maintenance/list_new)→ 按域停旧切换。
 **✅ 2026-08-17 全部完成** —— 验收记录见 `docs/production_cutover.md` §九。
 
+### 2026-10-14 product_chain 的 L0 扫描面:在架即扫,不看是不是 pass(所有者定稿)
+
+**所有者原话**:「此刻仍挂在沃尔玛目录上就需要扫,不一定 pass,因为有时产品有些
+变化,数据库会把该产品翻为 pending」。`product_audit -p mode=online` 的候选谓词从
+`audit_status = 'approved'` 改为 `audit_status IS DISTINCT FROM 'rejected'`:在架的
+approved / pending / 从没审过(NULL)都进 L0。此前 product_ingest 在 slow_hash 变了
+时把 approved 翻回 pending,这批仍在架的品整整漏在每日黑名单扫描面外。
+**只排 rejected**:已是终判、problem_scan 按 `rejected_still_listed` 本就建删除建议;
+且它命中后 status 不变 ⇒ 永不退出候选,每天重命中一次就重写一次 runs/hits/events。
+L0 未命中仍不落结论、不盖版本、不写 pass(pending 保持 pending,照常走 1 天退避的
+全链重审)。`mode=pass`(全库 approved 的人工通道)不变。
+
 ### 2026-09-25 每店单品最大库存 + 维护补回门槛 5 + node_clear 改为库内数据批量清旧仓(所有者定稿)
 
 **需求**:按店限制在线商品的库存。限额表新建「最大库存」列(**不复用「库存特殊

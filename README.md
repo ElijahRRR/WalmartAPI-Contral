@@ -506,7 +506,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 | `item_id_sync` | 每天 05:00 | `item_id_sync`(有缺口的店各拿一份 ITEM 报表补 item_id;首轮手动 `-p all=1`) |
 | `daily_report` | 每天 06:40 | `catalog_sync` → `daily_report`(产品三列取今早现状,不再差一天) |
 | `order_daily` | 每天 07:30 | `perf_problems` → `order_asin_normalize` |
-| `product_chain` | 每天 13:00 | `catalog_sync` → `sources_backfill` → `product_refresh`(wait=1,采完就地按批摄取)→ `product_audit`(mode=online + stages=L0,在架 pass 重过 L0)→ `maintenance_scan` → `problem_scan` → `maintenance` → `problem_product_cleanup`(建议期在前、执行期在后,2026-08-24) |
+| `product_chain` | 每天 13:00 | `catalog_sync` → `sources_backfill` → `product_refresh`(wait=1,采完就地按批摄取)→ `product_audit`(mode=online + stages=L0,在架行重过 L0:approved/pending/未审都扫,只排 rejected)→ `maintenance_scan` → `problem_scan` → `maintenance` → `problem_product_cleanup`(建议期在前、执行期在后,2026-08-24) |
 | `blacklist` | 每天 15:00 | `risk_sync` → `blacklist_push` |
 | `product_clear` | 每天 15:00 | `product_clear` |
 | `audit_sheet` | 每天 18:10 | `product_audit -p from_sheet=1` |

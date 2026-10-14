@@ -173,7 +173,8 @@ JOBS = (
     # 自己推的批(批次端点,无锁),维护判据当轮就是刚采回的值;全局对齐归
     # 单独长驻的 product_ingest(launchd 每小时)
     # product_audit 排在 problem_scan **紧前面**(所有者定稿 2026-08-22):
-    # 在架 pass 重过 L0(纯查库零 LLM)→ 今天新拉黑/新禁售的东西当天翻成
+    # 在架行重过 L0(纯查库零 LLM;approved/pending/未审都扫,只排 rejected,
+    # 所有者 2026-10-14)→ 今天新拉黑/新禁售的东西当天翻成
     # rejected → 紧接着 problem_scan 按 audit_listing_conflicts 建删除建议
     # → problem_product_cleanup 执行。三步同一轮闭环,不用等第二天。
     # ⚠ **建议期与执行期分开编排**(所有者定稿 2026-08-24):
@@ -186,7 +187,7 @@ JOBS = (
     #   本仓吃过"顺序即语义"的亏,不再让调度表承载判据。
     #   product_audit 跟着 problem_scan 一起前移,紧邻关系不变。
     # ⚠ 两个参数一个都不能少:
-    #   mode=online  只扫在架行(不在架的翻案下游产不出动作,白扫)
+    #   mode=online  只扫在架行、不看是不是 pass(不在架的翻案下游产不出动作,白扫)
     #   stages=L0    纯查库零 LLM(run() 里钉死,少了会被拒绝启动)
     # ⚠ 而 limit **一个都不许给**:这条**没有天然分页**(未命中不落结论不盖
     #   版本、不退出候选),给了小 limit 就每天从头扫同一批前缀,尾巴永远轮不到

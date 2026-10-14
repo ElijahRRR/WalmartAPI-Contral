@@ -349,14 +349,16 @@ Made in USA 五条硬拒,外加一条 0 分软证据(品牌黑名单扫文案,**
 | `-p asins=A,B` | 点名这几个,无视现有结论 | 排查单品 |
 | `-p mode=nonpass` | **非 pass 全部**(rejected + pending + 未审) | **判定标准改了**,整批用新标准重认一次 |
 | `-p mode=pass -p stages=L0` | 现役 pass,**只重过 L0** | 黑名单在长,放行过的行也要被新拉黑覆盖;L0 未命中**保持原状不动**,命中即 reject |
+| `-p mode=online -p stages=L0` | **在架且非 rejected**(approved / pending / 未审),只重过 L0 | **唯一进调度的一条**(product_chain 13:00):今天新拉黑的在架品当天翻拒 → problem_scan 建删除建议;L0 未命中保持原状(2026-10-14 起不再限 approved) |
 | `-p rerule=<规则码>` | 历史命中过某条规则、现仍 rejected | 只改了一条规则,定点翻案 |
 | `-p force_rerun=<旧版本>` | `audit_version` ≠ 该值的**全部**(含 pass) | 全链全库重审,最贵 |
 | `-p mode=pending` | 只重刷 pending,无退避 | LLM 故障恢复后排空待定存量 |
 | `-p mode=stale -p active_days=90` | `approved` 且版本落后、**且近 N 天有动销** | 判据提版后消化存量;`active_days` 缺省 90,`=0` 显式不按动销过滤(全量 approved,最贵)。动销口径 = `orders.order_lines` 上按 `asin` 列、窗口打 `order_date`、只排 `Cancelled`(与 `alloc_survey` 同一条口径)|
 
-`mode=nonpass` / `mode=pass` / `mode=pending` / `rerule` 都带**版本闸做天然分页**
-(`mode=pass` 除外,它未命中不盖版本,须一次大 limit 扫完):真跑判过的自动
-退出候选集,`limit` 撞满再跑一轮接着判,不会原地打转。
+`mode=nonpass` / `mode=stale` / `rerule` 带**版本闸做天然分页**:真跑判过的自动
+退出候选集,`limit` 撞满再跑一轮接着判,不会原地打转。`mode=pass` / `mode=online`
+**没有**版本闸(L0 未命中不盖版本、不退出候选),所以**别给 limit**(2026-09-03 起
+缺省不限量;给个小 limit 只会每轮重扫同一批前缀)。
 
 ### 6.4 上架域
 
@@ -506,7 +508,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 | `item_id_sync` | 每天 05:00 | `item_id_sync`(有缺口的店各拿一份 ITEM 报表补 item_id;首轮手动 `-p all=1`) |
 | `daily_report` | 每天 06:40 | `catalog_sync` → `daily_report`(产品三列取今早现状,不再差一天) |
 | `order_daily` | 每天 07:30 | `perf_problems` → `order_asin_normalize` |
-| `product_chain` | 每天 13:00 | `catalog_sync` → `sources_backfill` → `product_refresh`(wait=1,采完就地按批摄取)→ `product_audit`(mode=online + stages=L0,在架 pass 重过 L0)→ `maintenance_scan` → `problem_scan` → `maintenance` → `problem_product_cleanup`(建议期在前、执行期在后,2026-08-24) |
+| `product_chain` | 每天 13:00 | `catalog_sync` → `sources_backfill` → `product_refresh`(wait=1,采完就地按批摄取)→ `product_audit`(mode=online + stages=L0,在架行重过 L0:approved/pending/未审都扫,只排 rejected)→ `maintenance_scan` → `problem_scan` → `maintenance` → `problem_product_cleanup`(建议期在前、执行期在后,2026-08-24) |
 | `blacklist` | 每天 15:00 | `risk_sync` → `blacklist_push` |
 | `product_clear` | 每天 15:00 | `product_clear` |
 | `audit_sheet` | 每天 18:10 | `product_audit -p from_sheet=1` |

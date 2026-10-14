@@ -27,9 +27,10 @@
                                                     # 未命中不退出候选 ⇒ **别给 limit**
                                                     # (给了就每轮重扫同一批前缀)
   python cli.py product_audit -p mode=online -p stages=L0
-                                                    # **在架** pass 重过 L0(product_chain
-                                                    # 每天 13:00 跑这一条);翻成 rejected 的
-                                                    # 由紧随其后的 problem_scan 建删除建议
+                                                    # **在架**行重过 L0(product_chain 每天
+                                                    # 13:00 跑这一条;approved/pending/未审都扫,
+                                                    # 只排 rejected,2026-10-14);翻成 rejected
+                                                    # 的由紧随其后的 problem_scan 建删除建议
   python cli.py product_audit -p l3=off                    # 关 L3 语义层(省 LLM 配额)
   python cli.py product_audit -p l4=on                     # 开 L4 视觉(默认关,批复 #2)
   python cli.py product_audit -p from_sheet=1              # 上架表驱动:审真待审的 + 回填审核六列
@@ -235,7 +236,7 @@ _KNOWN_PARAMS = {"asins", "limit", "mode", "force_rerun", "rerule",
 # 上线当天就是这么炸的:`--dry-run` 直接让 product_audit 起不来)
 _CLI_INJECTED = {"execute", "dry_run"}
 # mode 取值白名单:backfill=只补没审过的;pending=只重刷待定(无退避);
-# pass=现役 pass 重过 L0;online=**在架** pass 重过 L0(链上那条);
+# pass=现役 pass 重过 L0;online=**在架**非 rejected 行重过 L0(链上那条);
 # nonpass=非 pass 全量重判
 _MODES = {"backfill", "pending", "pass", "online", "nonpass", "stale"}
 
@@ -474,12 +475,20 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # 所以**别给 limit**(缺省就是不限量;L0 纯查库,几十万行也就多几分钟)。
         return "p.audit_status = 'approved'", {}
     if mode == "online":
-        # **在架** pass 重过 L0(所有者定稿 2026-08-22:接进 product_chain,
+        # **在架**行重过 L0(所有者定稿 2026-08-22:接进 product_chain,
         # 排在 problem_scan 之前 —— 今天新拉黑的东西当天就能变成删除建议)。
-        # 与 mode=pass 只差范围:那条扫全库 approved(几十万行),这条只扫
-        # 此刻还挂在沃尔玛上的。下游 problem_scan 只认在架行
-        # (audit_listing_conflicts.rejected_still_listed),不在架的翻案
-        # 产不出任何动作 —— 白扫一遍还把 audit_runs 灌大。
+        # 范围只看"此刻还挂在沃尔玛上",**不看是不是 pass**(所有者 2026-10-14:
+        # 「此刻仍挂在沃尔玛目录上就需要扫,不一定 pass,因为有时产品有些变化,
+        # 数据库会把该产品翻为 pending」—— product_ingest 在 slow_hash 变了时把
+        # approved 翻回 pending,这批在架品此前整整漏在 L0 扫描面外;从没审过
+        # (NULL)却在架的行同理)。此前这里是 `audit_status = 'approved'`。
+        # **只排 rejected**:它已经是终判、下游 problem_scan 按 rejected_still_listed
+        # 本就会建删除建议;而且它命中后 status 不变 ⇒ **永不退出候选**,每天
+        # 重命中一次就重写一次 runs/hits/events,把账本灌成每日流水。
+        # `IS DISTINCT FROM`(不是 `<>`):NULL 要进来,`<>` 对 NULL 求值为 NULL
+        # 会整批漏掉且不报错(mode=nonpass 同款告诫)。
+        # 下游 problem_scan 只认在架行(audit_listing_conflicts.rejected_still_listed),
+        # 不在架的翻案/首判产不出任何动作 —— 白扫一遍还把 audit_runs 灌大。
         # 口径是 `missing_since IS NULL`(还在目录里),**不加**
         # published_status:UNPUBLISHED 的行也占着账号、也删得掉。
         # ⚠ 与 mode=pass 同样**没有天然分页**(机械见 _pick_where 头注),
@@ -493,7 +502,7 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # 第一条腿逐字保留今天的语义(走 walmart_items_sku_idx),第二条腿经
         # 登记簿(走 listing_sources_key_idx)**只覆盖新码** —— 存量 amz 行
         # source_key = sku,是第一条腿的子集,切换后才开始起作用。
-        return ("p.audit_status = 'approved' AND (EXISTS ("
+        return ("p.audit_status IS DISTINCT FROM 'rejected' AND (EXISTS ("
                 "SELECT 1 FROM catalog.walmart_items w "
                 "WHERE w.sku = p.asin AND w.missing_since IS NULL) OR EXISTS ("
                 "SELECT 1 FROM catalog.listing_sources ls "
@@ -565,8 +574,8 @@ def _candidate_what(params: dict) -> tuple[str, str]:
         return ("现役 pass 全量重过 L0(黑名单翻案;**无天然分页**,别给 limit)",
                 "一个都没有:库里没有 approved 的行")
     if mode == "online":
-        return ("**在架** pass 重过 L0(**无天然分页**,别给 limit)",
-                "一个都没有:没有在架且 approved 的行")
+        return ("**在架**行重过 L0(approved/pending/未审都扫,只排 rejected;**无天然分页**,别给 limit)",
+                "一个都没有:没有在架且非 rejected 的行")
     return ("缺省口径:未审 + pending 过 1 天退避 + approved 但判据版本过期的",
             "一个都没有:全库都按当前版本判过了")
 
@@ -1732,8 +1741,9 @@ def _summary(opts: Opts, counts: Counts, stage_stats: dict, l1s: dict,
               f"/待定 {counts.verdicts['pending']})"]
     if opts.only_l0:
         lines.append(
-            f"stages=L0:Phase0 未命中 {counts.l0_untouched} 个**保持原结论**"
-            f"(不落 runs、不盖版本,仍在候选集 —— 要终局请补全链重审)")
+            f"stages=L0:Phase0 未命中 {counts.l0_untouched} 个**保持原状态**"
+            f"(approved 仍 approved、pending/未审仍无结论;不落 runs、不盖版本,"
+            f"仍在候选集 —— 要终局请补全链重审)")
     if l1s.get("llm_called", 0) or l1s.get("no_candidate", 0):
         lines.append(f"L1 rerank:调用 {l1s['llm_called']}"
                      f"(失败 {l1s.get('llm_failed', 0)}/坏 JSON {l1s.get('bad_json', 0)}),"

@@ -253,16 +253,25 @@ def test_pick_where_four_states():
 
 
 def test_pick_where_online_scopes_to_listed_rows():
-    """mode=online:**在架** pass 重过 L0(product_chain 每天 13:00 那条)。
+    """mode=online:**在架**行重过 L0(product_chain 每天 13:00 那条)。
 
-    与 mode=pass 只差范围。为什么要收窄:下游 problem_scan 只认在架行
-    (`audit_listing_conflicts.rejected_still_listed`),不在架的翻案产不出
-    任何动作 —— 白扫一遍还把 audit_runs 灌大。
+    范围只看"此刻还挂在沃尔玛上",**不看是不是 pass**(所有者 2026-10-14:
+    产品有变化时 product_ingest 把 approved 翻回 pending,翻回去的在架品一样要
+    过黑名单;从没审过却在架的也要)。**只排 rejected**:已是终判、下游本就建
+    删除建议,且命中后不退出候选会把 runs/hits/events 灌成每日流水。
+    `IS DISTINCT FROM` 不是 `<>`:NULL 要进来。
+    下游 problem_scan 只认在架行(`audit_listing_conflicts.rejected_still_listed`),
+    不在架的翻案产不出任何动作 —— 白扫一遍还把 audit_runs 灌大。
     口径是 `missing_since IS NULL`(还在目录里),**不加** published_status:
     UNPUBLISHED 的行也占着账号、也删得掉。
     """
     w, e = product_audit._pick_where({"mode": "online"})
-    assert "p.audit_status = 'approved'" in w and e == {}
+    assert "p.audit_status IS DISTINCT FROM 'rejected'" in w and e == {}
+    assert "p.audit_status = 'approved'" not in w      # 2026-10-14 前的旧口径
+    assert "<> 'rejected'" not in w                    # NULL 行会被 <> 漏掉
+    # mode=pass 不跟着变:它是"全库 approved 重过 L0"的人工通道
+    w_pass, _ = product_audit._pick_where({"mode": "pass"})
+    assert w_pass == "p.audit_status = 'approved'"
     assert "catalog.walmart_items" in w and "missing_since IS NULL" in w
     assert "published_status" not in w
     assert "online" in product_audit._MODES
@@ -2423,7 +2432,7 @@ def test_candidate_what_covers_every_pick_where_branch():
         "nonpass": ({"mode": "nonpass"}, "非 pass 全量重判"),
         "stale": ({"mode": "stale"}, "版本重审"),
         "pass": ({"mode": "pass"}, "现役 pass 全量重过 L0"),
-        "online": ({"mode": "online"}, "**在架** pass"),
+        "online": ({"mode": "online"}, "**在架**行重过 L0"),
         "缺省": ({}, "缺省口径"),
     }
     for name, (params, want) in cases.items():

@@ -56,7 +56,11 @@
 含 rejected)、`-p rerule=<rule_code>`(只翻某一条规则的历史命中)、`-p repts=1`
 (飞书类目表判据在我判过之后变过的那批 rejected)、`-p mode=pending` /
 `mode=nonpass`(非 approved 全量)/ `mode=stale`(approved 版本落后,必须全链)/
-`mode=pass`、`mode=online`(只与 `stages=L0` 连用)。
+`mode=pass`(全库 approved)、`mode=online`(**此刻在架**:`walmart_items.missing_since
+IS NULL`,经 `walmart_items.sku=asin` 或 `listing_sources` 两条腿任一关联,且
+`audit_status IS DISTINCT FROM 'rejected'` —— 2026-10-14 起不再限 approved,在架的
+pending / 未审一并过黑名单;只排已是终判的 rejected)—— 两者只与 `stages=L0` 连用,
+`mode=online` 是 product_chain 每天 13:00 跑的那条。
 
 **`mode=stale` 还带一道动销闸**(2026-09-02 B2,所有者定稿
 `docs/audit_step3_spec.md` §六.8:「只跑近 90 天有动销的一批,不再全量重付」):

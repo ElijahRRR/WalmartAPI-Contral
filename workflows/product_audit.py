@@ -488,7 +488,7 @@ def _pick_where(params: dict) -> tuple[str, dict]:
         # `IS DISTINCT FROM`(不是 `<>`):NULL 要进来,`<>` 对 NULL 求值为 NULL
         # 会整批漏掉且不报错(mode=nonpass 同款告诫)。
         # 下游 problem_scan 只认在架行(audit_listing_conflicts.rejected_still_listed),
-        # 不在架的翻案产不出任何动作 —— 白扫一遍还把 audit_runs 灌大。
+        # 不在架的翻案/首判产不出任何动作 —— 白扫一遍还把 audit_runs 灌大。
         # 口径是 `missing_since IS NULL`(还在目录里),**不加**
         # published_status:UNPUBLISHED 的行也占着账号、也删得掉。
         # ⚠ 与 mode=pass 同样**没有天然分页**(机械见 _pick_where 头注),
@@ -1741,8 +1741,9 @@ def _summary(opts: Opts, counts: Counts, stage_stats: dict, l1s: dict,
               f"/待定 {counts.verdicts['pending']})"]
     if opts.only_l0:
         lines.append(
-            f"stages=L0:Phase0 未命中 {counts.l0_untouched} 个**保持原结论**"
-            f"(不落 runs、不盖版本,仍在候选集 —— 要终局请补全链重审)")
+            f"stages=L0:Phase0 未命中 {counts.l0_untouched} 个**保持原状态**"
+            f"(approved 仍 approved、pending/未审仍无结论;不落 runs、不盖版本,"
+            f"仍在候选集 —— 要终局请补全链重审)")
     if l1s.get("llm_called", 0) or l1s.get("no_candidate", 0):
         lines.append(f"L1 rerank:调用 {l1s['llm_called']}"
                      f"(失败 {l1s.get('llm_failed', 0)}/坏 JSON {l1s.get('bad_json', 0)}),"

@@ -87,9 +87,15 @@ maintenance/list_new)→ 按域停旧切换。
 approved / pending / 从没审过(NULL)都进 L0。此前 product_ingest 在 slow_hash 变了
 时把 approved 翻回 pending,这批仍在架的品整整漏在每日黑名单扫描面外。
 **只排 rejected**:已是终判、problem_scan 按 `rejected_still_listed` 本就建删除建议;
-且它命中后 status 不变 ⇒ 永不退出候选,每天重命中一次就重写一次 runs/hits/events。
-L0 未命中仍不落结论、不盖版本、不写 pass(pending 保持 pending,照常走 1 天退避的
-全链重审)。`mode=pass`(全库 approved 的人工通道)不变。
+且它命中后 status 不变 ⇒ 永不退出候选,每天重命中一次就重写一次 runs/hits/events
+—— 还会把 `audited_at` 天天推到 now(),让 `repts` 通道的候选谓词
+(`c.changed_at > p.audited_at`)永远查空,并让视图 `rejected_after_listing` /
+`audit_reject_times` 被每日事件污染。rejected 行要刷黑名单理由走专用通道
+`-p rerule=<规则码> -p stages=L0`。
+L0 未命中仍不落结论、不盖版本、不写 pass(approved 仍 approved,pending/未审仍无
+结论;它们的全链重审仍走缺省谓词 —— 调度里只有 audit_sheet 18:10 跑缺省谓词且只对
+上架表里的 ASIN,其余靠人工 `mode=pending` / 缺省跑)。`mode=pass`(全库 approved
+的人工通道)不变。
 
 ### 2026-09-25 每店单品最大库存 + 维护补回门槛 5 + node_clear 改为库内数据批量清旧仓(所有者定稿)
 

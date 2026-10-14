@@ -91,6 +91,12 @@
 > 🔴 §七 开头补一条贯穿纪律「字段名以线上实回为准,不以官方文档样例为准」
 > ——#140 实证官方样例写 `holdAmt`、线上回 `holdAmount`,而本设计的字段表正是
 > 从 eBay 文档抄的,暴露面一字不差。
+> **2026-10-14 对齐 main #141**(product_chain 的 L0 扫描面改 `IS DISTINCT FROM
+> 'rejected'`):§2.3 补两条——① 扫描面与入料面是两个谓词、问的是两件事
+> (「要不要查」vs「能不能上」),eBay 入料**继续** `= 'approved'`,照抄扫描面
+> 会把没过审的品发上 eBay;② #141 顺带证实「在架但 NULL/pending」不是空集,
+> 故 `= 'approved'` 的代价不止"品类连坐"一种,P1-4 量化时把这一类条数也数出来
+> (高得意外是二期「给 eBay 单独走审核」的输入,不是放宽谓词的理由)。
 > ⚠ 本文引用的仓库行号以 **2026-09-23 的 main(06140c3)** 为快照(§2.1/§2.2/
 > §3.2 已按它重定位;其余节仍是 09-07 快照),批次实施时现场重定位。
 
@@ -293,6 +299,19 @@ SKU↔offerId/listingId 权威在 `ops.feed_items`)。
 - 审核:入料谓词 `p.audit_status='approved'`(结论是沃尔玛政策口径,代价=
   品类连坐收窄;`risk_product_types` 内连接 + `walmart_pt<>'unknown'` 三重
   收窄**一期保留**作 fail-safe,P1-4 验收量化一次"去掉后候选数变化")。
+  ⚠ **别把它跟「扫描面」的谓词搞混(2026-10-14 对齐 main #141)**:#141 把
+  `product_audit -p mode=online` 的 L0 候选从 `audit_status = 'approved'` 改成
+  **`audit_status IS DISTINCT FROM 'rejected'`**(所有者原话「此刻仍挂在沃尔玛
+  目录上就需要扫,不一定 pass」),`mode=pass` 不变。两个谓词问的是两件事:
+  **扫描面问"要不要查"**(在架即扫,NULL / pending 都进),**入料面问"能不能
+  上"**(未审 / pending **一律不上**)。eBay 入料继续用 `= 'approved'`,
+  照抄扫描面那个会把**没过审的品发到 eBay 上去**。
+  ⚠ 但 #141 顺带证实了一件事,原稿漏写:`audit_status` 为 **NULL / pending 且
+  仍在沃尔玛在架**的品**不是空集**(否则 L0 改这个谓词毫无意义)。所以
+  `= 'approved'` 的代价**不只是"品类连坐"那一种**,还有"沃尔玛在架但没过审"
+  这一整类——它们在一期拿不到 eBay 上架资格(拍板 ⑤ 复用审核结果的直接后果,
+  不是 bug)。P1-4 那次量化**顺带把这一类的条数也数出来**:若占比高得意外,
+  那是「要不要给 eBay 单独走一遍审核」的二期输入,而不是悄悄放宽谓词的理由。
 
 ## 三、P1-1 基建批次(约 7 人日)
 
@@ -896,7 +915,7 @@ api 留签名。要做=+4~5 人日,四项前置:①UPC 结构裁决落地(本文
 | 批次 | 内容 | 人日 | 验收要点 |
 |---|---|---|---|
 | P1-1 | _http 抽取+registry(含 platforms.py/飞书两表)+ebay_accounts+_client+tokens+authorize+runbook+文档勘误回改 | 7 | 沃尔玛 pytest 全绿(18 处 monkeypatch 例外清单)/sandbox 与 production 各铸令牌+getRateLimits/进程超时 90.0 冒烟/账号互斥断言单测(含停用店名反例)/state 不符抛错单测 |
-| P1-2 | 全部 DDL(**含 `upc_usage` 对位部分索引,§2.2**)+claims/upc 改造+台账谓词补全+**risk_trace 四证据源谓词(§4.4)**+events 契约 | 7 | db_init 两跑(**记录是否踩到 `lock_timeout 30s`,§4.5**)+六格对拍+读 SQL count·md5 对拍+**取号/烧号 EXPLAIN 走 `upc_usage` 部分索引**/沃尔玛上架与分配链 --dry-run 摘要逐字一致(claims 11 读+3 写+3 事件桥、upc 7 写+6 读投影,**含 `alloc_plan -p from_sheet=1` 点名分配那条路径**——预期红清单按 §2.1/§2.2 的现场重核数,别按旧稿的 9+2)/UPC 三级取号+烧号保护+「烧后重上领新号」单测/飞书 UPC 表投影逐行对拍/browse_node_id 空行占比落数/**risk_trace 展开结果不含 eBay 账号**(造 claims+listing_sources+product_events 三条 eBay 行) |
+| P1-2 | 全部 DDL(**含 `upc_usage` 对位部分索引,§2.2**)+claims/upc 改造+台账谓词补全+**risk_trace 四证据源谓词(§4.4)**+events 契约 | 7 | db_init 两跑(**记录是否踩到 `lock_timeout 30s`,§4.5**)+六格对拍+读 SQL count·md5 对拍+**取号/烧号 EXPLAIN 走 `upc_usage` 部分索引**/沃尔玛上架与分配链 --dry-run 摘要逐字一致(claims 11 读+3 写+3 事件桥、upc 7 写+6 读投影,**含 `alloc_plan -p from_sheet=1` 点名分配那条路径**——预期红清单按 §2.1/§2.2 的现场重核数,别按旧稿的 9+2)/UPC 三级取号+烧号保护+「烧后重上领新号」单测/飞书 UPC 表投影逐行对拍/browse_node_id 空行占比落数+**「沃尔玛在架但 audit_status 为 NULL/pending」的条数落数(§2.3)**/**risk_trace 展开结果不含 eBay 账号**(造 claims+listing_sources+product_events 三条 eBay 行) |
 | P1-3 | bootstrap+taxonomy+catmap 测试链+account_health | 6 | sandbox 户口链重入两遍/生产拉真树+版本哨兵/aspects 解耦拉取(新 promote 类目当日拿到 aspects)/promote 三格(缺省中、入料只吃高、置高路径逐条点名)/refresh 探活停链 |
 | P1-4 | 中立抽取(3)+admission/conform/pricing+api 两文件+list_new+submit_poll+**`refdata/ebay_slas.tsv`(官方期限登记表,§6.5)**+飞书投影 | 15 | 沙箱清单 13 项完成/sandbox 端到端 3 SKU PUBLISHED/防重三态+熔断+双闸+重试闸单测/**抽码即登记单测**(eBay 行落 `listing_sources` 且 `abandoned_at IS NULL`、码形符 `OPAQUE_SQL_PREDICATE`、`-p dry_run` 走 `DRYRUN_PLACEHOLDER` 不落码)/**残局单测:造一条「`feed_log` pending 但无 `feed_items` 行」,断言 `list_new` 下一轮不选中该 SKU、`submit_poll` 的选行面选得中它**/--dry-run 人眼确认/中立抽取后沃尔玛输出逐字不变 |
 | P1-5 | 生产单账号试点 | 2+观察 | 首批 ≤10 条人工放行类目/真实 PUBLISHED/错误账收官/两周观察后再谈放量。**界定:试点 ≠ ebay_plan 批次 10;试点期不拉订单、库内无买家数据,不触发合规订阅义务;放量、拉订单、提额之前批次 11 仍是硬门槛** |

@@ -27,6 +27,11 @@ productIdentifiers 取库里 `catalog.walmart_items.upc`,与维护链改标题�
   · 库里这条没有 UPC:载荷必填,拿不到不猜;
   · 店铺不在可调用列表里(未启用 / 没代理 / 没凭证)。
 
+**请求没发出 ≠ 被拒**(2026-10-16 生产实见:A085朱丽霖 代理 TLS 握手 EOF):取 token /
+代理阶段失败时请求根本没到沃尔玛,台账落 failed、可原样重占。这种店按店维标准
+**串行补试一遍**,仍失败就在摘要首行点名「N 条请求没发出」,修好代理直接重跑即可。
+沃尔玛明确拒收(4xx)不补试,摘要写「沃尔玛拒收」。
+
 ⚠ **回执 SUCCESS 不等于改成了**。MP_MAINTENANCE 有过"回执成功、内容静默丢弃"的
 生产实证(2026-09-04 带 SkuUpdate 的改码 feed,那是规范外字段)。ShippingWeight 在
 规范内,但本仓从没用这个通道改过重量,所以**第一次真跑先 `-p limit=1`**,等回执
@@ -138,6 +143,10 @@ def read_list(path: str, sheet: str = "") -> tuple[dict[str, list[str]], dict]:
     return by_store, stat
 
 
+class _NotSent(Exception):
+    """本店有切片请求没发出(取 token / 代理阶段失败)→ 交 fan_out 串行补试一遍。"""
+
+
 def build_item(sku: str, upc: str, weight: float) -> dict:
     """输入:SKU + UPC + 磅数 → 输出:MP_MAINTENANCE 只改发货重量的 MPItem。
 
@@ -150,11 +159,14 @@ def build_item(sku: str, upc: str, weight: float) -> dict:
 
 
 def _fix_store(store: dict, skus: list[str], weight: float, limit: int,
-               preview: bool) -> dict:
+               preview: bool, not_sent: dict | None = None) -> dict:
     """输入:店铺 + 名单里该店的 SKU + 磅数 + 单店上限 + 是否空跑 → 输出:{name, lines, 各计数}。
 
     读库失败或提交时凭证死直接抛,交 fan_out 按店维标准处理(失败店串行补试一遍;
     补试时同一批载荷若已提交成功,feed 台账防重会拦成 dedup,不会重复提交)。
+    请求**没发出**的切片(取 token / 代理阶段失败,submit_feed 标 retryable)也抛
+    `_NotSent` 交补试:那一片在台账里是 failed、可原样重占,补交的是同一载荷。
+    `not_sent` 记下哪家店是这种失败,补试仍失败时摘要照实写「请求没发出」。
     """
     name = store["name"]
     with db.pg_conn() as conn, conn.cursor() as cur:
@@ -169,7 +181,8 @@ def _fix_store(store: dict, skus: list[str], weight: float, limit: int,
         ready = ready[:limit]
     res = {"name": name, "lines": [], "listed": len(skus), "planned": len(ready),
            "not_found": len(not_found), "no_upc": len(no_upc), "held": held,
-           "submitted": 0, "dedup": 0, "failed": 0, "unknown": 0, "feeds": []}
+           "submitted": 0, "dedup": 0, "failed": 0, "unknown": 0, "not_sent": 0,
+           "feeds": []}
     line = f"  {name}:名单 {len(skus)} 条,要改 {len(ready)} 条"
     if held:
         line += f"(limit 截下 {held} 条,下次再发)"
@@ -185,16 +198,27 @@ def _fix_store(store: dict, skus: list[str], weight: float, limit: int,
     for r in feeds.submit_feed(store, _FEED_TYPE, entries, workflow="weight_fix"):
         # submit_feed 的结局:submitted / dedup / failed / unknown
         # (不传 defer_settle 就不会有 deferred;真出现了也按不确定报)
-        outcome = (r["outcome"] if r["outcome"] in ("submitted", "dedup", "failed")
-                   else "unknown")
+        if r["outcome"] == "failed" and r.get("retryable"):
+            outcome = "not_sent"        # 取 token / 代理阶段失败:请求没发出,不是被拒
+        elif r["outcome"] in ("submitted", "dedup", "failed"):
+            outcome = r["outcome"]
+        else:
+            outcome = "unknown"
         res[outcome] += r["count"]
         if r.get("feed_id"):
             res["feeds"].append(r["feed_id"])
+    if not_sent is not None:
+        if res["not_sent"]:
+            not_sent[name] = res["not_sent"]
+        else:
+            not_sent.pop(name, None)    # 补试成功:撤掉第一轮的记号
+    if res["not_sent"]:
+        raise _NotSent(f"{name}:{res['not_sent']} 条请求没发出(取 token / 代理阶段失败)")
     parts = [f"已提交 {res['submitted']} 条"]
     if res["dedup"]:
         parts.append(f"同一批还在处理中、防重拦下 {res['dedup']} 条")
     if res["failed"]:
-        parts.append(f"⚠ 被拒 {res['failed']} 条(看日志里的 HTTP 响应)")
+        parts.append(f"⚠ 沃尔玛拒收 {res['failed']} 条(看日志里的 HTTP 响应)")
     if res["unknown"]:
         parts.append(f"⚠ 结局不确定 {res['unknown']} 条"
                      "(feed_poll 的 pending 对账会接手,不要手工补发)")
@@ -245,8 +269,11 @@ def run(params: dict) -> str:
         return (f"{mode}改发货重量 → {weight:g} 磅:没有可调用的店,无事可做;"
                 + read_note + head_skip)
 
+    not_sent: dict[str, int] = {}
+
     def _one(store: dict) -> dict:
-        return _fix_store(store, by_store[store["name"]], weight, limit, preview)
+        return _fix_store(store, by_store[store["name"]], weight, limit, preview,
+                          not_sent)
 
     results, dead, absent, gate_note = store_retry.fan_out(
         store_list, _one, stores_svc.STORE_WORKERS, log_label="改发货重量")
@@ -255,13 +282,15 @@ def run(params: dict) -> str:
             for k in ("planned", "not_found", "no_upc", "held",
                       "submitted", "dedup", "failed", "unknown")}
     missed = [f"{s}(凭证失效)" for s in sorted(dead)] + \
-        [f"{s}({w})" for s, w in sorted(absent)]
+        [f"{s}({w}" + (f",{not_sent[s]} 条请求没发出:取 token / 代理阶段失败"
+                       if s in not_sent else "") + ")"
+         for s, w in sorted(absent)]
     if preview:
         tail = "(dry-run:一条都没发)"
     else:
         tail = (f",已提交 {sums['submitted']} 条,结果由 feed_poll 回写"
                 + (f",防重拦下 {sums['dedup']}" if sums["dedup"] else "")
-                + (f",⚠ 被拒 {sums['failed']}" if sums["failed"] else "")
+                + (f",⚠ 沃尔玛拒收 {sums['failed']}" if sums["failed"] else "")
                 + (f",⚠ 结局不确定 {sums['unknown']}" if sums["unknown"] else ""))
     skipped = []
     if sums["not_found"]:
@@ -273,8 +302,9 @@ def run(params: dict) -> str:
     head = (f"{mode}改发货重量 → {weight:g} 磅:{len(results)} 店,要改 "
             f"{sums['planned']} 条{tail}"
             + (f";不发:{','.join(skipped)}" if skipped else "")
-            + (f";⚠ 失败 {len(missed)} 店:{','.join(missed)}"
-               "(修好后重跑即补,防重会挡住已提交的那批)" if missed else "")
+            + (f";⚠ 失败 {len(missed)} 店(已串行补试一遍):{','.join(missed)}"
+               "(修好后直接重跑即可,没发出的会重发,已提交的被防重挡住、不会重复提交)"
+               if missed else "")
             + head_skip)
     lines = [head, f"  {read_note}"]
     if gate_note:

@@ -157,9 +157,16 @@ def _wire(monkeypatch, callable_stores, catalog, outcome="submitted"):
     monkeypatch.setattr(wf.db, "pg_conn", pg_conn)
     sent: list = []
 
+    seq = list(outcome) if isinstance(outcome, list) else None
+
     def submit_feed(store, feed_type, entries, *, workflow="", defer_settle=False):
         sent.append((store["name"], feed_type, list(entries), workflow))
-        return [{"feed_id": f"F{len(sent)}", "count": len(entries), "outcome": outcome}]
+        o = seq.pop(0) if seq is not None else outcome
+        extra = {}
+        if o == "not_sent":             # submit_feed 对取 token / 代理失败的真实形状
+            o, extra = "failed", {"retryable": True}
+        return [{"feed_id": None if o == "failed" else f"F{len(sent)}",
+                 "count": len(entries), "outcome": o, **extra}]
 
     monkeypatch.setattr(wf.feeds, "submit_feed", submit_feed)
     return seen, sent
@@ -252,3 +259,38 @@ def test_not_scheduled_and_dangerous():
     from registry import schedule
     assert wf.DANGEROUS is True
     assert "weight_fix" not in Path(schedule.__file__).read_text(encoding="utf-8")
+
+
+# ── 请求没发出(取 token / 代理阶段失败):补试一遍,照实点名 ───────────────────
+
+def test_not_sent_is_retried_once_and_named_not_called_rejected(monkeypatch):
+    """2026-10-16 生产实见(A085朱丽霖,代理 TLS 握手 EOF):请求根本没发出,
+    摘要不能写成「被拒」;按店维标准串行补试一遍,仍失败就点名并说明可直接重跑。"""
+    _list(monkeypatch, {"谭总2": ["A"]})
+    _, sent = _wire(monkeypatch, ["谭总2"], {"谭总2": {"A": "1"}},
+                    outcome=["not_sent", "not_sent"])
+    out = wf.run({"file": "x.xlsx"})
+    assert len(sent) == 2                                    # 第一轮 + 串行补试一次
+    first = out.splitlines()[0]
+    assert "失败 1 店(已串行补试一遍):谭总2(" in first
+    assert "1 条请求没发出:取 token / 代理阶段失败" in first
+    assert "被拒" not in out and "拒收" not in out
+
+
+def test_not_sent_then_ok_on_retry(monkeypatch):
+    _list(monkeypatch, {"谭总2": ["A"]})
+    _, sent = _wire(monkeypatch, ["谭总2"], {"谭总2": {"A": "1"}},
+                    outcome=["not_sent", "submitted"])
+    out = wf.run({"file": "x.xlsx"})
+    assert len(sent) == 2
+    first = out.splitlines()[0]
+    assert "已提交 1 条" in first and "失败" not in first
+
+
+def test_walmart_rejection_is_not_retried(monkeypatch):
+    """沃尔玛明确拒收(4xx)不补试:换姿势重试 = 重复提交制造机,原样再发也没用。"""
+    _list(monkeypatch, {"谭总2": ["A"]})
+    _, sent = _wire(monkeypatch, ["谭总2"], {"谭总2": {"A": "1"}}, outcome="failed")
+    out = wf.run({"file": "x.xlsx"})
+    assert len(sent) == 1
+    assert "沃尔玛拒收 1" in out.splitlines()[0]

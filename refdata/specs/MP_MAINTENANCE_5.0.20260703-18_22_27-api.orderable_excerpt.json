@@ -1,0 +1,109 @@
+{
+ "_provenance": {
+  "what": "官方 MP_MAINTENANCE 规范原件的摘录(只摘 Orderable 段;原件含 6700+ PT 的 Visible,约 100MB,不进仓)",
+  "url": "https://developer.walmart.com/file/mp/us/MP_MAINTENANCE.zip",
+  "zip_sha256": "743e5684a7952da39cb3c5aa37f917486f4827b310f056df954699c94d47acb7",
+  "file_in_zip": "5.0.20260703-18_22_27-api_MP_MAINTENANCE_0_0_en.json",
+  "spec_version_enum": [
+   "5.0.20260703-18_22_27-api"
+  ],
+  "extracted": "2026-10-16,脚本逐键拷贝,未改值"
+ },
+ "MPItem_item": {
+  "properties": [
+   "Visible",
+   "Orderable"
+  ],
+  "required": [],
+  "additionalProperties": false
+ },
+ "Orderable": {
+  "required": [
+   "sku",
+   "productIdentifiers"
+  ],
+  "additionalProperties": false,
+  "property_names": [
+   "sku",
+   "productIdentifiers",
+   "externalProductIdentifier",
+   "IsPreorder",
+   "releaseDate",
+   "startDate",
+   "endDate",
+   "removeVariantGroup",
+   "bundle_component_transactable",
+   "stateRestrictions",
+   "country_of_origin_substantial_transformation",
+   "price",
+   "msrp",
+   "automate_pricing",
+   "businessPrice",
+   "shipsInOriginalPackaging",
+   "MustShipAlone",
+   "ShippingWeight",
+   "fulfillmentLagTime",
+   "product_package_dimensions_and_weight"
+  ],
+  "properties": {
+   "sku": {
+    "title": "SKU",
+    "type": "string",
+    "description": "Alphanumeric, 50 characters - The letters and/or numbers a partner uses to identify an item. Walmart includes this value in all communications regarding item information such as orders. Example: TRVAL28726",
+    "examples": [
+     "TRVAL28726"
+    ],
+    "comments": "@group=Headers",
+    "minLength": 1,
+    "maxLength": 50
+   },
+   "productIdentifiers": {
+    "$schema": "http://json-schema.org/draft-07/schema#",
+    "title": "Product Identifiers",
+    "type": "object",
+    "description": "Specify at least one Product ID and its ID Type.",
+    "comments": "@group=Product Identifiers",
+    "properties": {
+     "productId": {
+      "title": "Product ID",
+      "type": "string",
+      "description": "Alphanumeric, 14 characters - Provide the GTIN that identifies the product's consumable (selling) unit. Expand the GTIN to 14 digits by adding preceding zeroes and check digit. A GTIN (Global Trade Item Number) is used to identify an item at any point in the Supply Chain. A GTIN refers to the data structure (not symbology) used to identify the scannable item, case, inner pack (i.e., break pack) or pallet that make up the hierarchy. Example: 00123456781011",
+      "examples": [
+       "00123456781011"
+      ],
+      "minLength": 1,
+      "maxLength": 14
+     },
+     "productIdType": {
+      "title": "Product ID Type",
+      "type": "string",
+      "description": "Closed List - Unique numbers used to tell items apart.\n\nUPC (Universal Product Code): 12-digit code.\nEAN (European Article Number): 13-digit code.\nGTIN (Global Trade Item Number): 14 digits code.\nISBN (International Standard Book Number): Code is used specifically for books (either 10 or 13 digits).",
+      "enum": [
+       "EAN",
+       "GTIN",
+       "ISBN",
+       "UPC"
+      ]
+     }
+    },
+    "required": [
+     "productId",
+     "productIdType"
+    ],
+    "additionalProperties": false
+   },
+   "ShippingWeight": {
+    "title": "Shipping Weight (lbs)",
+    "type": "number",
+    "description": "Decimal, Value range: 0 to 99999999999999 - The weight  including all of its packaging materials. Example: 5",
+    "examples": [
+     "5"
+    ],
+    "comments": "@group=Logistics & Transportation",
+    "minimum": 0,
+    "maximum": 99999999999999,
+    "multipleOf": 0.001
+   }
+  }
+ }
+}

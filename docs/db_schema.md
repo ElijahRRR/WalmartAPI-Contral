@@ -669,6 +669,8 @@ order_line_id = 'ol_' + sha256(po_id + '\x1f' + sku)[:24]
     "ship_days": 3, "seller": "Acme", "amz_title": "...",
     "shipping": 0.0, "shipping_raw": "FREE",      // NULL 表示没采到,不是免运费
     "scraped_at": "...",
+    "batch_name": "wm-audit-20261017-102105",     // 判定用的快照来自本链哪一批(截图沿它取,2026-10-17)
+    "source_id": "...",                           // 采集侧记录 ID,事后可追到那一条采集
     "supplier": "甲", "rate": 1.0,                // 本行实际套用的采购方与汇率
     "price_cap": 75.0, "cost": 54.0,
     "title_similarity": 0.9673,                   // →「标题相似度」列

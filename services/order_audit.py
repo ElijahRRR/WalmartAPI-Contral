@@ -400,7 +400,7 @@ def judge(line: dict, snap: dict | None, suppliers: list[Supplier],
     detail.update({k: snap.get(k) for k in
                    ("asin", "zip", "amz_price", "shipping", "shipping_raw",
                     "stock_qty", "ship_method", "ship_days", "seller",
-                    "amz_title", "scraped_at")})
+                    "amz_title", "scraped_at", "batch_name", "source_id")})
     if snap.get("outcome") and snap["outcome"] != "ok":
         # 契约的 outcome 是**粗粒度**的(所有者 2026-08-10 澄清):一条
         # `parse_failed` 底下可能是 network / timeout / parse_error 任意一种,
@@ -574,7 +574,7 @@ def plan_waves(pairs, blocked) -> list[list[tuple[str, str]]]:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def from_snapshot(row: dict | None) -> dict | None:
-    """输入:catalog.latest_snapshot 一行 → 输出:审核用统一形状(无行返回 None)。
+    """输入:工作流 _SNAP_SQL 的一行(catalog.snapshots JOIN 采集台账)→ 输出:审核用统一形状(无行返回 None)。
 
     这是全项目**唯一**把采集快照翻译成审核输入的地方。采集契约字段位置变了
     只改本函数,judge/限价/采购方匹配全部不动。
@@ -592,7 +592,10 @@ def from_snapshot(row: dict | None) -> dict | None:
     - 运费:`fast.shipping`(采集侧 2026-08-10 追加,落到 snapshots.shipping 列)。
       **None 不是 0**:FREE→0.0 是"确认免运费",N/A→None 是"这次没采到"。
     - 截图:**不在快照里**。取图走 api/scraper.fetch_screenshot(批次名, ASIN),
-      抓手是 ops.audit_scrape 台账里记的 batch_name。
+      抓手是 `batch_name`:工作流的快照查询 JOIN 台账带回的本链批次
+      (2026-10-17 起随 judge 落进 audit_detail,截图沿它取);采集原文里的
+      批次名(契约未列为一等字段,有就带)另给 `scrape_batch`,用来在同对多份
+      快照里认出"本链自己那批"。
     """
     if not row:
         return None
@@ -633,4 +636,10 @@ def from_snapshot(row: dict | None) -> dict | None:
         "stock_status": raw.get("stock_status"),
         "stock_state": row.get("stock_state"),
         "scraped_at": row.get("scraped_at"),
+        # 来源(2026-10-17):台账批次 / 那次请求的时刻(工作流新鲜闸用)/ 采集
+        # 原文批次名 / 采集侧记录 ID(落进结论,事后可追到那一条采集)
+        "batch_name": row.get("audit_batch"),
+        "audit_requested_at": row.get("audit_requested_at"),
+        "scrape_batch": raw.get("batch_name") or params.get("batch_name"),
+        "source_id": row.get("source_id"),
     }

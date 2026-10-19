@@ -1247,6 +1247,14 @@ WHERE feed_id IS NOT NULL` —— 按 feed 反查处置行(实际结果取目标
 其中一个的落定结果覆盖另一个。「破坏类存在即压制同 SKU 的维护类」不靠索引,
 靠 `claim()`(索引管不了跨行的条件,而且压制必须与两个扫描件谁先跑无关)。
 
+⚠ **这条索引决定了落定必须在写建议之前**(2026-10-19):同键已有 `executing` 行时
+`suggest_many` 的 upsert 是 no-op(`ON CONFLICT … DO UPDATE … WHERE status='suggested'`)。
+维护三类的落定(`settle_maintenance` + `expire_executing`)因此在 **`maintenance_scan`
+写建议之前、同一事务内**调;此前放在执行件 `maintenance` 开头(链序在扫描件之后),
+天天要改的 SKU 被砍成隔天一次(D 日提交 → D+1 扫描撞 executing 写不进 → 执行件才落定
+→ D+2 才重新建议)。破坏类的落定(`settle`)仍在 `problem_product_cleanup` 开头 ——
+删除不需要天天重发,48h 宽限期内挡住重复建议正是想要的。
+
 ## audit — 审核域(2026-08-13 批次 A,迁自 walmart-audit-system)
 
 审核系统迁入的落库形态(全案见 `docs/audit_migration_plan.md`)。结论权威在

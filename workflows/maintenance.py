@@ -56,8 +56,10 @@ _one_store,首轮已成功的部分会被在途防重(feed 路由)或绝对赋�
     outcome=dedup,本文件如实计数);
   · 建议行本身的防重 → ops.dispositions 的部分唯一索引 + claim() 只取 suggested;
   · 生效确认 → settle_maintenance()(标题/价格/库存,比对
-    catalog.walmart_items 的现值)。删除类的落定归 problem_product_cleanup,
-    本文件不再调 settle() —— 两个执行件都调会把同一批落定报两遍。
+    catalog.walmart_items 的现值)**归 maintenance_scan**,在它写建议之前调
+    (2026-10-19 前移:放在本文件开头时,扫描件先撞 executing 写不进、本文件
+    才落定 ⇒ 天天要改的 SKU 被砍成隔天一次)。本文件**不落定任何东西**;
+    删除类的落定归 problem_product_cleanup。
 
 维护记录(registry.MAINT_SHEET,电子表格「维护记录」工作表,只追加,11 列):
   **本轮领到的每一条建议都写一行**,不只是提交成功的那些 —— 所有者要的是
@@ -280,28 +282,6 @@ def _submit_kind(store: dict, kind: str, items: list[dict], today: str,
                                         failed_word="提交被拒"))
 
 
-def _settle(lines: list[str]) -> None:
-    """上一轮落定 + 超期放行,结果写进摘要。任何失败只告警不阻断本轮提交。
-
-    ⚠ **只落定维护三类**。删除/停用/反补的落定(dispositions.settle,按观测
-    事件判)归 problem_product_cleanup —— 两个执行件都调会把同一批落定报两遍,
-    人对账时会以为生效数翻倍。
-    """
-    with db.pg_conn() as conn:
-        maint = dispositions.settle_maintenance(conn)   # 三类:按线上现值
-        expired = dispositions.expire_executing(conn)
-    ok = maint["confirmed"]
-    bad = maint["ineffective"]
-    if ok or bad:
-        lines.append(f"上一轮落定:生效 {ok},**未生效 {bad}**"
-                     f"(提交成功但 catalog_sync 复核时线上值没变,"
-                     f"下轮 maintenance_scan 会重新建议)")
-    if expired:
-        lines.append(f"⚠ 超期放行 {expired} 条(超 {dispositions.EXPIRE_DAYS} 天"
-                     f"没等到 catalog_sync 复核 —— 多半是商品已下架;"
-                     f"不放行会把这些 SKU 的该类维护永久堵住)")
-
-
 def _write_sheet(all_records: list[tuple], lines: list[str]) -> None:
     """维护记录写表 + 裁剪。收口在 services.maint_sheet.publish(两个执行件共用)。"""
     maint_sheet.publish(all_records, lines)
@@ -323,8 +303,8 @@ def run(params: dict) -> str:
                    if only == "delete" else ""))
 
     lines: list[str] = []
-    if execute:
-        _settle(lines)
+    # 落定(上一轮 executing → confirmed/ineffective)**不在这里**:归 maintenance_scan,
+    # 在它写建议之前(2026-10-19,见头注「生效确认」)。这里再落定一遍就是双轨
     # 标题整路停闸(所有者 2026-09-05,唯一出处 mi.TITLE_SYNC):执行件也不领
     # 存量 title 建议 —— 只停生成侧的话,库里已有的 suggested 行下一轮照样被领走
     # 提交,停闸就只停了一半。留在 suggested 不撤:恢复后它们还在。
@@ -598,5 +578,5 @@ def run(params: dict) -> str:
     all_records = [r for name in sorted(records_by_store)
                    for r in records_by_store[name]]
     _write_sheet(all_records, lines)
-    lines.append("生效确认在下一轮本工作流开头(等 catalog_sync 重新观测)")
+    lines.append("生效确认在下一轮 maintenance_scan 写建议之前(等 catalog_sync 重新观测)")
     return "\n".join(lines)

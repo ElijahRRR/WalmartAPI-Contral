@@ -1253,7 +1253,8 @@ WHERE feed_id IS NOT NULL` —— 按 feed 反查处置行(实际结果取目标
 写建议之前、同一事务内**调;此前放在执行件 `maintenance` 开头(链序在扫描件之后),
 天天要改的 SKU 被砍成隔天一次(D 日提交 → D+1 扫描撞 executing 写不进 → 执行件才落定
 → D+2 才重新建议)。破坏类的落定(`settle`)仍在 `problem_product_cleanup` 开头 ——
-删除不需要天天重发,48h 宽限期内挡住重复建议正是想要的。
+删除不需要天天重发,观测核验期限内(删除 72h / 停用 48h,`feed_track` 期限表)挡住
+重复建议正是想要的;最坏只是把重删推迟一天(拿不准就不删)。
 
 ## audit — 审核域(2026-08-13 批次 A,迁自 walmart-audit-system)
 

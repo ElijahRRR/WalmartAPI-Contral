@@ -779,7 +779,8 @@ WHERE d.status = 'executing'
 # 落定宽限(2026-08-26,链尾重赛引入的时间压缩):此前"提交"与"下一次重新
 # 观测"天然隔 16~24 小时,判据只需 last_seen_at > executed_at;链尾重赛把
 # 这个间隔压到十几分钟 —— 主链 14:50 刚提交的 MP_MAINTENANCE 还在沃尔玛
-# 队列里,15:05 重赛的 catalog_sync 刷新观测、15:15 重赛的 maintenance 落定,
+# 队列里,15:05 重赛的 catalog_sync 刷新观测、15:15 重赛的 maintenance_scan 落定
+# (2026-10-19 起落定在扫描件写建议之前;此前在执行件 maintenance 开头),
 # 会把"太早看"谎报成 ineffective(销案后行卡 executing,该 SKU 白丢一天)。
 # 2 小时 > 价格 feed SLA(15 分钟)与 MP_MAINTENANCE 常规处理时长;正常
 # 隔日节奏(16~24h)完全不受影响。破坏侧本就有 48h 宽限(verify_deletions)。

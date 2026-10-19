@@ -2929,6 +2929,40 @@ def test_scan_settles_before_it_writes_suggestions(monkeypatch):
     assert calls["order"][:3] == ["settle", "expire", "suggest"]
     assert "上一轮落定:生效 5,**未生效 2**" in out and "本轮已按现值重新建议" in out
     assert "超期放行 1 条" in out
+    # 链通知只发首行:落定数必须在首行(此前它在执行件首行)
+    first = out.splitlines()[0]
+    assert "上一轮落定 生效 5/未生效 2" in first and "超期放行 1" in first
+    assert "全船队" not in first
+
+
+def test_scan_settles_fleet_wide_in_one_transaction_with_suggestions(monkeypatch):
+    """-p store=X 也按全船队落定(判据只看观测,单店重跑时别的店判了也对),
+    首行标「全船队」免得读成该店的数;落定与写建议同一连接 = 同一事务。"""
+    import contextlib
+
+    from registry import db
+
+    ms, calls = _scan_wire(monkeypatch, _zero(2))
+    calls["settle_result"] = {"confirmed": 1, "ineffective": 0}
+    conns = []
+
+    @contextlib.contextmanager
+    def _fresh():                       # 每次进入给一个新连接,才分得清是不是同一事务
+        c = _Conn()
+        conns.append(c)
+        yield c
+
+    monkeypatch.setattr(db, "pg_conn", _fresh)
+    seen = {}
+    monkeypatch.setattr(ms.dispositions, "settle_maintenance",
+                        lambda conn: (seen.__setitem__("settle", conn),
+                                      {"confirmed": 1, "ineffective": 0})[1])
+    monkeypatch.setattr(ms.dispositions, "suggest_many",
+                        lambda conn, rows: (seen.__setitem__("suggest", conn),
+                                            len(rows))[1])
+    out = ms.run({"store": "T1"})
+    assert seen["settle"] is seen["suggest"]
+    assert "(全船队)" in out.splitlines()[0]
 
 
 def test_scan_preview_settles_nothing(monkeypatch):

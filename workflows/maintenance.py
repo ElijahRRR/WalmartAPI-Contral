@@ -8,12 +8,13 @@
   python cli.py maintenance -p resync_sheet=1    # 只补维护记录表(写表炸过之后)
   python cli.py maintenance -p prune_sheet=1     # 只裁维护记录表(默认留 7 天)
 
-**本工作流不再做任何决策**(批次四,所有者定稿 2026-08-16)。它只做四件事:
-  ① 落定上一轮:维护三类按"线上值改过来了没有";
-  ② 超期放行:3 天没等到 catalog_sync 复核的 executing 行放行(见下);
-  ③ 领取 ops.dispositions 里 **action ∈ (title, price, inventory)** 且
+**本工作流不再做任何决策**(批次四,所有者定稿 2026-08-16)。它只做两件事:
+  ① 领取 ops.dispositions 里 **action ∈ (title, price, inventory)** 且
      status='suggested' 的建议行;
-  ④ 按 (店铺, 动作) 分桶提交,提交成功的转 executing 并落 feed_id。
+  ② 按 (店铺, 动作) 分桶提交,提交成功的转 executing 并落 feed_id。
+上一轮的落定与超期放行**归 maintenance_scan**,在它写建议之前调(2026-10-19
+前移,原因见 maintenance_scan 写建议那段注释):放在本文件开头时,扫描件先撞
+executing 写不进、本文件才落定 ⇒ 天天要改的 SKU 被砍成隔天一次。
 
 ⚠ **本工作流不再发任何删除 feed**(所有者定稿 2026-08-24)。破坏动作
 (delete/retire)全部归 `problem_product_cleanup` —— 两个执行件都能发
@@ -31,11 +32,10 @@ DELETE_ITEM 的时候,配额、在途防重、病历口径各有一套,同一个
 ⚠ **调度顺序是硬约束**:catalog_sync → product_refresh → maintenance_scan →
 本工作流。没跑 scan 就跑本工作流 = 消费上一轮的陈旧建议(或者什么都没有)。
 
-⚠ **超期放行不是洁癖**:ops.dispositions 的部分唯一索引只允许同
-(店铺,SKU,动作) 有一条未落定行。executing 行永远不落定 = 那个 SKU 的那类维护
-**永久停摆且完全静默**(扫描件照常算出意图,upsert 撞索引写不进去,rowcount 0)。
-等不到观测的常见原因:商品下架了(walmart_items 缺席,JOIN 不上)、
-catalog_sync 连着几轮没扫到那家店。
+⚠ **本文件提交出去的行要靠 maintenance_scan 收尾**:ops.dispositions 的部分
+唯一索引只允许同 (店铺,SKU,动作) 有一条未落定行,executing 行不落定 = 那个 SKU
+的那类维护停摆。落定(按观测)与超期放行(3 天没等到观测)都在扫描件写建议
+之前做,见 services/dispositions.settle_maintenance / expire_executing。
 
 路由(旧系统实证,原样保留):单店 改价 ≤5 / 改库存 ≤10 走单品 PUT(结果当场
 已知),超过走 feed;标题无同步接口永远 MP_MAINTENANCE feed。单店内
@@ -288,7 +288,7 @@ def _write_sheet(all_records: list[tuple], lines: list[str]) -> None:
 
 
 def run(params: dict) -> str:
-    """输入:params(execute/store/only/resync_sheet)→ 输出:落定 + 提交摘要。"""
+    """输入:params(execute/store/only/resync_sheet)→ 输出:领取 + 提交摘要。"""
     if params.get("resync_sheet"):
         # 只补表,不算维护动作:提交成功但写表炸了之后的恢复路径
         return maint_sheet.resync_from_ledger()
@@ -354,11 +354,14 @@ def run(params: dict) -> str:
                     for it in held_node]
 
     mode = "" if execute else "🧪 [DRY-RUN] "
-    if not mi.TITLE_SYNC:
-        # 停闸必须天天见人(静默关闭 = 没人记得它关着)
-        lines.append(f"  ⛔ 标题维护已整路停闸(所有者 2026-09-05):本轮不领 title 建议,"
-                     f"库里 {n_title_held} 条 title 建议留在 suggested 不动;"
-                     f"改价/改库存照常。恢复条件见 services/maintenance_intents.TITLE_SYNC")
+    # 停闸必须天天见人(静默关闭 = 没人记得它关着)。⚠ 用 ⚠ 不用 ⛔,而且**排在
+    # 结论行之后**:cli 约定首行以 ⛔ 开头 = 前提不成立、什么都没做(判 refused,
+    # 链停、problem_product_cleanup 被跳过、不触发链尾重赛)。2026-10-19 之前首行
+    # 恰好被「上一轮落定」那行占着,落定前移到扫描件后它就会天天当首行
+    title_note = ("" if mi.TITLE_SYNC else
+                  f"  ⚠ 标题维护已整路停闸(所有者 2026-09-05):本轮不领 title 建议,"
+                  f"库里 {n_title_held} 条 title 建议留在 suggested 不动;"
+                  f"改价/改库存照常。恢复条件见 services/maintenance_intents.TITLE_SYNC")
     if not intents:
         if execute and held_records:
             # 领到的全被第二道闸扣下:没有可提交的,但扣下的行照样进表
@@ -369,7 +372,7 @@ def run(params: dict) -> str:
             f"(catalog_sync → maintenance_scan → 本工作流,顺序是硬约束)"
             + (f";⚠ 另有 {n_sup} 条被压制(这些 SKU 挂着待执行的删除/停用,"
                f"要删的东西不再花配额去改;执行归 problem_product_cleanup)"
-               if n_sup else "")])
+               if n_sup else "")] + ([title_note] if title_note else []))
 
     # 分桶件在 services.dispositions(两个执行件共用,2026-08-27 上移):
     # 「未知动作即抛」的宁炸不吞判据原样在里面(conventions §三的安全闸)
@@ -386,6 +389,8 @@ def run(params: dict) -> str:
                  f"价格 {n_kind['price']},库存 {n_kind['inventory']}"
                  + (f";因同 SKU 待删/待停用被压制 {n_sup} 条"
                     f"(留在建议表,删除没生效的话下轮还在)" if n_sup else ""))
+    if title_note:
+        lines.append(title_note)
 
     if not execute:
         # 执行件的 dry-run 只回答"要提交什么、走哪条路由"。

@@ -3,7 +3,7 @@
 用法:
   python cli.py maintenance_scan                  # 扫描 + 落建议行(可随时跑)
   python cli.py maintenance_scan -p store=A085朱丽霖
-  python cli.py maintenance_scan -p preview=1     # 只打印不落建议行
+  python cli.py maintenance_scan -p preview=1     # 只打印:不落建议行、不落定
   python cli.py maintenance_scan --dry-run        # 同上(--dry-run 等价于 preview)
   python cli.py maintenance_scan -p oos_days=30   # 连续无货多少天算该删(默认 15)
 
@@ -18,10 +18,12 @@ maintenance 也应该像 problem_scan 和 problem_product_cleanup 一样分开,
   maintenance(DANGEROUS=True)                只消费建议行,自己不做任何决策
 
 判据全部在 `services.maintenance_intents`(provider + classify()),本文件
-不做任何新判断 —— 它只负责"把意图落成建议行 + 撤销不再成立的旧建议"。
+不做任何新判断 —— 它只负责"落定上一轮 + 把意图落成建议行 + 撤销不再成立的
+旧建议"。
 
-⚠ **只建议,不动状态、不发 feed。** 写库的只有 ops.dispositions 一张表,
-幂等(同 (店铺,SKU,动作) 未落定时只刷新,不堆行)。
+⚠ **不发 feed。** 写库的只有 ops.dispositions 一张表:写建议之前先把维护三类
+上一轮的 executing 行按观测落定、超期的放行(2026-10-19 从执行件前移,原因见
+run() 写建议那段注释);写建议幂等(同 (店铺,SKU,动作) 未落定时只刷新,不堆行)。
 
 调度顺序是硬约束:catalog_sync → product_refresh → 本工作流 → maintenance。
 没跑 catalog_sync 就扫 = 拿上一轮的沃尔玛现值算差异,会对已下架的 SKU 建议
@@ -39,7 +41,7 @@ from registry import db
 from services import alloc_survey, dispositions, \
     maintenance_intents as mi, store_absence, store_limits
 
-DANGEROUS = False       # 只读沃尔玛(其实一次都不调);写库仅限建议行
+DANGEROUS = False       # 只读沃尔玛(其实一次都不调);写库仅限建议行(含落定上一轮)
 SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重赛靠它识别)
 
 logger = logging.getLogger("workflows.maintenance_scan")
@@ -194,7 +196,7 @@ def _node_skip_names(skipped: dict, stats: dict) -> list[str]:
 
 
 def run(params: dict) -> str:
-    """输入:params(store/preview/oos_days)→ 输出:意图分布 + 建议行落账摘要。"""
+    """输入:params(store/preview/oos_days)→ 输出:意图分布 + 落定 + 建议行落账摘要。"""
     # --dry-run 与 -p preview=1 等价:本工作流 DANGEROUS=False(不碰沃尔玛写
     # 接口),但它**会写建议表** —— 人敲 --dry-run 的本意就是"这轮别落库"
     preview = (str(params.get("preview", "")).strip() == "1"
@@ -352,6 +354,13 @@ def run(params: dict) -> str:
         n_sup = dispositions.count_suppressed(conn, dispositions.MAINT_ACTIONS)
         stuck = dispositions.stuck_executing(
             conn, sources=dispositions.MAINT_SOURCES)
+    # 落定数进**首行**:链通知只发成功步骤的首行(cli.first_line_of),2026-10-19
+    # 之前它在执行件首行;挪到扫描件第 N 行就等于只写进日志,「未生效」从此没人看见
+    if settled["confirmed"] or settled["ineffective"] or expired:
+        lines[0] += (f";上一轮落定 生效 {settled['confirmed']}/"
+                     f"未生效 {settled['ineffective']}"
+                     + (f",⚠ 超期放行 {expired}" if expired else "")
+                     + ("(全船队)" if only else ""))
     if settled["confirmed"] or settled["ineffective"]:
         lines.append(f"上一轮落定:生效 {settled['confirmed']},"
                      f"**未生效 {settled['ineffective']}**(提交成功但 catalog_sync "

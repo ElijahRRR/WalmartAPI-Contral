@@ -906,9 +906,19 @@ def _scan_wire(monkeypatch, intents, sz=("T1",), capped=(), absent=()):
                             calls["collect"].append(only),
                             list(intents), list(capped))[1:])
     _fake_db(monkeypatch, _Conn())
+    calls["order"] = []
+    calls["settle_result"] = {"confirmed": 0, "ineffective": 0}
+    calls["expired"] = 0
+    monkeypatch.setattr(ms.dispositions, "settle_maintenance",
+                        lambda conn: (calls["order"].append("settle"),
+                                      dict(calls["settle_result"]))[1])
+    monkeypatch.setattr(ms.dispositions, "expire_executing",
+                        lambda conn: (calls["order"].append("expire"),
+                                      calls["expired"])[1])
     monkeypatch.setattr(ms.dispositions, "suggest_many",
-                        lambda conn, rows: (calls["suggest"].extend(rows),
-                                            len(rows))[1])
+                        lambda conn, rows: (calls["order"].append("suggest"),
+                                            calls["suggest"].extend(rows),
+                                            len(rows))[2])
     monkeypatch.setattr(ms.dispositions, "withdraw_stale",
                         lambda conn, src, keep, why, store=None,
                         exclude_stores=None: (
@@ -1119,7 +1129,7 @@ def _disp(it, i):
 
 def _wire(monkeypatch, intents, stores=(STORE,), absent=()):
     calls = {"put_inv": [], "put_price": [], "feeds": [], "sheet": [],
-             "marked": [], "marked_by": set(), "settled": 0,
+             "marked": [], "marked_by": set(),
              "suppressed": 0}
     _fake_db(monkeypatch, _Conn())
     # 打 stale_stores 这一层:执行件调的 stale_or_note 是它的降级外壳,
@@ -1136,11 +1146,13 @@ def _wire(monkeypatch, intents, stores=(STORE,), absent=()):
                         lambda conn: (_ for _ in ()).throw(
                             AssertionError("maintenance 不该落定破坏类"
                                            "——归 problem_product_cleanup")))
+    # 落定归 maintenance_scan(2026-10-19 前移):执行件再调一次 = 双轨
     monkeypatch.setattr(mw.dispositions, "settle_maintenance",
-                        lambda conn: (calls.__setitem__("settled",
-                                                        calls["settled"] + 1),
-                                      {"confirmed": 0, "ineffective": 0})[1])
-    monkeypatch.setattr(mw.dispositions, "expire_executing", lambda conn: 0)
+                        lambda conn: (_ for _ in ()).throw(
+                            AssertionError("执行件不该落定 —— 归 maintenance_scan")))
+    monkeypatch.setattr(mw.dispositions, "expire_executing",
+                        lambda conn: (_ for _ in ()).throw(
+                            AssertionError("执行件不该超期放行 —— 归 maintenance_scan")))
     monkeypatch.setattr(mw.dispositions, "count_suppressed",
                         lambda conn, actions=None: calls["suppressed"])
     monkeypatch.setattr(mw.dispositions, "mark_executing",
@@ -1196,7 +1208,6 @@ def test_dry_run_shows_route_and_submits_nothing(monkeypatch):
     calls = _wire(monkeypatch, _zero(3))
     out = mw.run({"execute": False})
     assert calls["put_inv"] == [] and calls["feeds"] == [] and calls["sheet"] == []
-    assert calls["settled"] == 0                # dry-run 不落定
     assert "DRY-RUN" in out and "库存 3" in out and "路由 PUT" in out
     assert "'1→0'" in out                       # 逐 SKU 旧值→新值样本
 
@@ -1390,13 +1401,17 @@ def test_no_suggestions_points_at_the_scanner(monkeypatch):
     assert "maintenance_scan" in out and "顺序是硬约束" in out
 
 
-def test_settle_runs_before_claim_and_only_when_executing(monkeypatch):
-    calls = _wire(monkeypatch, _zero(1))
-    mw.run({"execute": True})
-    assert calls["settled"] == 1
-    calls2 = _wire(monkeypatch, _zero(1))
+def test_executor_never_settles(monkeypatch):
+    """落定归 maintenance_scan(2026-10-19):_wire 把两个落定函数桩成"一调就炸"。
+
+    执行件真跑与 dry-run 都走完 = 一次都没调。放回执行件开头就是复发"隔天
+    维护":扫描件先撞 executing 写不进,执行件才落定,今天的建议已经没了。
+    """
+    _wire(monkeypatch, _zero(1))
+    out = mw.run({"execute": True})
+    assert "生效确认在下一轮 maintenance_scan" in out
+    _wire(monkeypatch, _zero(1))
     mw.run({"execute": False})
-    assert calls2["settled"] == 0
 
 
 
@@ -2896,3 +2911,64 @@ def test_executor_node_gate_fails_open_but_loudly_when_config_unreadable(monkeyp
     out = mw.run({"execute": True})
     assert calls["put_inv"] == [("T1", "S0", 0), ("T1", "S1", 0)]
     assert "受管仓配置读不到(feishu 503)" in out
+
+
+# ── 落定前移到扫描件(2026-10-19 生产缺陷:天天要改的 SKU 隔天才维护一次)──────
+
+def test_scan_settles_before_it_writes_suggestions(monkeypatch):
+    """部分唯一索引下,撞上 executing 行的 upsert 是 no-op —— 落定必须在写建议之前。
+
+    此前落定在执行件 maintenance 开头、而链序是扫描件在前:D 日提交 → D+1
+    扫描件撞昨天的 executing 写不进 → 执行件才落定、今天的建议已没了 → D+2
+    才重新建议(谭总23/A9NV2CGP689D 09-09/11/13/15/17/19,恰好隔天)。
+    """
+    ms, calls = _scan_wire(monkeypatch, _zero(2))
+    calls["settle_result"] = {"confirmed": 5, "ineffective": 2}
+    calls["expired"] = 1
+    out = ms.run({})
+    assert calls["order"][:3] == ["settle", "expire", "suggest"]
+    assert "上一轮落定:生效 5,**未生效 2**" in out and "本轮已按现值重新建议" in out
+    assert "超期放行 1 条" in out
+    # 链通知只发首行:落定数必须在首行(此前它在执行件首行)
+    first = out.splitlines()[0]
+    assert "上一轮落定 生效 5/未生效 2" in first and "超期放行 1" in first
+    assert "全船队" not in first
+
+
+def test_scan_settles_fleet_wide_in_one_transaction_with_suggestions(monkeypatch):
+    """-p store=X 也按全船队落定(判据只看观测,单店重跑时别的店判了也对),
+    首行标「全船队」免得读成该店的数;落定与写建议同一连接 = 同一事务。"""
+    import contextlib
+
+    from registry import db
+
+    ms, calls = _scan_wire(monkeypatch, _zero(2))
+    calls["settle_result"] = {"confirmed": 1, "ineffective": 0}
+    conns = []
+
+    @contextlib.contextmanager
+    def _fresh():                       # 每次进入给一个新连接,才分得清是不是同一事务
+        c = _Conn()
+        conns.append(c)
+        yield c
+
+    monkeypatch.setattr(db, "pg_conn", _fresh)
+    seen = {}
+    monkeypatch.setattr(ms.dispositions, "settle_maintenance",
+                        lambda conn: (seen.__setitem__("settle", conn),
+                                      {"confirmed": 1, "ineffective": 0})[1])
+    monkeypatch.setattr(ms.dispositions, "suggest_many",
+                        lambda conn, rows: (seen.__setitem__("suggest", conn),
+                                            len(rows))[1])
+    out = ms.run({"store": "T1"})
+    assert seen["settle"] is seen["suggest"]
+    assert "(全船队)" in out.splitlines()[0]
+
+
+def test_scan_preview_settles_nothing(monkeypatch):
+    """preview / --dry-run 连建议行都不写,落定(改状态)同样不做。"""
+    ms, calls = _scan_wire(monkeypatch, _zero(2))
+    ms.run({"preview": "1"})
+    assert calls["order"] == []
+    ms.run({"dry_run": True})
+    assert calls["order"] == []

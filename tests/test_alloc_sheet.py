@@ -118,18 +118,23 @@ def _vals(**over):
 
 
 def test_write_rows_writes_the_16_machine_columns_in_two_segments_around_asin(monkeypatch):
-    """今天的列序是 店铺 | ASIN | 品牌…是否在线:一行 = A 段 + C:Q 段,B 列永不出现。"""
+    """今天的列序是 店铺 | ASIN | 品牌…是否在线:一行 = C:Q 段 + A 段,B 列永不出现。
+
+    ★ 段按位次分组(2026-10-20):先是每行的 C:Q,再是每行的「店铺」。逐行交错
+    (A2、C2:Q2、A3、C3:Q3)时写通道一段都粘不起来;「店铺」放最后是因为它是
+    "这行处理过了"的标记(见 alloc_sheet.write_rows 的注释)。
+    """
     _wire(monkeypatch)
     sent = []
     monkeypatch.setattr(alloc_sheet.feishu, "sheet_write_ranges",
                         lambda s, ups: (sent.extend(ups), len(ups))[1])
     n = alloc_sheet.write_rows([(2, _vals()), (3, _vals(store="B012", score=None))])
     assert n == 2
-    assert [r for r, _ in sent] == ["A2:A2", "C2:Q2", "A3:A3", "C3:Q3"]
-    assert sent[0][1] == [["A085"]]
+    assert [r for r, _ in sent] == ["C2:Q2", "C3:Q3", "A2:A2", "A3:A3"]
     # 值按字段名落位:C=品牌 D=产品分 …;None 写空串,数字转文本
-    assert sent[1][1][0][:2] == ["acme", "88.5"]
-    assert sent[3][1][0][:2] == ["acme", ""]
+    assert sent[0][1][0][:2] == ["acme", "88.5"]
+    assert sent[1][1][0][:2] == ["acme", ""]
+    assert sent[2][1] == [["A085"]] and sent[3][1] == [["B012"]]
     assert all(len(vals[0]) == 15 for r, vals in sent if r.startswith("C"))
 
 
@@ -142,10 +147,11 @@ def test_write_rows_follows_a_shuffled_header_without_code_changes(monkeypatch):
     monkeypatch.setattr(alloc_sheet.feishu, "sheet_write_ranges",
                         lambda s, ups: (sent.extend(ups), len(ups))[1])
     alloc_sheet.write_rows([(4, _vals(online="是"))])
-    # 段按**字段序里相邻的列号**粘:店铺…窗口销售额 连成 B..P 一段,「是否在线」
-    # 单独落到 A;ASIN 在 Q,谁都碰不到它
-    assert [r for r, _ in sent] == ["B4:P4", "A4:A4"]
-    assert sent[0][1][0][0] == "A085" and sent[1][1] == [["是"]]
+    # 段按**字段序里相邻的列号**粘,而写入字段序里「店铺」排在最后:
+    # 品牌…窗口销售额 连成 C..P 一段;「是否在线」(A)与「店铺」(B)相邻,
+    # 粘成 A:B 段放在最后。ASIN 在 Q,谁都碰不到它
+    assert [r for r, _ in sent] == ["C4:P4", "A4:B4"]
+    assert sent[0][1][0][0] == "acme" and sent[1][1] == [["是", "A085"]]
 
 
 def test_write_rows_rejects_a_row_with_missing_or_extra_fields(monkeypatch):
@@ -167,3 +173,47 @@ def test_write_rows_dry_run_touches_nothing(monkeypatch):
                         lambda s, ups: pytest.fail("dry-run 还敢写"))
     assert alloc_sheet.write_rows([(2, _vals())], execute=False) == 0
     assert alloc_sheet.write_rows([]) == 0
+
+
+# ── 写入形状:同列的连续行要能被写通道粘成一段(2026-10-20)──────────────
+
+def _count_requests(monkeypatch, write):
+    """输入:一次写入动作 → 输出:真实写通道发出的每个请求里的范围列表。
+
+    走真的 `feishu.sheet_write_ranges`(粘段 + 预算切批),只把最后的 HTTP 换成记录。
+    """
+    batches = []
+    monkeypatch.setattr(alloc_sheet.feishu, "_post_batch",
+                        lambda s, chunk: batches.append([r for r, _ in chunk]))
+    monkeypatch.setattr(alloc_sheet.feishu.time, "sleep", lambda x: None)
+    write()
+    return batches
+
+
+def test_two_thousand_rows_go_out_in_one_request_not_forty(monkeypatch):
+    """所有者 2026-10-20:「现在似乎不是批量写入飞书的」。
+
+    逐行交错时每行占 2 段、每请求 100 段 ⇒ 2000 行 40 个请求(每个间隔 0.3s)。
+    分组后两段各 2000 行,合计 4000 行在单请求行预算(4750)之内 ⇒ 1 个请求。
+    """
+    _wire(monkeypatch)
+    rows = [(r, _vals(store=f"S{r}")) for r in range(2, 2002)]
+    batches = _count_requests(monkeypatch, lambda: alloc_sheet.write_rows(rows))
+    assert batches == [["C2:Q2001", "A2:A2001"]]
+
+
+def test_store_column_lands_after_every_other_column_even_across_requests(monkeypatch):
+    """「店铺」是"这行处理过了"的标记,必须最后落地。
+
+    6000 行超过单请求行预算,要分好几个请求。中途失败只会丢后面的请求,
+    所以任何一行的「店铺」都不许先于它的 C:Q 发出 —— 否则重跑时这行被跳过,
+    永远是半截。
+    """
+    _wire(monkeypatch)
+    rows = [(r, _vals()) for r in range(2, 6002)]
+    batches = _count_requests(monkeypatch, lambda: alloc_sheet.write_rows(rows))
+    flat = [r for b in batches for r in b]
+    assert len(batches) > 1
+    first_store = min(i for i, r in enumerate(flat) if r.startswith("A"))
+    assert all(r.startswith("C") for r in flat[:first_store])
+    assert all(r.startswith("A") for r in flat[first_store:])

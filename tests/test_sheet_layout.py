@@ -95,3 +95,80 @@ def test_ranges_split_where_fields_are_not_adjacent():
 def test_letters_and_header_scan_use_the_api_layers_column_letters():
     """列字母只从 api/feishu._col_letter 出(27 → AA 这种进位别再写第二遍)。"""
     assert sheet_layout.letters({"a": 1, "b": 26, "c": 27}) == {"a": "A", "b": "Z", "c": "AA"}
+
+
+# ── 多段写入按段位次分组:让写通道能把同列连续行粘成一段(2026-10-20)────────
+
+def test_rows_ranges_groups_segments_by_position_and_keeps_input_order():
+    """一行拆成两段时,输出是"每行第 1 段"全部在前、"每行第 2 段"全部在后。
+
+    逐行交错(A2、C2:D2、A3、C3:D3)时写通道一段都粘不起来;分组后同列首尾相接。
+    段的先后由字段顺序决定:这里把 store 放最后,它所在的段就最后。
+    同一行在一次调用里出现两次时,后写的仍在后(稳定)—— 覆盖语义不变。
+    """
+    s = _sheet({"store": "店铺", "asin": "ASIN", "brand": "品牌", "score": "产品分"})
+    idx = {"store": 1, "asin": 2, "brand": 3, "score": 4}
+    order = ["brand", "score", "store"]
+    got = sheet_layout.rows_ranges(s, idx, [(2, order, ["a", 1, "S2"]),
+                                            (3, order, ["b", 2, "S3"]),
+                                            (2, order, ["a2", 9, "S2b"])])
+    assert [r for r, _ in got] == ["C2:D2", "C3:D3", "C2:D2", "A2:A2", "A3:A3", "A2:A2"]
+    assert [v for _, v in got][2] == [["a2", 9]] and [v for _, v in got][5] == [["S2b"]]
+    # row_ranges 就是"每行同一组字段"的 rows_ranges
+    assert sheet_layout.row_ranges(s, idx, [(2, ["a", 1, "S2"]), (3, ["b", 2, "S3"])],
+                                   order) == got[:2] + got[3:5]
+
+
+def _listing_requests(monkeypatch, write):
+    """输入:一次上架表写入 → 输出:真实写通道发出的每个请求里的范围列表。"""
+    from registry import resources
+    from registry.resources import Spreadsheet
+    from api import feishu
+    monkeypatch.setattr(resources, "LISTING_SHEET", Spreadsheet(
+        name="上架表", token="TOK", sheet_id="SID",
+        columns=resources.LISTING_SHEET.columns,
+        headers=dict(resources.LISTING_SHEET.headers)))
+    batches = []
+    monkeypatch.setattr(feishu, "_post_batch",
+                        lambda s, chunk: batches.append([r for r, _ in chunk]))
+    monkeypatch.setattr(feishu.time, "sleep", lambda x: None)
+    write()
+    return batches
+
+
+_EIGHT = ["标题", "9.9", 3, "19.9", "Yes", "F1", "2026-10-20", ""]
+
+
+def test_list_new_submit_write_is_one_request_for_two_thousand_rows(monkeypatch):
+    """list_new 回写提交结果:标题(D)+ amz价~未上架理由(J:P)两段。
+
+    改前逐行交错,2000 行 40 个请求;分组后 1 个请求(4000 行,在 4750 预算内)。
+    含 SKU 的行 SKU 与标题相邻,粘成 C:D 段,与不带 SKU 的行各自成段。
+    """
+    rows = range(2, 2002)
+    batches = _listing_requests(monkeypatch, lambda: listing_sheet.write_submit_cols(
+        [(r, _EIGHT + ["A0X1Y2Z3W4V5"]) for r in rows]))
+    assert batches == [["C2:D2001", "J2:P2001"]]
+    batches = _listing_requests(monkeypatch, lambda: listing_sheet.write_data_cols(
+        [(r, ["标题", "9.9", 3, "19.9"]) for r in rows]))
+    assert batches == [["D2:D2001", "J2:L2001"]]
+
+
+def test_sku_lands_before_listed_even_across_requests(monkeypatch):
+    """SKU 必须先于「是否上架/feedid」落地(否则会出现「已提交但无码」的行,
+    回执反哺器靠 SKU 找行,那一行永远回填不上)。
+
+    6000 行要分好几个请求;中途失败只会丢后面的请求,所以整个发送序列里
+    含 SKU 列的段必须全部排在含「是否上架」列的段前面。
+    """
+    rows = range(2, 6002)
+    batches = _listing_requests(monkeypatch, lambda: listing_sheet.write_submit_cols(
+        [(r, _EIGHT + ["A0X1Y2Z3W4V5"]) for r in rows]))
+    flat = [r for b in batches for r in b]
+    assert len(batches) > 1
+    lay = listing_sheet.layout()
+    has = lambda rng, col: rng.split(":")[0].rstrip("0123456789") <= col \
+        <= rng.split(":")[1].rstrip("0123456789")
+    last_sku = max(i for i, r in enumerate(flat) if has(r, lay["sku"]))
+    first_listed = min(i for i, r in enumerate(flat) if has(r, lay["listed"]))
+    assert last_sku < first_listed

@@ -147,12 +147,46 @@ def ranges(sheet: Spreadsheet, index: dict[str, int], row_from: int,
     return out
 
 
+def rows_ranges(sheet: Spreadsheet, index: dict[str, int],
+                rows: list[tuple[int, list[str], list]]
+                ) -> list[tuple[str, list[list]]]:
+    """输入:登记条目 + 列布局 + [(行号, 该行字段序列, 等长值序列)]
+    → 输出:**按段位次分组**的 [(A1范围, 值矩阵)]:先是每行的第 1 段,再是每行的第 2 段……
+
+    **为什么要分组**(所有者 2026-10-20 实遇:产品分配表"不是批量写入的"):
+    一行的字段在表上不相邻时会拆成几段(产品分配表 = 店铺 A 一段 + C:Q 一段)。
+    逐行展开就成了 A2、C2:Q2、A3、C3:Q3……交错排列,而写通道的粘段
+    (`api/feishu._coalesce`)只合并**紧挨着的、列区间相同的连续行** ——
+    交错时相邻两段列永远不同,一段都粘不起来:每行占 2 段、每请求 100 段,
+    2000 行要发 40 个请求(每个间隔 0.3s)。按位次分组之后同列的段首尾相接,
+    通道把它们粘成 2 段,1 个请求写完。
+
+    **段的先后由调用方的字段顺序决定**:一行的段按「段里第一个字段在 `fields`
+    里的位置」排(`ranges` 本来就这么产出),分组后**第 k 段整列写完才轮到
+    第 k+1 段**。写入跨多个请求时,中途失败只会留下"前面的段写了、后面的没写",
+    所以**哪一列是"这行已处理"的标记,就把它的字段放在最后**(产品分配表的
+    「店铺」);哪一列必须先于别的落地,就放在最前(上架表的 SKU 先于
+    「是否上架/feedid」,否则会出现「已提交但无码」的行)。
+
+    同一位次里保持输入顺序(稳定),所以同一格在一次调用里被同一组字段写两次时,
+    后写的仍然在后 —— 与逐行展开的覆盖语义一致。一条输入拆出的各段列互不重叠,
+    换序不改变它的值。⚠ 例外只有一种:同一行在一次调用里出现多次、而且**字段组
+    不同**,不同位次的段才可能落在同一格,这时以位次靠后的那段为准。本仓的调用方
+    每行只写一次,没有这种用法;以后要这么用,先把同一行的几次写入合成一条。
+    """
+    groups: list[list[tuple[str, list[list]]]] = []
+    for rownum, fields, vals in rows:
+        for pos, seg in enumerate(ranges(sheet, index, rownum, fields,
+                                         [list(vals)])):
+            while len(groups) <= pos:
+                groups.append([])
+            groups[pos].append(seg)
+    return [seg for g in groups for seg in g]
+
+
 def row_ranges(sheet: Spreadsheet, index: dict[str, int],
                updates: list[tuple[int, list]],
                fields: list[str]) -> list[tuple[str, list[list]]]:
     """输入:登记条目 + 列布局 + [(行号, 等长值序列)] + 字段序列
-    → 输出:逐行展开的 [(A1范围, 值矩阵)]。"""
-    out: list[tuple[str, list[list]]] = []
-    for rownum, vals in updates:
-        out += ranges(sheet, index, rownum, fields, [list(vals)])
-    return out
+    → 输出:按段位次分组的 [(A1范围, 值矩阵)](每行同一组字段;见 `rows_ranges`)。"""
+    return rows_ranges(sheet, index, [(r, fields, vals) for r, vals in updates])

@@ -115,9 +115,14 @@ def write_rows(updates: list[tuple[int, dict]], execute: bool = True) -> int:
         if len(updates) > 20:
             logger.info("[DRY-RUN] …另有 %d 行省略", len(updates) - 20)
         return 0
+    # ★ 「店铺」**最后写**(2026-10-20)。它是"这行处理过了"的标记:重跑时
+    #   店铺已填的行整行跳过。写入跨多个请求时中途失败,只会留下前面的段;
+    #   店铺若先落地、别的列没写上,这行就永远是半截,而且再也不会被补写。
+    #   顺序由字段次序决定(见 sheet_layout.rows_ranges),所以这里把它挪到末尾。
+    order = [f for f in fields if f != "store"] + ["store"]
     feishu.sheet_write_ranges(resources.ALLOC_SHEET, sheet_layout.row_ranges(
         resources.ALLOC_SHEET, _index_map(),
-        [(r, [("" if vals[f] is None else str(vals[f])) for f in fields])
+        [(r, [("" if vals[f] is None else str(vals[f])) for f in order])
          for r, vals in updates],
-        fields))
+        order))
     return len(updates)

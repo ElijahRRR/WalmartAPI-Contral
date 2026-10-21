@@ -156,7 +156,7 @@ def run(params: dict) -> str:
     store_list = (stores_svc.load_stores(filter_names=[name]) if name
                   else stores_svc.load_stores())
     if name and not store_list:
-        return f"⚠ 店铺 {name} 不在可调用列表里(未启用/没配代理/没凭证?)"
+        return f"⚠ 店铺 {name} 不在可调用列表里(未启用/没凭证/代理只填了一半?)"
 
     # 受管仓:与维护链/上架链**同一个入口**,填了就必须被沃尔玛认过
     node_stats: dict = {}

@@ -229,7 +229,7 @@ def _run_dead(params: dict, execute: bool, mark_offline: bool) -> str:
     """输入:params → 输出:批量清死店摘要。**逐店走整店释放那条路,不另写。**
 
     **在不在营**是唯一判据,来源是 `stores.enabled_names()`(在册 ∧ 勾了启用)。
-    另外两个都不能用:`load_stores()` 还筛 ClientId/代理,会把「在营但代理没配
+    另外两个都不能用:`load_stores()` 还筛 ClientId/代理,会把「在营但代理半配
     的店」误判成死店(§九.4 的原话);`registered_names()` 连「启用」都不看,
     勾了停用的店会被当成还在营 —— 而这条命令直通整店下线。
 

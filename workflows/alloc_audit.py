@@ -51,7 +51,8 @@
    排除了多少必须打印——静默兜底等于主路径坏了没人知道。
 2. **"不在营" ≠ "被过滤"**:判在营用 `stores.enabled_names()`(在册 ∧ 勾了
    「启用」,所有者定稿 2026-08-22),**不用** `load_stores()`——后者还筛
-   ClientId/代理,会把"代理没配的在营店"误判成死店,而死店清单直通整店释放。
+   ClientId/代理,会把"代理只填了一半的在营店"误判成死店,而死店清单直通整店释放
+   (2026-10-21 起"没配代理"是直连、照样能调,唯一还会被拦的是"半配")。
    ⚠ 也**不用** `registered_names()`:它连「启用」都不看,勾了停用的店会被
    当成还在营,于是它的冻结行继续拦着别的店上架(2026-08-22 前正是如此)。
 3. **未知不算不符**:渠道判不符只在两侧都是 FBA/FBM 且不同时;采集没采到、
@@ -446,7 +447,7 @@ def _section_stores(c: Ctx) -> list[str]:
                      "没有店填 0;**要哪家不接货就把这一列填 0**"))
     if c.filtered:
         body.append(("凭证被过滤", f"{len(c.filtered)} 家",
-                     "缺代理/ClientId,**不是死店**,别整店释放"))
+                     "缺 ClientId/代理半配,**不是死店**,别整店释放"))
     if c.mism:
         body.append(("渠道有不符", f"{len(c.mism)} 家", f"共 {len(c.offenders)} 件待下架"))
     if c.cat_bad:
@@ -476,7 +477,7 @@ def _section_notes(c: Ctx) -> list[str]:
     if c.live_err:
         # 读不到就没有「配置缺失 vs 真不在册」这一栏,而不是"一家都没有"
         notes.append(f"店铺配置读不到({c.live_err}),本轮没法区分"
-                     f"「缺代理/ClientId 的在营店」和「已停用的死店」")
+                     f"「缺 ClientId/代理半配 的在营店」和「已停用的死店」")
     if not notes:
         return []
     return ["", "▍要留意"] + [f"  · {x}" for x in notes]

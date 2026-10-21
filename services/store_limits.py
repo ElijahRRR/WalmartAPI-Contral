@@ -412,7 +412,7 @@ def _managed(configured: dict[str, str], by_name: dict[str, dict], conn,
     for name in sorted(configured):
         store = by_name.get(name)
         if store is None:
-            # 填了「维护仓库」但这店根本调不了 API(未启用/没配代理/没凭证):
+            # 填了「维护仓库」但这店根本调不了 API(未启用/没凭证/代理半配):
             # 不算配置错误,各链本来就不会碰它 —— 但也不能悄悄当"未配置",
             # 否则哪天它恢复了,行为会从"按合计"跳到"按受管仓"而无人知情。
             # 全船队模式下要记日志:2026-09-06 谭总22/23/24 就是走的这条无日志
@@ -421,7 +421,7 @@ def _managed(configured: dict[str, str], by_name: dict[str, dict], conn,
             st["words"][name] = "不可调用"
             if fleet:
                 logger.warning("%s:填了「维护仓库」但不在可调用店铺列表里"
-                               "(凭证表未启用/缺代理/读表落到快照?)", name)
+                               "(凭证表未启用/缺 ClientId/代理半配/读表落到快照?)", name)
             continue
         try:
             node, how = _resolve(store, configured, conn)

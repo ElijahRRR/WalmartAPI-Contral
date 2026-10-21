@@ -31,8 +31,18 @@ python cli.py skill_export              # 改 registry/schedule.py 后重新生�
 
 ## 安全红线(事故背景见 conventions §一)
 
-- **沃尔玛 API 必须走 api/_client.py,每店固定出口代理,严禁直连**(直连会
-  导致店铺关联封号,业务生死线)。
+- **沃尔玛 API 必须走 api/_client.py;连不连、怎么连只由凭证表决定**(所有者
+  定稿 2026-10-21,事故背景 conventions §一)。**顺序判断,不是并列**:
+  **① 勾了「启用」才连接**(判据 `services/stores.is_enabled`,**缺省不启用**
+  —— 飞书对从未勾过的复选框整个字段不返回,原口径把"查无此字段"当成启用,
+  2026-09-19 实见 431 行是这种空值);**② 连接时才按代理规则**(判据
+  `services/stores.proxy_of`):
+  代理三件套(类型/IP/端口)**填齐 → 必须走这个代理**,连不上按原逻辑处理
+  (代理无效/代理波动 → 串行补试 → 缺席点名 → 链尾重赛),**不许改直连**;
+  **五个字段全空 → 直连**(`proxy=None`);**只填了一半 → 整店拒跑并点名**
+  (半配当没填会拿真实凭证裸连,正是店铺关联封号那条红线)。
+  **允许多店共用一个代理**;直连与共用每轮点名(`_log_egress`),**只告警不拦**
+  —— 共享出口的关联风险由所有者承担,代码只负责忠实执行 + 看得见。
 - **缺省即真跑**(2026-08-16 定稿);空跑用 `--dry-run`;AI 改完代码先
   dry-run、人眼确认后才跑真的(纪律,没有默认值替你挡)。
 - **防重状态先落库再调接口**:feed 先写 pending 后提交;重启先对账 pending
@@ -45,8 +55,9 @@ python cli.py skill_export              # 改 registry/schedule.py 后重新生�
 - **入口唯一**:一切执行走 cli.py(锁/ops.runs/通知/链尾缺席店重赛);
   workflow 文件只暴露 `run(params) -> 摘要`,不含 argparse、不自理调度/锁。
 - **数据库连接唯一入口** `registry/db.py`;禁自行 psycopg/sqlite3 connect。
-- **在营判据唯一** `services/stores.enabled_names()`;三层别混:
-  registered=在册、enabled=在营、load_stores=能调 API(§二)。
+- **在营判据唯一** `services/stores.enabled_names()`(底层 `is_enabled`,
+  **缺省不启用**);三层别混:registered=在册、enabled=在营、
+  load_stores=能调 API(§二)。
 - **处置建议按 `action` 分工,不看 `source`**;破坏动作只有一个出口
   (problem_product_cleanup);破坏组压制维护组,判在 `dispositions.claim()`,
   **调度顺序不许承载判据**(§三)。

@@ -40,7 +40,13 @@ logger = logging.getLogger("services.store_config")
 #: v2(2026-09-01):`limits` 的值只收登记列,未登记列名另存 `limits_extra_cols`。
 #: ⚠ v1 的 `limits` 里**存着未登记列的值**(SourceID 之类),拿它跟 v2 硬比会
 #: 把那些列判成"整体消失" —— 版本不同一律当首次快照,见 `_version_migrated`。
-SNAPSHOT_VERSION = 2
+#: v3(2026-10-21):形状没变,**`enabled` 的含义变了** —— `stores.is_enabled`
+#: 的缺省从"视为启用"翻成"不启用"(所有者定稿,见 plan.md 同日条目)。凭证表
+#: 一个字没动,但 431 行从未勾过复选框的店在新口径下都读成 `False`,拿它跟 v2
+#: 的快照硬比会产出 **431 条「启用 True→False」且全是 high** 的假事件 —— 正是
+#: 本常量存在要防的那件事。提版本 ⇒ 那一轮当首次快照(不产事件、覆盖快照、
+#: 摘要明说),下一轮起按新口径正常比对。
+SNAPSHOT_VERSION = 3
 
 _CURSOR = "store_config"
 SOURCE = "store_config"

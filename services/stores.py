@@ -80,12 +80,23 @@ def is_enabled(fields: dict) -> bool:
     `registered_names()`(不看启用)判在营,勾了停用的店照样占着品牌、
     照样用冻结行拦着别的店上架。
 
-    缺省视为启用:旧 xlsx 无此列,新表才加的(沿用旧系统口径)。
+    ★ **缺省是"不启用"**(所有者定稿 2026-10-21:「要根据是否勾选启用来决定是否
+    连接,没有被勾选的是不允许连接凭证的」)。**只有明确勾了才算启用** ——
+    顺序是:勾了启用 → 才连接 → 连接时按代理规则(`proxy_of`)。
+
+    ⚠ 为什么翻这个默认值:飞书对**从未勾过**的复选框**整个字段都不返回**
+    (勾过又取消的会老实回 `False`)。原口径是"缺省视为启用",于是"查无此字段"
+    被当成了"启用" —— 2026-09-19 生产实见:凭证表 530 行里 431 行是这种空值,
+    谭总1/谭总3 因此被拉去跑了,所有者只能手工把复选框点两下(勾上再取消)
+    才让飞书开始返回 `False`。原口径的理由是"旧 xlsx 无此列",那个理由已经
+    不存在:列在表上,所有者在用它。
     """
     v = fields.get(resources.STORE_CREDENTIALS.fields.enabled)
-    if v is False:
-        return False
-    return not (isinstance(v, str) and v.strip() in ("否", "false", "0"))
+    if v is True:
+        return True
+    # 旧 xlsx 迁来的文本写法;其余一切(含字段缺失、False、空串、看不懂的值)
+    # 一律按**不启用**。判不准就不连 —— 猜错的那个方向是拿真实凭证去连沃尔玛。
+    return isinstance(v, str) and v.strip() in ("是", "true", "True", "1")
 
 
 def enabled_names() -> set[str]:
@@ -121,7 +132,7 @@ def load_stores(filter_names: list[str] | None = None) -> list[dict]:
     飞书不可用时回退读最近一次快照并告警——保证飞书故障不瘫痪全部工作流。
 
     过滤规则:
-      1. 「启用」字段显式为否 → 跳过(旧 xlsx 无此列,新表新增;缺省视为启用)
+      1. 「启用」没勾 → 跳过(**缺省不启用**,所有者定稿 2026-10-21;见 `is_enabled`)
       2. ClientId 为空或 "0" → 跳过
       3. 代理按 `proxy_of` 三岔(所有者定稿 2026-10-21):三件套齐 → 走代理;
          五个字段全空 → `proxy=None` 直连;**只填了一半 → 跳过并点名**。
@@ -174,10 +185,10 @@ def _missing_msg(missing: list[str], by_name: dict, all_names: set | None) -> st
     for n in missing:
         if all_names is None:
             lines.append(f"  ✗ {n}:可用店铺里没有(本次是快照兜底,"
-                         f"分不清是不在册还是未启用/缺 ClientId/代理半配)")
+                         f"分不清是不在册还是没勾启用/缺 ClientId/代理半配)")
         elif n in all_names:
             lines.append(f"  ✗ {n}:在凭证表里,但被过滤掉了"
-                         f"(「启用」为否 / 缺 ClientId / 代理只填了一半 三者之一)")
+                         f"(「启用」没勾或为否 / 缺 ClientId / 代理只填了一半 三者之一)")
         else:
             lines.append(f"  ✗ {n}:凭证表里查无此店(名字要一字不差)")
     return ("指定的店铺名有 %d 个没落到实处:\n%s\n  可用店铺(%d 家):%s\n"
@@ -288,7 +299,8 @@ def _log_egress(stores: list[dict], direct: list[str], partial: list[str]) -> No
 
     为什么必须每轮都点名:2026-09-19 的「未启用店被拉取」就是靠人眼发现的 ——
     凭证表 530 行里有 431 行「启用」是空的(飞书对从未勾过的复选框**整个字段
-    不返回**),缺省视为启用,于是条件一放宽就会有店悄悄进名单。直连与共用代理
+    不返回**),而当时的口径是"缺省视为启用",于是条件一放宽就有店悄悄进了名单
+    (那个默认值已于 2026-10-21 翻成"不启用",见 `is_enabled`)。直连与共用代理
     都是"悄悄进来了也不报错"的那类变化,日志里不点名就只能等出事才知道。
     """
     if partial:

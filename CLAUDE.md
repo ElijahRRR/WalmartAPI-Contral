@@ -31,8 +31,12 @@ python cli.py skill_export              # 改 registry/schedule.py 后重新生�
 
 ## 安全红线(事故背景见 conventions §一)
 
-- **沃尔玛 API 必须走 api/_client.py;出口走法只由凭证表决定**(所有者定稿
-  2026-10-21,判据唯一出处 `services/stores.proxy_of`,事故背景 conventions §一):
+- **沃尔玛 API 必须走 api/_client.py;连不连、怎么连只由凭证表决定**(所有者
+  定稿 2026-10-21,事故背景 conventions §一)。**顺序判断,不是并列**:
+  **① 勾了「启用」才连接**(判据 `services/stores.is_enabled`,**缺省不启用**
+  —— 飞书对从未勾过的复选框整个字段不返回,原口径把"查无此字段"当成启用,
+  2026-09-19 实见 431 行是这种空值);**② 连接时才按代理规则**(判据
+  `services/stores.proxy_of`):
   代理三件套(类型/IP/端口)**填齐 → 必须走这个代理**,连不上按原逻辑处理
   (代理无效/代理波动 → 串行补试 → 缺席点名 → 链尾重赛),**不许改直连**;
   **五个字段全空 → 直连**(`proxy=None`);**只填了一半 → 整店拒跑并点名**
@@ -51,8 +55,9 @@ python cli.py skill_export              # 改 registry/schedule.py 后重新生�
 - **入口唯一**:一切执行走 cli.py(锁/ops.runs/通知/链尾缺席店重赛);
   workflow 文件只暴露 `run(params) -> 摘要`,不含 argparse、不自理调度/锁。
 - **数据库连接唯一入口** `registry/db.py`;禁自行 psycopg/sqlite3 connect。
-- **在营判据唯一** `services/stores.enabled_names()`;三层别混:
-  registered=在册、enabled=在营、load_stores=能调 API(§二)。
+- **在营判据唯一** `services/stores.enabled_names()`(底层 `is_enabled`,
+  **缺省不启用**);三层别混:registered=在册、enabled=在营、
+  load_stores=能调 API(§二)。
 - **处置建议按 `action` 分工,不看 `source`**;破坏动作只有一个出口
   (problem_product_cleanup);破坏组压制维护组,判在 `dispositions.claim()`,
   **调度顺序不许承载判据**(§三)。

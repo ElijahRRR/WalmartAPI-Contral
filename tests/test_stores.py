@@ -16,11 +16,16 @@ def _tmp_root(monkeypatch, tmp_path):
 
 
 def _rec(**fields):
+    """造一行凭证表记录。**缺省把「启用」勾上** —— 2026-10-21 起缺省是"不启用",
+    不显式给的话每个夹具都会被挡在门外,测的就不是本来要测的东西了。
+    要测"没勾启用"请传 `enabled=None`(= 飞书对从未勾过的复选框不返回该字段)。"""
     f = resources.STORE_CREDENTIALS.fields
     mapping = {"store": f.store, "client_id": f.client_id, "client_secret": f.client_secret,
                "proxy_type": f.proxy_type, "host": f.proxy_host, "port": f.proxy_port,
                "user": f.proxy_user, "pw": f.proxy_pass, "enabled": f.enabled}
-    return {"record_id": "r", "fields": {mapping[k]: v for k, v in fields.items()}}
+    fields.setdefault("enabled", True)
+    return {"record_id": "r", "fields": {mapping[k]: v for k, v in fields.items()
+                                         if not (k == "enabled" and v is None)}}
 
 
 def test_normalize_filters_and_proxy_url():
@@ -46,6 +51,31 @@ def test_normalize_filters_and_proxy_url():
 
 
 # ── 出口三岔(所有者定稿 2026-10-21)────────────────────────────────────
+
+def test_enabled_gate_comes_first_whatever_the_proxy_says():
+    """★ **顺序判断**(所有者定稿 2026-10-21):勾了「启用」才连接,连接时才看代理。
+
+    没勾启用的店,**配了代理也不连、没配代理也不直连** —— 「启用」是第一道门,
+    代理规则在门后面。这条钉住的是顺序本身:把两个判断写成并列(或把代理判在
+    启用之前)就会出现"没勾启用但配了代理所以连上了"这种组合。
+    """
+    out = stores_svc._normalize([
+        # 从未勾过(飞书整个字段不返回)—— 2026-09-19 那 431 行的形状
+        _rec(store="没勾有代理", client_id="c1", client_secret="s", enabled=None,
+             proxy_type="socks5", host="1.2.3.4", port=1080),
+        _rec(store="没勾没代理", client_id="c2", client_secret="s", enabled=None),
+        # 勾过又取消 ⇒ 飞书老实回 False
+        _rec(store="取消有代理", client_id="c3", client_secret="s", enabled=False,
+             proxy_type="socks5", host="1.2.3.4", port=1080),
+        _rec(store="取消没代理", client_id="c4", client_secret="s", enabled=False),
+        # 对照组:勾了的两种都连得上
+        _rec(store="勾了有代理", client_id="c5", client_secret="s", enabled=True,
+             proxy_type="socks5", host="1.2.3.4", port=1080),
+        _rec(store="勾了没代理", client_id="c6", client_secret="s", enabled=True),
+    ])
+    assert [s["name"] for s in out] == ["勾了有代理", "勾了没代理"]
+    assert [s["proxy"] for s in out] == ["socks5://1.2.3.4:1080", None]
+
 
 def test_no_proxy_configured_goes_direct():
     """★ 凭证表只填了沃尔玛凭证、代理五个字段一个没填 ⇒ **进名单,`proxy=None` 直连**。
@@ -252,11 +282,12 @@ def test_cross_store_concurrency_has_one_source():
 # ── 在营判据:三层之间的边界(所有者定稿 2026-08-22)────────────────────
 
 def _cred(name, **f):
+    """同 `_rec`:缺省把「启用」勾上(2026-10-21 起缺省不启用)。"""
     from registry import resources
     fl = resources.STORE_CREDENTIALS.fields
     fields = {fl.store: name, fl.client_id: "cid", fl.client_secret: "sec",
               fl.proxy_type: "http", fl.proxy_host: "1.2.3.4",
-              fl.proxy_port: "8080"}
+              fl.proxy_port: "8080", fl.enabled: True}
     fields.update(f)
     return {"fields": fields}
 
@@ -267,9 +298,13 @@ def test_is_enabled_is_the_single_predicate():
     from registry import resources
     from services import stores as st
     fl = resources.STORE_CREDENTIALS.fields
-    assert st.is_enabled({}) is True                      # 缺省视为启用(旧表无此列)
+    # ★ 缺省是**不启用**(所有者定稿 2026-10-21):飞书对从未勾过的复选框
+    # 整个字段不返回,原口径"缺省视为启用"把"查无此字段"当成了启用 ——
+    # 2026-09-19 谭总1/谭总3 被拉去跑就是这么来的。
+    assert st.is_enabled({}) is False                     # 从未勾过 ⇒ 不连
     assert st.is_enabled({fl.enabled: True}) is True
     assert st.is_enabled({fl.enabled: False}) is False
+    assert st.is_enabled({fl.enabled: None}) is False     # 看不懂的值一律不连
     for no in ("否", "false", "0", " 否 "):
         assert st.is_enabled({fl.enabled: no}) is False
     for yes in ("是", "true", "1"):
@@ -388,7 +423,9 @@ def test_no_shadow_imports_of_feishu_left(monkeypatch):
         assert "_feishu" not in inspect.getsource(fn), fn.__name__
     # 行为不变:两支都用模块级 feishu,现有 monkeypatch 写法照旧生效
     f = resources.STORE_CREDENTIALS.fields
-    recs = [{"fields": {f.store: "A1"}}, {"fields": {f.store: "A2", f.enabled: False}}]
+    # 「启用」显式给:2026-10-21 起缺省是不启用,本测试要测的不是那个默认值
+    recs = [{"fields": {f.store: "A1", f.enabled: True}},
+            {"fields": {f.store: "A2", f.enabled: False}}]
     monkeypatch.setattr(stores_svc.feishu, "list_records", lambda *a, **k: recs)
     assert stores_svc.enabled_names() == {"A1"}
     assert stores_svc.registered_names() == {"A1", "A2"}

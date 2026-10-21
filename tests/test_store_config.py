@@ -317,10 +317,14 @@ def test_check_and_record_lands_events_and_saves_the_new_snapshot(monkeypatch):
 
 def test_version_migration_skips_the_diff_but_still_saves_and_says_so(
         monkeypatch):
-    """★ v1(存着未登记列的值)→ v2:不产事件、**但快照要覆盖**(与飞书失败
-    那条路径正好相反),而且摘要必须**明说**这一轮为什么没比对。
+    """★ 旧版本(v1,存着未登记列的值)→ 当前版本:不产事件、**但快照要覆盖**
+    (与飞书失败那条路径正好相反),而且摘要必须**明说**这一轮为什么没比对。
 
     静默的话摘要上只显示"无变更",而这一轮真发生的配置改动确实丢了一轮。
+
+    断言照 `sc.SNAPSHOT_VERSION` 取值、不写死版本号:提版本正是这条机制的用法
+    (v3 于 2026-10-21 用它吞掉 431 条「启用」口径变更的假事件),每次提版本都
+    得来改一遍测试的话,改的人会倾向于不提版本。
     """
     v1 = {"v": 1, "limits": {"A085": {F.category1: "Home",
                                       "SourceID": _SOURCE_ID}},
@@ -331,10 +335,11 @@ def test_version_migration_skips_the_diff_but_still_saves_and_says_so(
     monkeypatch.setattr(sc, "take_snapshot", lambda: cur)
     events, warn = sc.check_and_record(conn)
     assert events == [] and conn.events == []
-    assert conn.saved is not None and '"v": 2' in conn.saved
+    assert conn.saved is not None and f'"v": {sc.SNAPSHOT_VERSION}' in conn.saved
     assert _SOURCE_ID not in conn.saved, "新快照里不许再有未登记列的值"
-    assert warn and "没比对" in warn and "v1" in warn and "v2" in warn
-    # 下一轮(两版都是 v2)恢复正常比对
+    assert warn and "没比对" in warn and "v1" in warn \
+        and f"v{sc.SNAPSHOT_VERSION}" in warn
+    # 下一轮(两版同号)恢复正常比对
     conn2 = _Conn(stored=cur)
     monkeypatch.setattr(sc, "take_snapshot",
                         lambda: _snap(limits={"A085": {F.category1: "Baby"}},
@@ -376,7 +381,9 @@ def test_store_snapshot_only_asks_feishu_for_two_columns(monkeypatch):
 
 def test_enabled_is_none_when_the_column_is_gone_from_the_whole_sheet(monkeypatch):
     """整张表一行都没带这个键 ⇒ 列被改名/删了 ⇒ 全记 None(不产事件);
-    个别行缺键仍按 stores.is_enabled 的既定口径「缺省视为启用」。"""
+    个别行缺键仍按 stores.is_enabled 的既定口径 —— 2026-10-21 起那个口径是
+    **缺省不启用**(从未勾过的复选框飞书整个字段不返回),所以单行缺键记 False。
+    这里不另立第二套解释,跟着 is_enabled 走。"""
     cf = resources.STORE_CREDENTIALS.fields
     monkeypatch.setattr(sc.feishu, "list_records",
                         lambda *a, **k: [{"fields": {cf.store: "A085"}},
@@ -388,7 +395,7 @@ def test_enabled_is_none_when_the_column_is_gone_from_the_whole_sheet(monkeypatc
         lambda *a, **k: [{"fields": {cf.store: "A085", cf.enabled: False}},
                          {"fields": {cf.store: "A107"}}])
     assert sc._stores_snapshot() == {"A085": {"enabled": False},
-                                     "A107": {"enabled": True}}
+                                     "A107": {"enabled": False}}
 
 
 def _limits_rows(monkeypatch, rows):

@@ -29,8 +29,8 @@ def test_normalize_filters_and_proxy_url():
              proxy_type="socks5", host="1.2.3.4", port=1080, user="u@x", pw="p:w"),
         _rec(store="无凭证", client_id="0", client_secret="s",
              proxy_type="socks5", host="1.1.1.1", port=1080),
-        _rec(store="无代理", client_id="cid2", client_secret="s2",
-             proxy_type="0", host="0", port="0"),
+        _rec(store="代理半配", client_id="cid2", client_secret="s2",
+             proxy_type="socks5", host="0", port=1080),       # 填了一半 → 拒跑
         _rec(store="已停用", client_id="cid3", client_secret="s3",
              proxy_type="http", host="2.2.2.2", port=8080, enabled=False),
         # 文本字段可能以富文本段列表返回
@@ -43,6 +43,90 @@ def test_normalize_filters_and_proxy_url():
     assert out[0]["proxy"] == "socks5://u%40x:p%3Aw@1.2.3.4:1080"
     # 数字字段 8080.0 → 8080
     assert out[1]["proxy"] == "http://3.3.3.3:8080"
+
+
+# ── 出口三岔(所有者定稿 2026-10-21)────────────────────────────────────
+
+def test_no_proxy_configured_goes_direct():
+    """★ 凭证表只填了沃尔玛凭证、代理五个字段一个没填 ⇒ **进名单,`proxy=None` 直连**。
+
+    2026-10-21 之前这家店是被整店过滤掉的(当时的规则是"严禁直连")。
+    `None` 必须原样传到 api 层:`httpx` 的 `proxy=None` 就是直连,而 `""` 会
+    在 transport 构造期抛 ValueError(见 `_client._norm_proxy`)。
+    """
+    out = stores_svc._normalize([
+        _rec(store="直连店", client_id="cid", client_secret="s"),            # 代理字段全缺
+        _rec(store="零值店", client_id="cid2", client_secret="s2",
+             proxy_type="0", host="0", port="0", user="0", pw="0"),          # 全是那个当空用的 "0"
+    ])
+    assert [s["name"] for s in out] == ["直连店", "零值店"]
+    assert [s["proxy"] for s in out] == [None, None]
+
+
+@pytest.mark.parametrize("partial", [
+    {"proxy_type": "socks5"},                                   # 只填了类型
+    {"host": "1.2.3.4"},                                        # 只填了 IP
+    {"port": 1080},                                             # 只填了端口
+    {"proxy_type": "socks5", "host": "1.2.3.4"},                # 漏了端口
+    {"proxy_type": "socks5", "port": 1080},                     # IP 填成空
+    {"host": "1.2.3.4", "port": 1080},                          # 漏了类型
+    {"proxy_type": "socks5", "host": "0", "port": 1080},        # IP 填成那个 "0"
+    {"user": "u", "pw": "p"},                                   # 只填了账号密码
+])
+def test_partial_proxy_is_refused_never_direct(partial):
+    """★ **代理只填了一半 ⇒ 整店拒跑,绝不当成"没填"去直连。**
+
+    这是本次改动唯一的新增拦截点,也是它存在的全部理由:填了一半说明所有者
+    **本来要走代理**,只是端口打错 / IP 填成了 `0`。当没填处理 → 拿真实店铺
+    凭证裸连沃尔玛 → 「店铺关联封号」那条红线。判不准就不跑:猜错的那个方向
+    是不可逆的。
+    """
+    out = stores_svc._normalize([
+        _rec(store="半配店", client_id="cid", client_secret="s", **partial)])
+    assert out == []
+
+
+def test_same_proxy_shared_by_several_stores_is_allowed():
+    """★ 多个凭证共用同一个代理 ⇒ **都要在名单里**(所有者 2026-10-21 明确要求)。
+
+    不去重、不报错:沃尔玛配额按 `(store, endpoint)` 计,`api/_client` 的令牌桶
+    按 `(client_id, bucket)` 记 —— 共用代理的店之间**不抢配额**,共用的只是那条
+    出口的带宽与连接池(`_client_pool` 按代理 URL 池化,握手还能复用)。
+    """
+    out = stores_svc._normalize([
+        _rec(store="甲", client_id="c1", client_secret="s",
+             proxy_type="socks5", host="1.2.3.4", port=1080, user="u", pw="p"),
+        _rec(store="乙", client_id="c2", client_secret="s",
+             proxy_type="socks5", host="1.2.3.4", port=1080, user="u", pw="p"),
+        _rec(store="丙", client_id="c3", client_secret="s",
+             proxy_type="socks5", host="1.2.3.4", port=1080, user="u", pw="p"),
+    ])
+    assert [s["name"] for s in out] == ["甲", "乙", "丙"]
+    assert len({s["proxy"] for s in out}) == 1          # 同一个代理 URL
+    assert len({s["client_id"] for s in out}) == 3      # 凭证各自独立
+
+
+def test_egress_is_named_in_logs(caplog):
+    """直连 / 半配 / 共用代理每轮都要点名 —— 不点名就只能等出事才知道名单变了
+    (2026-09-19「未启用店被拉取」就是靠人眼发现的)。**代理口令不许进日志。**"""
+    import logging
+    with caplog.at_level(logging.INFO, logger="services.stores"):
+        stores_svc._normalize([
+            _rec(store="直连甲", client_id="c1", client_secret="s"),
+            _rec(store="直连乙", client_id="c2", client_secret="s"),
+            _rec(store="半配丙", client_id="c3", client_secret="s", proxy_type="http"),
+            _rec(store="共用丁", client_id="c4", client_secret="s",
+                 proxy_type="socks5", host="9.9.9.9", port=1080, user="u", pw="secret"),
+            _rec(store="共用戊", client_id="c5", client_secret="s",
+                 proxy_type="socks5", host="9.9.9.9", port=1080, user="u", pw="secret"),
+        ])
+    text = caplog.text
+    assert "直连甲" in text and "直连乙" in text
+    assert "共享同一个出口 IP" in text                  # 多家直连要额外警告
+    assert "半配丙" in text and "本轮没跑" in text
+    assert "共用丁" in text and "共用戊" in text
+    assert "9.9.9.9:1080" in text                       # 标签只到 host:port
+    assert "secret" not in text                         # ⚠ 代理密码绝不进日志
 
 
 def test_snapshot_fallback_when_feishu_down(monkeypatch):
@@ -107,17 +191,20 @@ def test_filter_names_typo_raises_not_silently_skipped(monkeypatch):
 def test_filter_names_disabled_store_says_so(monkeypatch):
     """在册但被过滤掉的店,**不能**报成「查无此店」。
 
-    把「没配代理」说成「不存在」会让人去凭证表里找一个明明在那儿的店;
+    把「代理只填了一半」说成「不存在」会让人去凭证表里找一个明明在那儿的店;
     alloc_audit 的 docstring 专门警告过这一处混淆。
+
+    ⚠ 这里原本用的是「裸连店」(代理全空)—— 2026-10-21 起那是合法的直连店,
+    不再被过滤,所以换成**代理半配**这个唯一还会被拦的形状。
     """
     _live(monkeypatch, [
         _rec(store="A1", client_id="c1", client_secret="s", proxy_type="http", host="1.1.1.1", port=80),
         _rec(store="停用店", client_id="c2", client_secret="s",
              proxy_type="http", host="2.2.2.2", port=80, enabled=False),
-        _rec(store="裸连店", client_id="c3", client_secret="s",
-             proxy_type="0", host="0", port="0"),
+        _rec(store="半配店", client_id="c3", client_secret="s",
+             proxy_type="http", host="0", port=80),
     ])
-    for name in ("停用店", "裸连店"):
+    for name in ("停用店", "半配店"):
         with pytest.raises(ValueError) as ei:
             stores_svc.load_stores([name])
         assert "在凭证表里,但被过滤掉了" in str(ei.value)
@@ -193,17 +280,20 @@ def test_enabled_names_ignores_client_id_and_proxy(monkeypatch):
     """★ **在营 ≠ 能调 API。**
 
     「启用」是所有者的**意图**开关,ClientId/代理是**技术就绪**。合并的后果:
-    「在营但代理没配」的店会被当成死店 —— 而死店名录直通整店下线。
+    「在营但代理只填了一半」的店会被当成死店 —— 而死店名录直通整店下线。
+
+    ⚠ 2026-10-21 起"没配代理"**不再**是技术未就绪(那是直连),所以这里用
+    「代理半配」—— 它是唯一还会被 `load_stores` 拦下的形状。
     """
     from registry import resources
     from services import stores as st
     fl = resources.STORE_CREDENTIALS.fields
     recs = [_cred("A085朱丽霖"),
-            _cred("A102无代理", **{fl.proxy_host: "0"}),        # 在营,只是没配代理
+            _cred("A102代理半配", **{fl.proxy_host: "0"}),      # 在营,只是代理填了一半
             _cred("A107无凭证", **{fl.client_id: "0"}),
             _cred("Z001已停用", **{fl.enabled: False})]
     monkeypatch.setattr("api.feishu.list_records", lambda *a, **k: recs)
-    assert st.enabled_names() == {"A085朱丽霖", "A102无代理", "A107无凭证"}
+    assert st.enabled_names() == {"A085朱丽霖", "A102代理半配", "A107无凭证"}
 
 
 def test_load_stores_is_strictly_narrower_than_enabled_names(monkeypatch):
@@ -211,13 +301,13 @@ def test_load_stores_is_strictly_narrower_than_enabled_names(monkeypatch):
     from registry import resources
     from services import stores as st
     fl = resources.STORE_CREDENTIALS.fields
-    recs = [_cred("能调"), _cred("在营没代理", **{fl.proxy_host: "0"}),
+    recs = [_cred("能调"), _cred("在营代理半配", **{fl.proxy_host: "0"}),
             _cred("已停用", **{fl.enabled: False})]
     monkeypatch.setattr("api.feishu.list_records", lambda *a, **k: recs)
     monkeypatch.setattr(st, "_write_snapshot", lambda s: None)
     api_ok = {s["name"] for s in st.load_stores()}
     assert api_ok == {"能调"}
-    assert api_ok < st.enabled_names() == {"能调", "在营没代理"}
+    assert api_ok < st.enabled_names() == {"能调", "在营代理半配"}
     assert st.enabled_names() < st.registered_names()
 
 

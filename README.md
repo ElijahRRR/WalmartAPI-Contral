@@ -9,7 +9,7 @@
 python cli.py <workflow> [-p key=value ...] [--dry-run]
 ```
 
-- **84 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
+- **85 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
   类目映射、店铺分配、KPI 日报八个业务域;
 - **13 条自动任务**在生产运行(电脑 launchd 4 条高频 + 智能体定时任务 9 条每日/每周);
 - **PostgreSQL 17** 单库五 schema(56 表 / 14 视图)为唯一权威状态;
@@ -47,8 +47,19 @@ workflows 可以调 services 和 api;api **不准** import services;任何层**�
 **3. 一切路径、token、表 ID、服务器地址只准从 `registry/` 取。** 任何文件出现硬编码的
 飞书 token、表 ID、绝对路径、IP,都是违规。新增外部资源先登记进 registry 再引用。
 
-**4. 沃尔玛 API 必须走 `api/_client.py`,每店铺固定出口代理,严禁直连。**
-每个店铺凭证绑定固定出口 IP,直连会导致店铺关联封号。这是业务生死线。
+**4. 沃尔玛 API 必须走 `api/_client.py`;出口走法只由凭证表决定。**
+(所有者定稿 2026-10-21;判据唯一出处 `services/stores.proxy_of`)
+
+| 凭证表的代理三件套(类型 / IP / 端口) | 走法 |
+|---|---|
+| **填齐**(账号密码可选) | **必须**走这个代理;连不上按原逻辑处理(代理无效/代理波动 → 串行补试 → 缺席点名 → 链尾重赛),**不许退成直连** |
+| **五个字段全空** | **直连**(`proxy=None`) |
+| **只填了一半** | **整店拒跑并点名** —— 填了一半说明本来要走代理,当没填处理就是拿真实店铺凭证裸连沃尔玛 |
+
+**允许多个凭证共用同一个代理。** 共享出口(直连共享本机 IP、多店共用一个代理)
+会被沃尔玛用来做店铺关联,这个风险由所有者承担;代码的责任是**忠实执行 +
+每轮点名**(`services/stores._log_egress` 把"直连几家 / 半配被排除几家 / 哪几家
+共用一个代理"打进日志),**只告警不拦**。
 
 ### 三条安全纪律
 
@@ -120,7 +131,7 @@ maintenance      (DANGEROUS=True,纯执行件,只消费建议行,自己不做决
 
 | 层次 | 并发度 | 出处 |
 |---|---|---|
-| **跨店** | 24 | `services.stores.STORE_WORKERS` —— 每店有自己的固定出口代理,配额按 `(store, endpoint)` 计,店与店不抢同一个令牌桶 |
+| **跨店** | 24 | `services.stores.STORE_WORKERS` —— 配额按 `(store, endpoint)` 计,`api/_client` 的令牌桶按 `(client_id, bucket)` 记,店与店不抢同一个桶。⚠ 这里曾拿"每店有自己的固定出口代理"当论据,2026-10-21 起允许共用代理/直连,**论据换成令牌桶的键,结论不变**;共用出口共享的是带宽与连接池(吞吐问题),不是配额 |
 | **店内跨接口** | 各链自定 | 按端点配额定(如 `catalog_sync._FILL_WORKERS=8` 对应 items.get 800/min) |
 | **店内同接口** | 1(串行) | 同店同端点是同一个桶,并发只会让自己排队等退避 |
 | **审核判定** | 默认 128 | `product_audit -p workers=N`;线程等的是 LLM 的 HTTP,不是 CPU。**按 PG `max_connections` 余量自动钳并在摘要里说明** |
@@ -473,6 +484,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 | `db_init` | | 执行 `refdata/schema.sql` 建五 schema(幂等)+ 只读角色 |
 | `init_data_root` | | 初始化 `<DATA_ROOT>` 目录结构与 `.env` 模板(幂等) |
 | `ping_stores` | | 端到端验收:读凭证表 → 每店经代理调只读端点 → 汇总 |
+| `egress_preview` | | **只读**预览:每家店会走代理 / 直连 / 还是因代理半配被拦;点名「本次改动新增进名单」与「启用从未勾过」的店(出口规则改动的配套闸,见 plan.md 2026-10-21) |
 | `launchd_install` | 危 | 生成高频链的 launchd plist(装完就是真调度) |
 | `skill_export` | | 生成智能体定时任务的技能包(从调度表渲染) |
 | `cleanup_history_import` | 一 | 旧问题商品三笔历史入库 |
@@ -545,6 +557,7 @@ vi ~/walmart_data/.env                  # 填飞书凭据、代理、DSN 等(密
 createdb walmart_data                   # PostgreSQL 17
 python cli.py db_init                   # 五 schema + 只读角色(幂等)
 # 飞书建「店铺凭证表」,app_token/table_id 填进 .env(字段名见 registry/resources.py)
+python cli.py egress_preview            # 只读:先看清谁走代理、谁直连、谁被拦
 python cli.py ping_stores               # 每店经代理连通沃尔玛 = 地基就绪
 ```
 

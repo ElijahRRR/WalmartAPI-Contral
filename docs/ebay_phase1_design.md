@@ -120,6 +120,20 @@
 > ② 🔴 正确性:**段的落地顺序 = 调用方字段顺序**,跨请求中途失败只丢后面的段
 > ⇒ SKU 放最前、结论列在后、幂等标记列放最后,否则出现「标了已上架却没有
 > offerId/listingId」的行(沃尔玛侧对位是「已提交但无码」)。
+> 🔴 **2026-10-21 对齐 main #147(本轮最大的一次:安全红线被取代)**:
+> 「**沃尔玛 API 严禁直连**」这条红线已由「**连不连、怎么连只由凭证表决定**」
+> 取代(所有者定稿),CLAUDE.md 同步改写。§3.4 据此补三块原稿**完全没有**的内容:
+> ① 🔴 `is_enabled` **缺省从"视为启用"翻成"不启用"**(飞书对从未勾过的复选框
+> 整个字段不返回;2026-09-19 实见 530 行里 431 行是空值,两家店被拉去跑了)——
+> eBay 账号表是新建的、复选框全处在"从未勾过",按旧口径会把**全部账号判成启用**;
+> ② 🔴 **代理三岔 + 顺序判断**(勾了启用才连 → 才按代理规则;填齐必走不许改直连 /
+> 全空直连 / **半配整账号拒跑**),判据做成 eBay 侧唯一出处,顺序本身要有回归;
+> ③ ⚠ `proxy=""` 抛 ValueError ⇒ `_norm_proxy` 抽进 §3.1 中立层;`direct` 标记、
+> `egress_preview` 对位、账号快照版本常量各记一条。§3.2 同步:store_retry 行号
+> 重定位(fan_out 148→153、diagnose 93→94,六档未加减),并补 `diagnose` 的
+> **`direct` 分支**(直连出口不通归「网络未达」而非「代理无效」)——参数化时别弄丢。
+> ⚠ 判据 ④ 要等的实值形状因此变了:不是"必须给每账号三件套",而是"要么给齐、
+> 要么全空直连,不许半配";选直连则代理三件套**不再阻塞 P1-1**。
 > ⚠ 本文引用的仓库行号以 **2026-09-23 的 main(06140c3)** 为快照(§2.1/§2.2/
 > §3.2 已按它重定位;其余节仍是 09-07 快照),批次实施时现场重定位。
 
@@ -369,9 +383,16 @@ SKU↔offerId/listingId 权威在 `ops.feed_items`)。
 ### 3.2 店级失败标准的跨平台接入(动沃尔玛侧 3 处)
 
 - `api/_http.py` 立中立基类 **`IdentityDeadError`**;两侧 dead 异常继承它。
-  沃尔玛侧改 **3 处**:`store_retry.fan_out:148`、`serial_second_pass:52`、
-  **`diagnose:93`**(漏了它,eBay 账号在串行补试阶段暴露的凭证死会被归进
-  「其他」档、进 absent 不进 dead,归类与分流同时错)。
+  沃尔玛侧改 **3 处**:`store_retry.fan_out:153`、`serial_second_pass:52`、
+  **`diagnose:94`**(漏了它,eBay 账号在串行补试阶段暴露的凭证死会被归进
+  「其他」档、进 absent 不进 dead,归类与分流同时错)。行号 2026-10-21 随
+  main #147 重定位(fan_out 148→153、diagnose 93→94;六档一个没加减)。
+- ⚠ **`diagnose` 里多了一个 `direct` 分支,参数化时别把它弄丢(#147)**:
+  「网络未达」的语义扩了——现在**也包括「没配代理的直连店出口不通」**,判据是
+  `getattr(err, "direct", False)`(`StoreProxyError` 带 `direct` 标记但**仍
+  子类化 `httpx.ProxyError`**,所以不加这个分支就会落到「代理无效」,把人指去
+  改一个根本不存在的代理配置)。eBay 侧直连账号**完全同形**:`vendor=` 参数化
+  必须保留这个分支,六档逐档断言里要有「直连账号出口不通 → 网络未达」这一例。
 - `store_retry.diagnose(err, vendor="沃尔玛")` 参数化,六档不加档;eBay api
   层报错逐字用同一文案形状(`返回 {status}`/`返回 None`)。守门:
   `test_store_retry_standard:247`
@@ -456,9 +477,45 @@ SKU↔offerId/listingId 权威在 `ops.feed_items`)。
 
 ### 3.4 services/ebay_accounts.py + api/ebay/_client.py + 令牌
 
-- 三层判据仿 stores.py:`registered_names()`/`enabled_names()`(`is_enabled`
-  照抄含 bool 分支)/`load_accounts()`(能调 API=库里有未过期 refresh_token,
-  跨层读 `ops.ebay_tokens`;凭证飞书表只放 启用+代理三件套+marketplace)。
+- 三层判据仿 stores.py:`registered_names()`/`enabled_names()`/
+  `load_accounts()`(能调 API=库里有未过期 refresh_token,跨层读
+  `ops.ebay_tokens`;凭证飞书表只放 启用+代理三件套+marketplace)。
+  🔴 **「照抄 `is_enabled`」的内容在 2026-10-21 被 main #147 反转了**:新口径
+  **缺省不启用**——只有明确勾了(或旧表文本「是」)才算启用。事故证据:飞书对
+  **从未勾过**的复选框**整个字段不返回**(勾过又取消的会老实回 `False`),旧口径
+  把"查无此字段"当启用,2026-09-19 实见 **530 行里 431 行**是这种空值,谭总1/
+  谭总3 因此**被拉去跑了**。⚠ 这条对 eBay **比对沃尔玛更要紧**:eBay 账号表是
+  **新建**的,所有复选框都处在"从未勾过"状态 ⇒ 按旧口径会把**全部账号判成启用**,
+  第一轮就去连一堆还没配好的账号。照抄**新**的那套,并配一条"字段缺失 ⇒ 不启用"
+  的单测。
+- 🔴 **连不连、怎么连只由凭证表决定(#147 取代原「严禁直连」红线,顺序判断不是
+  并列)**——原稿这一节只说了"凭证飞书表放代理三件套",**没有判据**,等于把
+  半配裸连的口子留着。照搬 CLAUDE.md 新红线的三岔,判据做成 eBay 侧的**唯一
+  出处**(对位 `stores.proxy_of` 与它的三个常量 `PROXY_FULL/PROXY_NONE/
+  PROXY_PARTIAL`):**① 勾了「启用」才连接 → ② 连接时才按代理规则**。没勾启用的
+  账号,配了代理也不连、没配也不直连;**顺序本身要有回归钉住**(#147 专门写了)。
+  代理三岔:**三件套填齐 → 必须走这个代理**,连不上按 §3.2 的店级失败标准处理
+  (代理无效/代理波动 → 串行补试 → 缺席点名),**不许改直连**;**五个字段全空 →
+  `proxy=None` 直连**;**只填了一半 → 整账号拒跑并点名**(半配当没填会拿真实
+  凭证裸连,正是账号关联封号那条红线——eBay 同样有账号关联风控)。允许多账号
+  共用一个代理;直连与共用**每轮点名**(对位 `_log_egress`),**只告警不拦**
+  (共享出口的关联风险由所有者承担);**代理口令不进日志**。
+  ⚠ **这条改变了判据 ④ 要等的实值形状**:不再是"必须给每账号三件套",而是
+  **"每账号要么给齐三件套、要么五个字段全空(直连),不许半配"**——若所有者选
+  直连,代理三件套就**不再阻塞 P1-1**。
+- ⚠ **`proxy=""` 与 `None` 只差一个空串,但 httpx 会抛 `ValueError`(#147 补了
+  `api/_client._norm_proxy`)**:这个坑对 `api/ebay/_client` 一字不差适用,所以
+  `_norm_proxy` **抽进 §3.1 的 `api/_http.py` 中立层**,不是两边各写一份。
+  同理 `StoreProxyError` 的 `direct` 标记(仍子类化 `httpx.ProxyError`)要在
+  中立基类 `IdentityDeadError` 那批里一起想清楚。#147 还新增了只读工作流
+  `egress_preview`(看每店最终走哪个出口)——eBay 侧值得有对位的只读预览,
+  P1-1 的冒烟里顺手跑一次比读五个字段可靠。
+- ⚠ **账号快照若要做 diff/事件,必须有版本常量**:#147 把
+  `store_config.SNAPSHOT_VERSION` 从 2 提到 3,**专门用来吞掉** 431 条
+  「启用 True→False」的假 high 事件(该常量本来就为这件事设计:形状变了就 +1,
+  见到版本不同当**首次快照**处理)。eBay 账号快照
+  (`paths.ebay_accounts_snapshot_file`)同形,一期即便只存不 diff,也先把版本
+  常量立好——等到要 diff 时才补,就会先产一屏假事件。
   快照 `paths.ebay_accounts_snapshot_file`(新函数,不复用 stores 文件)。
   `EBAY_ACCOUNT_WORKERS = 4` 起步。
 - `ops.ebay_tokens`:PK **`(account, env, token_kind, scopes)`**。刷新响应
@@ -993,7 +1050,7 @@ api 留签名。要做=+4~5 人日,四项前置:①UPC 结构裁决落地(本文
 
 | 批次 | 内容 | 人日 | 验收要点 |
 |---|---|---|---|
-| P1-1 | _http 抽取+registry(含 platforms.py/飞书两表)+ebay_accounts+_client+tokens+authorize+runbook+文档勘误回改 | 7 | 沃尔玛 pytest 全绿(18 处 monkeypatch 例外清单)/sandbox 与 production 各铸令牌+getRateLimits/进程超时 90.0 冒烟/账号互斥断言单测(含停用店名反例)/state 不符抛错单测 |
+| P1-1 | _http 抽取+registry(含 platforms.py/飞书两表)+ebay_accounts+_client+tokens+authorize+runbook+文档勘误回改 | 7 | 沃尔玛 pytest 全绿(18 处 monkeypatch 例外清单)/sandbox 与 production 各铸令牌+getRateLimits/进程超时 90.0 冒烟/账号互斥断言单测(含停用店名反例)/state 不符抛错单测/**`is_enabled` 字段缺失 ⇒ 不启用单测(§3.4)**/**代理三岔单测:填齐必走 / 全空直连 / 半配整账号拒跑,外加「没勾启用 ⇒ 配了代理也不连」的顺序回归**/**出口预览(对位 `egress_preview`)跑一次,人眼核对每账号最终走哪个出口** |
 | P1-2 | 全部 DDL(**含 `upc_usage` 对位部分索引,§2.2**)+claims/upc 改造+台账谓词补全+**risk_trace 四证据源谓词(§4.4)**+events 契约 | 7 | db_init 两跑(**记录是否踩到 `lock_timeout 30s`,§4.5**)+六格对拍+读 SQL count·md5 对拍+**取号/烧号 EXPLAIN 走 `upc_usage` 部分索引**/沃尔玛上架与分配链 --dry-run 摘要逐字一致(claims 11 读+3 写+3 事件桥、upc 7 写+6 读投影,**含 `alloc_plan -p from_sheet=1` 点名分配那条路径**——预期红清单按 §2.1/§2.2 的现场重核数,别按旧稿的 9+2)/UPC 三级取号+烧号保护+「烧后重上领新号」单测/飞书 UPC 表投影逐行对拍/browse_node_id 空行占比落数+**「沃尔玛在架但 audit_status 为 NULL/pending」的条数落数(§2.3)**/**risk_trace 展开结果不含 eBay 账号**(造 claims+listing_sources+product_events 三条 eBay 行) |
 | P1-3 | bootstrap+taxonomy+catmap 测试链+account_health | 6 | sandbox 户口链重入两遍/生产拉真树+版本哨兵/aspects 解耦拉取(新 promote 类目当日拿到 aspects)/promote 三格(缺省中、入料只吃高、置高路径逐条点名)/refresh 探活停链 |
 | P1-4 | 中立抽取(3)+admission/conform/pricing+api 两文件+list_new+submit_poll+**`refdata/ebay_slas.tsv`(官方期限登记表,§6.5)**+飞书投影 | 15 | 沙箱清单 13 项完成/sandbox 端到端 3 SKU PUBLISHED/防重三态+熔断+双闸+重试闸单测/**抽码即登记单测**(eBay 行落 `listing_sources` 且 `abandoned_at IS NULL`、码形符 `OPAQUE_SQL_PREDICATE`、`-p dry_run` 走 `DRYRUN_PLACEHOLDER` 不落码)/**残局单测:造一条「`feed_log` pending 但无 `feed_items` 行」,断言 `list_new` 下一轮不选中该 SKU、`submit_poll` 的选行面选得中它**/--dry-run 人眼确认/中立抽取后沃尔玛输出逐字不变 |
@@ -1034,3 +1091,8 @@ feed_poll 55-64→55-67)/oauth-quick-ref-user-tokens.html 已 404 删引用。
    `packageWeightAndSize`(§6.4)。⚠ 若要走 calculated shipping,则重量必传,
    且重量**解析不出或不可信时「不上架」**——**不许**沿用沃尔玛那条
    「>11 磅写 1 磅」(在 calculated 下方向是反的:会少收运费、差价卖家吃)。
+8. **eBay 账号的出口形态**(2026-10-21 随 main #147 新增;原来这是判据 ④ 的
+   "实值"、现在有默认值了):默认**每账号给齐代理三件套**(与沃尔玛同形、
+   关联风险最小)。⚠ 若选**全空直连**,代理三件套就**不再阻塞 P1-1**,但要知情:
+   多账号共用同一出口的关联风险由所有者承担(代码只点名、不拦)。**半配一律拒跑**,
+   这条不是选项。

@@ -74,7 +74,9 @@ def store_activity(store_status) -> str:
 
 # 每店最新一行。⚠ 同形的 Python 副本还有 services/alloc_survey._SQL_STATUS、
 # workflows/problem_scan._SQL_STATUS、workflows/list_new._SQL_INACTIVE(历史存量,
-# 待迁);**新代码一律调 latest_store_status**,别再抄第五份
+# 待迁);内嵌在大 SQL 里的 CTE 另有 services/maintenance_intents 两处、
+# workflows/product_refresh 一处(调不了 Python,留着)。**新代码一律调
+# latest_store_status**,别再抄一份
 _SQL_LATEST_STATUS = """
 SELECT DISTINCT ON (store) store, store_status
 FROM ops.store_kpi_daily ORDER BY store, data_date DESC

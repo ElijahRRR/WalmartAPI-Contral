@@ -170,7 +170,9 @@ warning 计数 —— 它不许混进"标题 N 条"里无声发生。
 published_status / lifecycle(在途改码的旧码仍排除)。走向由归类的**原子集合**判
 (`services/error_taxonomy.is_recoverable_only`):只含 EXPIRED / STAGE → 不删;无原因
 → 不是候选;其余一律删(含未识别,摘要告警)。**店铺状态不设闸**(所有者同日追加:
-「非 ACTIVE 店也需要在扫描范围内」),非 ACTIVE 店照扫照建议,摘要按店点名。逐原子明细落
+「非 ACTIVE 店也需要在扫描范围内」),非 ACTIVE 店照扫照建议,摘要按店点名。⚠ 例外
+(2026-10-22,与维护链同一道顺序判断):凭证未启用、或启用了但已终止的店**整店不处置**
+(存量建议整店撤销,原因「店铺不处置(…)」);SUSPENDED 等未终止的店照旧。逐原子明细落
 `product_events.detail.atoms` / `ops.dispositions.detail.atoms`。摘要首行报
 「扫描 N 行(无原因 / 仅可恢复原子不删)→ 建议删除 …」,并按店列「仅可恢复原子不删」。
 09-06 那条 RETIRED 全豁免的依据(08-28 可见性变更翻回来的死档删不掉)已随 09-09
@@ -209,8 +211,8 @@ published_status / lifecycle(在途改码的旧码仍排除)。走向由归类�
 withdrawn,那一轮执行件根本没领到它 —— 要看撤销走
 `SELECT * FROM ops.dispositions WHERE status='withdrawn'`。
 撤销还有第二个原因(2026-10-22):店铺**不维护**(凭证未启用 / 店铺已终止)时
-整店撤销,原因记在 `detail->>'withdrawn_reason'`(「店铺不维护(…)」),与
-「本轮扫描不再建议」分得开。
+整店撤销,原因记在 `detail->>'withdrawn_reason'` —— 维护链写「店铺不维护(…)」,
+问题商品链(scan / audit 两个来源)写「店铺不处置(…)」,与「本轮扫描不再建议」分得开。
 
 ## 六·二、维护链拆分(批次四,已落地)
 

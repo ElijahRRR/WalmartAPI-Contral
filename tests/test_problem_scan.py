@@ -1307,11 +1307,13 @@ def test_closed_stores_get_no_disposals_in_sequential_order(monkeypatch):
     line = next(ln for ln in out.splitlines() if "整店不处置" in ln)
     assert "凭证未启用 1 店(C017)" in line and "店铺已终止 1 店(Z9)" in line
     assert line.index("凭证未启用") < line.index("店铺已终止")
-    assert "4 条候选不建议删除/停用" in line
+    assert "4 条在架行不参与处置" in line
     closed_wd = {(w[0], w[3]): w[2] for w in calls["withdraw"] if not w[1] and w[3]}
     assert closed_wd[("scan", "C017")] == "店铺不处置(凭证未启用)"
     assert closed_wd[("audit", "C017")] == "店铺不处置(凭证未启用)"
     assert closed_wd[("scan", "Z9")] == "店铺不处置(店铺已终止)"
+    assert closed_wd[("audit", "Z9")] == "店铺不处置(店铺已终止)"
+    assert ("scan", "T1") not in closed_wd
     general = [w for w in calls["withdraw"] if w[3] is None]
     assert general and all({"C017", "Z9"} <= set(w[4]) for w in general)
     # 观察面不连坐:归类事件/黑名单照样看得见不维护店的历史问题
@@ -1331,3 +1333,42 @@ def test_closed_gate_falls_open_when_roster_is_unknown(monkeypatch):
     scan.run({})
     assert {r["store"] for r in calls["suggest"]} == {"T1", "C017"}
 
+
+def test_closed_store_only_in_audit_is_still_gated(monkeypatch):
+    """只在审核来源里出现的店(扫描面没有它的行)也走同一道判断,两个来源都撤。"""
+    calls = _closed_wire(monkeypatch, enabled={"T1", "C017", "Z9"}, terminated=set(),
+                         audit=[("T1", "A1"), ("Q5", "A9")])
+    out = scan.run({})
+    assert ("Q5", "A9") not in {(r["store"], r["sku"]) for r in calls["suggest"]}
+    assert "凭证未启用 1 店(Q5)" in out and "1 条在架行不参与处置" in out
+    closed_wd = {(w[0], w[3]) for w in calls["withdraw"] if not w[1] and w[3]}
+    assert {("scan", "Q5"), ("audit", "Q5")} <= closed_wd
+
+
+def test_closed_gate_with_single_store_scan(monkeypatch):
+    """`-p store=C017` 且该店凭证没启用:不写它的建议;整店撤销只碰 C017,
+    通用撤销仍限 store=C017(别把其余店的待执行清空)。"""
+    calls = _closed_wire(monkeypatch, enabled={"T1", "Z9"}, terminated=set(),
+                         audit=[("C017", "A2")])
+    out = scan.run({"store": "C017"})
+    assert calls["suggest"] == []
+    assert "凭证未启用 1 店(C017)" in out
+    assert {w[3] for w in calls["withdraw"]} == {"C017"}
+
+
+def test_closed_gate_preview_writes_nothing(monkeypatch):
+    """preview:照样点名,说"将撤销",不写建议、不撤销。"""
+    calls = _closed_wire(monkeypatch, enabled={"T1", "Z9"}, terminated={"Z9"})
+    out = scan.run({"preview": "1"})
+    assert "整店不处置" in out and "存量建议将撤销(preview 不写)" in out
+    assert calls["suggest"] == [] and calls["withdraw"] == []
+
+
+def test_roster_note_lands_on_the_first_line(monkeypatch):
+    """①判不出的喊话拼在首行(链通知只显示首行)。"""
+    calls = _closed_wire(monkeypatch, enabled=None, terminated=set())
+    monkeypatch.setattr(scan.stores_svc, "enabled_or_note", lambda: (
+        None, "⚠ 在营名录读不到(FeishuError),本轮不按「启用」剔店"))
+    first = scan.run({}).splitlines()[0]
+    assert "在营名录读不到" in first and not first.startswith("⛔")
+    assert {r["store"] for r in calls["suggest"]} == {"T1", "C017", "Z9"}

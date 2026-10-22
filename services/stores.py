@@ -126,8 +126,10 @@ def enabled_names() -> set[str]:
 # 连接规则(CLAUDE.md 安全红线)同一种结构:**顺序,不是并列**。
 #   ① 凭证启用了没有(enabled_names)—— 没启用 ⇒ 不维护,到此为止;
 #   ② 启用了,店铺终止了没有(kpi.terminated_stores)—— 终止 ⇒ 不维护;否则维护。
-# 三处用同一套:maintenance_scan(维护三类 + 维护链的删除)、problem_scan(删除/
-# 停用建议)、product_refresh(推采集)。判据在这里一份,别在 workflow 里各写一遍。
+# maintenance_scan(维护三类 + 维护链的删除)与 problem_scan(删除/停用建议)整套走
+# closed_verdict;product_refresh(推采集)只共用第①步 enabled_or_note —— 它的第②步
+# 是自己 SQL 里原有的「非 ACTIVE 不推」(连 SUSPENDED 也不推,比"终止"更严,不动)。
+# 判据在这里一份,别在 workflow 里各写一遍。
 #: 两个不维护原因,按判断顺序;摘要也按这个顺序报
 CLOSED_DISABLED = "凭证未启用"
 CLOSED_TERMINATED = "店铺已终止"

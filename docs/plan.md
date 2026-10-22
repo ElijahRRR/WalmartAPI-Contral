@@ -115,9 +115,10 @@ SUSPENDED 不剔(可能恢复)。名录读不到(飞书)不剔、首行喊(与�
   「非 ACTIVE 店照扫照建议」对 SUSPENDED 等**未终止**的店不变。只挡处置建议,观察面
   (归类事件、黑名单收集、K 类信号)与缺席避让同款不连坐。
 - `product_refresh`:凭证未启用的店的在架 ASIN 不再推采集(冻结行推了只是白耗采集
-  预算);原有的「店铺非 ACTIVE 不推」不变。①判不出时不剔、首行喊。
-- 判据收成一份:`services/stores.enabled_or_note` / `closed_verdict` / `closed_names`,
-  三处共用,workflow 里不再各写一遍。
+  预算);首行报「凭证未启用的店独有的 ASIN N 个不推」;原有的「店铺非 ACTIVE 不推」
+  不变(它就是这里的第②步,比"终止"更严)。①判不出时不剔、首行喊。
+- 判据收成一份:`services/stores.enabled_or_note` / `closed_verdict` / `closed_names`。
+  两个扫描件整套共用;推采集只共用第①步。workflow 里不再各写一遍。
 
 ### 2026-10-21 连不连、怎么连只由凭证表决定:勾了启用才连 → 填了代理必走、没填即直连、半配拒跑(所有者定稿)
 

@@ -81,10 +81,11 @@
 判据从 `catalog.walmart_items` 每店 `max(last_seen_at)` 水位派生)。
 平台侧的店铺状态(`ops.store_kpi_daily.store_status`,沃尔玛报的 ACTIVE /
 SUSPENDED / TERMINATED)是**另一维,不是在营判据**:在营仍只看 `enabled_names()`。
-维护链 / 问题商品链 / 推采集对店**顺序判断**是否维护(2026-10-22):① 不在营 ⇒
-不维护、到此为止;② 在营再看最近一次观测是否 TERMINATED ⇒ 是则不维护。判据一份在
+维护链 / 问题商品链对店**顺序判断**是否维护(2026-10-22):① 不在营 ⇒ 不维护、到此
+为止;② 在营再看最近一次观测是否 TERMINATED ⇒ 是则不维护。判据一份在
 `services/stores.closed_verdict`(①判不出走 `enabled_or_note`:不剔、首行喊),已终止
 的唯一取数口是 `kpi.terminated_stores`(每店最新一行,`kpi.latest_store_status`)。
+推采集(product_refresh)只共用第①步;它的第②步是原有的「非 ACTIVE 不推」(更严)。
 
 ## 三、处置建议路由(所有者定稿 2026-08-24)
 

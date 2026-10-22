@@ -18,7 +18,9 @@
 照样会拿着陈旧数据算出价格和库存去提交——**比任何字段问题都危险**。
 
 口径(所有者定稿 2026-08-09):
-  · 每次改价前**全量重推**在线产品(PUBLISHED + 店铺 ACTIVE),不做优先级
+  · 每次改价前**全量重推**在线产品(PUBLISHED + 凭证启用 + 店铺 ACTIVE),不做优先级
+    (「凭证启用」2026-10-22 起:停用店的在架行是冻结的,推了白耗采集预算。为此本
+    工作流每轮读一次飞书凭证表;读不到 / 读回空集不剔、首行喊,其它异常照炸)
   · 采集器吞吐 2000~3000/分钟(不切邮编、不截图)
   · **一次性提交一个批次**(上传上限 50MB,几十万 ASIN 也只有几 MB)
   · **必须确认推上去了才开始计时**;超时 1 小时
@@ -71,6 +73,9 @@ _ASIN_RE = re.compile(r"^B[0-9A-Z]{9}$")
 # 白耗采集预算,维护链也不会用;② 店铺状态取 ops.store_kpi_daily 每店最新一行,
 # 非 ACTIVE 不推,无 KPI 记录视为 ACTIVE(与 list_new 闸门同口径,fail-open)。
 # `enabled` 为 NULL = ①判不出(名录读不到 / 读回空集),不按「启用」剔(fail-open)。
+# ①不在 WHERE 里剔、而是按 ASIN 聚合出 wanted(任一启用店在架即推):这样同一条
+# SQL 顺带数出"只挂在停用店上"的 ASIN 有几个,摘要首行报出来 —— 推送量突然下降时
+# 人能一眼看到是谁剔的(DANGEROUS 工作流,人眼闸门要看得见)。
 # 取的是**身份键** coalesce(ls.source_key, w.sku)(conventions §九),不是裸
 # SKU:切码之后裸 SKU 全过不了下面的形态闸,推采集目标会**静默归零** ——
 # 不报错,只是维护链新鲜度的源头断掉。存量 amz 行 source_key = sku,推的集合
@@ -80,21 +85,26 @@ WITH latest_status AS (
     SELECT DISTINCT ON (store) store, store_status
     FROM ops.store_kpi_daily ORDER BY store, data_date DESC
 )
-SELECT DISTINCT coalesce(ls.source_key, w.sku) AS asin
+SELECT coalesce(ls.source_key, w.sku) AS asin,
+       bool_or(%(enabled)s::text[] IS NULL
+               OR w.store = ANY(%(enabled)s::text[])) AS wanted
 FROM catalog.walmart_items w
 LEFT JOIN catalog.listing_sources ls
   ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
 LEFT JOIN latest_status s ON s.store = w.store
 WHERE w.missing_since IS NULL
   AND w.published_status = 'PUBLISHED'
-  AND (%(enabled)s::text[] IS NULL OR w.store = ANY(%(enabled)s::text[]))
   AND (s.store_status IS NULL OR upper(s.store_status) = 'ACTIVE')
+GROUP BY 1
 ORDER BY 1
 """
 
 
 def _targets() -> tuple[list[str], int, str]:
-    """输入:无 → 输出:(合法 ASIN 形态的在线身份键, 被过滤掉的行数, 名录判不出的提示语或空串)。
+    """输入:无 → 输出:(要推的合法 ASIN 形态身份键, 非 ASIN 形态被过滤的个数, 提示语)。
+
+    提示语:①判不出时是判不出的原因;①剔掉了 ASIN 时报「凭证未启用的店独有 N 个
+    不推」;都没有是空串。
 
     历史遗留:一部分在线 SKU 根本不是 ASIN 形态(旧系统留下的自定义编码)。
     采集侧建任务时就把它们丢掉(2026-08-09 实证:推 27722,采集侧只建了
@@ -105,7 +115,12 @@ def _targets() -> tuple[list[str], int, str]:
     with db.pg_conn() as conn, conn.cursor() as cur:
         cur.execute(_SQL_TARGETS,
                     {"enabled": sorted(enabled) if enabled is not None else None})
-        skus = [r[0] for r in cur.fetchall()]
+        rows = cur.fetchall()
+    skus = [a for a, wanted in rows if wanted]
+    n_closed = sum(1 for a, wanted in rows
+                   if not wanted and _ASIN_RE.fullmatch(a or ""))
+    if n_closed:
+        note = (note + ";" if note else "") + f"凭证未启用的店独有的 ASIN {n_closed} 个不推"
     ok = [s for s in skus if _ASIN_RE.fullmatch(s or "")]
     return ok, len(skus) - len(ok), note
 

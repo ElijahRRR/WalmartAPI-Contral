@@ -860,7 +860,7 @@ def run(params: dict) -> str:
         lines[len(head):len(head)] = _blocked_notes(gone_skipped, perm_skipped)
         if closed:
             lines.append("  整店不处置:" + stores_svc.closed_names(closed)
-                         + f" —— {n_closed} 条候选不建议删除/停用,"
+                         + f" —— {n_closed} 条在架行不参与处置,"
                          + ("存量建议将撤销(preview 不写)" if preview
                             else "存量建议撤销")
                          + f"({stores_svc.CLOSED_RECOVERY_HINT})")

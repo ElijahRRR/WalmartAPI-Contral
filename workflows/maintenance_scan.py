@@ -29,6 +29,13 @@ run() 写建议那段注释);写建议幂等(同 (店铺,SKU,动作) 未落定�
 没跑 catalog_sync 就扫 = 拿上一轮的沃尔玛现值算差异,会对已下架的 SKU 建议
 改价改库存(生产实证:38 条改库存 + 30 条改价 not found)。
 
+⚠ **不在营 / 已终止的店整店不维护**(所有者 2026-10-22),**顺序判断**:先看
+凭证表勾没勾「启用」(`stores.enabled_names()`,唯一在营判据)—— 没勾就不维护、
+到此为止;勾了再看最近一次 KPI 观测是不是 TERMINATED(`kpi.terminated_stores`)
+—— 是就不维护,否则维护。不维护的店意图整店不产出、存量建议整店撤销。
+SUSPENDED 不在此列(可能恢复,照常维护)。判据与降级方向在 services/stores
+(`closed_verdict` / `enabled_or_note`,三处共用)。
+
 ⚠ **本工作流照常建议删除,但执行它的不是 maintenance**(2026-08-24):
 破坏动作(delete/retire)的唯一出口是 `problem_product_cleanup`,建议按
 **动作**分工领取,不按来源。本文件产出的 action='delete' 行归它执行,
@@ -38,8 +45,8 @@ action ∈ (title/price/inventory) 的行归 maintenance。
 import logging
 
 from registry import db
-from services import alloc_survey, dispositions, \
-    maintenance_intents as mi, store_absence, store_limits
+from services import alloc_survey, dispositions, kpi, \
+    maintenance_intents as mi, store_absence, store_limits, stores as stores_svc
 
 DANGEROUS = False       # 只读沃尔玛(其实一次都不调);写库仅限建议行(含落定上一轮)
 SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重赛靠它识别)
@@ -195,6 +202,14 @@ def _node_skip_names(skipped: dict, stats: dict) -> list[str]:
     return [f"{n}({words[n]})" if words.get(n) else n for n in sorted(skipped)]
 
 
+def _closed_line(closed: dict[str, str], n_closed: int, preview: bool) -> str:
+    """输入:不维护的店 + 被剔掉的意图条数(+ 是否 preview)→ 输出:摘要那一行。"""
+    return ("  整店不维护:" + stores_svc.closed_names(closed)
+            + f" —— {n_closed} 条意图不产出,"
+            + ("存量建议将撤销(preview 不写)" if preview else "存量建议撤销")
+            + f"({stores_svc.CLOSED_RECOVERY_HINT})")
+
+
 def run(params: dict) -> str:
     """输入:params(store/preview/oos_days)→ 输出:意图分布 + 落定 + 建议行落账摘要。"""
     # --dry-run 与 -p preview=1 等价:本工作流 DANGEROUS=False(不碰沃尔玛写
@@ -229,6 +244,7 @@ def run(params: dict) -> str:
         intents, capped = mi.collect_all(conn, stockzero,
                                          int(params.get("oos_days", 0) or 0),
                                          managed=managed, only=only)
+        terminated = kpi.terminated_stores(conn)
     if only:
         # ⚠ 下推之后这两行**恒真**,但**故意保留**:它们是双保险 —— 万一将来
         # 哪条按店取行的 SQL 漏了 `only`(加一条 provider 时最容易漏),后果只是
@@ -237,6 +253,26 @@ def run(params: dict) -> str:
         # 两边都不报错。删这两行之前先想清楚这个不对称。
         intents = [i for i in intents if i["store"] == only]
         capped = [c for c in capped if c["store"] == only]
+    # 不在营 / 已终止的店**整店不维护**(所有者 2026-10-22):先判凭证再判终止,
+    # 判据与降级方向在 services/stores(closed_verdict / enabled_or_note)。
+    # 为什么要在这里判:catalog_sync 只扫能调 API 的店,停用店的 walmart_items 行
+    # 冻结成"在架"(store_release 才会标缺席);缺席避让又只看在营店 —— 不剔的话
+    # 天天拿冻结旧值算差异、建议,执行件再以「凭证缺失」跳过,维护记录表天天一批
+    # 「未执行」。
+    # 排在缺席避让之前:停用店本来就不进缺席名单(store_absence 只看在营店),
+    # 这里不剔就没人剔。存量 suggested 行下面单独撤销并记原因 —— 不能混进通用
+    # withdraw,那里的原因是「商品自己恢复正常了」,是错误取证
+    enabled, closed_note = stores_svc.enabled_or_note()
+    closed = stores_svc.closed_verdict(
+        {i["store"] for i in intents} | {c["store"] for c in capped},
+        enabled, terminated)
+    n_closed = sum(1 for i in intents if i["store"] in closed)
+    if closed:
+        intents = [i for i in intents if i["store"] not in closed]
+        capped = [c for c in capped if c["store"] not in closed]
+    # 不维护的店不在后两条名单里重复点名(缺席 / 受管仓不可调用都是它的推论)
+    absent = set(absent) - set(closed)
+    skipped_nodes = {k: v for k, v in skipped_nodes.items() if k not in closed}
     n_avoided = sum(1 for i in intents if i["store"] in absent)
     if absent:
         intents = [i for i in intents if i["store"] not in absent]
@@ -281,13 +317,16 @@ def run(params: dict) -> str:
                 f"({n_node_skipped} 条意图不产出,不回落默认节点;"
                 f"填错改「维护仓库」,读不到等下轮)"
                 if skipped_nodes else "")
-             + absence_gap]
+             + absence_gap
+             + (f";{closed_note}" if closed_note else "")]
     for c in capped:
         # 逐店明细留在后续行(全文进 ops.runs 与单跑通知;首行只放总数)
         lines.append(f"  ⚠ 截断:{c['store']} {_KIND_LABEL[c['kind']]} "
                      f"{c['total']}→{c['kept']} 条(超单店单轮上限,按截断"
                      f"优先级取,其余下轮;上限=按店配额×单 feed 条数,"
                      f"见 services/maintenance_intents.MAX_INTENTS_PER_STORE)")
+    if closed:
+        lines.append(_closed_line(closed, n_closed, preview))
     lines += _preview_lines(intents, stockzero)
     node_note = store_limits.managed_note(managed, skipped_nodes, node_stats)
     if node_note:
@@ -336,6 +375,12 @@ def run(params: dict) -> str:
         settled = dispositions.settle_maintenance(conn)
         expired = dispositions.expire_executing(conn)
         n_sug = dispositions.suggest_many(conn, rows)
+        # 不维护的店:存量 suggested 整店撤销,原因写实(不是「恢复正常了」)。
+        # 不撤的话执行件天天领到、天天以「凭证缺失」跳过、维护记录表天天一批「未执行」
+        n_closed_wd = sum(
+            dispositions.withdraw_stale(conn, "maint", [],
+                                        why=f"店铺不维护({why})", store=name)
+            for name, why in sorted(closed.items()))
         # 撤销本轮不再建议的陈旧行:昨天建议清零、今天亚马逊回货了,扫描件
         # 不再建议它 —— 但昨天那条 suggested 还挂着,执行件照样会把它清零。
         # ⚠ store=only 不能省:`-p store=X` 那一轮 keep 里只有该店的行,
@@ -348,7 +393,7 @@ def run(params: dict) -> str:
             conn, "maint", keep,
             why=f"本轮扫描不再建议{f'(限 {only})' if only else ''}",
             store=only or None,
-            exclude_stores=sorted(set(absent) | set(skipped_nodes)))
+            exclude_stores=sorted(set(absent) | set(skipped_nodes) | set(closed)))
         n_open = dispositions.count_open(conn,
                                          sources=dispositions.MAINT_SOURCES)
         n_sup = dispositions.count_suppressed(conn, dispositions.MAINT_ACTIONS)
@@ -373,6 +418,7 @@ def run(params: dict) -> str:
         f"建议行落账:本轮写入 {n_sug} 次 → **库里待执行 {n_open} 条**"
         + (f";撤销陈旧建议 {n_wd} 条(本轮不再建议 —— 商品自己恢复正常了)"
            if n_wd else "")
+        + (f";撤销不维护店的建议 {n_closed_wd} 条" if n_closed_wd else "")
         + (f"。⚠ 写入 {n_sug} < 意图 {len(intents)}:差额是同 (店铺,SKU,动作) "
            f"已有 executing 行**且本轮还落定不了**(提交后 catalog_sync 还没重新"
            f"观测到、或观测离提交不足 {dispositions.MAINT_SETTLE_GRACE_HOURS} 小时),"

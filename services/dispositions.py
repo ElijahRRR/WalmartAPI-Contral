@@ -342,6 +342,25 @@ def suggest_many(conn, rows: list[dict]) -> int:
 # 回填,但别让这条 SQL 依赖它跑过 —— 漏回填的行会永远撤不掉且不报错)。
 # ⚠ keep 比对用**该来源自己记的动作**:破坏组撞车时行上的 action 可能已被
 # 升格(retire → delete),拿升格后的动作去比对方的 keep 清单必然对不上。
+# 空 keep = 该来源(该范围内)的 suggested 全撤。⚠ 模块级常量,不许写回函数里的
+# 内联字符串:test_every_sql_param_is_cast 只扫模块级 _xxSQL,内联的那份连
+# `jsonb_build_object('withdrawn_reason', %(why)s…)` 这种生产实炸过的写法都拦不住
+_WITHDRAW_ALL_SQL = """
+UPDATE ops.dispositions d
+SET sources = d.sources - %(source)s::text,
+    status = CASE WHEN (d.sources - %(source)s::text) = '{}'::jsonb
+                  THEN 'withdrawn' ELSE d.status END,
+    settled_at = CASE WHEN (d.sources - %(source)s::text) = '{}'::jsonb
+                      THEN now() ELSE d.settled_at END,
+    detail = d.detail || jsonb_build_object('withdrawn_reason', %(why)s::text)
+WHERE d.status = 'suggested'
+  AND (jsonb_exists(d.sources, %(source)s::text)
+       OR (d.sources = '{}'::jsonb AND d.source = %(source)s::text))
+  AND (%(store)s::text IS NULL OR d.store = %(store)s::text)
+  AND NOT (d.store = ANY(%(exclude)s::text[]))
+RETURNING d.status
+"""
+
 _WITHDRAW_SQL = """
 UPDATE ops.dispositions d
 SET sources = d.sources - %(source)s::text,
@@ -396,25 +415,9 @@ def withdraw_stale(conn, source: str, keep: list[tuple], why: str,
     with conn.cursor() as cur:
         if not keep:
             # 本轮一条都不建议 = 该来源(该范围内)的 suggested 全撤
-            cur.execute(
-                "UPDATE ops.dispositions d "
-                "SET sources = d.sources - %(source)s::text, "
-                "    status = CASE WHEN (d.sources - %(source)s::text) "
-                "                       = '{}'::jsonb "
-                "                  THEN 'withdrawn' ELSE d.status END, "
-                "    settled_at = CASE WHEN (d.sources - %(source)s::text) "
-                "                           = '{}'::jsonb "
-                "                      THEN now() ELSE d.settled_at END "
-                "WHERE d.status = 'suggested' "
-                "  AND (jsonb_exists(d.sources, %(source)s::text) "
-                "       OR (d.sources = '{}'::jsonb "
-                "           AND d.source = %(source)s::text)) "
-                "  AND (%(store)s::text IS NULL "
-                "       OR d.store = %(store)s::text) "
-                "  AND NOT (d.store = ANY(%(exclude)s::text[])) "
-                "RETURNING d.status",
-                {"source": source, "store": store,
-                 "exclude": list(exclude_stores or [])})
+            cur.execute(_WITHDRAW_ALL_SQL,
+                        {"source": source, "store": store, "why": why,
+                         "exclude": list(exclude_stores or [])})
             return sum(1 for (st,) in cur.fetchall() if st == "withdrawn")
         cur.execute(_WITHDRAW_SQL, {
             "source": source, "why": why, "store": store,

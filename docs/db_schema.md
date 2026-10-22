@@ -1216,6 +1216,7 @@ CREATE TABLE ops.node_validations (
 | `detail->'atoms'` | 这条建议的逐原子归类 `[{code, policy_name, text}]`(2026-09-10,problem_scan 写) | 与 `problem_categorized` 事件同款;`category` 列只是主码,复合原文还带哪些原子(「End Date 过期; 禁售」)看这里。维护链的建议行不带这个键 |
 | `sources` | 每个支撑来源各一格:`{来源: {action, code, reason, at}}` | 展示用的 reason/category 由 `claim()` 按它现算(单来源逐字不变,多来源拼成「维护:… \| 审核:…」);`reason`/`category` 两列是**首次建议**的病历,不再被后写方覆盖 |
 | `detail->>'settled_by'` | **是谁判的**这条落定 | 破坏类三种来源(2026-09-09):`delete_verified`/`delete_not_effective` = 观测判;`receipt_gone` = 回执码 ∈ `registry.resources.WALMART_ERR_ITEM_GONE`(沃尔玛说这个 SKU 已经不在了 ⇒ confirmed,**不论回执 status** —— QARTH「No matching record」是 status=success 带回来的);`receipt_failed` = 回执 failed/missing(含 WFS 不许删等永久拒)⇒ ineffective;`receipt_none`(2026-09-25)= 回执**没给结论**(overdue / unrecognized / unreadable)⇒ ineffective 关单,不是失败。维护三类是 `observed`/`value_unchanged`,超期放行是 `expired`。同时并进 `detail` 的还有 `receipt_status`/`error_code`/`error_desc`(截 300),查账不用再回 `ops.feed_items` 翻 |
+| `detail->>'withdrawn_reason'` | **为什么撤**这条建议 | `withdraw_stale` 调用方传的原因原文:「本轮扫描不再建议(限 X)」= 商品自己恢复正常了;「店铺不维护(凭证未启用 / 店铺已终止)」(2026-10-22,维护链)/「店铺不处置(…)」(同日,问题商品链 scan / audit 来源)= 整店不维护。两个分支都写(空 keep 分支此前漏写)。⚠ 合并行只撤掉自己那一格、仍为 suggested 时也带这个键 —— 它不代表 status=withdrawn |
 
 改码(批次 3)只准经两个积木碰这张表:`dispositions.open_executing_count`
 (前置闸:改码前该店必须无 `executing` 行 —— 它等的观测判决会随身份列一起换掉,

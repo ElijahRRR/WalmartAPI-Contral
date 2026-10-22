@@ -919,11 +919,23 @@ def _scan_wire(monkeypatch, intents, sz=("T1",), capped=(), absent=()):
                         lambda conn, rows: (calls["order"].append("suggest"),
                                             calls["suggest"].extend(rows),
                                             len(rows))[2])
+    calls["withdraw_why"] = []
+    calls["closed_wd"] = 0
     monkeypatch.setattr(ms.dispositions, "withdraw_stale",
                         lambda conn, src, keep, why, store=None,
                         exclude_stores=None: (
                             calls["withdraw"].append(
-                                (src, keep, store, exclude_stores)), 0)[1])
+                                (src, keep, store, exclude_stores)),
+                            calls["withdraw_why"].append(why),
+                            calls["closed_wd"] if not keep and store else 0)[2])
+    # 缺省:本轮出现的店都在营、都没终止 = 改造前的行为;钉剔店规则的用例自己覆盖
+    calls["enabled"] = ({i["store"] for i in intents}
+                        | {c["store"] for c in capped} | {"T1", "T2"})
+    calls["terminated"] = set()
+    monkeypatch.setattr(ms.stores_svc, "enabled_names",
+                        lambda: set(calls["enabled"]))
+    monkeypatch.setattr(ms.kpi, "terminated_stores",
+                        lambda conn: set(calls["terminated"]))
     monkeypatch.setattr(ms.dispositions, "count_open",
                         lambda conn, sources=None: len(calls["suggest"]))
     monkeypatch.setattr(ms.dispositions, "count_suppressed",
@@ -2972,3 +2984,210 @@ def test_scan_preview_settles_nothing(monkeypatch):
     assert calls["order"] == []
     ms.run({"dry_run": True})
     assert calls["order"] == []
+
+
+# ── 不在营 / 已终止的店整店不维护(所有者 2026-10-22)──────────────────────────
+
+def _two_stores():
+    return (_zero(2) + [{"store": "C017", "sku": "X1", "kind": "inventory",
+                         "old": 3, "new": 0, "code": "out_of_stock",
+                         "reason": "亚马逊缺货"},
+                        {"store": "C017", "sku": "X2", "kind": "price",
+                         "old": 9.0, "new": 8.0, "code": "price_sync",
+                         "reason": "跟价"}])
+
+
+def test_scan_skips_stores_whose_credentials_are_not_enabled(monkeypatch):
+    """凭证没勾「启用」= 不在营(唯一判据 enabled_names)⇒ 整店不维护。
+
+    此前本工作流根本不看在营:catalog_sync 不扫停用店,它的在架行冻结;缺席
+    避让只看在营店 —— 于是天天拿冻结旧值算差异、建议,执行件再以凭证缺失
+    跳过,维护记录表天天一批「未执行」。存量建议整店撤销,原因写实,而且
+    不许混进通用撤销(那里写的是「商品自己恢复正常了」)。
+    """
+    ms, calls = _scan_wire(monkeypatch, _two_stores())
+    calls["enabled"] = {"T1"}
+    calls["closed_wd"] = 4
+    out = ms.run({})
+    assert {r["store"] for r in calls["suggest"]} == {"T1"}
+    assert "整店不维护:凭证未启用 1 店(C017)" in out and "2 条意图不产出" in out
+    assert "撤销不维护店的建议 4 条" in out
+    # 专门撤销:按店、空 keep、原因写实
+    closed = [(w, why) for w, why in zip(calls["withdraw"], calls["withdraw_why"])
+              if w[2] == "C017"]
+    assert closed and closed[0][0][1] == [] and "凭证未启用" in closed[0][1]
+    # 通用撤销把它排除在外
+    general = [w for w in calls["withdraw"] if w[2] != "C017"]
+    assert "C017" in general[0][3]
+
+
+def test_scan_skips_terminated_stores_even_if_enabled(monkeypatch):
+    """② 凭证启用了,再看终止:KPI 最近一次观测 TERMINATED ⇒ 整店不维护。"""
+    ms, calls = _scan_wire(monkeypatch, _two_stores())
+    calls["terminated"] = {"C017"}
+    out = ms.run({})
+    assert {r["store"] for r in calls["suggest"]} == {"T1"}
+    assert "店铺已终止 1 店(C017)" in out
+
+
+def test_store_gate_is_sequential_credentials_first(monkeypatch):
+    """顺序判断,不是并列(所有者 2026-10-22):① 凭证没启用 ⇒ 不维护、到此为止,
+    不再看终止(原因只记「凭证未启用」);① 启用 ⇒ ② 终止 ⇒ 不维护;都不中 ⇒ 维护。
+    ①判不出(名录读不到)按启用往下走 ②。"""
+    from api import feishu
+
+    ms, calls = _scan_wire(monkeypatch, _two_stores() + [
+        {"store": "Z9", "sku": "Z1", "kind": "inventory", "old": 1, "new": 0,
+         "code": "out_of_stock", "reason": "亚马逊缺货"}])
+    calls["enabled"] = {"T1", "Z9"}               # C017 没启用;Z9 启用但已终止
+    calls["terminated"] = {"C017", "Z9"}
+    out = ms.run({})
+    assert {r["store"] for r in calls["suggest"]} == {"T1"}
+    line = next(ln for ln in out.splitlines() if "整店不维护" in ln)
+    assert "凭证未启用 1 店(C017)" in line and "店铺已终止 1 店(Z9)" in line
+    assert "+" not in line.split("——")[0]        # 不再合写两条原因
+    assert line.index("凭证未启用") < line.index("店铺已终止")   # 按判断顺序报
+    why = dict(zip([w[2] for w in calls["withdraw"]], calls["withdraw_why"]))
+    assert why["C017"] == "店铺不维护(凭证未启用)"
+    assert why["Z9"] == "店铺不维护(店铺已终止)"
+
+    # ①判不出:按启用往下走②——终止的照旧剔,没终止的照常维护
+    ms, calls = _scan_wire(monkeypatch, _two_stores())
+    calls["terminated"] = {"C017"}
+
+    def boom():
+        raise feishu.FeishuError(503, "busy")
+
+    monkeypatch.setattr(ms.stores_svc, "enabled_names", boom)
+    out = ms.run({})
+    assert {r["store"] for r in calls["suggest"]} == {"T1"}
+    assert "店铺已终止 1 店(C017)" in out
+
+
+def test_scan_does_not_drop_stores_when_the_roster_is_unreadable(monkeypatch):
+    """名录(飞书)读不到:不剔、首行喊 —— 与缺席探测同向,抖一下不该全船队停维护。"""
+    from api import feishu
+
+    ms, calls = _scan_wire(monkeypatch, _two_stores())
+
+    def boom():
+        raise feishu.FeishuError(503, "busy")
+
+    monkeypatch.setattr(ms.stores_svc, "enabled_names", boom)
+    out = ms.run({})
+    assert {r["store"] for r in calls["suggest"]} == {"T1", "C017"}
+    assert "在营名录读不到(FeishuError)" in out.splitlines()[0]
+    assert "整店不维护" not in out
+
+    # 只接飞书错:编程错误照炸,不许被当成"名录读不到"天天静默放行
+    def bug():
+        raise AttributeError("renamed field")
+
+    monkeypatch.setattr(ms.stores_svc, "enabled_names", bug)
+    with pytest.raises(AttributeError):
+        ms.run({})
+
+    # 读回空集同样当读不到:一家在营店都没有不可能是真值(「启用」整列没返回)
+    ms, calls = _scan_wire(monkeypatch, _two_stores())
+    calls["enabled"] = set()
+    out = ms.run({})
+    assert {r["store"] for r in calls["suggest"]} == {"T1", "C017"}
+    assert "在营名录读回空集" in out.splitlines()[0]
+
+
+def test_scan_preview_reports_closed_stores_without_writing(monkeypatch):
+    ms, calls = _scan_wire(monkeypatch, _two_stores())
+    calls["enabled"] = {"T1"}
+    out = ms.run({"preview": "1"})
+    assert "整店不维护:凭证未启用 1 店(C017)" in out
+    assert "将撤销(preview 不写)" in out
+    assert calls["withdraw"] == [] and calls["suggest"] == []
+    # 补救文案:dead=1 只认「启用」,先取消勾选再 dry-run
+    assert "先在凭证表取消「启用」" in out and "--dry-run" in out
+
+
+def test_scan_single_store_run_on_a_closed_store(monkeypatch):
+    """-p store=X(链尾重赛 / 人工单店):X 不维护 ⇒ 只撤 X、通用撤销排除 X;
+    X 在营 ⇒ 一家店都不专门撤(不越出 only 范围)。"""
+    ms, calls = _scan_wire(monkeypatch, _two_stores())
+    calls["enabled"] = {"T1"}
+    out = ms.run({"store": "C017"})
+    assert calls["suggest"] == []
+    stores_wd = [w[2] for w in calls["withdraw"]]
+    assert stores_wd.count("C017") == 2                # 专门撤一次 + 通用(store=only)一次
+    assert "C017" in calls["withdraw"][-1][3]          # 通用那次把它排除
+    assert "整店不维护:凭证未启用 1 店(C017)" in out
+
+    ms, calls = _scan_wire(monkeypatch, _two_stores())
+    calls["enabled"] = {"T1"}
+    ms.run({"store": "T1"})
+    assert [w for w in calls["withdraw"] if not w[1] and w[2] != "T1"] == []
+
+
+def test_closed_store_is_not_named_again_as_absent_or_node_skipped(monkeypatch):
+    """停用店填了「维护仓库」会被受管仓判「不可调用」、已终止店可能缺席 ——
+    它们的推论,不在那两条名单里再点一次名(否则首行同一家店出现三遍)。"""
+    ms, calls = _scan_wire(monkeypatch, _two_stores())
+    calls["enabled"] = {"T1"}
+    monkeypatch.setattr(ms.store_limits, "managed_nodes",
+                        lambda conn=None, stats=None: ({}, {"C017": "不在可调用店铺列表里"}))
+    out = ms.run({})
+    first = out.splitlines()[0]
+    assert "受管仓校验失败" not in first and "C017" not in first
+    assert "整店不维护:凭证未启用 1 店(C017)" in out
+
+
+def test_terminated_stores_reads_the_latest_kpi_row_only():
+    """只认 TERMINATED(终局);SUSPENDED 可能恢复,照常维护;空 = 没拿到,判活。"""
+    from services import kpi
+
+    class _C:
+        def cursor(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, args=None):
+            self.sql = sql
+
+        def fetchall(self):
+            return [("A", "TERMINATED"), ("B", "terminated "), ("C", "SUSPENDED"),
+                    ("D", ""), ("E", None), ("F", "ACTIVE")]
+
+    c = _C()
+    assert kpi.terminated_stores(c) == {"A", "B"}
+    assert "DISTINCT ON (store)" in c.sql and "data_date DESC" in c.sql
+
+
+def test_withdraw_with_empty_keep_records_the_reason():
+    """空 keep 分支此前把 why 静默丢掉 —— 整店撤销的原因得落进 detail 才查得到账。"""
+    from services import dispositions
+
+    seen = {}
+
+    class _Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, args=None):
+            seen["sql"], seen["args"] = sql, args
+
+        def fetchall(self):
+            return [("withdrawn",)]
+
+    class _C:
+        def cursor(self):
+            return _Cur()
+
+    dispositions.withdraw_stale(_C(), "maint", [], "店铺不维护(凭证未启用)", store="C017")
+    assert "withdrawn_reason" in seen["sql"] and "%(why)s::text" in seen["sql"]
+    assert seen["sql"] is dispositions._WITHDRAW_ALL_SQL   # 模块级常量,铸型守门扫得到
+    assert seen["args"]["why"] == "店铺不维护(凭证未启用)"
+

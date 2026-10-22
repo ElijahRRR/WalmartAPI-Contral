@@ -429,3 +429,46 @@ def test_no_shadow_imports_of_feishu_left(monkeypatch):
     monkeypatch.setattr(stores_svc.feishu, "list_records", lambda *a, **k: recs)
     assert stores_svc.enabled_names() == {"A1"}
     assert stores_svc.registered_names() == {"A1", "A2"}
+
+
+# ── 「维护不维护」顺序判断(所有者 2026-10-22,三处共用)──────────────────────────
+
+def test_closed_verdict_is_sequential_credentials_then_terminated():
+    """① 不在营 ⇒「凭证未启用」,到此为止(哪怕也已终止);② 在营且已终止 ⇒
+    「店铺已终止」;其余维护。①判不出(None)按在营往下走②。"""
+    from services import stores as st
+
+    v = st.closed_verdict({"A", "B", "C", "D"}, {"B", "C"}, {"A", "B"})
+    assert v == {"A": st.CLOSED_DISABLED, "D": st.CLOSED_DISABLED,
+                 "B": st.CLOSED_TERMINATED}
+    assert st.closed_verdict({"A", "B"}, None, {"B"}) == {"B": st.CLOSED_TERMINATED}
+    assert st.closed_names(v) == "凭证未启用 2 店(A,D);店铺已终止 1 店(B)"
+
+
+def test_enabled_or_note_falls_open_only_on_feishu_errors_and_empty_roster(monkeypatch):
+    """判不出两种:飞书报错、读回空集 —— 都不剔、给提示;编程错误照炸。"""
+    import pytest
+
+    from api import feishu
+    from services import stores as st
+
+    monkeypatch.setattr(st, "enabled_names", lambda: {"T1"})
+    assert st.enabled_or_note() == ({"T1"}, "")
+
+    def _fe():
+        raise feishu.FeishuError(503, "busy")
+
+    monkeypatch.setattr(st, "enabled_names", _fe)
+    enabled, note = st.enabled_or_note()
+    assert enabled is None and "在营名录读不到(FeishuError)" in note
+
+    monkeypatch.setattr(st, "enabled_names", lambda: set())
+    enabled, note = st.enabled_or_note()
+    assert enabled is None and "读回空集" in note
+
+    def _bug():
+        raise KeyError("renamed")
+
+    monkeypatch.setattr(st, "enabled_names", _bug)
+    with pytest.raises(KeyError):
+        st.enabled_or_note()

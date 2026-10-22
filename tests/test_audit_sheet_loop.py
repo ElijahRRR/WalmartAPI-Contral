@@ -1127,3 +1127,21 @@ def test_claim_from_sheet_says_unlimited_when_no_limit_given(monkeypatch):
     # 账要说全:补采救回来的那些也在这一轮判(_close_gap 跑在判定之前)
     assert "补采救回来的还会加进来" in body
     assert "只判" not in body
+
+
+def test_explicit_refresh_validates_before_scraper_and_uses_empty_sheet(monkeypatch):
+    import pytest
+    monkeypatch.setattr(pa, "_cap_by_connections", lambda n: (n, ""))
+    seen = []
+    def gap(want, sheet_rows, execute, wait_min, force):
+        seen.append((want, sheet_rows, execute, force))
+        raise RuntimeError("gap reached")
+    monkeypatch.setattr(pa, "_close_gap", gap)
+    with pytest.raises(ValueError):
+        pa.run({"refresh": "1", "asins": "bad", "execute": True})
+    with pytest.raises(ValueError):
+        pa.run({"refresh": "1", "asins": "B0AAAA0001", "typo": 1, "execute": True})
+    assert not seen
+    with pytest.raises(RuntimeError, match="gap reached"):
+        pa.run({"refresh": "1", "asins": "B0AAAA0001", "execute": False})
+    assert seen == [(["B0AAAA0001"], [], False, True)]

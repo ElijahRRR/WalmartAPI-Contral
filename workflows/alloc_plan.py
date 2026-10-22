@@ -69,7 +69,7 @@ FLOW_FREE, FLOW_DIRECTED, FLOW_NONE = "自由流", "定向流", "未分配"
 # 这条闸是点名分配带来的:`-p from_sheet=1` 打错一个字(fromsheet / from_sheets),
 # 静默吞掉就退化成**全库分配并真落几千条占用**,而占用撤不回。
 _KNOWN_PARAMS = {"batch", "days", "sales_days", "as_of", "export",
-                 "from_sheet", "cutoff"}
+                 "from_sheet", "cutoff", "from_csv"}
 # cli 自己塞进 params 的键,不是人敲的(product_audit 那边 2026-08-16 `dry_run`
 # 上线当天就炸过一次:白名单漏放行 cli 级开关,整条工作流起不来)
 _CLI_INJECTED = {"execute", "dry_run"}
@@ -215,6 +215,10 @@ def run(params: dict) -> str:
         raise ValueError(
             f"alloc_plan 不认识这些参数:{unknown}(认识的:{sorted(_KNOWN_PARAMS)})。"
             f"宁炸不吞:`-p from_sheet=1` 打错一个字就会退化成全库分配并真落几千条占用")
+    if params.get("from_csv"):
+        if any(k in params for k in ("from_sheet", "batch", "cutoff")):
+            raise ValueError("from_csv 不与 from_sheet/batch/cutoff 混用")
+        return _run_csv(params)
     if _flag(params.get("from_sheet")):
         return _run_sheet(params)
     if "cutoff" in params:
@@ -1387,3 +1391,108 @@ def _run_sheet(params: dict) -> str:
           (f"  产品分配表已回写 {written} 行;货还没上架 —— 照着表上「店铺」列去上架"
            if not sheet_err else "  产品分配表**未回写**(见首行)")]
     return "\n".join(L)
+
+
+def _read_fixed_plan(path):
+    """输入:店铺/ASIN CSV → 输出:唯一 ASIN 到明确目标店的映射。"""
+    import csv
+    from pathlib import Path
+    from services import sku_asin
+    with Path(path).expanduser().open(encoding="utf-8-sig", newline="") as fh:
+        rd = csv.DictReader(fh)
+        if not {"店铺", "ASIN"} <= set(rd.fieldnames or []):
+            raise ValueError("定向清单必须有 店铺/ASIN 两列")
+        out = {}
+        for row in rd:
+            store, asin = row["店铺"].strip(), row["ASIN"].strip().upper()
+            if not store or not sku_asin.is_standard_asin(asin):
+                raise ValueError(f"清单店铺或 ASIN 无效:{store}/{asin}")
+            if asin in out:
+                raise ValueError(f"清单重复 ASIN:{asin}")
+            out[asin] = store
+    if not out:
+        raise ValueError("定向清单为空")
+    return out
+
+
+def _fixed_claims(want, scored, cfg, registered, online_now,
+                  listed, held_brand, held_prod, gate):
+    """输入:已明确去向的清单及实时证据 → 输出:全清单通过硬闸后的占用行。
+
+    不自动换店、不放占用、不扩充池；任何一行冲突就整批拒绝。
+    用户点名选品与 from_sheet 一样不设分数线，仍共用产品池/库存硬闸和店铺谓词。
+    """
+    from services import brand_key, risk_gate
+    by_asin = {r["asin"]: r for r in scored}
+    missing = set(want) - set(by_asin)
+    if missing:
+        raise ValueError(f"清单有 {len(missing)} 个未通过产品池/库存硬闸:{sorted(missing)[:10]}")
+    counts = Counter(want.values())
+    for store, n in counts.items():
+        conf = cfg.get(store)
+        if store not in registered or sv.is_excluded(store):
+            raise ValueError(f"店铺不在分配范围:{store}")
+        if not store_targets.accepts_allocation(conf):
+            raise ValueError(f"店铺容量未填或不接货:{store}")
+        if n > int(conf["max_online"]) - online_now.get(store, 0):
+            raise ValueError(f"当前容量不足:{store} 请求 {n}，不预支尚未完成的下架")
+    result, assigned_brands = [], {}
+    for asin, store in want.items():
+        r, conf = by_asin[asin], cfg[store]
+        if asin in listed:
+            raise ValueError(f"产品已在架:{asin}")
+        brand = brand_key.brand_key(r.get("brand"), r.get("manufacturer"))
+        if held_prod.get(asin) not in (None, store):
+            raise ValueError(f"产品占用冲突:{asin} 属于 {held_prod[asin]}")
+        if brand and held_brand.get(brand) not in (None, store):
+            raise ValueError(f"品牌占用冲突:{brand} 属于 {held_brand[brand]}")
+        if brand and assigned_brands.get(brand) not in (None, store):
+            raise ValueError(f"清单把同品牌分给两店:{brand}")
+        if not store_targets.allowed(conf, r["category"]):
+            raise ValueError(f"店铺类目不符:{store}/{asin}")
+        if not store_targets.lead_ok(conf, r["lead"]):
+            raise ValueError(f"店铺货期不符:{store}/{asin}")
+        if not conf.get("channel") or conf["channel"] != r.get("channel"):
+            raise ValueError(f"店铺配送方式不符:{store}/{asin}")
+        reason = risk_gate.check(gate, r["pt"], r.get("brand"), r.get("manufacturer"))
+        if reason:
+            raise ValueError(f"风控拦截:{asin}/{reason}")
+        if brand and brand not in assigned_brands:
+            result.append({"kind": claims.BRAND, "claim_key": brand,
+                           "store": store, "source": "alloc_plan_csv"})
+            assigned_brands[brand] = store
+        result.extend(_prod_claims({"items": [r]}, store, source="alloc_plan_csv"))
+    return result
+
+
+def _run_csv(params):
+    """输入:from_csv 指定已确认店铺/ASIN → 输出:只登记这份清单的占用，不推上架表。"""
+    from services import risk_gate
+    want = _read_fixed_plan(params["from_csv"])
+    cfg, registered = store_targets.load_targets(), stores_svc.enabled_names()
+    pwin = sv.sales_window(str(params.get("as_of", "")),
+                           int(params.get("sales_days", ps.SALES_WINDOW_DAYS)))
+    with db.pg_conn() as conn:
+        data = product_pool.load(conn, pwin, asins=sorted(want))
+        if data.get("risk_err"):
+            raise ValueError(f"产品风险记录不可用:{data['risk_err']}")
+        scored, _gated = product_pool.score_all(data)
+        with conn.cursor() as cur:
+            cur.execute(_SQL_ONLINE_NOW)
+            online_now = {s: int(n) for s, n in cur.fetchall()}
+        listed = _listed_where(conn, registered)
+        to_claim = _fixed_claims(want, scored, cfg, registered, online_now, listed,
+                                claims.load_active(conn, claims.BRAND),
+                                claims.load_active(conn, claims.PRODUCT),
+                                risk_gate.load_gate(conn))
+        counts = Counter(want.values())
+        head = "定向清单:" + "、".join(f"{s} {n} 款" for s, n in sorted(counts.items()))
+        if not params.get("execute"):
+            return f"🧪 {head}；全部通过现行硬闸；未落占用、未写上架表"
+        ok, conflicts, landed = claims.claim_many(conn, to_claim)
+        if conflicts:
+            # 同事务回滚，不能留下“品牌冲突但单品却成功”的半份清单。
+            raise ValueError(f"并发占用冲突，整批回滚:{conflicts[:10]}")
+        se.record_many(conn, claims.claim_created_rows(landed, "alloc_plan_csv"))
+    return (f"✅ {head}；占用核验成功 {ok} 条，实际新增 {len(landed)} 条"
+            "；未释放他店占用、未写上架表、未执行上架")

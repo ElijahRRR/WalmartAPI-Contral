@@ -821,3 +821,48 @@ def test_hitting_the_round_guard_is_shouted_not_swallowed(monkeypatch, tmp_path)
     _wire_tight(monkeypatch, pool)
     out = wf.run({"execute": False})
     assert "撞到轮次护栏" in out and "不是发完了" in out
+
+# 已确认清单只落占用：不能把它降级成全库分配或绕过店铺硬闸。
+def _fixed_args():
+    return dict(want={"B0AAAA0001": "A"}, scored=[_c("B0AAAA0001", "acme", 50)],
+                cfg={"A": {"max_online": 10, "categories": ["Home"], "channel": "FBA", "lead_limit": 7}},
+                registered={"A"}, online_now={"A": 9}, listed={},
+                held_brand={}, held_prod={}, gate={"banned_pts": set(), "brands": set()})
+
+
+def test_fixed_plan_reserves_only_requested_brand_and_product():
+    args = _fixed_args()
+    rows = wf._fixed_claims(**args)
+    assert {(r["kind"], r["claim_key"], r["store"]) for r in rows} == {
+        ("brand", "acme", "A"), ("product", "B0AAAA0001", "A")}
+
+
+@pytest.mark.parametrize("field,value", [
+    ("held_brand", {"acme": "B"}), ("held_prod", {"B0AAAA0001": "B"}),
+    ("online_now", {"A": 10}), ("listed", {"B0AAAA0001": ["B"]}),
+    ("registered", set()), ("scored", []),
+])
+def test_fixed_plan_rejects_unsafe_whole_plan(field, value):
+    args = _fixed_args(); args[field] = value
+    with pytest.raises(ValueError):
+        wf._fixed_claims(**args)
+
+
+@pytest.mark.parametrize("change", [
+    {"max_online": None}, {"max_online": 0}, {"channel": "FBM"},
+    {"channel": None}, {"lead_limit": 1}, {"categories": ["Food"]},
+])
+def test_fixed_plan_uses_existing_store_gates(change):
+    args = _fixed_args(); args["cfg"]["A"].update(change)
+    with pytest.raises(ValueError):
+        wf._fixed_claims(**args)
+
+
+def test_fixed_plan_csv_duplicate_and_invalid_rejected(tmp_path):
+    p = tmp_path / "plan.csv"
+    p.write_text("店铺,ASIN\nA,B0AAAA0001\nB,B0AAAA0001\n")
+    with pytest.raises(ValueError, match="重复"):
+        wf._read_fixed_plan(p)
+    p.write_text("店铺,ASIN\nA,not-an-asin\n")
+    with pytest.raises(ValueError, match="无效"):
+        wf._read_fixed_plan(p)

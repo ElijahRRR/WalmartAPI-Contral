@@ -871,7 +871,7 @@ def test_fixed_plan_csv_duplicate_and_invalid_rejected(tmp_path):
 # ── from_csv 走 run() 全程(2026-10-22 复核)─────────────────────────────────────
 
 def _wire_csv(monkeypatch, tmp_path, rows="店铺,ASIN\nA,B0AAAA0001\n", pool=None,
-              conflicts=(), absent=None):
+              conflicts=(), absent=None, held=None, targets=None):
     """run({"from_csv": …}) 的全链桩:记下 claim_many / record_many / 全库分配有没有被碰。"""
     import contextlib
 
@@ -881,9 +881,9 @@ def _wire_csv(monkeypatch, tmp_path, rows="店铺,ASIN\nA,B0AAAA0001\n", pool=No
     p.write_text(rows, encoding="utf-8")
     seen = {"claim": [], "events": [], "full": 0}
     pool = pool if pool is not None else [_c("B0AAAA0001", "acme", 50)]
-    monkeypatch.setattr(wf.store_targets, "load_targets", lambda: {
+    monkeypatch.setattr(wf.store_targets, "load_targets", lambda: targets or {
         "A": {"max_online": 10, "categories": ["Home"], "channel": "FBA", "lead_limit": 7}})
-    monkeypatch.setattr(wf.stores_svc, "enabled_names", lambda: {"A"})
+    monkeypatch.setattr(wf.stores_svc, "enabled_names", lambda: set(targets or {"A"}))
     monkeypatch.setattr(wf.product_pool, "load", lambda conn, win, asins=None: (
         seen.__setitem__("full", seen["full"] + (asins is None)),
         {"pool": [(c["asin"],) for c in pool], "sales": {}, "refund": {},
@@ -893,7 +893,8 @@ def _wire_csv(monkeypatch, tmp_path, rows="店铺,ASIN\nA,B0AAAA0001\n", pool=No
     monkeypatch.setattr(wf, "_why_absent", lambda conn, asins: {
         a: ((absent or {}).get(a, "不在库(产品库没有这个 ASIN)"), None) for a in asins})
     monkeypatch.setattr(wf, "_listed_where", lambda conn, registered: {})
-    monkeypatch.setattr(wf.claims, "load_active", lambda conn, kind: {})
+    monkeypatch.setattr(wf.claims, "load_active",
+                        lambda conn, kind: dict((held or {}).get(kind, {})))
     monkeypatch.setattr(risk_gate, "load_gate",
                         lambda conn: {"banned_pts": set(), "brands": set()})
     monkeypatch.setattr(wf.claims, "claim_many", lambda conn, rows: (
@@ -976,3 +977,31 @@ def test_fixed_plan_csv_is_forgiving_about_layout_but_not_about_data(tmp_path):
     p.write_bytes("店铺,ASIN\nA,B0AAAA0001\n".encode("gbk"))
     with pytest.raises(ValueError, match="UTF-8"):
         wf._read_fixed_plan(p)
+
+
+def test_from_csv_dry_run_counts_only_claims_that_would_really_land(monkeypatch, tmp_path):
+    """已在本店名下的品牌 / 产品 claim_many 按幂等成功、一行不写:dry-run 不能把它们
+    报成"将落"、更不能列进「品牌排他」(那是新锁)。"""
+    p, _seen = _wire_csv(monkeypatch, tmp_path, held={"brand": {"acme": "A"}})
+    out = wf.run({"from_csv": str(p), "execute": False})
+    assert "将落品牌 0 + 产品 1 条" in out and "品牌排他" not in out
+    assert "已在本店名下 1 条不重落" in out
+
+
+def test_store_level_failure_still_reports_its_rows_store_independent_problems(monkeypatch, tmp_path):
+    """店级不成立(B 容量为 0)只跳过类目/货期/渠道;已在架、品牌分两店照报,而且写明是哪一行
+    —— 否则修好 B 的容量再 dry-run 才发现这一行本来就去不了 B。"""
+    rows = "店铺,ASIN\nA,B0AAAA0001\nB,B0AAAA0002\n"
+    pool = [_c("B0AAAA0001", "acme", 50), _c("B0AAAA0002", "acme", 50)]
+    targets = {"A": {"max_online": 10, "categories": ["Home"], "channel": "FBA", "lead_limit": 7},
+               "B": {"max_online": 0, "categories": ["Home"], "channel": "FBA", "lead_limit": 7}}
+    p, seen = _wire_csv(monkeypatch, tmp_path, rows=rows, pool=pool, targets=targets)
+    monkeypatch.setattr(wf, "_listed_where", lambda conn, registered: {"B0AAAA0002": ["C"]})
+    with pytest.raises(ValueError) as e:
+        wf.run({"from_csv": str(p), "execute": False})
+    msg = str(e.value)
+    assert "3 处不通过" in msg and "店铺容量未填或不接货:B" in msg
+    assert "产品已在架:B0AAAA0002" in msg
+    assert "清单把同品牌分给两店:B0AAAA0002→B,品牌 acme 已在清单里给了 A" in msg
+    assert "店铺类目不符:B" not in msg and seen["claim"] == []
+

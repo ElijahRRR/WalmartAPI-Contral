@@ -1452,6 +1452,8 @@ def _fixed_claims(want, scored, cfg, registered, online_now,
     **一次报全**:每道闸都查完再整批拒绝,不在第一处就停 —— 否则 80 行的清单
     有几类问题就要 dry-run 几轮才清得干净;不在池的 ASIN 带上具体原因(不在库 /
     未审核 / 落地价…),分得清该去 `product_audit -p refresh=1` 还是该删行。
+    店级不成立的店(不在范围 / 容量未填或为 0),它的行照查与店配置无关的闸
+    (已在架 / 占用冲突 / 品牌分两店 / 风控),只跳过类目 / 货期 / 渠道三道店铺谓词。
     """
     from services import brand_key, risk_gate
     why = why or {}
@@ -1460,7 +1462,7 @@ def _fixed_claims(want, scored, cfg, registered, online_now,
     for a in sorted(set(want) - set(by_asin)):
         problems.append(f"{a}:未通过产品池/库存硬闸({why.get(a) or '原因未知'})")
     counts = Counter(want.values())
-    bad_store = set()           # 店级就不成立的店,它的行不再逐条判(没有配置可判)
+    bad_store = set()           # 店级就不成立的店:它的行不判类目/货期/渠道(店铺谓词无从谈起)
     for store, n in sorted(counts.items()):
         conf = cfg.get(store)
         if store not in registered or sv.is_excluded(store):
@@ -1476,31 +1478,34 @@ def _fixed_claims(want, scored, cfg, registered, online_now,
     result, assigned_brands = [], {}
     for asin, store in want.items():
         r = by_asin.get(asin)
-        if r is None or store in bad_store:
+        if r is None:
             continue
-        conf = cfg[store]
         if asin in listed:
             problems.append(f"产品已在架:{asin}")
         brand = brand_key.brand_key(r.get("brand"), r.get("manufacturer"))
         if held_prod.get(asin) not in (None, store):
             problems.append(f"产品占用冲突:{asin} 属于 {held_prod[asin]}")
         if brand and held_brand.get(brand) not in (None, store):
-            problems.append(f"品牌占用冲突:{brand} 属于 {held_brand[brand]}")
+            problems.append(f"品牌占用冲突:{asin}→{store},品牌 {brand} 属于 {held_brand[brand]}")
         if brand and assigned_brands.get(brand) not in (None, store):
-            problems.append(f"清单把同品牌分给两店:{brand}")
+            problems.append(f"清单把同品牌分给两店:{asin}→{store},品牌 {brand} "
+                            f"已在清单里给了 {assigned_brands[brand]}")
+        reason = risk_gate.check(gate, r["pt"], r.get("brand"), r.get("manufacturer"))
+        if reason:
+            problems.append(f"风控拦截:{asin}/{reason}")
+        if brand and brand not in assigned_brands:
+            assigned_brands[brand] = store
+            result.append({"kind": claims.BRAND, "claim_key": brand,
+                           "store": store, "source": "alloc_plan_csv"})
+        if store in bad_store:
+            continue
+        conf = cfg[store]
         if not store_targets.allowed(conf, r["category"]):
             problems.append(f"店铺类目不符:{store}/{asin}")
         if not store_targets.lead_ok(conf, r["lead"]):
             problems.append(f"店铺货期不符:{store}/{asin}")
         if not conf.get("channel") or conf["channel"] != r.get("channel"):
             problems.append(f"店铺配送方式不符:{store}/{asin}")
-        reason = risk_gate.check(gate, r["pt"], r.get("brand"), r.get("manufacturer"))
-        if reason:
-            problems.append(f"风控拦截:{asin}/{reason}")
-        if brand and brand not in assigned_brands:
-            result.append({"kind": claims.BRAND, "claim_key": brand,
-                           "store": store, "source": "alloc_plan_csv"})
-            assigned_brands[brand] = store
         result.extend(_prod_claims({"items": [r]}, store, source="alloc_plan_csv"))
     if problems:
         raise ValueError(
@@ -1532,21 +1537,28 @@ def _run_csv(params):
             cur.execute(_SQL_ONLINE_NOW)
             online_now = {s: int(n) for s, n in cur.fetchall()}
         listed = _listed_where(conn, registered)
+        held = {claims.BRAND: claims.load_active(conn, claims.BRAND),
+                claims.PRODUCT: claims.load_active(conn, claims.PRODUCT)}
         to_claim = _fixed_claims(want, scored, cfg, registered, online_now, listed,
-                                claims.load_active(conn, claims.BRAND),
-                                claims.load_active(conn, claims.PRODUCT),
+                                held[claims.BRAND], held[claims.PRODUCT],
                                 risk_gate.load_gate(conn), why=why)
         counts = Counter(want.values())
         head = "定向清单:" + "、".join(f"{s} {n} 款" for s, n in sorted(counts.items()))
         if not params.get("execute"):
-            # 与全库 / 点名两条路同口径报"将落品牌 N + 产品 M 条",并点名品牌排他
-            # 落到哪家店 —— 品牌占用一落,同品牌的别的货都只能去这家(人眼闸门要看得见)
-            brands = [f"{c['claim_key']}→{c['store']}" for c in to_claim
+            # 报"将落品牌 N + 产品 M 条",并点名新落的品牌排他去哪家店 —— 品牌占用
+            # 一落,同品牌的别的货都只能去这家(人眼闸门要看得见)。只数**真会新落**的:
+            # 已在本店名下的那些 claim_many 按幂等成功处理,一行不写
+            new = [c for c in to_claim
+                   if held[c["kind"]].get(c["claim_key"]) != c["store"]]
+            brands = [f"{c['claim_key']}→{c['store']}" for c in new
                       if c["kind"] == claims.BRAND]
-            n_prod = sum(1 for c in to_claim if c["kind"] == claims.PRODUCT)
+            n_prod = sum(1 for c in new if c["kind"] == claims.PRODUCT)
+            n_kept = len(to_claim) - len(new)
             return (f"🧪 {head};全部通过现行硬闸;将落品牌 {len(brands)} + 产品 {n_prod} 条"
                     + (f"(品牌排他:{'、'.join(brands[:20])}"
-                       f"{' …' if len(brands) > 20 else ''})" if brands else "")
+                       f"{f' …另 {len(brands) - 20} 个' if len(brands) > 20 else ''})"
+                       if brands else "")
+                    + (f";已在本店名下 {n_kept} 条不重落" if n_kept else "")
                     + ";未落占用、未写上架表")
         ok, conflicts, landed = claims.claim_many(conn, to_claim)
         if conflicts:

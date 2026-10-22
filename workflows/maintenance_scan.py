@@ -33,7 +33,8 @@ run() 写建议那段注释);写建议幂等(同 (店铺,SKU,动作) 未落定�
 凭证表勾没勾「启用」(`stores.enabled_names()`,唯一在营判据)—— 没勾就不维护、
 到此为止;勾了再看最近一次 KPI 观测是不是 TERMINATED(`kpi.terminated_stores`)
 —— 是就不维护,否则维护。不维护的店意图整店不产出、存量建议整店撤销。
-SUSPENDED 不在此列(可能恢复,照常维护)。判据与降级方向见 `_closed_stores`。
+SUSPENDED 不在此列(可能恢复,照常维护)。判据与降级方向在 services/stores
+(`closed_verdict` / `enabled_or_note`,三处共用)。
 
 ⚠ **本工作流照常建议删除,但执行它的不是 maintenance**(2026-08-24):
 破坏动作(delete/retire)的唯一出口是 `problem_product_cleanup`,建议按
@@ -43,7 +44,6 @@ action ∈ (title/price/inventory) 的行归 maintenance。
 
 import logging
 
-from api import feishu
 from registry import db
 from services import alloc_survey, dispositions, kpi, \
     maintenance_intents as mi, store_absence, store_limits, stores as stores_svc
@@ -202,72 +202,12 @@ def _node_skip_names(skipped: dict, stats: dict) -> list[str]:
     return [f"{n}({words[n]})" if words.get(n) else n for n in sorted(skipped)]
 
 
-#: 不维护的两个原因,按判断顺序(①凭证 → ②终止);摘要也按这个顺序报
-CLOSED_DISABLED = "凭证未启用"
-CLOSED_TERMINATED = "店铺已终止"
-
-
 def _closed_line(closed: dict[str, str], n_closed: int, preview: bool) -> str:
-    """输入:不维护的店 + 被剔掉的意图条数(+ 是否 preview)→ 输出:摘要那一行(按判断顺序分组点名)。"""
-    parts = []
-    for why in (CLOSED_DISABLED, CLOSED_TERMINATED):
-        names = sorted(n for n, w in closed.items() if w == why)
-        if names:
-            parts.append(f"{why} {len(names)} 店(" + ",".join(names[:10])
-                         + (" …" if len(names) > 10 else "") + ")")
-    return ("  整店不维护:" + ";".join(parts)
+    """输入:不维护的店 + 被剔掉的意图条数(+ 是否 preview)→ 输出:摘要那一行。"""
+    return ("  整店不维护:" + stores_svc.closed_names(closed)
             + f" —— {n_closed} 条意图不产出,"
             + ("存量建议将撤销(preview 不写)" if preview else "存量建议撤销")
-            + "(恢复:凭证表勾回「启用」。冻结的在架行要标下线:先在凭证表取消"
-            "「启用」,再 `store_release -p dead=1 --dry-run` 看名单 —— dead=1 只认"
-            "「启用」,已终止但还勾着的店它不处理)")
-
-
-def _closed_stores(seen: set[str], terminated: set[str]
-                   ) -> tuple[dict[str, str], str]:
-    """输入:本轮出现过的店 + 已终止的店 → 输出:({不维护的店: 原因}, 名录读不到时的提示语)。
-
-    **顺序判断,不是并列**(所有者 2026-10-22:「先判断凭证是否启用,然后判断店铺
-    是否终止来取定维护还是不维护」;与凭证表连接规则 CLAUDE.md 安全红线同一种
-    结构):
-      ① **凭证启用了没有** —— 判据唯一出处 `stores.enabled_names()`(conventions §二)。
-         没启用 ⇒ **不维护,到此为止**,不再往下看终止与否(原因只记「凭证未启用」);
-      ② **启用了,店铺终止了没有** —— 最近一次 KPI 观测 TERMINATED
-         (`kpi.terminated_stores`)。终止 ⇒ 不维护(原因「店铺已终止」);否则维护。
-    ①判不出(名录读不到,见下)时按"启用"往下走 ②:终止的照旧剔,其余照常维护。
-    为什么要在这里判:catalog_sync 只扫能调 API 的店,停用店的 walmart_items 行
-    冻结成"在架"(store_release 才会标缺席);缺席避让又只看在营店(停用店不进
-    缺席名单)—— 于是本工作流天天拿冻结的旧现值对新采的亚马逊值算差异、建议、
-    执行件再以「凭证缺失」跳过、维护记录表天天多一批「未执行」。
-
-    ⚠ 名录读不到(飞书)**不剔、只喊**:与缺席探测同向(fail-open),维护三类
-    最坏是多算一轮会被执行件以凭证缺失跳过的建议;一次飞书抖动不该让全船队
-    整轮不维护。只接 `feishu.FeishuError`(网络错也收口成它):编程错误照炸,
-    不许被当成"名录读不到"天天静默放行(conventions §六 条件明确)。
-    ⚠ **读回空名录同样当读不到**:飞书对从没勾过的复选框整个字段都不返回、
-    缺省判不启用(conventions §二);哪天整列不返回,名录就是空集 —— 照字面
-    剔就是全船队整轮不维护、存量建议全撤。一家在营店都没有不可能是真值。
-    已终止那条读的是 PG,同一连接,失败本轮直接炸。
-    """
-    note = ""
-    try:
-        enabled = stores_svc.enabled_names()
-    except feishu.FeishuError as e:
-        logger.warning("在营名录读不到,本轮不按「启用」剔店:%s: %s",
-                       e.__class__.__name__, e)
-        enabled = None
-        note = f"⚠ 在营名录读不到({e.__class__.__name__}),本轮不按「启用」剔店"
-    if enabled is not None and not enabled:
-        logger.warning("在营名录读回空集(凭证表「启用」整列没返回?),本轮不按「启用」剔店")
-        enabled = None
-        note = "⚠ 在营名录读回空集(凭证表「启用」整列没返回?),本轮不按「启用」剔店"
-    out: dict[str, str] = {}
-    for name in seen:
-        if enabled is not None and name not in enabled:     # ① 没启用:到此为止
-            out[name] = CLOSED_DISABLED
-        elif name in terminated:                            # ② 启用了,但已终止
-            out[name] = CLOSED_TERMINATED
-    return out, note
+            + f"({stores_svc.CLOSED_RECOVERY_HINT})")
 
 
 def run(params: dict) -> str:
@@ -313,13 +253,19 @@ def run(params: dict) -> str:
         # 两边都不报错。删这两行之前先想清楚这个不对称。
         intents = [i for i in intents if i["store"] == only]
         capped = [c for c in capped if c["store"] == only]
-    # 不在营 / 已终止的店**整店不维护**(所有者 2026-10-22,先判凭证再判终止,
-    # 见 _closed_stores)。
+    # 不在营 / 已终止的店**整店不维护**(所有者 2026-10-22):先判凭证再判终止,
+    # 判据与降级方向在 services/stores(closed_verdict / enabled_or_note)。
+    # 为什么要在这里判:catalog_sync 只扫能调 API 的店,停用店的 walmart_items 行
+    # 冻结成"在架"(store_release 才会标缺席);缺席避让又只看在营店 —— 不剔的话
+    # 天天拿冻结旧值算差异、建议,执行件再以「凭证缺失」跳过,维护记录表天天一批
+    # 「未执行」。
     # 排在缺席避让之前:停用店本来就不进缺席名单(store_absence 只看在营店),
     # 这里不剔就没人剔。存量 suggested 行下面单独撤销并记原因 —— 不能混进通用
     # withdraw,那里的原因是「商品自己恢复正常了」,是错误取证
-    closed, closed_note = _closed_stores(
-        {i["store"] for i in intents} | {c["store"] for c in capped}, terminated)
+    enabled, closed_note = stores_svc.enabled_or_note()
+    closed = stores_svc.closed_verdict(
+        {i["store"] for i in intents} | {c["store"] for c in capped},
+        enabled, terminated)
     n_closed = sum(1 for i in intents if i["store"] in closed)
     if closed:
         intents = [i for i in intents if i["store"] not in closed]

@@ -224,6 +224,16 @@ def test_audit_scan_no_longer_caps_but_stays_ordered():
     assert "_AUDIT_DELETE_PER_STORE" not in src and "retire_caps" not in src
 
 
+@pytest.fixture(autouse=True)
+def _all_stores_maintained(monkeypatch):
+    """缺省:①名录判不出(不剔、不喊)、②没有已终止的店 = 改造前的行为。
+
+    钉「不维护的店整店不处置」的用例自己覆盖这两项(2026-10-22)。
+    """
+    monkeypatch.setattr(scan.stores_svc, "enabled_or_note", lambda: (None, ""))
+    monkeypatch.setattr(scan.kpi, "terminated_stores", lambda conn: set())
+
+
 def test_preview_writes_nothing(monkeypatch):
     """preview=1 只打印:一条建议行都不许落(与危险工作流的 dry-run 同精神)。"""
     monkeypatch.setattr(scan, "_load_state", lambda: (
@@ -1240,3 +1250,84 @@ def test_审核冲突视图的仍在架必须是真在卖():
     assert "w.missing_since IS NULL" in head
     assert "w.published_status = 'PUBLISHED'" in head
     assert "p.audit_status = 'rejected'" in head
+
+
+# ── 不维护的店整店不处置(所有者 2026-10-22,与维护链同一道顺序判断)──────────────
+
+def _closed_wire(monkeypatch, *, enabled, terminated, audit=()):
+    """problem_scan.run 的非 preview 全链桩:记下建议行、撤销调用与观察面输入。"""
+    import contextlib
+
+    from registry import db as _db
+
+    calls = {"suggest": [], "withdraw": [], "observed": []}
+    monkeypatch.setattr(scan, "_load_state", lambda: (
+        [_item("T1", "S1", "prohibited product policy"),
+         _item("C017", "X1", "prohibited product policy"),
+         _item("Z9", "Z1", "prohibited product policy")],
+        set(), set(), {}, set(), set(), set(), set()))
+    monkeypatch.setattr(scan, "_audit_rejected_rows",
+                        lambda conn, inflight, only, gone=None, perm=None: [
+                            {"store": st, "sku": sk, "asin": sk, "source": "audit",
+                             "action": "delete", "category": "AUDIT",
+                             "reason": "审核判拒", "detail": {}}
+                            for st, sk in audit])
+    monkeypatch.setattr(_db, "pg_conn",
+                        contextlib.contextmanager(lambda: iter([None])))
+    monkeypatch.setattr(scan.store_absence, "stale_stores",
+                        lambda conn, since=None, hours=None: [])
+    monkeypatch.setattr(scan.stores_svc, "enabled_or_note", lambda: (enabled, ""))
+    monkeypatch.setattr(scan.kpi, "terminated_stores", lambda conn: set(terminated))
+    monkeypatch.setattr(scan, "_record_categories",
+                        lambda conn, items, last: calls["observed"].extend(
+                            i["store"] for i in items) or 0)
+    monkeypatch.setattr(scan, "_collect_blacklists", lambda conn, items: "")
+    monkeypatch.setattr(scan, "_policy_gap_note", lambda conn, items: "")
+    monkeypatch.setattr(scan.dispositions, "suggest_many",
+                        lambda conn, rows: (calls["suggest"].extend(rows), len(rows))[1])
+    monkeypatch.setattr(scan.dispositions, "withdraw_stale",
+                        lambda conn, src, keep, why, store=None, exclude_stores=None: (
+                            calls["withdraw"].append((src, keep, why, store,
+                                                      exclude_stores)), 0)[1])
+    monkeypatch.setattr(scan.dispositions, "count_open", lambda conn, sources=None: 0)
+    monkeypatch.setattr(scan.dispositions, "stuck_executing",
+                        lambda conn, sources=None: [])
+    return calls
+
+
+def test_closed_stores_get_no_disposals_in_sequential_order(monkeypatch):
+    """① 凭证没启用 ⇒ 不处置、到此为止(C017,即使也已终止);② 启用但已终止 ⇒
+    不处置(Z9);其余照常(T1)。审核来源同样剔。存量建议两个来源各自整店撤销、
+    原因写实;通用撤销把它们排除。"""
+    calls = _closed_wire(monkeypatch, enabled={"T1", "Z9"},
+                         terminated={"C017", "Z9"},
+                         audit=[("T1", "A1"), ("C017", "A2"), ("Z9", "A3")])
+    out = scan.run({})
+    assert {r["store"] for r in calls["suggest"]} == {"T1"}
+    line = next(ln for ln in out.splitlines() if "整店不处置" in ln)
+    assert "凭证未启用 1 店(C017)" in line and "店铺已终止 1 店(Z9)" in line
+    assert line.index("凭证未启用") < line.index("店铺已终止")
+    assert "4 条候选不建议删除/停用" in line
+    closed_wd = {(w[0], w[3]): w[2] for w in calls["withdraw"] if not w[1] and w[3]}
+    assert closed_wd[("scan", "C017")] == "店铺不处置(凭证未启用)"
+    assert closed_wd[("audit", "C017")] == "店铺不处置(凭证未启用)"
+    assert closed_wd[("scan", "Z9")] == "店铺不处置(店铺已终止)"
+    general = [w for w in calls["withdraw"] if w[3] is None]
+    assert general and all({"C017", "Z9"} <= set(w[4]) for w in general)
+    # 观察面不连坐:归类事件/黑名单照样看得见不维护店的历史问题
+    assert set(calls["observed"]) == {"T1", "C017", "Z9"}
+
+
+def test_suspended_stores_are_still_disposed(monkeypatch):
+    """9-10 定稿不变:SUSPENDED 等非 ACTIVE(未终止)店照扫照建议。"""
+    calls = _closed_wire(monkeypatch, enabled={"T1", "C017", "Z9"}, terminated=set())
+    scan.run({})
+    assert {r["store"] for r in calls["suggest"]} == {"T1", "C017", "Z9"}
+
+
+def test_closed_gate_falls_open_when_roster_is_unknown(monkeypatch):
+    """①判不出(None):按启用往下走②——终止的照旧剔,其余照常。"""
+    calls = _closed_wire(monkeypatch, enabled=None, terminated={"Z9"})
+    scan.run({})
+    assert {r["store"] for r in calls["suggest"]} == {"T1", "C017"}
+

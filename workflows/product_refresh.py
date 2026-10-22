@@ -35,7 +35,8 @@ from datetime import datetime
 
 from api import scraper
 from registry import db
-from services import kpi, product_ingest, scrape_batches as batches
+from services import kpi, product_ingest, scrape_batches as batches, \
+    stores as stores_svc
 
 DANGEROUS = True        # 会给采集器压十几万个任务,空跑用 --dry-run
 
@@ -64,9 +65,12 @@ BATCH_PREFIX = "wm-refresh-"
 # SKU→ASIN 那一跳由下面 _SQL_TARGETS 的身份键表达式在 SQL 里做完。
 _ASIN_RE = re.compile(r"^B[0-9A-Z]{9}$")
 
-# 在线且店铺 ACTIVE 的 ASIN。同一 ASIN 多店只推一次(采集结果按 ASIN 共享)。
-# 店铺状态取 ops.store_kpi_daily 每店最新一行;无 KPI 记录的店视为 ACTIVE
-# (与 list_new 闸门同口径,fail-open)。
+# 在线、**凭证启用**且店铺 ACTIVE 的 ASIN。同一 ASIN 多店只推一次(采集结果按 ASIN
+# 共享)。顺序同维护链(所有者 2026-10-22,判据在 services/stores):① 凭证没勾
+# 「启用」的店不推 —— 它的在架行是冻结的(catalog_sync 不扫停用店),推了只是
+# 白耗采集预算,维护链也不会用;② 店铺状态取 ops.store_kpi_daily 每店最新一行,
+# 非 ACTIVE 不推,无 KPI 记录视为 ACTIVE(与 list_new 闸门同口径,fail-open)。
+# `enabled` 为 NULL = ①判不出(名录读不到 / 读回空集),不按「启用」剔(fail-open)。
 # 取的是**身份键** coalesce(ls.source_key, w.sku)(conventions §九),不是裸
 # SKU:切码之后裸 SKU 全过不了下面的形态闸,推采集目标会**静默归零** ——
 # 不报错,只是维护链新鲜度的源头断掉。存量 amz 行 source_key = sku,推的集合
@@ -83,24 +87,27 @@ LEFT JOIN catalog.listing_sources ls
 LEFT JOIN latest_status s ON s.store = w.store
 WHERE w.missing_since IS NULL
   AND w.published_status = 'PUBLISHED'
+  AND (%(enabled)s::text[] IS NULL OR w.store = ANY(%(enabled)s::text[]))
   AND (s.store_status IS NULL OR upper(s.store_status) = 'ACTIVE')
 ORDER BY 1
 """
 
 
-def _targets() -> tuple[list[str], int]:
-    """输入:无 → 输出:(合法 ASIN 形态的在线身份键, 被过滤掉的行数)。
+def _targets() -> tuple[list[str], int, str]:
+    """输入:无 → 输出:(合法 ASIN 形态的在线身份键, 被过滤掉的行数, 名录判不出的提示语或空串)。
 
     历史遗留:一部分在线 SKU 根本不是 ASIN 形态(旧系统留下的自定义编码)。
     采集侧建任务时就把它们丢掉(2026-08-09 实证:推 27722,采集侧只建了
     27170 个任务),所以推了也是白推。所有者定稿:**不在维护范围内,直接
     过滤**——它们也永远不会有 amz 数据,维护链本来就碰不到。
     """
+    enabled, note = stores_svc.enabled_or_note()
     with db.pg_conn() as conn, conn.cursor() as cur:
-        cur.execute(_SQL_TARGETS)
+        cur.execute(_SQL_TARGETS,
+                    {"enabled": sorted(enabled) if enabled is not None else None})
         skus = [r[0] for r in cur.fetchall()]
     ok = [s for s in skus if _ASIN_RE.fullmatch(s or "")]
-    return ok, len(skus) - len(ok)
+    return ok, len(skus) - len(ok), note
 
 
 # 批次台账三件套(record / finish / pull_failures)住在 services/scrape_batches:
@@ -124,18 +131,20 @@ def run(params: dict) -> str:
         return "\n".join(["在途采集批次(check:只读采集侧,结果同步进台账):"]
                          + _check_open())
 
-    asins, dropped = _targets()
+    asins, dropped, roster_note = _targets()
     if not asins:
-        return "无在线产品可推(catalog_sync 是否跑过?)"
+        return "无在线产品可推(catalog_sync 是否跑过?)" + (
+            f";{roster_note}" if roster_note else "")
 
     chunks = [asins[i:i + BATCH_SIZE]
               for i in range(0, len(asins), BATCH_SIZE)]
     est_min = len(asins) / 2500        # 所有者口径:2000~3000/分钟
-    skip = f",非 ASIN 形态 SKU 已过滤 {dropped} 个" if dropped else ""
+    skip = (f",非 ASIN 形态 SKU 已过滤 {dropped} 个" if dropped else "") + (
+        f";{roster_note}" if roster_note else "")
     if not params.get("execute"):
         split = "一个批次" if len(chunks) == 1 else f"{len(chunks)} 个批次"
         return (f"🧪 [DRY-RUN] 将全量重推 {len(asins)} 个在线 ASIN"
-                f"(PUBLISHED + 店铺 ACTIVE,跨店去重){skip},{split};"
+                f"(PUBLISHED + 凭证启用 + 店铺 ACTIVE,跨店去重){skip},{split};"
                 f"按 2500/分钟估算约 {est_min:.0f} 分钟采完\n"
                 + "\n".join(["在途批次:"] + _check_open()))
 

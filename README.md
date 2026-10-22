@@ -297,7 +297,7 @@ V4.1 Flash 顶替、按 Flash 计费 —— 也就是今天不报错,但拿回�
 |---|---|---|
 | `catalog_sync` | 调 | 全店扫沃尔玛在架商品 + 库存 → `catalog.walmart_items`。**它是几乎所有判据的现值来源**,链里必须排第一 |
 | `item_id_sync` | 调 | 用沃尔玛 On-request **ITEM 报表**补 `walmart_items.item_id`(数字 itemId 只有报表批量给)。每天只为有缺口的店各拿一份报表(创建每店每小时一次、生成 15–45 分钟),先落台账 `ops.report_requests` 再调接口,超时/限流下轮接着;写库**报表为准**;首轮 `-p all=1`,探针 `-p store=X -p probe=1`。飞书 itemId 列仍由 catalog_sync 投影 |
-| `product_refresh` | 危 调 | 在架产品全量重推采集(维护链的数据新鲜度源头)。`-p wait=1` 阻塞等采完 |
+| `product_refresh` | 危 调 | 在架产品全量重推采集(维护链的数据新鲜度源头;凭证未启用的店不推,2026-10-22)。`-p wait=1` 阻塞等采完 |
 | `product_ingest` | 调 | 采集服务增量 → `catalog.products` / `snapshots`。**全项目唯一从采集器取数的工作流**;游标在 `ops.cursors`,空页不推进 |
 | `scrape_missing` | 危 | 给库里缺亚马逊数据的产品补采(分类分档 + 冷却期) |
 | `brand_scrape` | | 缺品牌的 C/E 类 ASIN:推采集 → 摄取 → 品牌入账 |
@@ -392,7 +392,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 |---|---|---|
 | `maintenance_scan` | 调 | 扫描定性,产建议行(改价 / 改库存 / 改标题 / 删除);先判凭证是否启用、再判店铺是否终止,任一步不过即整店不维护(2026-10-22)。判据全在 `services.maintenance_intents.classify()` —— 全项目唯一一处决定"这个在线商品该拿它怎么办"。改库存跟随亚马逊时:<5 写 0(所有店),过了门槛写 min(亚马逊库存, 限额表「最大库存」N)(2026-09-25;首行报「封顶 N」) |
 | `maintenance` | 危 调 | 维护执行件。改价 ≤5 / 改库存 ≤10 走单品 PUT,否则走 feed;标题恒 feed |
-| `problem_scan` | 调 | 问题商品扫描定性(一切非 PUBLISHED 的在架行 + 审核判拒但仍在架;2026-08-28 定稿一律建议删除,反补退役)。尾段顺手收黑名单并投影飞书 |
+| `problem_scan` | 调 | 问题商品扫描定性(一切非 PUBLISHED 的在架行 + 审核判拒但仍在架;2026-08-28 定稿一律建议删除,反补退役;先判凭证启用、再判店铺终止,任一步不过整店不处置,2026-10-22)。尾段顺手收黑名单并投影飞书 |
 | `problem_product_cleanup` | 危 调 | 问题商品处置执行件(删除 / 停用) |
 | `error_reclass_report` | | 报错归类对照(只读排查,手动跑):同一批生产数据在 `services.error_taxonomy` 16 码下的主码分布 / unknown 全文 / 政策表缺口 / feed 政策族分类 / 已产生后果的黑名单行。⚠ 2026-09-04 换轨完成后**退役了「旧码 → 新码迁移矩阵」那一面**,旧引擎 `problem_products.categorize()` 一并删除 |
 | `error_reclass` | | **存量报错按新码重新归类并回填**(手动跑;所有者 2026-09-03「标准不统一,审核误差很大」)。写 `audit.walmart_error_records` 与 `catalog.asin_blacklist` 的 `taxonomy_*` 新列,**老列与判定行为一个字不动**;原文四级优先(records 全文 → events 病历 → items 当前值 → 本表 200 字符样本,都没有就留 NULL 不猜);`taxonomy_version` 天然分页,跑一半可直接重跑。⚠ 报出「依据在新码下站不住」的黑名单行,但**不放行任何一条** —— 那是另一次裁决 |

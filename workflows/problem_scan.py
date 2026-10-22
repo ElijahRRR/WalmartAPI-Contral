@@ -42,6 +42,12 @@
 店铺状态**不设闸**(所有者定稿 2026-09-10:「非 ACTIVE 店也需要在扫描范围内」):
 ops.store_kpi_daily 里 store_status 非 ACTIVE 的店照扫照建议;此前整店跳过。
 状态只用来在摘要里按店点名,让人眼闸门看得见这批建议来自非 ACTIVE 店。
+⚠ **例外:不维护的店整店不处置**(所有者定稿 2026-10-22,与维护链同一道顺序判断,
+判据在 services/stores):① 凭证没勾「启用」⇒ 不处置,到此为止;② 启用了但最近一次
+KPI 观测 TERMINATED ⇒ 不处置。这两类店的在架行是冻结的(catalog_sync 不扫停用店),
+建议了执行件也连不上,只会天天往维护记录表写「未执行(凭证缺失)」。SUSPENDED 等
+其余非 ACTIVE 店仍照扫照建议(9-10 的定稿不变)。只挡**处置建议**;观察面(归类事件、
+黑名单收集、K 类信号)与缺席避让同款不连坐。
 
 调度顺序:catalog_sync → problem_scan → problem_product_cleanup(真跑)。
 """
@@ -53,7 +59,7 @@ from registry import db
 from registry import resources
 from services import blacklist, blacklist_sheet, dispositions
 from services import error_taxonomy, feed_track
-from services import product_events, store_absence
+from services import kpi, product_events, store_absence, stores as stores_svc
 
 DANGEROUS = False       # 只读沃尔玛;写库仅限事件与建议行,都可重跑
 SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重赛靠它识别)
@@ -492,7 +498,8 @@ def _inactive_note(allrows: list[dict], inactive: set) -> str:
             by_store[r["store"]] = by_store.get(r["store"], 0) + 1
     if not by_store:
         return ""
-    return ("  ⚠ 非 ACTIVE 店照常建议(店铺状态不设闸,2026-09-10):"
+    return ("  ⚠ 非 ACTIVE 店照常建议(店铺状态不设闸,2026-09-10;"
+            "凭证未启用 / 已终止的店除外,2026-10-22):"
             + ",".join(f"{st}×{c}" for st, c in
                         sorted(by_store.items(), key=lambda kv: -kv[1])))
 
@@ -766,6 +773,11 @@ def run(params: dict) -> str:
      inactive, stubborn, gone_blocked, perm_blocked) = _load_state()
     if only:
         items = [i for i in items if i["store"] == only]
+    # ⚠ 下面的不维护剔除与缺席避让都只挡**处置建议**(plan/audit_rows —— 会变成
+    # 删除/停用 feed 的那些);观察面不连坐:黑名单收集、K 类聚集信号、归类事件
+    # 都是只增不减的记录,静音会让 15:00 blacklist 链少一天的 ASIN/品牌
+    # (对抗校验 2026-08-26)
+    items_all = items
     # 缺席避让(店级重试标准③,所有者定稿 2026-08-26):缺席店的在架状态
     # 停在上一轮,拿它判「仍在架 → 删」会对可能已变的现实开破坏 feed。
     # 判据从库里水位派生(services/store_absence),与调度顺序无关。
@@ -775,11 +787,17 @@ def run(params: dict) -> str:
         # 降级与 only 范围收敛都在 store_absence.stale_or_note 里(四处同形,
         # 2026-08-27 收口);拼进首行的分号由调用方补
         absent, absence_note = store_absence.stale_or_note(conn, only)
+        terminated = kpi.terminated_stores(conn)
     absence_gap = f";{absence_note}" if absence_note else ""
-    # ⚠ 避让只挡**处置建议**(plan/audit_rows —— 会变成删除/停用 feed 的那些);
-    # 观察面不连坐:黑名单收集、K 类聚集信号、归类事件都是只增不减的记录,
-    # 静音一天会让 15:00 blacklist 链少一天的 ASIN/品牌(对抗校验 2026-08-26)
-    items_all = items
+    # 不维护的店**整店不处置**(所有者 2026-10-22,顺序判断见头注 / services/stores)。
+    # 排在缺席避让之前:停用店本来就不进缺席名单,这里不剔就没人剔
+    enabled, closed_note = stores_svc.enabled_or_note()
+    closed = stores_svc.closed_verdict({i["store"] for i in items},
+                                       enabled, terminated)
+    n_closed = sum(1 for i in items if i["store"] in closed)
+    if closed:
+        items = [i for i in items if i["store"] not in closed]
+    absent = set(absent) - set(closed)      # 不在缺席名单里重复点名
     n_avoided = sum(1 for i in items if i["store"] in absent)
     if absent:
         items = [i for i in items if i["store"] not in absent]
@@ -803,6 +821,12 @@ def run(params: dict) -> str:
     with db.pg_conn() as conn:
         audit_rows = _audit_rejected_rows(conn, inflight, only,
                                           gone_blocked, perm_blocked)
+        # 审核来源同一道顺序判断(只多判 audit 里才出现的店)
+        closed.update(stores_svc.closed_verdict(
+            {r["store"] for r in audit_rows} - set(closed), enabled, terminated))
+        n_closed += sum(1 for r in audit_rows if r["store"] in closed)
+        audit_rows = [r for r in audit_rows if r["store"] not in closed]
+        absent = set(absent) - set(closed)
         if absent:
             n_audit_avoided = sum(1 for r in audit_rows
                                   if r["store"] in absent)
@@ -830,10 +854,16 @@ def run(params: dict) -> str:
             head[0] += (f";⚠ 缺席避让 {len(absent)} 店:"
                         f"{','.join(sorted(absent))}"
                         f"({n_avoided} 条候选不参与本轮处置)")
-        head[0] += absence_gap
+        head[0] += absence_gap + (f";{closed_note}" if closed_note else "")
         lines[:0] = head        # 总览 + 分店明细排在最前,审核/剔除说明跟其后
         # 两道回执闸的点名紧跟总览:它们是"今天为什么少了这么多建议"的答案
         lines[len(head):len(head)] = _blocked_notes(gone_skipped, perm_skipped)
+        if closed:
+            lines.append("  整店不处置:" + stores_svc.closed_names(closed)
+                         + f" —— {n_closed} 条候选不建议删除/停用,"
+                         + ("存量建议将撤销(preview 不写)" if preview
+                            else "存量建议撤销")
+                         + f"({stores_svc.CLOSED_RECOVERY_HINT})")
         if (note := _inactive_note(allrows, inactive)):
             lines.append(note)
         # 观察面用 items_all(缺席不连坐,见上)
@@ -854,6 +884,13 @@ def run(params: dict) -> str:
         # 撤销本轮不再建议的陈旧行(按来源各撤各的):否则昨天建议删、今天
         # 已恢复正常的 SKU,那条 suggested 还挂着,执行件照样会删
         n_wd = 0
+        # 不维护的店:两个来源各自整店撤销,原因写实(不混进下面的通用撤销 ——
+        # 那里的原因是「本轮扫描不再建议」,对它们是错误取证)
+        n_closed_wd = sum(
+            dispositions.withdraw_stale(conn, src, [],
+                                        why=f"店铺不处置({why})", store=name)
+            for name, why in sorted(closed.items())
+            for src in ("scan", "audit"))
         for src, srows in (("scan", rows), ("audit", audit_rows)):
             # ⚠ store=only 不能省:`-p store=X` 那一轮只扫了一个店,keep 里
             # 只有该店的行,不限范围会把其余全部店铺的待执行建议一次清空
@@ -862,7 +899,8 @@ def run(params: dict) -> str:
             n_wd += dispositions.withdraw_stale(
                 conn, src, [(r["store"], r["sku"], r["action"]) for r in srows],
                 why=f"本轮扫描不再建议{f'(限 {only})' if only else ''}",
-                store=only or None, exclude_stores=sorted(absent))
+                store=only or None,
+                exclude_stores=sorted(set(absent) | set(closed)))
         # 限本链来源:维护链共用同一张建议表,不限的话摘要报的数会把它的
         # 待执行也算进来,与本链执行件领到的数对不上
         n_open = dispositions.count_open(
@@ -876,6 +914,7 @@ def run(params: dict) -> str:
                  + (f"(差额 {n_sug - n_open} 是同一 (店铺,SKU,动作) 被两个来源"
                     f"命中、按唯一索引合并的)" if n_sug > n_open else "")
                  + (f";撤销陈旧建议 {n_wd} 条(本轮不再建议)" if n_wd else "")
+                 + (f";撤销不处置店的建议 {n_closed_wd} 条" if n_closed_wd else "")
                  + f";归类事件新记 {n_cat} 条")
     if stuck:
         lines.append(dispositions.stuck_note(stuck))

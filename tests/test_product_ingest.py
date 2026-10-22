@@ -639,9 +639,40 @@ def test_refresh_filters_non_asin_skus(monkeypatch):
         def cursor(self): return _C()
 
     monkeypatch.setattr(pr.db, "pg_conn", lambda: _Conn())
-    ok, dropped = pr._targets()
+    monkeypatch.setattr(pr.stores_svc, "enabled_or_note", lambda: ({"T1"}, ""))
+    ok, dropped, note = pr._targets()
     # 11 位、小写、自定义编码、空串全过滤掉
-    assert ok == ["B0ABCDEFGH", "B0Z9Y8X7W6"] and dropped == 4
+    assert ok == ["B0ABCDEFGH", "B0Z9Y8X7W6"] and dropped == 4 and note == ""
+
+
+def test_refresh_skips_stores_whose_credentials_are_not_enabled(monkeypatch):
+    """凭证没勾「启用」的店不推采集(所有者 2026-10-22):它的在架行是冻结的,
+    推了只是白耗采集预算。①判不出(名录读不到 / 空集)不剔 —— 参数传 NULL。"""
+    from workflows import product_refresh as pr
+
+    assert "%(enabled)s::text[] IS NULL OR w.store = ANY(%(enabled)s::text[])" \
+        in pr._SQL_TARGETS
+    seen = {}
+
+    class _C:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, params=None): seen["params"] = params
+        def fetchall(self): return [("B0ABCDEFGH",)]
+
+    class _Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def cursor(self): return _C()
+
+    monkeypatch.setattr(pr.db, "pg_conn", lambda: _Conn())
+    monkeypatch.setattr(pr.stores_svc, "enabled_or_note", lambda: ({"T2", "T1"}, ""))
+    pr._targets()
+    assert seen["params"] == {"enabled": ["T1", "T2"]}
+    monkeypatch.setattr(pr.stores_svc, "enabled_or_note",
+                        lambda: (None, "⚠ 在营名录读不到(FeishuError),本轮不按「启用」剔店"))
+    _ok, _d, note = pr._targets()
+    assert seen["params"] == {"enabled": None} and "在营名录读不到" in note
 
 
 def test_snapshot_carries_shipping_null_is_not_zero():

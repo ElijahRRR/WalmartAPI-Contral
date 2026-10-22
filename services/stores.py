@@ -121,6 +121,73 @@ def enabled_names() -> set[str]:
                         for r in recs if is_enabled(r.get("fields", {}))) if n}
 
 
+# ── 「这家店维护不维护」:顺序判断(所有者定稿 2026-10-22)────────────────────
+# 「先判断凭证是否启用,然后判断店铺是否终止来取定维护还是不维护」—— 与凭证表
+# 连接规则(CLAUDE.md 安全红线)同一种结构:**顺序,不是并列**。
+#   ① 凭证启用了没有(enabled_names)—— 没启用 ⇒ 不维护,到此为止;
+#   ② 启用了,店铺终止了没有(kpi.terminated_stores)—— 终止 ⇒ 不维护;否则维护。
+# 三处用同一套:maintenance_scan(维护三类 + 维护链的删除)、problem_scan(删除/
+# 停用建议)、product_refresh(推采集)。判据在这里一份,别在 workflow 里各写一遍。
+#: 两个不维护原因,按判断顺序;摘要也按这个顺序报
+CLOSED_DISABLED = "凭证未启用"
+CLOSED_TERMINATED = "店铺已终止"
+#: 冻结的在架行怎么标下线(三处摘要共用这句;dead=1 只认「启用」)
+CLOSED_RECOVERY_HINT = ("恢复:凭证表勾回「启用」。冻结的在架行要标下线:先在凭证表取消"
+                        "「启用」,再 `store_release -p dead=1 --dry-run` 看名单 —— dead=1 "
+                        "只认「启用」,已终止但还勾着的店它不处理")
+
+
+def enabled_or_note() -> tuple[set[str] | None, str]:
+    """输入:无 → 输出:(在营店名集合;①判不出时 None, 判不出的提示语或空串)。
+
+    给"维护不维护"那道顺序判断用的①:**判不出不剔、只喊**(fail-open)——
+    一次飞书抖动不该让全船队整轮不维护 / 不推采集。两种算判不出:
+      · 飞书报错:只接 `feishu.FeishuError`(网络错也收口成它);编程错误照炸,
+        不许被当成"名录读不到"天天静默放行(conventions §六 条件明确);
+      · **读回空集**:飞书对从没勾过的复选框整个字段都不返回、缺省判不启用
+        (conventions §二);哪天整列不返回,名录就是空集 —— 照字面剔就是全船队
+        整轮停摆、存量建议全撤。一家在营店都没有不可能是真值。
+    提示语给调用方拼进摘要首行(链通知只发首行)。
+    """
+    try:
+        enabled = enabled_names()
+    except feishu.FeishuError as e:
+        logger.warning("在营名录读不到,本轮不按「启用」剔店:%s: %s",
+                       e.__class__.__name__, e)
+        return None, f"⚠ 在营名录读不到({e.__class__.__name__}),本轮不按「启用」剔店"
+    if not enabled:
+        logger.warning("在营名录读回空集(凭证表「启用」整列没返回?),本轮不按「启用」剔店")
+        return None, "⚠ 在营名录读回空集(凭证表「启用」整列没返回?),本轮不按「启用」剔店"
+    return enabled, ""
+
+
+def closed_verdict(names, enabled: set[str] | None,
+                   terminated: set[str]) -> dict[str, str]:
+    """输入:要判的店 + 在营名录(None = ①判不出)+ 已终止的店 → 输出:{不维护的店: 原因}。
+
+    顺序判断(见上):① 不在营 ⇒「凭证未启用」,到此为止,不再看终止;
+    ② 在营(或①判不出,按在营往下走)且已终止 ⇒「店铺已终止」;其余维护。
+    """
+    out: dict[str, str] = {}
+    for name in names:
+        if enabled is not None and name not in enabled:     # ① 没启用:到此为止
+            out[name] = CLOSED_DISABLED
+        elif name in terminated:                            # ② 启用了,但已终止
+            out[name] = CLOSED_TERMINATED
+    return out
+
+
+def closed_names(closed: dict[str, str], limit: int = 10) -> str:
+    """输入:closed_verdict 的结果 → 输出:「凭证未启用 N 店(…);店铺已终止 M 店(…)」(按判断顺序)。"""
+    parts = []
+    for why in (CLOSED_DISABLED, CLOSED_TERMINATED):
+        names = sorted(n for n, w in closed.items() if w == why)
+        if names:
+            parts.append(f"{why} {len(names)} 店(" + ",".join(names[:limit])
+                         + (" …" if len(names) > limit else "") + ")")
+    return ";".join(parts)
+
+
 def load_stores(filter_names: list[str] | None = None) -> list[dict]:
     """输入:可选店铺名列表(None=全部)→ 输出:有效店铺 list[dict](name/client_id/client_secret/proxy)。
 

@@ -1145,3 +1145,23 @@ def test_explicit_refresh_validates_before_scraper_and_uses_empty_sheet(monkeypa
     with pytest.raises(RuntimeError, match="gap reached"):
         pa.run({"refresh": "1", "asins": "B0AAAA0001", "execute": False})
     assert seen == [(["B0AAAA0001"], [], False, True)]
+
+
+def test_named_refresh_reports_reasons_in_the_summary_not_a_sheet(monkeypatch):
+    """refresh=1 点名刷新没有表行(sheet_rows=[]):仍采不回来的**逐个原因进摘要**。
+    此前原因算出来就扔(写给空表),摘要还照搬"写进表格「具体内容」、下轮重试"
+    —— 既没有表、也没有下一轮会自动领它(2026-10-22 复核)。"""
+    notes = []
+    _stub(monkeypatch, [_BEFORE, _AFTER_PART], pushed=[], notes=notes,
+          failures={"B0GONE0001": "captcha"})
+    out = "\n".join(pa._close_gap(_WANT, [], True, 20, force=True))
+    assert "点名刷新(-p refresh=1)" in out and "-p force=1" not in out
+    assert "仍缺 1 个:逐个原因见下" in out
+    assert "B0GONE0001:未采集(库里没有这个 ASIN)" in out and "验证码" in out
+    assert "表格" not in out and "下轮重试" not in out and notes == []
+
+
+def test_named_refresh_gap_wait_zero_does_not_promise_a_next_round(monkeypatch):
+    _stub(monkeypatch, [_BEFORE, _BEFORE], pushed=[], notes=[])
+    out = "\n".join(pa._close_gap(_WANT, [], True, 0, force=True))
+    assert "采完后重跑本命令再审" in out and "下一轮自动捞起" not in out

@@ -8,6 +8,8 @@
   python cli.py alloc_plan -p from_sheet=1 --dry-run   # 点名分配:只分「产品分配表」里的 ASIN
   python cli.py alloc_plan -p from_sheet=1             # 同上,落占用 + 逐行回写表格
   python cli.py alloc_plan -p from_sheet=1 -p cutoff=30  # 点名模式临时加一条淘汰线(缺省不设)
+  python cli.py alloc_plan -p from_csv=plan.csv --dry-run  # 定向清单(表头 店铺,ASIN):只校验硬闸
+  python cli.py alloc_plan -p from_csv=plan.csv            # 同上,落品牌 + 产品占用(不写上架表)
 
 把候选池打分、组队、切批、发牌,产出**分配方案表**。真跑只多做一件事:
 把方案里的品牌与 ASIN 落成占用(`catalog.claims`)。上架表另说 —— 分配是
@@ -70,6 +72,10 @@ FLOW_FREE, FLOW_DIRECTED, FLOW_NONE = "自由流", "定向流", "未分配"
 # 静默吞掉就退化成**全库分配并真落几千条占用**,而占用撤不回。
 _KNOWN_PARAMS = {"batch", "days", "sales_days", "as_of", "export",
                  "from_sheet", "cutoff", "from_csv"}
+# 定向清单(from_csv)不出方案表、不打分、不切批:这些参数在那条路上不起作用,
+# 带上了就炸 —— 静默忽略等于让人以为"窗口钉住了 / 导出了 / 封顶了"
+_CSV_EXCLUSIVE = ("from_sheet", "batch", "cutoff", "days", "sales_days",
+                  "as_of", "export")
 # cli 自己塞进 params 的键,不是人敲的(product_audit 那边 2026-08-16 `dry_run`
 # 上线当天就炸过一次:白名单漏放行 cli 级开关,整条工作流起不来)
 _CLI_INJECTED = {"execute", "dry_run"}
@@ -209,16 +215,25 @@ def _flag(v) -> bool:
 
 
 def run(params: dict) -> str:
-    """输入:params(batch/days/sales_days/as_of/export/execute;from_sheet/cutoff)→ 输出:方案摘要。"""
+    """输入:params(batch/days/sales_days/as_of/export/execute;from_sheet/cutoff;from_csv)→ 输出:方案摘要。"""
     unknown = sorted(set(params) - _KNOWN_PARAMS - _CLI_INJECTED)
     if unknown:
         raise ValueError(
             f"alloc_plan 不认识这些参数:{unknown}(认识的:{sorted(_KNOWN_PARAMS)})。"
             f"宁炸不吞:`-p from_sheet=1` 打错一个字就会退化成全库分配并真落几千条占用")
-    if params.get("from_csv"):
-        if any(k in params for k in ("from_sheet", "batch", "cutoff")):
-            raise ValueError("from_csv 不与 from_sheet/batch/cutoff 混用")
-        return _run_csv(params)
+    # ⚠ 按**键在不在**分派,不按值真假:`-p from_csv=$PLAN` 变量没展开时值是空串,
+    # 按真假判就静默掉进下面的全库分配(缺省真跑、落几千条不可逆占用)——
+    # 正是上面那句"宁炸不吞"要挡的事(2026-10-22 复核)
+    if "from_csv" in params:
+        path = str(params.get("from_csv") or "").strip()
+        if not path:
+            raise ValueError("-p from_csv= 给了空值(变量没展开?):宁炸不吞 —— "
+                             "空着往下走就是全库分配并真落几千条占用")
+        mixed = [k for k in _CSV_EXCLUSIVE if k in params]
+        if mixed:
+            raise ValueError(f"from_csv 不与 {mixed} 混用:定向清单不出方案表、"
+                             f"不打分、不切批,这些参数在这条路上不起作用")
+        return _run_csv({**params, "from_csv": path})
     if _flag(params.get("from_sheet")):
         return _run_sheet(params)
     if "cutoff" in params:
@@ -1394,74 +1409,104 @@ def _run_sheet(params: dict) -> str:
 
 
 def _read_fixed_plan(path):
-    """输入:店铺/ASIN CSV → 输出:唯一 ASIN 到明确目标店的映射。"""
+    """输入:店铺/ASIN CSV → 输出:唯一 ASIN 到明确目标店的映射。
+
+    坏行一律整份拒绝并报行号(不跳过、不猜);只有**两格都空**的行跳过 —— 那是
+    Excel 清过内容但留着格式的行导出成的 `,`,不是数据。
+    """
     import csv
     from pathlib import Path
     from services import sku_asin
-    with Path(path).expanduser().open(encoding="utf-8-sig", newline="") as fh:
-        rd = csv.DictReader(fh)
-        if not {"店铺", "ASIN"} <= set(rd.fieldnames or []):
-            raise ValueError("定向清单必须有 店铺/ASIN 两列")
-        out = {}
-        for row in rd:
-            store, asin = row["店铺"].strip(), row["ASIN"].strip().upper()
-            if not store or not sku_asin.is_standard_asin(asin):
-                raise ValueError(f"清单店铺或 ASIN 无效:{store}/{asin}")
-            if asin in out:
-                raise ValueError(f"清单重复 ASIN:{asin}")
-            out[asin] = store
+    try:
+        with Path(path).expanduser().open(encoding="utf-8-sig", newline="") as fh:
+            rd = csv.DictReader(fh)
+            if not {"店铺", "ASIN"} <= {(f or "").strip() for f in (rd.fieldnames or [])}:
+                raise ValueError(f"定向清单必须有 店铺/ASIN 两列(读到的表头:{rd.fieldnames})")
+            out = {}
+            for row in rd:
+                # 表头带空格也认;短行缺的格是 None(DictReader 的 restval)
+                row = {(k or "").strip(): v for k, v in row.items()}
+                store = (row.get("店铺") or "").strip()
+                asin = (row.get("ASIN") or "").strip().upper()
+                if not store and not asin:
+                    continue
+                if not store or not sku_asin.is_standard_asin(asin):
+                    raise ValueError(f"清单第 {rd.line_num} 行店铺或 ASIN 无效:{store}/{asin}")
+                if asin in out:
+                    raise ValueError(f"清单第 {rd.line_num} 行重复 ASIN:{asin}")
+                out[asin] = store
+    except UnicodeDecodeError as e:
+        raise ValueError("定向清单不是 UTF-8:Excel 请「另存为 → CSV UTF-8(逗号分隔)」") from e
     if not out:
         raise ValueError("定向清单为空")
     return out
 
 
 def _fixed_claims(want, scored, cfg, registered, online_now,
-                  listed, held_brand, held_prod, gate):
-    """输入:已明确去向的清单及实时证据 → 输出:全清单通过硬闸后的占用行。
+                  listed, held_brand, held_prod, gate, why=None):
+    """输入:已明确去向的清单及实时证据(+ 不在池的逐 ASIN 原因)→ 输出:全清单通过硬闸后的占用行。
 
     不自动换店、不放占用、不扩充池；任何一行冲突就整批拒绝。
     用户点名选品与 from_sheet 一样不设分数线，仍共用产品池/库存硬闸和店铺谓词。
+
+    **一次报全**:每道闸都查完再整批拒绝,不在第一处就停 —— 否则 80 行的清单
+    有几类问题就要 dry-run 几轮才清得干净;不在池的 ASIN 带上具体原因(不在库 /
+    未审核 / 落地价…),分得清该去 `product_audit -p refresh=1` 还是该删行。
     """
     from services import brand_key, risk_gate
+    why = why or {}
+    problems: list[str] = []
     by_asin = {r["asin"]: r for r in scored}
-    missing = set(want) - set(by_asin)
-    if missing:
-        raise ValueError(f"清单有 {len(missing)} 个未通过产品池/库存硬闸:{sorted(missing)[:10]}")
+    for a in sorted(set(want) - set(by_asin)):
+        problems.append(f"{a}:未通过产品池/库存硬闸({why.get(a) or '原因未知'})")
     counts = Counter(want.values())
-    for store, n in counts.items():
+    bad_store = set()           # 店级就不成立的店,它的行不再逐条判(没有配置可判)
+    for store, n in sorted(counts.items()):
         conf = cfg.get(store)
         if store not in registered or sv.is_excluded(store):
-            raise ValueError(f"店铺不在分配范围:{store}")
-        if not store_targets.accepts_allocation(conf):
-            raise ValueError(f"店铺容量未填或不接货:{store}")
-        if n > int(conf["max_online"]) - online_now.get(store, 0):
-            raise ValueError(f"当前容量不足:{store} 请求 {n}，不预支尚未完成的下架")
+            problems.append(f"店铺不在分配范围:{store}")
+            bad_store.add(store)
+        elif not store_targets.accepts_allocation(conf):
+            problems.append(f"店铺容量未填或不接货:{store}")
+            bad_store.add(store)
+        elif n > int(conf["max_online"]) - online_now.get(store, 0):
+            problems.append(f"当前容量不足:{store} 请求 {n},剩 "
+                            f"{max(int(conf['max_online']) - online_now.get(store, 0), 0)},"
+                            f"不预支尚未完成的下架")
     result, assigned_brands = [], {}
     for asin, store in want.items():
-        r, conf = by_asin[asin], cfg[store]
+        r = by_asin.get(asin)
+        if r is None or store in bad_store:
+            continue
+        conf = cfg[store]
         if asin in listed:
-            raise ValueError(f"产品已在架:{asin}")
+            problems.append(f"产品已在架:{asin}")
         brand = brand_key.brand_key(r.get("brand"), r.get("manufacturer"))
         if held_prod.get(asin) not in (None, store):
-            raise ValueError(f"产品占用冲突:{asin} 属于 {held_prod[asin]}")
+            problems.append(f"产品占用冲突:{asin} 属于 {held_prod[asin]}")
         if brand and held_brand.get(brand) not in (None, store):
-            raise ValueError(f"品牌占用冲突:{brand} 属于 {held_brand[brand]}")
+            problems.append(f"品牌占用冲突:{brand} 属于 {held_brand[brand]}")
         if brand and assigned_brands.get(brand) not in (None, store):
-            raise ValueError(f"清单把同品牌分给两店:{brand}")
+            problems.append(f"清单把同品牌分给两店:{brand}")
         if not store_targets.allowed(conf, r["category"]):
-            raise ValueError(f"店铺类目不符:{store}/{asin}")
+            problems.append(f"店铺类目不符:{store}/{asin}")
         if not store_targets.lead_ok(conf, r["lead"]):
-            raise ValueError(f"店铺货期不符:{store}/{asin}")
+            problems.append(f"店铺货期不符:{store}/{asin}")
         if not conf.get("channel") or conf["channel"] != r.get("channel"):
-            raise ValueError(f"店铺配送方式不符:{store}/{asin}")
+            problems.append(f"店铺配送方式不符:{store}/{asin}")
         reason = risk_gate.check(gate, r["pt"], r.get("brand"), r.get("manufacturer"))
         if reason:
-            raise ValueError(f"风控拦截:{asin}/{reason}")
+            problems.append(f"风控拦截:{asin}/{reason}")
         if brand and brand not in assigned_brands:
             result.append({"kind": claims.BRAND, "claim_key": brand,
                            "store": store, "source": "alloc_plan_csv"})
             assigned_brands[brand] = store
         result.extend(_prod_claims({"items": [r]}, store, source="alloc_plan_csv"))
+    if problems:
+        raise ValueError(
+            f"定向清单 {len(problems)} 处不通过,整批拒绝(未落任何占用):\n"
+            + "\n".join(f"  · {x}" for x in problems[:40])
+            + (f"\n  …另有 {len(problems) - 40} 处" if len(problems) > 40 else ""))
     return result
 
 
@@ -1470,13 +1515,19 @@ def _run_csv(params):
     from services import risk_gate
     want = _read_fixed_plan(params["from_csv"])
     cfg, registered = store_targets.load_targets(), stores_svc.enabled_names()
-    pwin = sv.sales_window(str(params.get("as_of", "")),
-                           int(params.get("sales_days", ps.SALES_WINDOW_DAYS)))
+    # 分数这条路不用(不设淘汰线、不排序),窗口只是 load 的必填参数:取缺省,
+    # as_of / sales_days 在 run() 里就拒了
+    pwin = sv.sales_window("", ps.SALES_WINDOW_DAYS)
     with db.pg_conn() as conn:
         data = product_pool.load(conn, pwin, asins=sorted(want))
         if data.get("risk_err"):
             raise ValueError(f"产品风险记录不可用:{data['risk_err']}")
-        scored, _gated = product_pool.score_all(data)
+        gate_why: dict = {}
+        scored, _gated = product_pool.score_all(data, gated_by_asin=gate_why)
+        in_pool = {row[0] for row in data["pool"]}
+        why = {a: w for a, (w, _b) in _why_absent(
+            conn, [a for a in sorted(want) if a not in in_pool]).items()}
+        why.update(gate_why)
         with conn.cursor() as cur:
             cur.execute(_SQL_ONLINE_NOW)
             online_now = {s: int(n) for s, n in cur.fetchall()}
@@ -1484,11 +1535,19 @@ def _run_csv(params):
         to_claim = _fixed_claims(want, scored, cfg, registered, online_now, listed,
                                 claims.load_active(conn, claims.BRAND),
                                 claims.load_active(conn, claims.PRODUCT),
-                                risk_gate.load_gate(conn))
+                                risk_gate.load_gate(conn), why=why)
         counts = Counter(want.values())
         head = "定向清单:" + "、".join(f"{s} {n} 款" for s, n in sorted(counts.items()))
         if not params.get("execute"):
-            return f"🧪 {head}；全部通过现行硬闸；未落占用、未写上架表"
+            # 与全库 / 点名两条路同口径报"将落品牌 N + 产品 M 条",并点名品牌排他
+            # 落到哪家店 —— 品牌占用一落,同品牌的别的货都只能去这家(人眼闸门要看得见)
+            brands = [f"{c['claim_key']}→{c['store']}" for c in to_claim
+                      if c["kind"] == claims.BRAND]
+            n_prod = sum(1 for c in to_claim if c["kind"] == claims.PRODUCT)
+            return (f"🧪 {head};全部通过现行硬闸;将落品牌 {len(brands)} + 产品 {n_prod} 条"
+                    + (f"(品牌排他:{'、'.join(brands[:20])}"
+                       f"{' …' if len(brands) > 20 else ''})" if brands else "")
+                    + ";未落占用、未写上架表")
         ok, conflicts, landed = claims.claim_many(conn, to_claim)
         if conflicts:
             # 同事务回滚，不能留下“品牌冲突但单品却成功”的半份清单。

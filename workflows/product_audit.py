@@ -7,6 +7,9 @@
                                                     # 拿不准规模先跑它,摘要会报"共 N 个"
   python cli.py product_audit -p limit=2000                # 要限量才给(不给 = 全判)
   python cli.py product_audit -p asins=B0A,B0B             # 指定 ASIN(无视现有结论强审)
+  python cli.py product_audit -p asins=B0A,B0B -p refresh=1  # 点名新品:缺资料/快照超 12 小时的
+                                                           # 先同轮补采→摄取→再审;不与 from_sheet
+                                                           # 混用;仍采不回的逐个原因进摘要
   python cli.py product_audit -p mode=backfill             # 补刷:只审无结论,历史结论直接采用
   python cli.py product_audit -p mode=pending              # 待定专刷:只重判 pending,无退避
   python cli.py product_audit -p mode=nonpass              # **非 pass 全量重判**(rejected+
@@ -1357,10 +1360,15 @@ def _run_gap_round(want: list[str], state: dict[str, _GapRow], plan: _GapPlan,
                    wait_min: int, out: list[str]) -> None:
     """输入:本轮计划 + 上下文 → 输出:无(摘要写进 out)。见 `_close_gap` 头注。"""
     stamp = datetime.now(kpi.CN_TZ).strftime("%Y%m%dT%H%M%S")
+    # 没有表行 = `-p asins= -p refresh=1` 点名刷新(唯一传空 sheet_rows 的入口):
+    # 没有「具体内容」列可写、也没有"下轮"会自动领它 —— 措辞不能照搬上架表那套
+    named = not sheet_rows
     head = (f"⚠ 审不了 {plan.n_broken} 个 ASIN(不在库 {plan.n_absent} / "
             f"无标题 {plan.n_broken - plan.n_absent}),待审但快照过旧 {plan.n_stale} 个"
             f" → 推采集 {len(plan.push)} 个({_FRESH_HOURS} 小时内没有快照的)"
-            + (f";⚡ 重审开(-p force=1):含库里已有结论的 {plan.n_concluded} 个"
+            + (f";⚡ 点名刷新(-p refresh=1):含库里已有结论的 {plan.n_concluded} 个"
+               if force and named else
+               f";⚡ 重审开(-p force=1):含库里已有结论的 {plan.n_concluded} 个"
                if force else ";重审关:库里已有结论的不推"))
     if plan.hold:
         head += (f";另有 {len(plan.hold)} 个审不了但 {_FRESH_HOURS} 小时内刚采过,"
@@ -1376,7 +1384,8 @@ def _run_gap_round(want: list[str], state: dict[str, _GapRow], plan: _GapPlan,
     if not execute:
         out.append(f"  真跑时会推采集批次 {_GAP_PREFIX}{stamp}、等它采完"
                    f"(最多 {wait_min} 分钟)、就地按批摄取,**采回来的这一轮就审掉**;"
-                   f"审不了又没等到的把理由写进表格「具体内容」列(dry-run 一格未写)")
+                   + ("审不了又没等到的逐个报原因" if named else
+                      "审不了又没等到的把理由写进表格「具体内容」列(dry-run 一格未写)"))
         reasons = {a: f"将推采集 {_GAP_PREFIX}{stamp}(dry-run,未推)"
                    for a in broken_push}
         reasons.update(plan.hold)
@@ -1390,7 +1399,8 @@ def _run_gap_round(want: list[str], state: dict[str, _GapRow], plan: _GapPlan,
         out.append("  一个批次都没推成:审不了的这些行本轮判不了,理由照写")
     elif wait_min <= 0:
         out.append(f"  gap_wait=0:只推不等,审不了的这批退回下轮审"
-                   f"(采回来在 {', '.join(n for n, _ in sent)},下一轮自动捞起)")
+                   f"(采回来在 {', '.join(n for n, _ in sent)},"
+                   + ("采完后重跑本命令再审)" if named else "下一轮自动捞起)"))
     else:
         line, stuck = scrape_batches.wait_settled([n for n, _ in sent],
                                                   wait_min)
@@ -1414,7 +1424,8 @@ def _run_gap_round(want: list[str], state: dict[str, _GapRow], plan: _GapPlan,
                    f",没等到的 {plan.n_stale - refreshed} 个用现有数据审")
     still = {a for a in want if after[a].broken and not after[a].concluded}
     if still:
-        out.append(f"  ⚠ 仍缺 {len(still)} 个:理由写进表格「具体内容」列,下轮重试")
+        out.append(f"  ⚠ 仍缺 {len(still)} 个:" + ("逐个原因见下,采回来后重跑本命令" if named
+                                                  else "理由写进表格「具体内容」列,下轮重试"))
     reasons = _explain_still(still, plan, state, after, sent, push_failed,
                              wait_min)
     _note_gap(sheet_rows, still, {a for a in still if not after[a].in_db},
@@ -1466,6 +1477,15 @@ def _note_gap(sheet_rows: list[dict], still: set, absent: set,
     而表面上"表里写着原因呢"。
     """
     if not still:
+        return
+    if not sheet_rows:
+        # 点名刷新(refresh=1):没有表行可写,原因直接进摘要 —— 写给空表等于算完就扔
+        for a in sorted(still)[:30]:
+            why = ("未采集(库里没有这个 ASIN)" if a in absent
+                   else "采集降级(采到了但没有标题)")
+            out.append(f"    · {a}:{why};{reasons.get(a) or '原因未知'}")
+        if len(still) > 30:
+            out.append(f"    …另有 {len(still) - 30} 个")
         return
     notes = []
     for r in sheet_rows:

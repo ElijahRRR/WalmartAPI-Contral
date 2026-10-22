@@ -29,10 +29,11 @@ run() 写建议那段注释);写建议幂等(同 (店铺,SKU,动作) 未落定�
 没跑 catalog_sync 就扫 = 拿上一轮的沃尔玛现值算差异,会对已下架的 SKU 建议
 改价改库存(生产实证:38 条改库存 + 30 条改价 not found)。
 
-⚠ **不在营 / 已终止的店整店不维护**(所有者 2026-10-22):凭证表没勾「启用」
-(`stores.enabled_names()`,唯一在营判据)或最近一次 KPI 观测 TERMINATED
-(`kpi.terminated_stores`)的店,意图整店不产出、存量建议整店撤销。SUSPENDED
-不在此列(可能恢复,照常维护)。判据与降级方向见 run() 前的 `_closed_stores`。
+⚠ **不在营 / 已终止的店整店不维护**(所有者 2026-10-22),**顺序判断**:先看
+凭证表勾没勾「启用」(`stores.enabled_names()`,唯一在营判据)—— 没勾就不维护、
+到此为止;勾了再看最近一次 KPI 观测是不是 TERMINATED(`kpi.terminated_stores`)
+—— 是就不维护,否则维护。不维护的店意图整店不产出、存量建议整店撤销。
+SUSPENDED 不在此列(可能恢复,照常维护)。判据与降级方向见 `_closed_stores`。
 
 ⚠ **本工作流照常建议删除,但执行它的不是 maintenance**(2026-08-24):
 破坏动作(delete/retire)的唯一出口是 `problem_product_cleanup`,建议按
@@ -201,14 +202,19 @@ def _node_skip_names(skipped: dict, stats: dict) -> list[str]:
     return [f"{n}({words[n]})" if words.get(n) else n for n in sorted(skipped)]
 
 
+#: 不维护的两个原因,按判断顺序(①凭证 → ②终止);摘要也按这个顺序报
+CLOSED_DISABLED = "凭证未启用"
+CLOSED_TERMINATED = "店铺已终止"
+
+
 def _closed_line(closed: dict[str, str], n_closed: int, preview: bool) -> str:
-    """输入:不维护的店 + 被剔掉的意图条数(+ 是否 preview)→ 输出:摘要那一行(按原因分组点名)。"""
-    by_why: dict[str, list[str]] = {}
-    for name, why in closed.items():
-        by_why.setdefault(why, []).append(name)
-    parts = [f"{why} {len(names)} 店(" + ",".join(sorted(names)[:10])
-             + (" …" if len(names) > 10 else "") + ")"
-             for why, names in sorted(by_why.items())]
+    """输入:不维护的店 + 被剔掉的意图条数(+ 是否 preview)→ 输出:摘要那一行(按判断顺序分组点名)。"""
+    parts = []
+    for why in (CLOSED_DISABLED, CLOSED_TERMINATED):
+        names = sorted(n for n, w in closed.items() if w == why)
+        if names:
+            parts.append(f"{why} {len(names)} 店(" + ",".join(names[:10])
+                         + (" …" if len(names) > 10 else "") + ")")
     return ("  整店不维护:" + ";".join(parts)
             + f" —— {n_closed} 条意图不产出,"
             + ("存量建议将撤销(preview 不写)" if preview else "存量建议撤销")
@@ -221,10 +227,14 @@ def _closed_stores(seen: set[str], terminated: set[str]
                    ) -> tuple[dict[str, str], str]:
     """输入:本轮出现过的店 + 已终止的店 → 输出:({不维护的店: 原因}, 名录读不到时的提示语)。
 
-    两条各自成立(所有者 2026-10-22:「店铺终止则不应该维护,凭证不启用也不应该
-    维护」):
-      · **凭证未启用** —— 不在营,判据唯一出处 `stores.enabled_names()`(conventions §二);
-      · **已终止** —— 最近一次 KPI 观测 TERMINATED(`kpi.terminated_stores`)。
+    **顺序判断,不是并列**(所有者 2026-10-22:「先判断凭证是否启用,然后判断店铺
+    是否终止来取定维护还是不维护」;与凭证表连接规则 CLAUDE.md 安全红线同一种
+    结构):
+      ① **凭证启用了没有** —— 判据唯一出处 `stores.enabled_names()`(conventions §二)。
+         没启用 ⇒ **不维护,到此为止**,不再往下看终止与否(原因只记「凭证未启用」);
+      ② **启用了,店铺终止了没有** —— 最近一次 KPI 观测 TERMINATED
+         (`kpi.terminated_stores`)。终止 ⇒ 不维护(原因「店铺已终止」);否则维护。
+    ①判不出(名录读不到,见下)时按"启用"往下走 ②:终止的照旧剔,其余照常维护。
     为什么要在这里判:catalog_sync 只扫能调 API 的店,停用店的 walmart_items 行
     冻结成"在架"(store_release 才会标缺席);缺席避让又只看在营店(停用店不进
     缺席名单)—— 于是本工作流天天拿冻结的旧现值对新采的亚马逊值算差异、建议、
@@ -253,10 +263,10 @@ def _closed_stores(seen: set[str], terminated: set[str]
         note = "⚠ 在营名录读回空集(凭证表「启用」整列没返回?),本轮不按「启用」剔店"
     out: dict[str, str] = {}
     for name in seen:
-        why = [w for w, hit in (("凭证未启用", enabled is not None and name not in enabled),
-                                ("店铺已终止", name in terminated)) if hit]
-        if why:
-            out[name] = "+".join(why)
+        if enabled is not None and name not in enabled:     # ① 没启用:到此为止
+            out[name] = CLOSED_DISABLED
+        elif name in terminated:                            # ② 启用了,但已终止
+            out[name] = CLOSED_TERMINATED
     return out, note
 
 
@@ -303,7 +313,8 @@ def run(params: dict) -> str:
         # 两边都不报错。删这两行之前先想清楚这个不对称。
         intents = [i for i in intents if i["store"] == only]
         capped = [c for c in capped if c["store"] == only]
-    # 不在营 / 已终止的店**整店不维护**(所有者 2026-10-22,判据见 _closed_stores)。
+    # 不在营 / 已终止的店**整店不维护**(所有者 2026-10-22,先判凭证再判终止,
+    # 见 _closed_stores)。
     # 排在缺席避让之前:停用店本来就不进缺席名单(store_absence 只看在营店),
     # 这里不剔就没人剔。存量 suggested 行下面单独撤销并记原因 —— 不能混进通用
     # withdraw,那里的原因是「商品自己恢复正常了」,是错误取证

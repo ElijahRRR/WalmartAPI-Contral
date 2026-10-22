@@ -3022,15 +3022,46 @@ def test_scan_skips_stores_whose_credentials_are_not_enabled(monkeypatch):
 
 
 def test_scan_skips_terminated_stores_even_if_enabled(monkeypatch):
-    """KPI 最近一次观测 TERMINATED ⇒ 整店不维护,即使凭证还勾着「启用」。"""
+    """② 凭证启用了,再看终止:KPI 最近一次观测 TERMINATED ⇒ 整店不维护。"""
     ms, calls = _scan_wire(monkeypatch, _two_stores())
     calls["terminated"] = {"C017"}
     out = ms.run({})
     assert {r["store"] for r in calls["suggest"]} == {"T1"}
     assert "店铺已终止 1 店(C017)" in out
-    calls["enabled"] = {"T1"}                    # 两条都中:原因合写
+
+
+def test_store_gate_is_sequential_credentials_first(monkeypatch):
+    """顺序判断,不是并列(所有者 2026-10-22):① 凭证没启用 ⇒ 不维护、到此为止,
+    不再看终止(原因只记「凭证未启用」);① 启用 ⇒ ② 终止 ⇒ 不维护;都不中 ⇒ 维护。
+    ①判不出(名录读不到)按启用往下走 ②。"""
+    from api import feishu
+
+    ms, calls = _scan_wire(monkeypatch, _two_stores() + [
+        {"store": "Z9", "sku": "Z1", "kind": "inventory", "old": 1, "new": 0,
+         "code": "out_of_stock", "reason": "亚马逊缺货"}])
+    calls["enabled"] = {"T1", "Z9"}               # C017 没启用;Z9 启用但已终止
+    calls["terminated"] = {"C017", "Z9"}
     out = ms.run({})
-    assert "凭证未启用+店铺已终止 1 店(C017)" in out
+    assert {r["store"] for r in calls["suggest"]} == {"T1"}
+    line = next(ln for ln in out.splitlines() if "整店不维护" in ln)
+    assert "凭证未启用 1 店(C017)" in line and "店铺已终止 1 店(Z9)" in line
+    assert "+" not in line.split("——")[0]        # 不再合写两条原因
+    assert line.index("凭证未启用") < line.index("店铺已终止")   # 按判断顺序报
+    why = dict(zip([w[2] for w in calls["withdraw"]], calls["withdraw_why"]))
+    assert why["C017"] == "店铺不维护(凭证未启用)"
+    assert why["Z9"] == "店铺不维护(店铺已终止)"
+
+    # ①判不出:按启用往下走②——终止的照旧剔,没终止的照常维护
+    ms, calls = _scan_wire(monkeypatch, _two_stores())
+    calls["terminated"] = {"C017"}
+
+    def boom():
+        raise feishu.FeishuError(503, "busy")
+
+    monkeypatch.setattr(ms.stores_svc, "enabled_names", boom)
+    out = ms.run({})
+    assert {r["store"] for r in calls["suggest"]} == {"T1"}
+    assert "店铺已终止 1 店(C017)" in out
 
 
 def test_scan_does_not_drop_stores_when_the_roster_is_unreadable(monkeypatch):

@@ -134,6 +134,17 @@
 > **`direct` 分支**(直连出口不通归「网络未达」而非「代理无效」)——参数化时别弄丢。
 > ⚠ 判据 ④ 要等的实值形状因此变了:不是"必须给每账号三件套",而是"要么给齐、
 > 要么全空直连,不许半配";选直连则代理三件套**不再阻塞 P1-1**。
+> **2026-10-22 对齐 main #148 + #149**:🔴 §2.1 **alloc_plan 现在是 _三_ 条并列
+> 领用路径**(#149 加了 CSV 点名:1485/1486 读、1492 写、1496 记事件)——平台化
+> 与「事件桥跳过 eBay」各要落**三遍**,预期红清单改按 **13 读 + 4 写 + 4 事件桥**;
+> ⚠ 并记一条搜法陷阱:前两条用常量 `SOURCE`/`SOURCE_SHEET`,CSV 这条是**裸字面量**
+> `"alloc_plan_csv"`,按常量名 grep 会正好漏掉它。🔴 §3.4 补 #148 的**第四层**:
+> 判据链是 **在册 → 凭证启用 → 平台侧没判死 → 能调 API**(我原稿的"三层"少一层),
+> 判据一份在 `services/stores`(`enabled_or_note`/`closed_verdict`/`closed_names`);
+> **`SUSPENDED` 不算终止**(eBay 对位:selling limit 0 / privileges 受限 ≠ 吊销,
+> 读成"账号废了"就误停);**①判不出(FeishuError/名录空集)⇒ 按启用往下走并首行喊**
+> ——不是"读不到就全判未启用"(一次飞书抖动 = 全链停摆);停账号要撤未执行候选
+> 但**不作废历史台账与观测**(台账是证据不是待办)。
 > ⚠ 本文引用的仓库行号以 **2026-09-23 的 main(06140c3)** 为快照(§2.1/§2.2/
 > §3.2 已按它重定位;其余节仍是 09-07 快照),批次实施时现场重定位。
 
@@ -189,27 +200,34 @@ SKU↔offerId/listingId 权威在 `ops.feed_items`)。
   platform 谓词**。`load_active(conn, kind, *, platform)` 的 platform 做成
   **必填关键字参数**;每平台唯一后 `_LOAD` 的 `dict(cur.fetchall())` 塌陷坑
   真实存在(同 key 两平台各一行),谓词本身就是修复。
-- **调用面全量**(2026-09-17 对齐 main #133 后现场重核;P1-2 验收写明
-  "以下红/改是预期内的"):读侧 `load_active` **6 文件 11 处**
-  (alloc_push:83 / alloc_plan:254,255 **+1229,1230** / claim_audit:96 /
-  alloc_audit:187,188 / alloc_products:102 / list_new:453,456)全部显式传
-  walmart 常量;写侧 `claim_many` **3 处**(alloc_plan:430 **+1307**、
-  alloc_backfill:162)——⚠ 它在 #85 后
+- **调用面全量**(2026-10-22 对齐 main #149 后现场重核;P1-2 验收写明
+  "以下红/改是预期内的"):读侧 `load_active` **6 文件 13 处**
+  (alloc_push:83 / alloc_plan:258,259 **+1233,1234 +1485,1486** /
+  claim_audit:96 / alloc_audit:188,189 / alloc_products:102 /
+  list_new:463,466)全部显式传 walmart 常量;写侧 `claim_many` **4 处**
+  (alloc_plan:434 **+1311 +1492**、alloc_backfill:162)——⚠ 它在 #85 后
   **返回三元组 `(ok, conflicts, landed)`**,两处调用点已按三元组解包,平台化
   不改这个形态;测试替身 test_alloc_push:43、test_alloc_plan:221/265/326…、
   test_claims:104/186 等。**`try_claim` 仍返回 store 字符串**(同平台性由
   `_OWNER` 的 platform 谓词保证;Owner 具名改形留二期)。
-- 🔴 **alloc_plan 现在有两条领用路径(2026-09-17 对齐 main #133)**:
-  缺省的全库分配(254/255 读、430 写、434 记事件、`SOURCE`)之外,
-  `-p from_sheet=1` 点名分配(口径 #19)自带一整套(1229/1230 读、1307 写、
-  1308 记事件、**`SOURCE_SHEET`** = `alloc_plan_sheet`)。平台化改造**两条都要改**——它们不是
-  同一段代码的两个分支,是并列的两段;只改缺省那条,点名分配会拿**不带
+- 🔴 **alloc_plan 现在有 _三_ 条并列的领用路径(2026-10-22 对齐 main #149;
+  #133 时是两条)**:① 缺省全库分配(258/259 读、434 写、438 记事件、`SOURCE`);
+  ② `-p from_sheet=1` 点名分配(口径 #19;1233/1234 读、1311 写、1312 记事件、
+  `SOURCE_SHEET` = `alloc_plan_sheet`);③ **#149 新增的 CSV 点名**
+  (1485/1486 读、1492 写、1496 记事件)。平台化改造**三条都要改**——它们不是
+  同一段代码的三个分支,是并列的三段;漏掉任一条,那条路径就会拿**不带
   platform 谓词**的占用表去判冲突(eBay 行会挡住沃尔玛点名),而且
-  **事件桥那条 🔴 "跳过 eBay" 的规则在 1301 也得再落一遍**。P1-2 验收的
-  "预期红清单"按 **11 读 + 3 写 + 3 事件桥** 数,不是旧稿的 9+2+2。
+  **事件桥那条 🔴 "跳过 eBay" 的规则要落三遍**。
+  ⚠ **别用 grep `SOURCE` 去找事件桥调用点**:前两条用的是模块常量
+  (`SOURCE` / `SOURCE_SHEET`),而 #149 这条的 source 是**裸字面量**
+  `"alloc_plan_csv"` —— 按常量名搜会**正好漏掉第三条**。按
+  `claims.claim_created_rows(` 搜才齐。
+  P1-2 验收的"预期红清单"按 **13 读 + 4 写 + 4 事件桥** 数,不是 11+3+3,
+  更不是旧稿的 9+2+2。
 - 🔴 **事件桥必须显式跳过 eBay(#99 新增,本设计原稿完全没有)**:`claims`
-  在 #99 后多了两个桥函数 `claim_created_rows`(alloc_plan:434 **+1308**、
-  alloc_backfill:165)与 `released_rows`(store_release:216/325/385),它们把
+  在 #99 后多了两个桥函数 `claim_created_rows`(alloc_plan:438 **+1312
+  +1496**、alloc_backfill:165)与 `released_rows`(store_release:216/325/385),
+  它们把
   占用/释放写进 **`ops.store_events`**——而那张账本的身份键是 `store`、
   语义是**沃尔玛店铺状态迁移与 TRO 封店预警**(`store_watch` 按 store 扫描
   并分级)。eBay 账号名写进去 = 账本里出现一家**不存在的沃尔玛店**,其占用
@@ -488,6 +506,28 @@ SKU↔offerId/listingId 权威在 `ops.feed_items`)。
   **新建**的,所有复选框都处在"从未勾过"状态 ⇒ 按旧口径会把**全部账号判成启用**,
   第一轮就去连一堆还没配好的账号。照抄**新**的那套,并配一条"字段缺失 ⇒ 不启用"
   的单测。
+- 🔴 **判据链在 #148 又加了一层:凭证 → 终止观测(2026-10-22)**。沃尔玛侧现在
+  是**顺序判断**:① 凭证没勾「启用」⇒ 不维护/不处置/不推采集,**到此为止**;
+  ② 启用了但**最近一次观测 TERMINATED** ⇒ 同样不做;其余照常。判据**一份**,
+  在 `services/stores`(`enabled_or_note` / `closed_verdict` / `closed_names`,
+  配 `kpi.latest_store_status` / `terminated_stores`)。三条对位 eBay:
+  ① **我原稿的"三层"少一层**(registered / enabled / load_accounts)——真正的
+  形状是 **在册 → 凭证启用 → 平台侧没判死 → 能调 API**。eBay 的"平台侧判死"
+  已经有料了:§3.4 的 `ebay_account_health` 每日 refresh grant 探活
+  (`invalid_grant` = 已吊销)+ `getPrivileges`。把它**接成判据的一层**,不是
+  只做告警。
+  ② 🔴 **`SUSPENDED` 不算终止**——中间态不当终态。eBay 对位极容易踩:
+  selling limit 降到 0、或 privileges 某项受限,**都不等于账号吊销**;若把
+  "配额 0"读成"账号废了"就会误停整账号(与 §3.4 那条「空 privileges 会被读成
+  『配额 0』或『无限制』,两种都危险」是同一个雷的两面)。
+  ③ 🔴 **①判不出时的 fail 方向是定稿**:`FeishuError` / 名录空集 ⇒
+  **按启用往下走 ②,并在摘要首行喊**。不是"读不到就全判未启用"——那样一次
+  飞书抖动就是全链停摆。eBay 账号表读不到时照这个方向(与 §3.4「读不到 ≠
+  不认识」同向,这里给了更具体的先例)。
+  ⚠ 还有一条形状值得照抄:#148 对已停的店**撤销存量建议**(整店撤销并写原因),
+  但**观察面不连坐**(problem_scan 的观察面照旧扫)。对位 eBay:账号停了要撤回
+  **未执行的上架候选**,但**不作废该账号的历史台账与观测**——台账是证据,不是
+  待办。
 - 🔴 **连不连、怎么连只由凭证表决定(#147 取代原「严禁直连」红线,顺序判断不是
   并列)**——原稿这一节只说了"凭证飞书表放代理三件套",**没有判据**,等于把
   半配裸连的口子留着。照搬 CLAUDE.md 新红线的三岔,判据做成 eBay 侧的**唯一
@@ -1051,7 +1091,7 @@ api 留签名。要做=+4~5 人日,四项前置:①UPC 结构裁决落地(本文
 | 批次 | 内容 | 人日 | 验收要点 |
 |---|---|---|---|
 | P1-1 | _http 抽取+registry(含 platforms.py/飞书两表)+ebay_accounts+_client+tokens+authorize+runbook+文档勘误回改 | 7 | 沃尔玛 pytest 全绿(18 处 monkeypatch 例外清单)/sandbox 与 production 各铸令牌+getRateLimits/进程超时 90.0 冒烟/账号互斥断言单测(含停用店名反例)/state 不符抛错单测/**`is_enabled` 字段缺失 ⇒ 不启用单测(§3.4)**/**代理三岔单测:填齐必走 / 全空直连 / 半配整账号拒跑,外加「没勾启用 ⇒ 配了代理也不连」的顺序回归**/**出口预览(对位 `egress_preview`)跑一次,人眼核对每账号最终走哪个出口** |
-| P1-2 | 全部 DDL(**含 `upc_usage` 对位部分索引,§2.2**)+claims/upc 改造+台账谓词补全+**risk_trace 四证据源谓词(§4.4)**+events 契约 | 7 | db_init 两跑(**记录是否踩到 `lock_timeout 30s`,§4.5**)+六格对拍+读 SQL count·md5 对拍+**取号/烧号 EXPLAIN 走 `upc_usage` 部分索引**/沃尔玛上架与分配链 --dry-run 摘要逐字一致(claims 11 读+3 写+3 事件桥、upc 7 写+6 读投影,**含 `alloc_plan -p from_sheet=1` 点名分配那条路径**——预期红清单按 §2.1/§2.2 的现场重核数,别按旧稿的 9+2)/UPC 三级取号+烧号保护+「烧后重上领新号」单测/飞书 UPC 表投影逐行对拍/browse_node_id 空行占比落数+**「沃尔玛在架但 audit_status 为 NULL/pending」的条数落数(§2.3)**/**risk_trace 展开结果不含 eBay 账号**(造 claims+listing_sources+product_events 三条 eBay 行) |
+| P1-2 | 全部 DDL(**含 `upc_usage` 对位部分索引,§2.2**)+claims/upc 改造+台账谓词补全+**risk_trace 四证据源谓词(§4.4)**+events 契约 | 7 | db_init 两跑(**记录是否踩到 `lock_timeout 30s`,§4.5**)+六格对拍+读 SQL count·md5 对拍+**取号/烧号 EXPLAIN 走 `upc_usage` 部分索引**/沃尔玛上架与分配链 --dry-run 摘要逐字一致(claims 13 读+4 写+4 事件桥、upc 7 写+6 读投影,**含 `alloc_plan` 的 `-p from_sheet=1` 点名与 #149 的 CSV 点名两条额外路径**——预期红清单按 §2.1/§2.2 的现场重核数,别按旧稿的 9+2)/UPC 三级取号+烧号保护+「烧后重上领新号」单测/飞书 UPC 表投影逐行对拍/browse_node_id 空行占比落数+**「沃尔玛在架但 audit_status 为 NULL/pending」的条数落数(§2.3)**/**risk_trace 展开结果不含 eBay 账号**(造 claims+listing_sources+product_events 三条 eBay 行) |
 | P1-3 | bootstrap+taxonomy+catmap 测试链+account_health | 6 | sandbox 户口链重入两遍/生产拉真树+版本哨兵/aspects 解耦拉取(新 promote 类目当日拿到 aspects)/promote 三格(缺省中、入料只吃高、置高路径逐条点名)/refresh 探活停链 |
 | P1-4 | 中立抽取(3)+admission/conform/pricing+api 两文件+list_new+submit_poll+**`refdata/ebay_slas.tsv`(官方期限登记表,§6.5)**+飞书投影 | 15 | 沙箱清单 13 项完成/sandbox 端到端 3 SKU PUBLISHED/防重三态+熔断+双闸+重试闸单测/**抽码即登记单测**(eBay 行落 `listing_sources` 且 `abandoned_at IS NULL`、码形符 `OPAQUE_SQL_PREDICATE`、`-p dry_run` 走 `DRYRUN_PLACEHOLDER` 不落码)/**残局单测:造一条「`feed_log` pending 但无 `feed_items` 行」,断言 `list_new` 下一轮不选中该 SKU、`submit_poll` 的选行面选得中它**/--dry-run 人眼确认/中立抽取后沃尔玛输出逐字不变 |
 | P1-5 | 生产单账号试点 | 2+观察 | 首批 ≤10 条人工放行类目/真实 PUBLISHED/错误账收官/两周观察后再谈放量。**界定:试点 ≠ ebay_plan 批次 10;试点期不拉订单、库内无买家数据,不触发合规订阅义务;放量、拉订单、提额之前批次 11 仍是硬门槛** |

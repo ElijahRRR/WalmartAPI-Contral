@@ -208,6 +208,9 @@ published_status / lifecycle(在途改码的旧码仍排除)。走向由归类�
 「撤销」不进表:它是 `maintenance_scan` 发现商品自己恢复正常后把建议行置
 withdrawn,那一轮执行件根本没领到它 —— 要看撤销走
 `SELECT * FROM ops.dispositions WHERE status='withdrawn'`。
+撤销还有第二个原因(2026-10-22):店铺**不维护**(凭证未启用 / 店铺已终止)时
+整店撤销,原因记在 `detail->>'withdrawn_reason'`(「店铺不维护(…)」),与
+「本轮扫描不再建议」分得开。
 
 ## 六·二、维护链拆分(批次四,已落地)
 

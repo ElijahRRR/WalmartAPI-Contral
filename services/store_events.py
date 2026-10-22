@@ -33,6 +33,8 @@ high,SUSPENDED→ACTIVE 只是 info),所以 severity 由写入方按内容定级
 import json
 import logging
 
+from services import kpi
+
 logger = logging.getLogger("services.store_events")
 
 # ── 事件码常量(唯一出处;新增先在此登记)──────────────────────────────────────
@@ -217,8 +219,9 @@ _STATUS_COLS = {
     "sales_status": (SALES_STATUS_CHANGED, "可售"),
 }
 
-#: 终局值:进入即 high,不管从哪来(90 天 10 次,全部在 store_status)
-_TERMINAL = frozenset({"TERMINATED"})
+#: 终局值:进入即 high,不管从哪来(90 天 10 次,全部在 store_status)。
+#: 取值只在 services/kpi 出生(maintenance_scan 的「已终止不维护」用的是同一个)
+_TERMINAL = frozenset({kpi.TERMINATED_STATUS})
 
 
 def _sev(col: str, old: str, new: str) -> str:

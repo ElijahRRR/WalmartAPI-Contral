@@ -42,6 +42,7 @@ action ∈ (title/price/inventory) 的行归 maintenance。
 
 import logging
 
+from api import feishu
 from registry import db
 from services import alloc_survey, dispositions, kpi, \
     maintenance_intents as mi, store_absence, store_limits, stores as stores_svc
@@ -200,8 +201,8 @@ def _node_skip_names(skipped: dict, stats: dict) -> list[str]:
     return [f"{n}({words[n]})" if words.get(n) else n for n in sorted(skipped)]
 
 
-def _closed_line(closed: dict[str, str], n_closed: int) -> str:
-    """输入:不维护的店 + 被剔掉的意图条数 → 输出:摘要那一行(按原因分组点名)。"""
+def _closed_line(closed: dict[str, str], n_closed: int, preview: bool) -> str:
+    """输入:不维护的店 + 被剔掉的意图条数(+ 是否 preview)→ 输出:摘要那一行(按原因分组点名)。"""
     by_why: dict[str, list[str]] = {}
     for name, why in closed.items():
         by_why.setdefault(why, []).append(name)
@@ -209,9 +210,11 @@ def _closed_line(closed: dict[str, str], n_closed: int) -> str:
              + (" …" if len(names) > 10 else "") + ")"
              for why, names in sorted(by_why.items())]
     return ("  整店不维护:" + ";".join(parts)
-            + f" —— {n_closed} 条意图不产出,存量建议撤销"
-            f"(恢复:凭证表勾回「启用」;已终止的店不会恢复,"
-            f"在架行请跑 `store_release -p dead=1` 标下线)")
+            + f" —— {n_closed} 条意图不产出,"
+            + ("存量建议将撤销(preview 不写)" if preview else "存量建议撤销")
+            + "(恢复:凭证表勾回「启用」。冻结的在架行要标下线:先在凭证表取消"
+            "「启用」,再 `store_release -p dead=1 --dry-run` 看名单 —— dead=1 只认"
+            "「启用」,已终止但还勾着的店它不处理)")
 
 
 def _closed_stores(seen: set[str], terminated: set[str]
@@ -229,16 +232,25 @@ def _closed_stores(seen: set[str], terminated: set[str]
 
     ⚠ 名录读不到(飞书)**不剔、只喊**:与缺席探测同向(fail-open),维护三类
     最坏是多算一轮会被执行件以凭证缺失跳过的建议;一次飞书抖动不该让全船队
-    整轮不维护。已终止那条读的是 PG,同一连接,失败本轮直接炸。
+    整轮不维护。只接 `feishu.FeishuError`(网络错也收口成它):编程错误照炸,
+    不许被当成"名录读不到"天天静默放行(conventions §六 条件明确)。
+    ⚠ **读回空名录同样当读不到**:飞书对从没勾过的复选框整个字段都不返回、
+    缺省判不启用(conventions §二);哪天整列不返回,名录就是空集 —— 照字面
+    剔就是全船队整轮不维护、存量建议全撤。一家在营店都没有不可能是真值。
+    已终止那条读的是 PG,同一连接,失败本轮直接炸。
     """
     note = ""
     try:
         enabled = stores_svc.enabled_names()
-    except Exception as e:                          # noqa: BLE001 —— 降级是刻意的,见上
+    except feishu.FeishuError as e:
         logger.warning("在营名录读不到,本轮不按「启用」剔店:%s: %s",
                        e.__class__.__name__, e)
         enabled = None
         note = f"⚠ 在营名录读不到({e.__class__.__name__}),本轮不按「启用」剔店"
+    if enabled is not None and not enabled:
+        logger.warning("在营名录读回空集(凭证表「启用」整列没返回?),本轮不按「启用」剔店")
+        enabled = None
+        note = "⚠ 在营名录读回空集(凭证表「启用」整列没返回?),本轮不按「启用」剔店"
     out: dict[str, str] = {}
     for name in seen:
         why = [w for w, hit in (("凭证未启用", enabled is not None and name not in enabled),
@@ -301,6 +313,9 @@ def run(params: dict) -> str:
     if closed:
         intents = [i for i in intents if i["store"] not in closed]
         capped = [c for c in capped if c["store"] not in closed]
+    # 不维护的店不在后两条名单里重复点名(缺席 / 受管仓不可调用都是它的推论)
+    absent = set(absent) - set(closed)
+    skipped_nodes = {k: v for k, v in skipped_nodes.items() if k not in closed}
     n_avoided = sum(1 for i in intents if i["store"] in absent)
     if absent:
         intents = [i for i in intents if i["store"] not in absent]
@@ -354,7 +369,7 @@ def run(params: dict) -> str:
                      f"优先级取,其余下轮;上限=按店配额×单 feed 条数,"
                      f"见 services/maintenance_intents.MAX_INTENTS_PER_STORE)")
     if closed:
-        lines.append(_closed_line(closed, n_closed))
+        lines.append(_closed_line(closed, n_closed, preview))
     lines += _preview_lines(intents, stockzero)
     node_note = store_limits.managed_note(managed, skipped_nodes, node_stats)
     if node_note:

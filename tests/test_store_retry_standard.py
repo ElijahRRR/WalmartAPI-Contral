@@ -638,6 +638,7 @@ def test_withdraw_sql_carries_the_exclude_stores_clause():
 
     from services import dispositions as ds
     assert "NOT (d.store = ANY(%(exclude)s::text[]))" in ds._WITHDRAW_SQL
+    # 空 keep 分支 2026-10-22 提成模块级常量(让参数铸型守门扫得到)
+    assert "NOT (d.store = ANY(%(exclude)s::text[]))" in ds._WITHDRAW_ALL_SQL
     src = inspect.getsource(ds.withdraw_stale)
-    assert src.count("NOT (d.store = ANY(%(exclude)s::text[]))") >= 1  # 空 keep 分支
-    assert "exclude_stores" in src
+    assert "_WITHDRAW_ALL_SQL" in src and "exclude_stores" in src

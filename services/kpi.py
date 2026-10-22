@@ -72,11 +72,25 @@ def store_activity(store_status) -> str:
     return "active" if s == ACTIVE_STATUS else "inactive"
 
 
-# 每店最新一行(与 services/alloc_survey._SQL_STATUS 同一条全仓统一写法)
+# 每店最新一行。⚠ 同形的 Python 副本还有 services/alloc_survey._SQL_STATUS、
+# workflows/problem_scan._SQL_STATUS、workflows/list_new._SQL_INACTIVE(历史存量,
+# 待迁);**新代码一律调 latest_store_status**,别再抄第五份
 _SQL_LATEST_STATUS = """
 SELECT DISTINCT ON (store) store, store_status
 FROM ops.store_kpi_daily ORDER BY store, data_date DESC
 """
+
+
+def latest_store_status(conn) -> dict[str, str]:
+    """输入:连接 → 输出:{店: 最近一次 KPI 观测的店铺状态(strip+upper,空 = 没拿到)}。
+
+    「每店最新一行」的 Python 侧唯一公开取数口;判活/判死用 store_activity,
+    判终局用 terminated_stores —— 别在调用方各写一遍 upper() 比较。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_SQL_LATEST_STATUS)
+        rows = cur.fetchall()
+    return {store: str(st or "").strip().upper() for store, st in rows}
 
 
 def terminated_stores(conn) -> set[str]:
@@ -87,11 +101,8 @@ def terminated_stores(conn) -> set[str]:
     「店铺终止则不应该维护」)。状态为空 = 没拿到,不算终止(判不准就判活,
     见 store_activity 头注)。
     """
-    with conn.cursor() as cur:
-        cur.execute(_SQL_LATEST_STATUS)
-        rows = cur.fetchall()
-    return {store for store, st in rows
-            if str(st or "").strip().upper() == TERMINATED_STATUS}
+    return {store for store, st in latest_store_status(conn).items()
+            if st == TERMINATED_STATUS}
 
 
 def derived_sales_status(store_status) -> str | None:

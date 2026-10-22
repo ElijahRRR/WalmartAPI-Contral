@@ -79,6 +79,10 @@
 唯一还会被它拦下的形状是「代理只填了一半」(§一)。此前举的例子是前者,已失效。
 第四维「本轮数据新鲜不新鲜」是 `services/store_absence`(缺席 ≠ 停用,
 判据从 `catalog.walmart_items` 每店 `max(last_seen_at)` 水位派生)。
+平台侧的店铺状态(`ops.store_kpi_daily.store_status`,沃尔玛报的 ACTIVE /
+SUSPENDED / TERMINATED)是**另一维,不是在营判据**:在营仍只看 `enabled_names()`。
+维护链对「不在营 ∪ 最近一次观测 TERMINATED」的店整店不维护(2026-10-22),
+已终止的唯一取数口是 `kpi.terminated_stores`(每店最新一行,`kpi.latest_store_status`)。
 
 ## 三、处置建议路由(所有者定稿 2026-08-24)
 
@@ -138,6 +142,9 @@ EXISTS 的话它永远删不了,而且没人看得出是被自己的闸拦着。
    链例外(`catalog_sync:strict=1`,同步不全就不出日报)。下游店维工作流按
    目录水位避让缺席店(`services/store_absence`,不建新表、不靠调度顺序);
    两个执行件同样避让(缺席店的存量 suggested 留在原地)。
+   ⚠ **不在营的店不在缺席名单里**(缺席只对在营店有定义):它们的在架行冻结在
+   最后一次同步,却不会被避让 —— 下游要整店剔除,得自己按 `enabled_names()` 判
+   (2026-10-22 维护链就是在这个盲区里天天给停用店算建议)。
 4. **链尾重赛**:cli 对缺席店把链内声明 `SUPPORTS_STORE` 的步骤逐店重跑一次,
    **再失败即止**。四道闸:主链带 store= 范围参数不重赛/长期缺席(落后船队
    >72h)只点名不逐日空跑/今日缺席超 5 店判系统性故障/重赛后按水位复核,

@@ -230,7 +230,7 @@ WHERE marketplace = %(marketplace)s AND asin = %(asin)s
 
 _KNOWN_PARAMS = {"asins", "limit", "mode", "force_rerun", "rerule",
                  "l3", "l4", "stages", "workers", "adopt_only", "from_sheet",
-                 "gap_wait", "force", "repts", "active_days"}
+                 "gap_wait", "force", "repts", "active_days", "refresh"}
 # cli 自己塞进 params 的键,不是人敲的 —— 白名单必须放行,否则每加一个
 # cli 级开关就会把所有"宁炸不吞"的工作流一起炸掉(2026-08-16 `dry_run`
 # 上线当天就是这么炸的:`--dry-run` 直接让 product_audit 起不来)
@@ -1886,6 +1886,20 @@ def run(params: dict) -> str:
     sheet_rows: list[dict] = []
     sheet_head: list[str] = []
     sheet_want: list[str] = []
+    if str(params.get("refresh", "0")) == "1":
+        # 点名新品尚未入库时复用同轮补采闭环，不必先派到上架表。
+        # 这样审核/占用可以在正式上架派工之前完成。
+        from services import sku_asin
+        explicit = sorted({a.strip().upper() for a in str(params.get("asins", "")).split(",") if a.strip()})
+        if params.get("from_sheet") or not explicit or any(
+                not sku_asin.is_standard_asin(a) for a in explicit):
+            raise ValueError("refresh=1 只接受明确有效的 asins，不能与 from_sheet 混用")
+        # 先验证所有参数，避免拼错参数却已经推送采集。
+        _pick_where(params)
+        sheet_head += _close_gap(explicit, [], execute,
+                                  int(params.get("gap_wait", _GAP_WAIT_MIN)),
+                                  force=True)
+        params = {**params, "asins": ",".join(explicit)}
     if params.get("from_sheet"):
         sheet_rows, sheet_want, sheet_head = _claim_from_sheet(
             limit, force=_forced_sheet(params))

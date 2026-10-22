@@ -1368,3 +1368,14 @@ python cli.py alloc_plan -p from_sheet=1 -p cutoff=30  # 临时加一条淘汰�
    没有任何自动释放路径。落错了走 `store_release`,不要改库。
 3. **配置改完必跑 `claim_audit`。** 飞书限额表一改(开类目 / 换渠道 /
    调配送时长限制),已有占用可能就站不住了 —— 它不会自己失效。
+
+## 2026-10-22 定向清单落占用
+
+`python cli.py alloc_plan -p from_csv=<CSV> --dry-run` 接受表头 `店铺,ASIN`，
+用于已经明确店铺的商品调整清单。真跑只登记占用及治理事件，不改飞书上架表、
+不提交 Walmart feed、不自动释放任何占用。重复 ASIN、跨店品牌/产品占用、
+未审核/库存硬闸、店铺类目/渠道/货期/当前容量任一失败即整批拒绝；并发占用
+冲突同事务回滚。与 from_sheet 一样，点名品不设评分淘汰线。from_csv 不与
+from_sheet/batch/cutoff 混用。释放仍只走 store_release，并限定原占用店。
+数字目标和容量列兼容飞书公式结果 `{"type":2,"value":[7000]}`，空结果仍为
+未配置，明确的 0 仍为不接货。

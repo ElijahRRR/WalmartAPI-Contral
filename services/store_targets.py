@@ -33,6 +33,15 @@ CHANNELS = ("FBA", "FBM")
 
 def _num(v):
     """输入:单元格 → 输出:float 或 None(空/非数字都是 None,不退 0)。"""
+    # 飞书公式数字列返回 {"type": 2, "value": [7000]}，不是裸数字。
+    # 只接受一个标量，空结果/多值不猜，尤其不能把显式 0 变成未配置。
+    if isinstance(v, dict) and "value" in v:
+        value = v["value"]
+        if isinstance(value, list):
+            if len(value) != 1:
+                return None
+            value = value[0]
+        return _num(value)
     s = feishu._plain_text(v).strip().replace(",", "")
     if not s:
         return None

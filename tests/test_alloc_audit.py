@@ -262,6 +262,15 @@ def test_targets_blank_is_none_not_zero():
     assert store_targets._num(0) == 0.0        # 真填了 0 要保留
 
 
+def test_targets_formula_numeric_result_preserves_capacity_and_zero():
+    assert store_targets._num({"type": 2, "value": [7000]}) == 7000
+    assert store_targets._num({"type": 2, "value": [500]}) == 500
+    assert store_targets._num({"type": 2, "value": [0]}) == 0
+    assert store_targets._num({"type": 2, "value": []}) is None
+    assert store_targets._num({"type": 2, "value": [1, 2]}) is None
+    assert store_targets._num({"type": 2, "value": [None]}) is None
+
+
 def test_channel_value_normalization():
     assert store_targets._channel("fba") == ("FBA", "fba")
     assert store_targets._channel(" FBM ") == ("FBM", "FBM")

@@ -29,6 +29,11 @@ run() 写建议那段注释);写建议幂等(同 (店铺,SKU,动作) 未落定�
 没跑 catalog_sync 就扫 = 拿上一轮的沃尔玛现值算差异,会对已下架的 SKU 建议
 改价改库存(生产实证:38 条改库存 + 30 条改价 not found)。
 
+⚠ **不在营 / 已终止的店整店不维护**(所有者 2026-10-22):凭证表没勾「启用」
+(`stores.enabled_names()`,唯一在营判据)或最近一次 KPI 观测 TERMINATED
+(`kpi.terminated_stores`)的店,意图整店不产出、存量建议整店撤销。SUSPENDED
+不在此列(可能恢复,照常维护)。判据与降级方向见 run() 前的 `_closed_stores`。
+
 ⚠ **本工作流照常建议删除,但执行它的不是 maintenance**(2026-08-24):
 破坏动作(delete/retire)的唯一出口是 `problem_product_cleanup`,建议按
 **动作**分工领取,不按来源。本文件产出的 action='delete' 行归它执行,
@@ -38,8 +43,8 @@ action ∈ (title/price/inventory) 的行归 maintenance。
 import logging
 
 from registry import db
-from services import alloc_survey, dispositions, \
-    maintenance_intents as mi, store_absence, store_limits
+from services import alloc_survey, dispositions, kpi, \
+    maintenance_intents as mi, store_absence, store_limits, stores as stores_svc
 
 DANGEROUS = False       # 只读沃尔玛(其实一次都不调);写库仅限建议行(含落定上一轮)
 SUPPORTS_STORE = True   # 接受 -p store=X 单店范围(cli 链尾缺席店重赛靠它识别)
@@ -195,6 +200,54 @@ def _node_skip_names(skipped: dict, stats: dict) -> list[str]:
     return [f"{n}({words[n]})" if words.get(n) else n for n in sorted(skipped)]
 
 
+def _closed_line(closed: dict[str, str], n_closed: int) -> str:
+    """输入:不维护的店 + 被剔掉的意图条数 → 输出:摘要那一行(按原因分组点名)。"""
+    by_why: dict[str, list[str]] = {}
+    for name, why in closed.items():
+        by_why.setdefault(why, []).append(name)
+    parts = [f"{why} {len(names)} 店(" + ",".join(sorted(names)[:10])
+             + (" …" if len(names) > 10 else "") + ")"
+             for why, names in sorted(by_why.items())]
+    return ("  整店不维护:" + ";".join(parts)
+            + f" —— {n_closed} 条意图不产出,存量建议撤销"
+            f"(恢复:凭证表勾回「启用」;已终止的店不会恢复,"
+            f"在架行请跑 `store_release -p dead=1` 标下线)")
+
+
+def _closed_stores(seen: set[str], terminated: set[str]
+                   ) -> tuple[dict[str, str], str]:
+    """输入:本轮出现过的店 + 已终止的店 → 输出:({不维护的店: 原因}, 名录读不到时的提示语)。
+
+    两条各自成立(所有者 2026-10-22:「店铺终止则不应该维护,凭证不启用也不应该
+    维护」):
+      · **凭证未启用** —— 不在营,判据唯一出处 `stores.enabled_names()`(conventions §二);
+      · **已终止** —— 最近一次 KPI 观测 TERMINATED(`kpi.terminated_stores`)。
+    为什么要在这里判:catalog_sync 只扫能调 API 的店,停用店的 walmart_items 行
+    冻结成"在架"(store_release 才会标缺席);缺席避让又只看在营店(停用店不进
+    缺席名单)—— 于是本工作流天天拿冻结的旧现值对新采的亚马逊值算差异、建议、
+    执行件再以「凭证缺失」跳过、维护记录表天天多一批「未执行」。
+
+    ⚠ 名录读不到(飞书)**不剔、只喊**:与缺席探测同向(fail-open),维护三类
+    最坏是多算一轮会被执行件以凭证缺失跳过的建议;一次飞书抖动不该让全船队
+    整轮不维护。已终止那条读的是 PG,同一连接,失败本轮直接炸。
+    """
+    note = ""
+    try:
+        enabled = stores_svc.enabled_names()
+    except Exception as e:                          # noqa: BLE001 —— 降级是刻意的,见上
+        logger.warning("在营名录读不到,本轮不按「启用」剔店:%s: %s",
+                       e.__class__.__name__, e)
+        enabled = None
+        note = f"⚠ 在营名录读不到({e.__class__.__name__}),本轮不按「启用」剔店"
+    out: dict[str, str] = {}
+    for name in seen:
+        why = [w for w, hit in (("凭证未启用", enabled is not None and name not in enabled),
+                                ("店铺已终止", name in terminated)) if hit]
+        if why:
+            out[name] = "+".join(why)
+    return out, note
+
+
 def run(params: dict) -> str:
     """输入:params(store/preview/oos_days)→ 输出:意图分布 + 落定 + 建议行落账摘要。"""
     # --dry-run 与 -p preview=1 等价:本工作流 DANGEROUS=False(不碰沃尔玛写
@@ -229,6 +282,7 @@ def run(params: dict) -> str:
         intents, capped = mi.collect_all(conn, stockzero,
                                          int(params.get("oos_days", 0) or 0),
                                          managed=managed, only=only)
+        terminated = kpi.terminated_stores(conn)
     if only:
         # ⚠ 下推之后这两行**恒真**,但**故意保留**:它们是双保险 —— 万一将来
         # 哪条按店取行的 SQL 漏了 `only`(加一条 provider 时最容易漏),后果只是
@@ -237,6 +291,16 @@ def run(params: dict) -> str:
         # 两边都不报错。删这两行之前先想清楚这个不对称。
         intents = [i for i in intents if i["store"] == only]
         capped = [c for c in capped if c["store"] == only]
+    # 不在营 / 已终止的店**整店不维护**(所有者 2026-10-22,判据见 _closed_stores)。
+    # 排在缺席避让之前:停用店本来就不进缺席名单(store_absence 只看在营店),
+    # 这里不剔就没人剔。存量 suggested 行下面单独撤销并记原因 —— 不能混进通用
+    # withdraw,那里的原因是「商品自己恢复正常了」,是错误取证
+    closed, closed_note = _closed_stores(
+        {i["store"] for i in intents} | {c["store"] for c in capped}, terminated)
+    n_closed = sum(1 for i in intents if i["store"] in closed)
+    if closed:
+        intents = [i for i in intents if i["store"] not in closed]
+        capped = [c for c in capped if c["store"] not in closed]
     n_avoided = sum(1 for i in intents if i["store"] in absent)
     if absent:
         intents = [i for i in intents if i["store"] not in absent]
@@ -281,13 +345,16 @@ def run(params: dict) -> str:
                 f"({n_node_skipped} 条意图不产出,不回落默认节点;"
                 f"填错改「维护仓库」,读不到等下轮)"
                 if skipped_nodes else "")
-             + absence_gap]
+             + absence_gap
+             + (f";{closed_note}" if closed_note else "")]
     for c in capped:
         # 逐店明细留在后续行(全文进 ops.runs 与单跑通知;首行只放总数)
         lines.append(f"  ⚠ 截断:{c['store']} {_KIND_LABEL[c['kind']]} "
                      f"{c['total']}→{c['kept']} 条(超单店单轮上限,按截断"
                      f"优先级取,其余下轮;上限=按店配额×单 feed 条数,"
                      f"见 services/maintenance_intents.MAX_INTENTS_PER_STORE)")
+    if closed:
+        lines.append(_closed_line(closed, n_closed))
     lines += _preview_lines(intents, stockzero)
     node_note = store_limits.managed_note(managed, skipped_nodes, node_stats)
     if node_note:
@@ -336,6 +403,12 @@ def run(params: dict) -> str:
         settled = dispositions.settle_maintenance(conn)
         expired = dispositions.expire_executing(conn)
         n_sug = dispositions.suggest_many(conn, rows)
+        # 不维护的店:存量 suggested 整店撤销,原因写实(不是「恢复正常了」)。
+        # 不撤的话执行件天天领到、天天以「凭证缺失」跳过、维护记录表天天一批「未执行」
+        n_closed_wd = sum(
+            dispositions.withdraw_stale(conn, "maint", [],
+                                        why=f"店铺不维护({why})", store=name)
+            for name, why in sorted(closed.items()))
         # 撤销本轮不再建议的陈旧行:昨天建议清零、今天亚马逊回货了,扫描件
         # 不再建议它 —— 但昨天那条 suggested 还挂着,执行件照样会把它清零。
         # ⚠ store=only 不能省:`-p store=X` 那一轮 keep 里只有该店的行,
@@ -348,7 +421,7 @@ def run(params: dict) -> str:
             conn, "maint", keep,
             why=f"本轮扫描不再建议{f'(限 {only})' if only else ''}",
             store=only or None,
-            exclude_stores=sorted(set(absent) | set(skipped_nodes)))
+            exclude_stores=sorted(set(absent) | set(skipped_nodes) | set(closed)))
         n_open = dispositions.count_open(conn,
                                          sources=dispositions.MAINT_SOURCES)
         n_sup = dispositions.count_suppressed(conn, dispositions.MAINT_ACTIONS)
@@ -373,6 +446,7 @@ def run(params: dict) -> str:
         f"建议行落账:本轮写入 {n_sug} 次 → **库里待执行 {n_open} 条**"
         + (f";撤销陈旧建议 {n_wd} 条(本轮不再建议 —— 商品自己恢复正常了)"
            if n_wd else "")
+        + (f";撤销不维护店的建议 {n_closed_wd} 条" if n_closed_wd else "")
         + (f"。⚠ 写入 {n_sug} < 意图 {len(intents)}:差额是同 (店铺,SKU,动作) "
            f"已有 executing 行**且本轮还落定不了**(提交后 catalog_sync 还没重新"
            f"观测到、或观测离提交不足 {dispositions.MAINT_SETTLE_GRACE_HOURS} 小时),"

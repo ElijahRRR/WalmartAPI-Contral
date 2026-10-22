@@ -51,6 +51,7 @@ METRIC_LABELS = {
 _SELLER_ID_RE = re.compile(r"/seller/(\d+)")
 
 ACTIVE_STATUS = "ACTIVE"        # sellerStatus 的在营取值
+TERMINATED_STATUS = "TERMINATED"  # sellerStatus 的终局取值(沃尔玛不再恢复)
 NOT_SELLING = "不可售"          # 销售状态取值,与旧表一致(另一取值「可售」)
 
 
@@ -69,6 +70,28 @@ def store_activity(store_status) -> str:
     if not s:
         return "unknown"
     return "active" if s == ACTIVE_STATUS else "inactive"
+
+
+# 每店最新一行(与 services/alloc_survey._SQL_STATUS 同一条全仓统一写法)
+_SQL_LATEST_STATUS = """
+SELECT DISTINCT ON (store) store, store_status
+FROM ops.store_kpi_daily ORDER BY store, data_date DESC
+"""
+
+
+def terminated_stores(conn) -> set[str]:
+    """输入:连接 → 输出:最近一次 KPI 观测为 TERMINATED 的店名集合。
+
+    只认 **TERMINATED**(终局),不认 SUSPENDED:暂停的店可能恢复,维护链照常
+    跟价跟库存;终止的店沃尔玛不再恢复,再维护只是每天白跑(所有者 2026-10-22:
+    「店铺终止则不应该维护」)。状态为空 = 没拿到,不算终止(判不准就判活,
+    见 store_activity 头注)。
+    """
+    with conn.cursor() as cur:
+        cur.execute(_SQL_LATEST_STATUS)
+        rows = cur.fetchall()
+    return {store for store, st in rows
+            if str(st or "").strip().upper() == TERMINATED_STATUS}
 
 
 def derived_sales_status(store_status) -> str | None:

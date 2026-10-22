@@ -404,7 +404,9 @@ def withdraw_stale(conn, source: str, keep: list[tuple], why: str,
                 "                  THEN 'withdrawn' ELSE d.status END, "
                 "    settled_at = CASE WHEN (d.sources - %(source)s::text) "
                 "                           = '{}'::jsonb "
-                "                      THEN now() ELSE d.settled_at END "
+                "                      THEN now() ELSE d.settled_at END, "
+                "    detail = d.detail || jsonb_build_object("
+                "        'withdrawn_reason', %(why)s::text) "
                 "WHERE d.status = 'suggested' "
                 "  AND (jsonb_exists(d.sources, %(source)s::text) "
                 "       OR (d.sources = '{}'::jsonb "
@@ -413,7 +415,7 @@ def withdraw_stale(conn, source: str, keep: list[tuple], why: str,
                 "       OR d.store = %(store)s::text) "
                 "  AND NOT (d.store = ANY(%(exclude)s::text[])) "
                 "RETURNING d.status",
-                {"source": source, "store": store,
+                {"source": source, "store": store, "why": why,
                  "exclude": list(exclude_stores or [])})
             return sum(1 for (st,) in cur.fetchall() if st == "withdrawn")
         cur.execute(_WITHDRAW_SQL, {

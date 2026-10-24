@@ -401,8 +401,12 @@ carrierMethodType} / calendarDayConfiguration{standardProcessingSchedule.<sunday
    对这个键是错的;改为**缺省发空数组 `[]`**(官方 schema 该键唯一允许值 `TWO_DAY_DELIVERY`,
    国内仓不该承诺两日达,所以缺省空而不是填它)。`[]` 收不收是**第二次真跑要验的**:
    被拒就只能 `-p services=TWO_DAY_DELIVERY`,那时要所有者拍板承诺不承诺。
-2. `shippingDetails` 没带,首跑的 400 没嫌它(校验可能逐项报,不排除下一个就是它)。
-   不填 `-p carrier=` 仍不带这个键,被拒原文会进摘要与台账(首版只进日志,已修:
+2. ✅ **`shippingDetails` 也不能为 null**(第二次真跑 14:27,400 原文:`shippingDetails
+   can't be null`;同次证实 `distributorSupportedServices: []` **被收**,校验才走到了下一项)。
+   同款处理:不填 `-p carrier=` 就发 `shippingDetails: []`。`[]` 收不收是**第三次真跑要验的**;
+   官方 schema 里它的子键只有 `twoDayShipping`,填承运商 = 声明两日达的承运方式,国内仓
+   不该缺省声明。Seller Center 建的中山仓(谭总12)是唯一被收过的实体仓样本,`node_probe`
+   能打出它这两个键的真实取值,照抄最稳。被拒原文进摘要与台账(首版只进日志,已修:
    `safe_post_ex(error_body=True)` opt-in,老调用方契约不变)。
 3. 官方 schema(reference/createfulfillmentcenter,2026-10-24 核验):`timeZone` 枚举
    PST/MST/CST/EST/PDT/MDT/CDT/EDT/ADT/NDT/GMT/CET/TRT/IST/CTT/HKT/SGT/ICT/JST/KST/VST/CLT

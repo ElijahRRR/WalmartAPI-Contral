@@ -41,7 +41,8 @@ PARAM_HELP = {
     "postal": "邮编(必填)",
     "tz": "时区(timeZone,必填,官方枚举见 TIME_ZONES;L001 实证国内仓填 CST)",
     "status": "ACTIVE / INACTIVE(缺省 ACTIVE)",
-    "carrier": "承运商(carrierMethodName,如 FEDEX;填了就对该店 GET carriers 校验)",
+    "carrier": "承运商(carrierMethodName,如 FEDEX;填了就对该店 GET carriers 校验;"
+               "不填 shippingDetails 发空数组 [],2026-10-24 实证该键不能为 null)",
     "carrier_type": "承运方式(carrierMethodType,缺省 GROUND;只在填了 carrier 时用)",
     "services": "distributorSupportedServices,逗号分隔;官方唯一允许值 TWO_DAY_DELIVERY;"
                 "**缺省发空数组 []**(2026-10-24 首跑实证:这个键不能为 null)",
@@ -150,6 +151,9 @@ def build_node(spec: dict) -> dict:
     if custom_id:
         node["customNodeId"] = custom_id
     carrier = _clean(spec.get("carrier"))
+    # 2026-10-24 第二次真跑实证(L001贾林红 400):「shippingDetails can't be null」——
+    # 与 distributorSupportedServices 同款:键必须在,不声明承运方式就发空数组
+    node["shippingDetails"] = []
     if carrier:
         node["shippingDetails"] = [{"twoDayShipping": [{
             "carrierMethodName": carrier.upper(),

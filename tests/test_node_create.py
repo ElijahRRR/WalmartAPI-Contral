@@ -61,13 +61,15 @@ def test_full_payload_uses_only_keys_from_the_official_sample():
     assert node["calendarDayConfiguration"]["additionalDaysOff"] == ["2026-12-25"]
 
 
-def test_minimal_payload_carries_no_invented_optional_keys_but_services_is_always_present():
-    """可选项没给就不带键 —— 唯一例外 distributorSupportedServices:2026-10-24 首跑实证
-    (L001贾林红 400「can't be null」)它必须在,不提供两日达就发空数组。"""
+def test_minimal_payload_carries_no_invented_optional_keys_but_two_arrays_are_always_present():
+    """可选项没给就不带键 —— 两个例外 distributorSupportedServices / shippingDetails:
+    2026-10-24 两次真跑实证(L001贾林红 400「can't be null」×2)它们必须在,
+    不提供两日达 / 不声明承运方式就发空数组,不是不带键。"""
     node = ship_nodes.build_node(_MIN)
     assert set(node) == {"shipNodeName", "status", "timeZone", "postalAddress",
-                         "distributorSupportedServices"}
+                         "distributorSupportedServices", "shippingDetails"}
     assert node["distributorSupportedServices"] == []
+    assert node["shippingDetails"] == []
     assert "addressLine2" not in node["postalAddress"]
 
 

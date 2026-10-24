@@ -413,3 +413,27 @@ def test_array_item_open_schema_keeps_extra_keys():
     vis = {"f": [{"materialName": "Cotton", "extra": 1}]}
     out, notes = mc.fix_array_items(spec, vis)
     assert out == vis and notes == []
+
+
+def test_conditionally_required_object_array_emptied_blocks_submission():
+    """条件必填(upholstered=Yes ⇒ fabricContent)的对象数组元素全无效:不能当可选删掉
+    照发(必被拒),要进缺失清单不提交(2026-10-24 对抗审查,0829 Beds 实证)。"""
+    spec = {"required": [], "properties": {
+        "upholstered": {"type": "string", "enum": ["Yes", "No"]},
+        "fabricContent": _FABRIC},
+        "allOf": [{"if": {"properties": {"upholstered": {"enum": ["Yes"]}},
+                          "required": ["upholstered"]},
+                   "then": {"required": ["fabricContent"]}}]}
+    v, o, notes, missing = mc.conform(
+        spec, _OSPEC,
+        {"upholstered": "Yes",
+         "fabricContent": [{"fabricMaterialName": "Polyester"}]},
+        {"sku": "S1", "price": 9.9})
+    assert "visible.fabricContent" in missing
+    # 条件不触发时照旧:非必填整字段删、可以提交
+    v, o, notes, missing = mc.conform(
+        spec, _OSPEC,
+        {"upholstered": "No",
+         "fabricContent": [{"fabricMaterialName": "Polyester"}]},
+        {"sku": "S1", "price": 9.9})
+    assert "fabricContent" not in v and missing == []

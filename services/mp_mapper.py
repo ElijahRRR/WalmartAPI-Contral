@@ -363,7 +363,8 @@ def finalize_visible(pt: str, llm_attrs: dict, spec: dict | None,
     return apply_images(attrs, images or [], spec)
 
 
-def _field_block(name: str, meta: dict, required: bool) -> dict:
+def _field_block(name: str, meta: dict, required: bool,
+                 item_subfields: bool = True) -> dict:
     """输入:字段 schema → 输出:给 LLM 的字段元数据块。
 
     2026-08-12 旧仓对照恢复(旧 _format_field_block/_summarize_prop 给 12 类
@@ -392,9 +393,10 @@ def _field_block(name: str, meta: dict, required: bool) -> dict:
         # items.type=object,LLM 照标题「Fabric Material Name」自己编出
         # fabricMaterialName,同一载荷连拒三次 EXT_DATA_ERROR_72600149546850)。
         # 键名与 object 字段同款(object_properties / object_required),系统提示词
-        # 第 4 条原样适用 —— 提示词正文不改,缓存只对含这类字段的 PT 失效一次。
+        # 第 4 条原样适用 —— 提示词正文不改,缓存只对 Visible 里含这类字段的
+        # PT 失效一次(Orderable 段关掉,见 _fields_for_llm 的 item_subfields)。
         isub = items.get("properties")
-        if isinstance(isub, dict):
+        if item_subfields and isinstance(isub, dict):
             it["object_properties"] = _sub_fields(isub)
             if items.get("required"):
                 it["object_required"] = items["required"]
@@ -419,12 +421,20 @@ def _sub_fields(sub: dict) -> dict:
             for sn, sd in list(sub.items())[:20] if isinstance(sd, dict)}
 
 
-def _fields_for_llm(spec: dict | None, skip: tuple,
-                    optional_cap: int) -> tuple[dict, dict]:
-    """输入:spec + 剔除清单 + 可选字段上限 → 输出:(必填字段块, 可选字段块)。
+def _fields_for_llm(spec: dict | None, skip: tuple, optional_cap: int,
+                    item_subfields: bool = True) -> tuple[dict, dict]:
+    """输入:spec + 剔除清单 + 可选字段上限(+ 是否送数组元素子字段)→ 输出:(必填字段块, 可选字段块)。
 
     必填**全量**送(旧提示词同款,不设上限——此前 [:200] 硬截断会让排在
     后面的必填字段永不出现);可选按旧口径截断(Visible 20 / Orderable 10)。
+
+    ⚠ Orderable 段一律 `item_subfields=False`(build_llm_messages 与 reuse_sig
+    两处必须同步):Orderable spec 是**所有 PT 共用**的一份,它的对象数组字段
+    (stateRestrictions / externalProductIdentifier)一旦多出子字段块,每一个 PT
+    的 messages 与复用签名都变 ⇒ 全量缓存作废重打(2026-10-24 对抗审查实证)。
+    其中 externalProductIdentifier 的子字段是 ASIN/MLID 类型 + 编号 —— 把填法
+    教给 LLM 等于教它把亚马逊 ASIN 交给沃尔玛(sku_plan §0 来源隐藏)。
+    Orderable 载荷照样过 mp_conform.fix_array_items 收口。
     """
     props = (spec or {}).get("properties") or {}
     required = set((spec or {}).get("required") or [])
@@ -433,9 +443,9 @@ def _fields_for_llm(spec: dict | None, skip: tuple,
         if name in skip or not isinstance(meta, dict):
             continue
         if name in required:
-            req_out[name] = _field_block(name, meta, True)
+            req_out[name] = _field_block(name, meta, True, item_subfields)
         elif len(opt_out) < optional_cap:
-            opt_out[name] = _field_block(name, meta, False)
+            opt_out[name] = _field_block(name, meta, False, item_subfields)
     return req_out, opt_out
 
 
@@ -497,7 +507,8 @@ def reuse_sig(pt: str, spec: dict | None, product: dict,
     import hashlib as _hashlib
     import json as _json
     v_req, v_opt = _fields_for_llm(spec, SYSTEM_OWNED_FIELDS, 20)
-    o_req, o_opt = _fields_for_llm(ospec, ORDERABLE_SYSTEM_FIELDS, 10)
+    o_req, o_opt = _fields_for_llm(ospec, ORDERABLE_SYSTEM_FIELDS, 10,
+                                   item_subfields=False)
     raw = _json.dumps(
         {"pt": pt, "vr": v_req, "vo": v_opt, "onr": o_req, "ono": o_opt,
          "cond": _conditional_blocks(spec),
@@ -576,7 +587,8 @@ def build_llm_messages(pt: str, spec: dict | None, product: dict,
     """
     import json as _json
     v_req, v_opt = _fields_for_llm(spec, SYSTEM_OWNED_FIELDS, 20)
-    o_req, o_opt = _fields_for_llm(ospec, ORDERABLE_SYSTEM_FIELDS, 10)
+    o_req, o_opt = _fields_for_llm(ospec, ORDERABLE_SYSTEM_FIELDS, 10,
+                                   item_subfields=False)
     sys = (
         "你是沃尔玛商品属性映射器。根据亚马逊产品资料,填写目标 Product Type "
         "的字段,只输出一个 JSON 对象,形如 {\"visible\": {字段→值}, "
@@ -816,6 +828,14 @@ ORDERABLE_SYSTEM_FIELDS = (
 )
 
 
+# LLM 的 Orderable 出参里**只丢不教**的字段(2026-10-24 对抗审查):
+# externalProductIdentifier = 外部平台编号(类型枚举 ASIN/MLID),LLM 若照采集资料
+# 把亚马逊 ASIN 填进去,沃尔玛就拿到了来源(sku_plan §0 来源隐藏,发出去收不回)。
+# ⚠ 不进 ORDERABLE_SYSTEM_FIELDS:那张表同时决定提示词里送哪些字段,加进去会让
+# 每个 PT 的 Orderable 可选字段顺移一位 ⇒ 全量缓存作废;这里只在出参上丢。
+ORDERABLE_LLM_DENY = ("externalProductIdentifier",)
+
+
 def build_orderable(sku: str, upc: str, price, qty: int, partner_id: str,
                     pt: str = "", product: dict | None = None,
                     llm_fields: dict | None = None) -> dict:
@@ -858,8 +878,13 @@ def build_orderable(sku: str, upc: str, price, qty: int, partner_id: str,
     职责只剩一个:挡住 LLM 往 Orderable 里塞它。
     """
     end_date = SITE_END_DATE if "T" in SITE_END_DATE else f"{SITE_END_DATE}T00:00:00Z"
+    leaked = [k for k in ORDERABLE_LLM_DENY if (llm_fields or {}).get(k)]
+    if leaked:
+        logger.warning("LLM 给了 Orderable 外部标识字段 %s,已丢弃(来源隐藏,sku=%s)",
+                       leaked, sku)
     o = {k: v for k, v in (llm_fields or {}).items()
-         if k not in ORDERABLE_SYSTEM_FIELDS and v not in (None, "", [], {})}
+         if k not in ORDERABLE_SYSTEM_FIELDS and k not in ORDERABLE_LLM_DENY
+         and v not in (None, "", [], {})}
     o.update({
         "sku": str(sku),
         "productIdentifiers": {"productId": str(upc), "productIdType": "UPC"},

@@ -548,3 +548,50 @@ def test_unit_word_is_read_even_when_followed_by_punctuation_or_a_second_measure
     assert m._parse_weight_value("item weight: 600g / 1.3lb")[1] == "parsed"
     assert m._parse_weight_value("5 克") == (None, "unknown_unit")
     assert m._parse_weight_value("300") == (None, "no_unit")
+
+
+_ORDERABLE_WITH_OBJECT_ARRAYS = {"required": [], "properties": {
+    "stateRestrictions": {"type": "array", "items": {
+        "type": "object", "additionalProperties": False,
+        "properties": {"stateRestrictionsText": {"type": "string"},
+                       "zipCodes": {"type": "string"}}}},
+    "externalProductIdentifier": {"type": "array", "items": {
+        "type": "object", "additionalProperties": False,
+        "required": ["externalProductIdType", "externalProductId"],
+        "properties": {"externalProductIdType": {"type": "string",
+                                                 "enum": ["ASIN", "MLID"]},
+                       "externalProductId": {"type": "string"}}}}}}
+
+
+def test_orderable_blocks_never_carry_item_sub_fields():
+    """Orderable spec 所有 PT 共用:它的对象数组(stateRestrictions /
+    externalProductIdentifier)多出子字段块 ⇒ 每个 PT 的 messages 与复用签名都变
+    ⇒ 全量缓存作废;externalProductIdentifier 的填法还等于教 LLM 交出 ASIN。
+    (2026-10-24 对抗审查实证)"""
+    import json
+    spec = {"required": ["color"], "properties": {"color": {"type": "string"}}}
+    user = m.build_llm_messages("X", spec, {"title": "x"},
+                                ospec=_ORDERABLE_WITH_OBJECT_ARRAYS)[1]["content"]
+    assert "object_properties" not in user and "ASIN" not in user
+    body = json.loads(user)
+    assert body["orderable_optional"]["externalProductIdentifier"] == {
+        "type": "array", "items": {"type": "object"}}
+    # 复用签名与「Orderable 不送子字段」口径一致:和没有子字段时的签名相同
+    bare = {"required": [], "properties": {
+        k: {"type": "array", "items": {"type": "object"}}
+        for k in _ORDERABLE_WITH_OBJECT_ARRAYS["properties"]}}
+    prod = {"title": "x", "brand": "b", "category": "c"}
+    assert m.reuse_sig("X", spec, prod, _ORDERABLE_WITH_OBJECT_ARRAYS) == \
+        m.reuse_sig("X", spec, prod, bare)
+
+
+def test_build_orderable_drops_llm_external_product_identifier():
+    """LLM 若照采集资料把亚马逊 ASIN 填进 externalProductIdentifier,出参上丢掉:
+    来源隐藏(sku_plan §0),发出去收不回。"""
+    o = m.build_orderable("S1", "012345678905", 19.9, 5, "PID", {"attrs": {}},
+                          llm_fields={"externalProductIdentifier": [
+                              {"externalProductIdType": "ASIN",
+                               "externalProductId": "B0PARENT01"}],
+                              "IsPreorder": "No"})
+    assert "externalProductIdentifier" not in o
+    assert o["IsPreorder"] == "No"

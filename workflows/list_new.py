@@ -900,6 +900,12 @@ WHERE l.status = 'failed'
 """
 
 
+def _drop_dup_retry(fresh: list[dict], retry: list[dict]) -> list[dict]:
+    """输入:新行队列 + 重试队列 → 输出:去掉已在新行队列里的重试行(按表格行号)。"""
+    in_fresh = {r["rownum"] for r in fresh}
+    return [r for r in retry if r["rownum"] not in in_fresh]
+
+
 def _retry_rows(rows: list[dict], verdicts: dict,
                 requeue_invalid_field: bool = False
                 ) -> tuple[list[dict], list[tuple[str, str]]]:
@@ -1770,6 +1776,11 @@ def run(params: dict) -> str:
     retry, exhausted = _retry_rows(
         rows, verdicts,
         requeue_invalid_field=str(params.get("requeue_invalid_field", "")) in ("1", "true"))
+    # open_rows 与 _retry_rows 在「是否上架=No、无 feedid、上架结果=FAILED」的行上
+    # 重叠(heal_unknown 的 FAILED 分支、提交被拒都会留下这种行):两边各收一份 ⇒
+    # 同一 SKU 在同一个 MP_ITEM feed 里发两遍、可能领两个 UPC(2026-10-24 对抗
+    # 审查实证)。保留 fresh 那份,下游不读 listed/feed_id/list_result。
+    retry = _drop_dup_retry(fresh, retry)
     n_requeued = sum(1 for r in retry if r.get("_requeued"))
     pending = fresh + retry
     mode = "" if execute else "🧪 [DRY-RUN] "

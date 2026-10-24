@@ -727,7 +727,8 @@ def strip_unknown(spec: dict, ospec: dict, visible: dict, orderable: dict
     return nv, no, dropped
 
 
-def fix_array_items(spec: dict, section: dict) -> tuple[dict, list[str]]:
+def fix_array_items(spec: dict, section: dict, blocked: list | None = None
+                    ) -> tuple[dict, list[str]]:
     """输入:spec + 一段载荷 → 输出:(元素对齐后的段, 说明)。只管「数组元素是对象」的字段。
 
     2026-10-24 生产实证(装饰枕套 fabricContent,同一载荷连拒三次):LLM 在元素里
@@ -739,9 +740,15 @@ def fix_array_items(spec: dict, section: dict) -> tuple[dict, list[str]]:
       ③ 元素删光了:非必填字段整字段删(少一个可选属性,换整条能过);
          必填字段留空数组,交 validate 拦下不提交(省 UPC 与配额)。
     每一处删改都进说明,不静默。
+
+    「必填」含**条件必填**(allOf if/then,如 upholstered=Yes ⇒ fabricContent):
+    对抗审查实证(0829 Beds / Power Hedge Trimmers),只看顶层 required 会把条件
+    必填的字段当可选删掉,validate 也只查顶层,于是载荷照发、必被拒。条件必填的
+    空数组随后会被 drop_empty_optional(只认顶层必填)删掉,所以字段名另记进
+    `blocked`,由 conform 并进缺失清单 —— 不提交。
     """
     props = _props(spec)
-    required = _required(spec)
+    required = _required(spec) | resolve_conditional_required(spec, section)
     out, notes = dict(section), []
     for name, val in section.items():
         prop = props.get(name) or {}
@@ -774,6 +781,8 @@ def fix_array_items(spec: dict, section: dict) -> tuple[dict, list[str]]:
         elif name in required:
             out[name] = []
             notes.append(f"{name}: 元素全部无效(必填,交 validate 拦下)")
+            if blocked is not None:
+                blocked.append(name)
         else:
             del out[name]
             notes.append(f"{name}: 元素全部无效,非必填整字段删除")
@@ -986,9 +995,11 @@ def conform(spec: dict | None, ospec: dict | None, visible: dict,
             spec, {"properties": {k: {} for k in orderable}},
             visible, orderable)
     notes += n
-    visible, n = fix_array_items(spec, visible);             notes += n
+    v_blocked: list[str] = []
+    o_blocked: list[str] = []
+    visible, n = fix_array_items(spec, visible, v_blocked);  notes += n
     if _props(ospec):
-        orderable, n = fix_array_items(ospec, orderable)
+        orderable, n = fix_array_items(ospec, orderable, o_blocked)
         notes += [f"orderable:{x}" for x in n]
     orderable, n = clean_state_restrictions(orderable);     notes += n
     visible, orderable, n = drop_empty_optional(spec, ospec, visible, orderable)
@@ -997,4 +1008,10 @@ def conform(spec: dict | None, ospec: dict | None, visible: dict,
     notes += n
     visible, orderable, n = round_decimals(visible, orderable)
     notes += n
-    return visible, orderable, notes, validate(spec, ospec, visible, orderable)
+    missing = validate(spec, ospec, visible, orderable)
+    # 5a 判定为(条件)必填、元素全无效的数组字段:顶层 validate 看不见条件必填,
+    # 这里补进缺失清单 —— 不提交,省 UPC 与配额(见 fix_array_items ③)
+    missing += [f"{p}.{n}" for p, names in (("visible", v_blocked),
+                                             ("orderable", o_blocked))
+                for n in names if f"{p}.{n}" not in missing]
+    return visible, orderable, notes, missing

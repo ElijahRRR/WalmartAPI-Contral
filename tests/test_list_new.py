@@ -2792,3 +2792,13 @@ def test_store_max_stock_gate(monkeypatch):
     assert "按本店最大库存上架 3 行" in out
     assert "共 6 行将进入" in out
     assert "最大库存" not in out.split("闸门:")[1].split(";")[0]  # N 不拦任何行
+
+
+def test_retry_copy_dropped_when_row_already_in_fresh():
+    """是否上架=No、无 feedid、上架结果=FAILED 的行同时被 open_rows 与 _retry_rows
+    收下(2026-10-24 对抗审查实证):只留 fresh 那份,同一 SKU 不在一个 feed 里发两遍。"""
+    fresh = [{"rownum": 7, "asin": "B0HEALED01"}, {"rownum": 8, "asin": "B0NEW0001"}]
+    retry = [{"rownum": 7, "asin": "B0HEALED01", "_requeued": True},
+             {"rownum": 9, "asin": "B0RETRY01"}]
+    assert [r["rownum"] for r in ln._drop_dup_retry(fresh, retry)] == [9]
+    assert ln._drop_dup_retry([], retry) == retry

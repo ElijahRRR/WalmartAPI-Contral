@@ -92,12 +92,21 @@ FAILED,反哺器只跟「上架结果」为空/处理中的行,后两次回执�
 
 四处修复:
 - `mp_mapper._field_block`:数组元素是对象时送上子字段(`items.object_properties` /
-  `items.object_required`,键名与 object 字段同款)。提示词正文不改 ⇒ 缓存只对含这类
-  字段的 PT 失效一次重打。
+  `items.object_required`,键名与 object 字段同款)。提示词正文不改;**Orderable 段不送**
+  (所有 PT 共用,送了就全量缓存作废,且 externalProductIdentifier 的填法等于教 LLM 交出
+  ASIN)。按 0829 spec 实测:6973 个 PT 里只有 1761 个(Visible 里含这类字段的)提示词
+  变化、缓存失效一次,其余 5212 个逐字节不变。
+- `mp_mapper.build_orderable`:LLM 出参里的 `externalProductIdentifier` 一律丢弃并告警
+  (来源隐藏;只丢出参、不动提示词,不触发缓存失效)。
 - `mp_conform.fix_array_items`(工序 5a):元素 schema 封闭时剔 spec 外子字段;缺元素
-  必填的元素删掉;删光了非必填整字段删、必填交 validate 拦下。
+  必填的元素删掉;删光了非必填整字段删、必填(**含条件必填**,如 upholstered=Yes ⇒
+  fabricContent)进缺失清单不提交。
 - `listing_sheet.write_submit_cols`:写 是否上架=Yes/Unknown(新 feed 在途)时同一次清空
   上架结果/报错/feed查询日期,新回执照常落表(即 feed_ledger_v2_design C21 的那一条,先行落地)。
+  ⚠ Unknown 行的回执仍可能被 heal_unknown 用**上一次**提交的回执回填(既有缺口,
+  C22,本次未动)。
+- `list_new`:open_rows 与重试通道在「No / 无 feedid / FAILED」行上重叠,同一行进两次
+  队列 ⇒ 去重,保留新行那份(既有问题,一次性放行会多一条命中路径)。
 - `list_new -p requeue_invalid_field=1`:**一次性放行**。重试已达上限、且台账里最近一次
   list_new 提交的报错含「is not a valid field」的行再给一轮;只认最近一次,换了错误就不再
   命中,不会无限重试。先 `--dry-run` 看摘要首行「含达上限后一次性放行 N」。

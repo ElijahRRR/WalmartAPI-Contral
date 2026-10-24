@@ -174,6 +174,22 @@ def _error_text(data) -> str:
     return str(data)[:300]
 
 
+def _is_request_error(data) -> bool:
+    """输入:错误响应体 → 输出:沃尔玛是否把它归为请求侧错误(errors[].category ∈ REQUEST/DATA)。
+
+    5xx 一般是"不知道到没到",但响应体明说 category=REQUEST/DATA 的是校验阶段拒掉的
+    (HV000028 那种是校验器自己抛异常),没进创建 —— 按确认未达处理。判错的代价
+    由发前按名查重兜住:即便真建成了,下次重跑先 GET 看到同名也不会再发。
+    """
+    if not isinstance(data, dict):
+        return False
+    errs = data.get("errors")
+    if not isinstance(errs, list) or not errs:
+        return False
+    return all(isinstance(e, dict) and str(e.get("category", "")).upper() in ("REQUEST", "DATA")
+               for e in errs)
+
+
 def list_carrier_methods(store: dict) -> list[dict]:
     """输入:店铺 → 输出:该店可用承运方法 [{carrierMethodName, carrierMethodType, …}]。
 
@@ -215,10 +231,13 @@ def create_ship_node(store: dict, node: dict) -> dict:
         f"{_client.base_url()}/v3/settings/shipping/shipnodes",
         token, store["client_id"], store.get("proxy"), json_body=body,
         max_retries=0, error_body=True)
-    if status is None or status >= 500:
+    if status is None or (status >= 500 and not _is_request_error(data)):
         raise ShipNodeOutcomeUnknown(
             f"建仓请求结局不明,沃尔玛返回 {status}: {str(data)[:200]}")
     if status != 200:
+        # 4xx,或 5xx 但响应体明说是**请求侧**错误(2026-10-24 第三次真跑实见 520
+        # `HV000028: Unexpected exception during isValid call`,category=REQUEST:
+        # 校验器在 isValid 阶段抛异常,请求没走到创建)—— 都是确认未达
         raise RuntimeError(f"建仓被拒,沃尔玛返回 {status}: {_error_text(data)}")
     rows = _parse_rows(data, "payload", "elements", "shipNodes", "shipNode")
     created = [r for r in rows if r.get("shipNode")]

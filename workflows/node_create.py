@@ -100,6 +100,18 @@ def _create_one(store: dict, node: dict, preview: bool) -> dict:
     if preview:
         res["outcome"] = "preview"
         lines.append(f"  {name}:将新建「{node_name}」(在册 {len(nodes)} 个节点,无同名)")
+        if not ship:
+            # 没填承运商时顺带把该店可用的承运方法打出来(只读,10/min):2026-10-24
+            # 第三次真跑实证 shippingDetails 发 [] 让沃尔玛校验器越界(520 HV000028),
+            # 多半绕不开填一个 —— 人要先知道这店能填什么
+            try:
+                carriers = settings.list_carrier_methods(store)
+                avail = ",".join(sorted({f"{c.get('carrierMethodName')}/{c.get('carrierMethodType')}"
+                                         for c in carriers}))
+                lines.append(f"    该店可用承运方法(-p carrier=<名> -p carrier_type=<类型>):"
+                             f"{avail or '(空)'}")
+            except Exception as e:                   # noqa: BLE001 —— 预览里的参考信息,读不到只说一句
+                lines.append(f"    承运方法列表读不到:{e}")
         return res
 
     with db.pg_conn() as conn:

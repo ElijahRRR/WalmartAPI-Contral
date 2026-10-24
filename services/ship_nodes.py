@@ -34,15 +34,17 @@ PENDING_GRACE_MINUTES = 10
 PARAM_HELP = {
     "name": "仓名(shipNodeName,必填;也是防重键:同店同名不重建)",
     "address1": "地址行(addressLine1,必填;L001 实证一行拼完即可)",
+    "address2": "地址行 2(addressLine2,官方 schema 有此字段;缺省不带)",
     "city": "城市(必填)",
     "state": "省/州代码(必填;L001 实证重庆填 CQ)",
     "country": "国家代码(必填;L001 实证国内仓填 CN)",
     "postal": "邮编(必填)",
-    "tz": "时区(timeZone,必填;L001 实证国内仓填 CST)",
+    "tz": "时区(timeZone,必填,官方枚举见 TIME_ZONES;L001 实证国内仓填 CST)",
     "status": "ACTIVE / INACTIVE(缺省 ACTIVE)",
     "carrier": "承运商(carrierMethodName,如 FEDEX;填了就对该店 GET carriers 校验)",
     "carrier_type": "承运方式(carrierMethodType,缺省 GROUND;只在填了 carrier 时用)",
-    "services": "distributorSupportedServices,逗号分隔(如 TWO_DAY_DELIVERY;缺省不带)",
+    "services": "distributorSupportedServices,逗号分隔;官方唯一允许值 TWO_DAY_DELIVERY;"
+                "**缺省发空数组 []**(2026-10-24 首跑实证:这个键不能为 null)",
     "custom_id": "customNodeId,卖家自定义编号(缺省不带)",
     "workdays": "工作日,逗号或区间:mon,tue,wed 或 mon-fri(与 cutoff 必须同给)",
     "cutoff": "工作日截单时间 HH:MM 24 小时制(与 workdays 必须同给)",
@@ -55,6 +57,13 @@ _DAY_KEY = {"mon": "monday", "tue": "tuesday", "wed": "wednesday",
             "thu": "thursday", "fri": "friday", "sat": "saturday", "sun": "sunday"}
 _CUTOFF_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 _STATUSES = ("ACTIVE", "INACTIVE")
+#: 官方 create-fulfillment-center schema 的 timeZone 枚举(2026-10-24 核验原文)。
+#: 国内仓 L001 实证 CST(沃尔玛建的 VIRTUAL 节点就是它);HKT/CTT 也在表里。
+TIME_ZONES = ("PST", "MST", "CST", "EST", "PDT", "MDT", "CDT", "EDT", "ADT", "NDT",
+              "GMT", "CET", "TRT", "IST", "CTT", "HKT", "SGT", "ICT", "JST", "KST",
+              "VST", "CLT")
+#: distributorSupportedServices 官方唯一允许值(schema 原文 "The allowed values: TWO_DAY_DELIVERY")
+SUPPORTED_SERVICES = ("TWO_DAY_DELIVERY",)
 
 
 class SpecError(ValueError):
@@ -111,21 +120,32 @@ def build_node(spec: dict) -> dict:
     status = (_clean(spec.get("status")) or "ACTIVE").upper()
     if status not in _STATUSES:
         raise SpecError(f"status 只能是 {'/'.join(_STATUSES)},给的是 {status!r}")
+    tz = _clean(spec["tz"]).upper()
+    if tz not in TIME_ZONES:
+        raise SpecError(f"tz 不在官方 timeZone 枚举里:{tz!r}(可用 {','.join(TIME_ZONES)})")
+    services = [x.upper() for x in _split(_clean(spec.get("services")))]
+    bad = [x for x in services if x not in SUPPORTED_SERVICES]
+    if bad:
+        raise SpecError(f"services 不在官方允许值里:{bad}(唯一允许 {','.join(SUPPORTED_SERVICES)};"
+                        f"不提供就别填,缺省发空数组)")
+    address = {"addressLine1": _clean(spec["address1"])}
+    if _clean(spec.get("address2")):
+        address["addressLine2"] = _clean(spec["address2"])
+    address.update({
+        "city": _clean(spec["city"]),
+        "state": _clean(spec["state"]),
+        "country": _clean(spec["country"]),
+        "postalCode": _clean(spec["postal"]),
+    })
     node: dict = {
         "shipNodeName": _clean(spec["name"]),
         "status": status,
-        "timeZone": _clean(spec["tz"]),
-        "postalAddress": {
-            "addressLine1": _clean(spec["address1"]),
-            "city": _clean(spec["city"]),
-            "state": _clean(spec["state"]),
-            "country": _clean(spec["country"]),
-            "postalCode": _clean(spec["postal"]),
-        },
+        "timeZone": tz,
+        # 2026-10-24 首跑实证(L001贾林红 400):「distributorSupportedServices can't be null」
+        # —— 这个键**必须在**,不提供两日达就发空数组,不是不带键
+        "distributorSupportedServices": services,
+        "postalAddress": address,
     }
-    services = _split(_clean(spec.get("services")))
-    if services:
-        node["distributorSupportedServices"] = services
     custom_id = _clean(spec.get("custom_id"))
     if custom_id:
         node["customNodeId"] = custom_id

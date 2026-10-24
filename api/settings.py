@@ -152,6 +152,28 @@ def _parse_rows(data, *keys: str) -> list[dict]:
     return [r for r in rows if isinstance(r, dict)]
 
 
+def _error_text(data) -> str:
+    """输入:沃尔玛错误响应体 → 输出:人读的一句(errors[].description 拼起来;认不出给原文片段)。
+
+    首跑实见的形状:`{"errors":[{"code":"INVALID_REQUEST_CONTENT.INVALID_REQUEST","field":"shipNode",
+    "description":"shipNode object has invalid data: distributorSupportedServices can't be null",…}]}`。
+    """
+    if isinstance(data, dict):
+        errs = data.get("errors")
+        if isinstance(errs, list) and errs:
+            parts = []
+            for e in errs:
+                if isinstance(e, dict):
+                    desc = e.get("description") or e.get("info") or e.get("code") or ""
+                    field = e.get("field")
+                    parts.append(f"[{field}] {desc}" if field and desc else str(desc or e))
+            if parts:
+                return "; ".join(parts)[:400]
+        if "text" in data and len(data) == 1:
+            return str(data["text"])[:400]
+    return str(data)[:300]
+
+
 def list_carrier_methods(store: dict) -> list[dict]:
     """输入:店铺 → 输出:该店可用承运方法 [{carrierMethodName, carrierMethodType, …}]。
 
@@ -192,12 +214,12 @@ def create_ship_node(store: dict, node: dict) -> dict:
     status, _, data = _client.safe_post_ex(
         f"{_client.base_url()}/v3/settings/shipping/shipnodes",
         token, store["client_id"], store.get("proxy"), json_body=body,
-        max_retries=0)
+        max_retries=0, error_body=True)
     if status is None or status >= 500:
         raise ShipNodeOutcomeUnknown(
             f"建仓请求结局不明,沃尔玛返回 {status}: {str(data)[:200]}")
     if status != 200:
-        raise RuntimeError(f"建仓被拒,沃尔玛返回 {status}: {str(data)[:300]}")
+        raise RuntimeError(f"建仓被拒,沃尔玛返回 {status}: {_error_text(data)}")
     rows = _parse_rows(data, "payload", "elements", "shipNodes", "shipNode")
     created = [r for r in rows if r.get("shipNode")]
     if len(created) != 1:

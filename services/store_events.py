@@ -75,6 +75,10 @@ STORE_DEREGISTERED = "store_deregistered"            # governance(凭证表删�
 STORE_SCOPE_CHANGED = "store_scope_changed"          # governance(规划外名单,store=NULL)
 CLAIM_CREATED = "claim_created"                      # governance(按店按轮汇总)
 CLAIM_RELEASED = "claim_released"                    # governance(同上)
+# 建仓(node_create,2026-10-24):人给信息、人敲命令在该店新建了一个发货节点。
+# 一仓一条、恒 info(是所有者自己的动作,不叫醒人);存在的意义是时间线 ——
+# 「这家店什么时候多了个仓」与之后「维护仓库」改填、node_clear 清旧仓要能对上。
+SHIP_NODE_CREATED = "ship_node_created"              # governance(detail: ship_node/name/city/country)
 
 # ── 运营类(五条执行链,**每店每轮一条**)──────────────────────────────────
 # 回答的是"这家店这一轮到底干了多少活":上了几条、清了几条、维护改了几处。
@@ -108,6 +112,7 @@ CLASS = {
     STORE_SCOPE_CHANGED: "governance",
     CLAIM_CREATED: "governance",
     CLAIM_RELEASED: "governance",
+    SHIP_NODE_CREATED: "governance",
     LIST_ROUND: "ops",
     MAINT_ROUND: "ops",
     CLEANUP_ROUND: "ops",
@@ -599,6 +604,10 @@ def _brief_body(event: str, d: dict) -> str:
         return "凭证表新增在册"
     if event == STORE_DEREGISTERED:
         return "凭证表删店(不再在册)"
+    if event == SHIP_NODE_CREATED:
+        where = "/".join(x for x in (d.get("city"), d.get("country")) if x)
+        return (f"新建发货节点「{d.get('name')}」FC {d.get('ship_node')}"
+                + (f"({where})" if where else ""))
     if event in (CLAIM_CREATED, CLAIM_RELEASED):
         verb = "占用" if event == CLAIM_CREATED else "释放"
         got = [f"{k} {d[k]}" for k in ("brand", "product") if d.get(k)]

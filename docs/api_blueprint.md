@@ -51,9 +51,11 @@
 | 35 | GET /v3/reports/reportRequests | reports | 报表请求列表(**轮询走这条**;官方表 200/min 但生产实见小时级桶,与单查共用 18/hour;nextCursor 是完整 query 串**直接拼 URL**;requestStatus / src 过滤;只能查 30 天) | safe_get_ex(逐页生成器,找到即停) | item_id_sync |
 | 36 | GET /v3/reports/reportRequests/{requestId} | reports | 单个请求状态(20/hour,与列表共用 reports.query 桶,只作列表找不到时的兜底) | safe_get_ex | item_id_sync |
 | 37 | GET /v3/reports/downloadReport | reports | 预签名下载地址 + 时效(20/hour) | safe_get_ex + download_bytes | item_id_sync |
+| 38 | POST /v3/settings/shipping/shipnodes | settings | **建仓**(新建自发货 PHYSICAL 节点;body `{shipNodeHeader:{version:'1.2'}, shipNode:[…]}`,必填 shipNodeName/status/timeZone/postalAddress/≥1 shipping method;响应数组带生成的 `shipNode`。2026-10-24 所有者定稿由预留转正:人给信息、人手动执行,永不进调度;**不自动重试**,三种结局三种信号(200 成功 / 4xx 确认未达 / None·5xx·200 读不出 = 不明,留台账 pending 反查)) | safe_post_ex(max_retries=0) | node_create |
+| 39 | GET /v3/settings/shipping/carriers | settings | 该店可用承运方法(`carrierMethodName/Type`),建仓前校验 `-p carrier=` 填的认不认;不缓存 | safe_get_ex | node_create |
 
 **预留(旧系统文档记载/规划但未实现,新 api 层留接口位):**
-POST /v3/settings/shipping/shipnodes(**建仓**,人工 runbook,不自动化)、
+~~POST /v3/settings/shipping/shipnodes(建仓,人工 runbook,不自动化)~~(2026-10-24 转正为 #38,见上)、
 POST /v3/returns/{returnOrderId}/refund(售后退款,旧系统人工执行)、
 GET /v3/insights/items/unpublished/items|counts(被下架商品清单,清理工作流可换用)、
 GET /v3/insights/items/buybox 类(旧系统承认缺失)、DELETE /v3/items/{sku}(单品 retire,全仓未用过)、
@@ -99,6 +101,7 @@ marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁�
 | 9 catalog_sync | 2(fast 动态切片), 3(ITEM 报表兜底单查), 21, 22 | sync_online_products 的接口面;itemId 回填 2026-09-07 归 item_id_sync(#34–#37) |
 | 10 list_new | 8, 30, 16, (33) | 主链只发 MP_ITEM(+ partnerprofile;反查/延后结算用 GET /v3/feeds);上架仓 FC ID 走 33 校验(未配置店仍用 30,多仓批次 3);跟卖的 9 与 5(SPEC) 在 match_listing;7 未用(spec 读本地 <DATA_ROOT>/specs),18 不可用(见 §5.3) |
 | 11 sku_migrate | **9**(改码通道 MP_ITEM_MATCH,2026-09-06 定案;此前是 10 形态 A / 8 形态 B,两条都已作废),**3**(影子候选逐条单查),16 由 api/feeds 内部反查三态时用 | **存量改码**(SKU 改造批次 3,手动、永不进调度):载荷 `{Orderable:{sku 新码, productIdentifiers, SkuUpdate:'Yes'}}`,feedType 的唯一出生地是 `workflows/sku_migrate.FEED_TYPE`。**本工作流自己不调 17**:回执由 `feed_poll` 统一轮询落 `ops.feed_items`,改码只读那张台账(而且回执**不入病历、不反哺黑名单**);定案靠 2(catalog_sync)的观测,回执成功单独不定案。形态若改判为 B(MP_ITEM 全量),须先让 `mp_conform` 放行 SkuUpdate(否则被静默剔掉 ⇒ 每一行都双挂),且吃的是 list_new 的 MP_ITEM 桶。**3(GET /v3/items/{sku},补漏单查)2026-09-08 加**:只对「**影子候选**」逐条查 —— 新码在架 ∧ 旧码没缺席 ∧ **两码 wpid 相同**的那些行(判词 (a′),docs/sku_plan.md §9.15),**上限 = 该店 pending∪double 里的同 wpid 双挂行数**(A131吕灿荣 是 41 条),吃 `items.get` 桶(900/min);404 ⇒ 定案 confirmed、200 ⇒ 仍 double,抛异常/取不到凭证一律 fail-closed 判 double 并点名。dry-run 照样查(只读) |
+| node_create | 33, 39, 38 | 先 33 按仓名查重(同名不发)→ 填了承运商再 39 校验 → 台账 pending → 38;手动、永不进调度(多仓 2026-10-24 节) |
 | backup | 无沃尔玛调用 | — |
 
 ## 3. 配额表(三源对照,官方已核验)
@@ -132,6 +135,9 @@ marketplacelearn.walmart.com 政策页爬虫(类目映射 pipeline 归档不迁�
 | reconreport 两端点 | reconFile 100/min(availableReconFiles 未单列) | 一致 | 80/min;**明细只准走 CSV 端点 reconFile**(ZIP 包,Accept: application/octet-stream,text/csv 406)——reconFileJson 每账期硬截断 1000 行且 offset 只收 0,nextOffset 是字节偏移,超千行账期必丢数据(订单中心v1 2026-08-04 实证) |
 | insights performance summary/report | **1/min/端点**;unpublished items/counts **100/min**;listingQuality score 10/hour | CLAUDE.md"Insights 全部 1/分钟"**不准确** | 按端点分档登记 |
 | GET /v3/settings/partnerprofile | 50/min | 一致 | 40/min + lru_cache |
+| GET /v3/settings/shipping/shipnodes | 50/min(tsv:153) | 新登记(2026-08-24) | 40/min + lru_cache(建仓成功后清缓存) |
+| GET /v3/settings/shipping/carriers | 10/min(tsv:165) | 新登记(2026-10-24) | 8/min 持久桶,不缓存(只建仓前调) |
+| POST /v3/settings/shipping/shipnodes | 10/min(tsv:155) | 新登记(2026-10-24) | 8/min 持久桶;POST 不自动重试 |
 | DELETE /v3/items/{sku}(单品 retire) | 900/min | 全仓未用过 | 预留登记 |
 
 ### 3.2 写端点与 feed(官方"Feed type usage limits"表,按 feedType 独立配额)
@@ -438,6 +444,9 @@ api/insights.py
   performance_report(store, metric) -> bytes              # xlsx
 api/settings.py
   get_partner_id(store)                                   # lru_cache
+  list_ship_nodes(store) -> {shipNode: 节点字段}             # #33,lru_cache;200 空解析抛不缓存
+  list_carrier_methods(store) -> list[dict]                # #39,不缓存
+  create_ship_node(store, node) -> dict                    # #38;4xx RuntimeError(确认未达)/ ShipNodeOutcomeUnknown(不明);成功清 #33 缓存
 ```
 
 **明确不进 api 层的(业务规则,归 services/workflows):**

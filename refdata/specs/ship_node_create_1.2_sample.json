@@ -1,0 +1,69 @@
+{
+  "shipNodeHeader": {
+    "version": "1.2"
+  },
+  "shipNode": [
+    {
+      "shipNodeName": "my distrubutor786",
+      "status": "ACTIVE",
+      "timeZone": "PST",
+      "distributorSupportedServices": [
+        "TWO_DAY_DELIVERY"
+      ],
+      "customNodeId": "92hb1234",
+      "postalAddress": {
+        "addressLine1": "36 CALIFORNIA SAA233",
+        "city": "SC GABRIEL22",
+        "state": "CA",
+        "country": "USA",
+        "postalCode": "90100"
+      },
+      "shippingDetails": [
+        {
+          "twoDayShipping": [
+            {
+              "carrierMethodName": "FEDEX",
+              "carrierMethodType": "GROUND"
+            }
+          ]
+        }
+      ],
+      "calendarDayConfiguration": {
+        "standardProcessingSchedule": {
+          "sunday": {
+            "isWorkingDay": false,
+            "cutOffTime": "14:00"
+          },
+          "monday": {
+            "isWorkingDay": true,
+            "cutOffTime": "11:30"
+          },
+          "tuesday": {
+            "isWorkingDay": true,
+            "cutOffTime": "11:30"
+          },
+          "wednesday": {
+            "isWorkingDay": false,
+            "cutOffTime": "14:00"
+          },
+          "thursday": {
+            "isWorkingDay": true,
+            "cutOffTime": "11:30"
+          },
+          "friday": {
+            "isWorkingDay": true,
+            "cutOffTime": "11:30"
+          },
+          "saturday": {
+            "isWorkingDay": true,
+            "cutOffTime": "15:45"
+          }
+        },
+        "additionalDaysOff": [
+          "2021-12-24",
+          "2021-12-25"
+        ]
+      }
+    }
+  ]
+}

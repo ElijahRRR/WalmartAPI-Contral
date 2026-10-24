@@ -1391,6 +1391,26 @@ CREATE TABLE IF NOT EXISTS ops.node_validations (
     PRIMARY KEY (store, node)
 );
 
+-- 建仓请求台账(node_create,2026-10-24 所有者定稿:建仓改由 cli 手动执行)。
+-- POST shipnodes 不幂等(重发 = 重名建两个仓),所以**先 INSERT pending 再调接口**:
+--   200 ⇒ created(ship_node 填生成的 FC ID);4xx ⇒ failed(确认未达);
+--   网络中断 / 5xx / 200 读不出节点 ⇒ 留 pending,下次按仓名 GET shipnodes 反查:
+--   在册 ⇒ 收编 created;超宽限期(services/ship_nodes.PENDING_GRACE_MINUTES)
+--   仍不在 ⇒ failed「反查未见」后才允许重发。唯一读写者 services/ship_nodes。
+CREATE TABLE IF NOT EXISTS ops.ship_node_requests (
+    id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    store           text NOT NULL,
+    ship_node_name  text NOT NULL,        -- 防重键(同店同名不重建)
+    payload         jsonb NOT NULL,       -- 发出去的 shipNode[] 元素原文
+    status          text NOT NULL,        -- pending / created / failed
+    ship_node       text,                 -- 沃尔玛生成的 FC ID(created 时有)
+    note            text,                 -- 被拒原文 / 反查结论
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    settled_at      timestamptz
+);
+CREATE INDEX IF NOT EXISTS ship_node_requests_open_idx
+    ON ops.ship_node_requests (store, ship_node_name, status);
+
 -- 店铺日报 KPI:每 (店铺, 日期) 一行,32 列语义对齐旧飞书「店铺KPI」表
 CREATE TABLE IF NOT EXISTS ops.store_kpi_daily (
     store            text NOT NULL,

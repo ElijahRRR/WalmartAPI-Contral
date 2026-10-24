@@ -3,6 +3,9 @@
   get_partner_id()    GET /v3/settings/partnerprofile      → Partner ID
                       (无自建仓时的 Virtual Fulfillment Center ID)
   list_ship_nodes()   GET /v3/settings/shipping/shipnodes  → 该店的发货节点
+  list_carrier_methods()  GET /v3/settings/shipping/carriers → 可用承运方法(建仓前校验)
+  create_ship_node()  POST /v3/settings/shipping/shipnodes → 建仓(node_create 专用,
+                      2026-10-24 所有者定稿;不重试,三种结局三种信号,见函数注)
 
 用途:MP_ITEM 的 orderable.inventory[].fulfillmentCenterID 必填。官方原文:
 **建了自建仓就填该仓的 shipNode**;"没建过 FC、走 Default Node (Virtual) 时
@@ -106,3 +109,101 @@ def list_ship_nodes(store: dict) -> dict[str, dict]:
     """输入:店铺 → 输出:{shipNode: 节点字段};进程内缓存(节点不会天天变)。"""
     return dict(_cached_ship_nodes(store["client_id"], store["client_secret"],
                                    store.get("proxy")))
+
+
+# ── 建仓(2026-10-24 所有者定稿:建仓改由 `node_create` 工作流执行)──────────
+# 此前蓝图把 POST shipnodes 标为「人工 runbook,不自动化」(multi_node_plan §8)。
+# 所有者 2026-10-24 翻案:「建仓是在我有需要的时候给信息并手动执行创建的」——
+# 仍是人触发、人给信息,只是从 Seller Center 点鼠标换成 cli 一条命令。
+# 运费模板绑定与「维护仓库」切换**仍然人工**(两者是独立决策,见 multi_node_plan §7)。
+#
+# 官方(developer.walmart.com create-fulfillment-center,2026-10-24 核验):
+#   body = {"shipNodeHeader": {"version": "1.2"}, "shipNode": [ {...} ]}
+#   必填 shipNodeName / status / timeZone / postalAddress / 至少一种 shipping method;
+#   响应 = 节点数组,带生成的 shipNode(17 位数字)与 nodeType=PHYSICAL。
+#   原件存 refdata/specs/ship_node_create_1.2_sample.json(守门测试读它校键集合)。
+# 节点元素怎么组是业务(services/ship_nodes.build_node),本层只负责把接口调对。
+
+#: shipNodeHeader.version —— **唯一出生地**(官方样例 2026-10-24 核验值)
+SHIP_NODE_SPEC_VERSION = "1.2"
+
+
+class ShipNodeOutcomeUnknown(RuntimeError):
+    """建仓 POST 发出去了但不知道到没到(网络中断 / 5xx):**既不算成功也不算未达**。
+
+    调用方必须把台账行留在 pending、下次用 GET shipnodes 反查收编(写操作永不
+    自动兜底;「不知道到没到」不许当失败去重发 —— 重发 = 重名建两个仓)。
+    """
+
+
+def _parse_rows(data, *keys: str) -> list[dict]:
+    """输入:响应(裸数组或包在 payload/elements/… 里)→ 输出:字典行列表;认不出 []。"""
+    rows = data
+    if isinstance(data, dict):
+        for key in keys:
+            v = data.get(key)
+            if isinstance(v, list):
+                rows = v
+                break
+        else:
+            rows = []
+    if not isinstance(rows, list):
+        return []
+    return [r for r in rows if isinstance(r, dict)]
+
+
+def list_carrier_methods(store: dict) -> list[dict]:
+    """输入:店铺 → 输出:该店可用承运方法 [{carrierMethodName, carrierMethodType, …}]。
+
+    GET /v3/settings/shipping/carriers(10/min)。**不缓存**:只在建仓前校验
+    一次「填的承运商沃尔玛认不认」,不值得一个 lru。非 200 抛 RuntimeError
+    (文案「沃尔玛返回 NNN」是 store_retry.diagnose 认的格式)。
+    """
+    _client.rate_acquire("settings.carriers", store["client_id"])
+    token = _client.get_token(store["client_id"], store["client_secret"],
+                              store.get("proxy"))
+    status, _, data = _client.safe_get_ex(
+        f"{_client.base_url()}/v3/settings/shipping/carriers",
+        token, store["client_id"], store.get("proxy"), max_retries=3)
+    if status != 200:
+        raise RuntimeError(f"carriers 查询失败,沃尔玛返回 {status}: {str(data)[:200]}")
+    rows = _parse_rows(data, "payload", "elements", "carrierMethods")
+    if not rows:
+        raise RuntimeError("carriers 返回 200 但没解析出任何承运方法(响应形状变了?):"
+                           + str(data)[:200])
+    return rows
+
+
+def create_ship_node(store: dict, node: dict) -> dict:
+    """输入:店铺 + 一个节点元素(官方 shipNode[] 元素形状)→ 输出:沃尔玛回的该节点(含 shipNode)。
+
+    POST /v3/settings/shipping/shipnodes(10/min),**不自动重试**(非幂等:重发
+    = 重名建两个仓)。三种结局分三种信号,调用方按它定台账:
+      · 200 且解析出恰一个节点 → 返回它(成功);
+      · 4xx(含 401/403/400)→ RuntimeError(**确认未达**,沃尔玛明确拒了);
+      · status None / 5xx / 200 但解析不出 → ShipNodeOutcomeUnknown(不知道到没到)。
+    成功后清掉 `list_ship_nodes` 的进程内缓存:同进程里紧接着的校验要看得见新仓。
+    """
+    _client.rate_acquire("settings.shipnodes.create", store["client_id"])
+    token = _client.get_token(store["client_id"], store["client_secret"],
+                              store.get("proxy"))
+    body = {"shipNodeHeader": {"version": SHIP_NODE_SPEC_VERSION},
+            "shipNode": [node]}
+    status, _, data = _client.safe_post_ex(
+        f"{_client.base_url()}/v3/settings/shipping/shipnodes",
+        token, store["client_id"], store.get("proxy"), json_body=body,
+        max_retries=0)
+    if status is None or status >= 500:
+        raise ShipNodeOutcomeUnknown(
+            f"建仓请求结局不明,沃尔玛返回 {status}: {str(data)[:200]}")
+    if status != 200:
+        raise RuntimeError(f"建仓被拒,沃尔玛返回 {status}: {str(data)[:300]}")
+    rows = _parse_rows(data, "payload", "elements", "shipNodes", "shipNode")
+    created = [r for r in rows if r.get("shipNode")]
+    if len(created) != 1:
+        # 200 却读不出那一个节点:多半已经建成只是形状变了 —— 当「不明」留 pending,
+        # 由反查按名字收编,绝不重发
+        raise ShipNodeOutcomeUnknown(
+            f"建仓返回 200 但没解析出恰一个节点({len(created)} 个):{str(data)[:200]}")
+    _cached_ship_nodes.cache_clear()
+    return created[0]

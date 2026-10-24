@@ -292,6 +292,10 @@ _RATE_BUCKETS: dict[str, tuple[int, float]] = {
     "feeds.post.MP_INVENTORY": (40, 3600.0),    # 官方 50/hour(多仓批次 2 启用;与 v1.4 各自独立桶)
     "settings.partnerprofile": (40, 60.0),      # 官方 50/min(tsv:166),lru 缓存后每店仅首次调
     "settings.shipnodes": (40, 60.0),           # 官方 50/min(tsv:152),同样 lru 缓存
+    # 建仓两件(2026-10-24 所有者定稿:建仓由 node_create 按人给的信息手动执行):
+    # 都是官方 10/min ⇒ 上限 ≤10 自动落稀缺桶跨进程共享;一次建仓每店各调一次
+    "settings.carriers": (8, 60.0),             # GET /v3/settings/shipping/carriers 官方 10/min(tsv:165)
+    "settings.shipnodes.create": (8, 60.0),     # POST /v3/settings/shipping/shipnodes 官方 10/min(tsv:155)
     "prices.put": (80, 3600.0),                 # PUT /v3/price 官方 100/hour(旧 README 200/min 是错的)
     "inventory.put": (160, 60.0),               # PUT /v3/inventory 官方 200/min
     # ⚠ 分节点写与 legacy 写**共用官方那 200/min 吗?官方未明**。分桶登记是

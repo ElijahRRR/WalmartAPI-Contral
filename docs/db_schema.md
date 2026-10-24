@@ -1199,6 +1199,33 @@ CREATE TABLE ops.node_validations (
 两个常量只在 `store_limits` 出生。排障:`SELECT * FROM ops.node_validations ORDER BY validated_at`
 看每家配置店最近一次被认过的时间;行不存在 = 从没认过(新填 / 填错被抹)。
 
+### ops.ship_node_requests(建仓请求台账,2026-10-24)
+
+`node_create` 的防重状态(所有者定稿 2026-10-24 建仓转正,`docs/multi_node_plan.md` 同日节)。
+`POST shipnodes` 不幂等(重发 = 重名建两个仓),所以**先 INSERT pending 再调接口**。
+
+```sql
+CREATE TABLE ops.ship_node_requests (
+    id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    store           text NOT NULL,
+    ship_node_name  text NOT NULL,        -- 防重键(同店同名不重建)
+    payload         jsonb NOT NULL,       -- 发出去的 shipNode[] 元素原文
+    status          text NOT NULL,        -- pending / created / failed
+    ship_node       text,                 -- 沃尔玛生成的 FC ID(created 时有)
+    note            text,                 -- 被拒原文 / 反查结论
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    settled_at      timestamptz
+);
+CREATE INDEX ship_node_requests_open_idx ON ops.ship_node_requests (store, ship_node_name, status);
+```
+
+状态机:`pending → created | failed`。200 ⇒ created;4xx ⇒ failed(确认未达);网络中断 /
+5xx / 200 读不出节点 ⇒ **留 pending**。下次对同店同仓名重跑:先 `GET shipnodes` 反查,在册 ⇒
+收编 created;不在且超 `services/ship_nodes.PENDING_GRACE_MINUTES`(10 分钟)⇒ failed
+「反查未见」后才允许重发;期内 ⇒ 该店本轮按兵不动。**唯一读写者 `services/ship_nodes`**。
+排障:`SELECT * FROM ops.ship_node_requests ORDER BY id DESC` —— 一家店建过几次仓、哪次被拒
+为什么,全在 note。
+
 ### ops.dispositions(处置建议台账:「建议」与「执行」的分界面)
 
 两条链共用一张表:`maintenance_scan`/`problem_scan` 写建议,

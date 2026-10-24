@@ -79,6 +79,22 @@ TRO 跨仓边界(暂放)。
 maintenance/list_new)→ 按域停旧切换。
 **✅ 2026-08-17 全部完成** —— 验收记录见 `docs/production_cutover.md` §九。
 
+### 2026-10-24 建仓转正:`node_create` 给店铺账户新建物流中心(所有者定稿)
+
+**所有者原话**:「我需要一个给账户添加物流中心的功能」;追问定稿:「建仓是在我有需要的
+时候给信息并手动执行创建的」「国内仓收的」。推翻 `docs/multi_node_plan.md` §8「不自动建仓、
+人工 runbook」与蓝图预留段的「不自动化」—— 但**不是自动化**:仍是人触发、人给信息
+(`-p` 参数,不建飞书表),只是从 Seller Center 点鼠标换成 `python cli.py node_create`。
+**运费模板绑定、「维护仓库」切换仍人工**,摘要提醒顺序(配模板 → 等 4 小时 → 填 FC ID)。
+
+落地:`api/settings.create_ship_node` / `list_carrier_methods`(#38/#39,各 8/min 持久桶,
+POST 不重试、三种结局三种信号)、`services/ship_nodes`(载荷纯函数 + 台账
+`ops.ship_node_requests`:先 pending 再 POST、同名不重建、不明留 pending 下次反查收编、
+宽限 10 分钟按兵不动)、`workflows/node_create`(DANGEROUS,永不进调度,店维失败标准)、
+事件码 `ship_node_created`。守门 `tests/test_node_create.py`(载荷键集合对官方原件
+`refdata/specs/ship_node_create_1.2_sample.json`)。官方文档三处空白(shippingDetails 是否
+必带 / customNodeId 唯一性 / 国家码)待第一次真建实测回填 multi_node_plan 同日节。
+
 ### 2026-10-22 点名新品先审核后分配 + 定向清单落占用
 
 `product_audit -p asins=<逗号分隔ASIN> -p refresh=1` 复用已有同轮补采闭环，

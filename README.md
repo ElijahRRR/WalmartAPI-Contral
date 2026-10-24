@@ -9,7 +9,7 @@
 python cli.py <workflow> [-p key=value ...] [--dry-run]
 ```
 
-- **84 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
+- **86 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
   类目映射、店铺分配、KPI 日报八个业务域;
 - **13 条自动任务**在生产运行(电脑 launchd 4 条高频 + 智能体定时任务 9 条每日/每周);
 - **PostgreSQL 17** 单库五 schema(56 表 / 14 视图)为唯一权威状态;
@@ -47,8 +47,19 @@ workflows 可以调 services 和 api;api **不准** import services;任何层**�
 **3. 一切路径、token、表 ID、服务器地址只准从 `registry/` 取。** 任何文件出现硬编码的
 飞书 token、表 ID、绝对路径、IP,都是违规。新增外部资源先登记进 registry 再引用。
 
-**4. 沃尔玛 API 必须走 `api/_client.py`,每店铺固定出口代理,严禁直连。**
-每个店铺凭证绑定固定出口 IP,直连会导致店铺关联封号。这是业务生死线。
+**4. 沃尔玛 API 必须走 `api/_client.py`;出口走法只由凭证表决定。**
+(所有者定稿 2026-10-21;判据唯一出处 `services/stores.proxy_of`)
+
+| 凭证表的代理三件套(类型 / IP / 端口) | 走法 |
+|---|---|
+| **填齐**(账号密码可选) | **必须**走这个代理;连不上按原逻辑处理(代理无效/代理波动 → 串行补试 → 缺席点名 → 链尾重赛),**不许退成直连** |
+| **五个字段全空** | **直连**(`proxy=None`) |
+| **只填了一半** | **整店拒跑并点名** —— 填了一半说明本来要走代理,当没填处理就是拿真实店铺凭证裸连沃尔玛 |
+
+**允许多个凭证共用同一个代理。** 共享出口(直连共享本机 IP、多店共用一个代理)
+会被沃尔玛用来做店铺关联,这个风险由所有者承担;代码的责任是**忠实执行 +
+每轮点名**(`services/stores._log_egress` 把"直连几家 / 半配被排除几家 / 哪几家
+共用一个代理"打进日志),**只告警不拦**。
 
 ### 三条安全纪律
 
@@ -120,7 +131,7 @@ maintenance      (DANGEROUS=True,纯执行件,只消费建议行,自己不做决
 
 | 层次 | 并发度 | 出处 |
 |---|---|---|
-| **跨店** | 24 | `services.stores.STORE_WORKERS` —— 每店有自己的固定出口代理,配额按 `(store, endpoint)` 计,店与店不抢同一个令牌桶 |
+| **跨店** | 24 | `services.stores.STORE_WORKERS` —— 配额按 `(store, endpoint)` 计,`api/_client` 的令牌桶按 `(client_id, bucket)` 记,店与店不抢同一个桶。⚠ 这里曾拿"每店有自己的固定出口代理"当论据,2026-10-21 起允许共用代理/直连,**论据换成令牌桶的键,结论不变**;共用出口共享的是带宽与连接池(吞吐问题),不是配额 |
 | **店内跨接口** | 各链自定 | 按端点配额定(如 `catalog_sync._FILL_WORKERS=8` 对应 items.get 800/min) |
 | **店内同接口** | 1(串行) | 同店同端点是同一个桶,并发只会让自己排队等退避 |
 | **审核判定** | 默认 128 | `product_audit -p workers=N`;线程等的是 LLM 的 HTTP,不是 CPU。**按 PG `max_connections` 余量自动钳并在摘要里说明** |
@@ -286,7 +297,7 @@ V4.1 Flash 顶替、按 Flash 计费 —— 也就是今天不报错,但拿回�
 |---|---|---|
 | `catalog_sync` | 调 | 全店扫沃尔玛在架商品 + 库存 → `catalog.walmart_items`。**它是几乎所有判据的现值来源**,链里必须排第一 |
 | `item_id_sync` | 调 | 用沃尔玛 On-request **ITEM 报表**补 `walmart_items.item_id`(数字 itemId 只有报表批量给)。每天只为有缺口的店各拿一份报表(创建每店每小时一次、生成 15–45 分钟),先落台账 `ops.report_requests` 再调接口,超时/限流下轮接着;写库**报表为准**;首轮 `-p all=1`,探针 `-p store=X -p probe=1`。飞书 itemId 列仍由 catalog_sync 投影 |
-| `product_refresh` | 危 调 | 在架产品全量重推采集(维护链的数据新鲜度源头)。`-p wait=1` 阻塞等采完 |
+| `product_refresh` | 危 调 | 在架产品全量重推采集(维护链的数据新鲜度源头;凭证未启用的店不推,2026-10-22)。`-p wait=1` 阻塞等采完 |
 | `product_ingest` | 调 | 采集服务增量 → `catalog.products` / `snapshots`。**全项目唯一从采集器取数的工作流**;游标在 `ops.cursors`,空页不推进 |
 | `scrape_missing` | 危 | 给库里缺亚马逊数据的产品补采(分类分档 + 冷却期) |
 | `brand_scrape` | | 缺品牌的 C/E 类 ASIN:推采集 → 摄取 → 品牌入账 |
@@ -330,7 +341,7 @@ Made in USA 五条硬拒,外加一条 0 分软证据(品牌黑名单扫文案,**
 
 | 工作流 | | 做什么 |
 |---|---|---|
-| `product_audit` | 危 调 | 审核主流程。判定落 `audit.audit_runs`/`audit_hits`,结论写 `catalog.products` 五列。`-p from_sheet=1` 由上架表驱动并把结论投影回表 D~I(标题/PT/结果/类别/具体内容/日期);缺数据的行**同轮**推采集 → 等采完 → 就地摄取 → 本轮判掉。加 `-p force=1` 则 F 列(审核结果)为空的**一律重判**(库里已有结论的也重判,不是回填);`-p repts=1` 按**飞书类目表判据变更**取候选(risk_sync 落的台账,不看版本号) |
+| `product_audit` | 危 调 | 审核主流程。判定落 `audit.audit_runs`/`audit_hits`,结论写 `catalog.products` 五列。`-p from_sheet=1` 由上架表驱动并把结论投影回表 D~I(标题/PT/结果/类别/具体内容/日期);缺数据的行**同轮**推采集 → 等采完 → 就地摄取 → 本轮判掉。加 `-p force=1` 则 F 列(审核结果)为空的**一律重判**(库里已有结论的也重判,不是回填);`-p repts=1` 按**飞书类目表判据变更**取候选(risk_sync 落的台账,不看版本号);`-p asins=A,B -p refresh=1` 点名新品:12 小时内没有快照的先同轮补采再审(12 小时内刚采过的不重推,沿用采集冷却),不与 from_sheet 混用,仍采不回的逐个原因进摘要(前 30 个) |
 | `audit_why` | | 这个 ASIN 为什么是这个结论(只读排查) |
 | `audit_replay` | | **回放评估**(手动跑,不进调度):拿沃尔玛自己的裁决考现在这条链。反例 = `walmart_items.unpublished_reasons` 归类主码 ∈ POLICY/IP/CONTENT/BRAND/PROHIBITED_FINAL 的下架品(期望 reject,期望类别按 `error_taxonomy` 抽出的政策名 join 政策表;PT_WRONG/GATED 不进集),正例 = 在架在售且从没给过下架原因的品(期望 pass);`sku→asin` 走 `services/sku_asin`。每个样本调**与生产同一条** `audit_rules.audit_one`,与沃尔玛裁决 / 旧链最近一次 `audit_runs` 三方对照,出召回、类别准确率 + 混淆表、**正例误伤新旧并排**(所有者底线:新链不高于旧链)、新旧一致率、按置信分层错误率、pending 分层、成本与耗时。⚠ **只写** `audit.replay_results` 与 `<DATA_ROOT>/reports/audit_replay.txt`(判定链自己会写 `llm_cache`,那是缓存);`catalog.products`/`audit_runs`/`audit_hits`/事件/飞书**一个字都不碰**。`--dry-run` = 抽样 + 规模 + 预估成本,零 LLM。参数 `neg`(600)/`pos`(400)/`seed`/`tag`/`workers`/`limit_per_category`。⚠ **样本身份是 `run_tag` 不是 `seed`**:该 tag 已有行就**重放那一批 asin**(候选面 `walmart_items` 天天被 catalog_sync 重写,同 seed 隔天已不是同一批);**旧链基线**取每个 asin 最近一次 `audit_version` 不是当前版本的 `audit_runs` 行(那一列 2026-09-02 B2 补,否则 `mode=stale` 跑过之后就是新链自己跟自己比)|
 | `audit_calibrate` | | 双跑校准报告 |
@@ -379,9 +390,9 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 
 | 工作流 | | 做什么 |
 |---|---|---|
-| `maintenance_scan` | 调 | 扫描定性,产建议行(改价 / 改库存 / 改标题 / 删除)。判据全在 `services.maintenance_intents.classify()` —— 全项目唯一一处决定"这个在线商品该拿它怎么办"。改库存跟随亚马逊时:<5 写 0(所有店),过了门槛写 min(亚马逊库存, 限额表「最大库存」N)(2026-09-25;首行报「封顶 N」) |
+| `maintenance_scan` | 调 | 扫描定性,产建议行(改价 / 改库存 / 改标题 / 删除);先判凭证是否启用、再判店铺是否终止,任一步不过即整店不维护(2026-10-22)。判据全在 `services.maintenance_intents.classify()` —— 全项目唯一一处决定"这个在线商品该拿它怎么办"。改库存跟随亚马逊时:<5 写 0(所有店),过了门槛写 min(亚马逊库存, 限额表「最大库存」N)(2026-09-25;首行报「封顶 N」) |
 | `maintenance` | 危 调 | 维护执行件。改价 ≤5 / 改库存 ≤10 走单品 PUT,否则走 feed;标题恒 feed |
-| `problem_scan` | 调 | 问题商品扫描定性(一切非 PUBLISHED 的在架行 + 审核判拒但仍在架;2026-08-28 定稿一律建议删除,反补退役)。尾段顺手收黑名单并投影飞书 |
+| `problem_scan` | 调 | 问题商品扫描定性(一切非 PUBLISHED 的在架行 + 审核判拒但仍在架;2026-08-28 定稿一律建议删除,反补退役;先判凭证启用、再判店铺终止,任一步不过整店不处置,2026-10-22)。尾段顺手收黑名单并投影飞书 |
 | `problem_product_cleanup` | 危 调 | 问题商品处置执行件(删除 / 停用) |
 | `error_reclass_report` | | 报错归类对照(只读排查,手动跑):同一批生产数据在 `services.error_taxonomy` 16 码下的主码分布 / unknown 全文 / 政策表缺口 / feed 政策族分类 / 已产生后果的黑名单行。⚠ 2026-09-04 换轨完成后**退役了「旧码 → 新码迁移矩阵」那一面**,旧引擎 `problem_products.categorize()` 一并删除 |
 | `error_reclass` | | **存量报错按新码重新归类并回填**(手动跑;所有者 2026-09-03「标准不统一,审核误差很大」)。写 `audit.walmart_error_records` 与 `catalog.asin_blacklist` 的 `taxonomy_*` 新列,**老列与判定行为一个字不动**;原文四级优先(records 全文 → events 病历 → items 当前值 → 本表 200 字符样本,都没有就留 NULL 不猜);`taxonomy_version` 天然分页,跑一半可直接重跑。⚠ 报出「依据在新码下站不住」的黑名单行,但**不放行任何一条** —— 那是另一次裁决 |
@@ -389,6 +400,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 | `product_clear` | 危 调 | 飞书停用/删除表驱动的商品清理 |
 | `node_clear` | 危 调 | 把**受管仓以外**的节点库存清零(搬仓收尾,一次性,不进调度):切到受管仓后旧节点的存量货自动链一律不碰,等受管仓充起来再用它清空旧仓。2026-09-25 起**不调接口读库存、不逐条写**:从库里的分仓库存(`catalog.item_node_inventory`)查出要清的「SKU × 旧仓」,按「店 × 旧仓」分批用分仓库存 feed(MP_INVENTORY)写 0,结果由 feed_poll 回写。判断条件:**维护仓以外有货就清**(不再区分维护仓是否已接管,2026-09-25 所有者定稿;维护仓还没有记录的商品清完在所有仓都是 0,靠维护链往维护仓补货,非亚马逊来源的就此停售);维护仓永不清;同步时没给 shipNode 的数量不碰。不带 `-p store` = 所有填了「维护仓库」且校验通过的店;第一次真跑先只跑一家店看回执 |
 | `weight_fix` | 危 调 | **按名单改已上架商品的发货重量**(临时工具,不进调度;所有者 2026-10-16):读 `-p file=` 的 xlsx/csv,只认「店铺」「SKU」两列,把名单里的品的发货重量统一改成 `-p weight=`(缺省 11 磅)。走 MP_MAINTENANCE 部分更新,载荷只有 sku + UPC + ShippingWeight,价格、库存、标题都不碰(字段依据官方规范原件,摘录在 `refdata/specs/`)。目录里查不到 / 已缺席 / 没 UPC 的不发并点名。回执成功不等于改成了:**第一次真跑先 `-p store=<店> -p limit=1`**,后台确认重量变了再跑全量。只改线上值,不改上架链「> 11 磅写 1 磅」的规则 |
+| `node_create` | 危 | 给店铺账户**新建一个自发货物流中心**(发货节点,`POST shipnodes`;2026-10-24 所有者定稿,推翻 multi_node_plan §8「不自动建仓」:建仓是在有需要时**人给信息、人手动执行**,永不进调度)。信息全走 `-p`(清单见 `services/ship_nodes.PARAM_HELP`,必填 name/address1/city/state/country/postal/tz;L001 实证国内仓 country=CN、tz=CST;`distributorSupportedServices` 缺省发 `[]`,首跑实证不能为 null),`-p store=A,B` 可多店同一个仓(共用地址点名不拦)。防重:发前 `GET shipnodes` 同名不重建、先落 `ops.ship_node_requests` pending 再 POST、结局不明留 pending 下次反查收编(宽限 10 分钟内按兵不动);填了 `carrier` 先对该店 `GET carriers` 校验。建完**不替你填**「维护仓库」、不做运费模板(两件人工,摘要提醒;顺序:配模板 → 等 4 小时 → 再填 FC ID) |
 | `node_probe` | | 多仓实测探针(纯只读):对指定店验 `docs/multi_node_plan.md` §2.4 的四条官方文档空白(shipnodes 有无 Virtual Node / 单品库存端点真形状 / 订单行带不带 shipNode / 新节点何时出现在库存响应)。每新开一个仓的店跑一次,输出贴回给 AI 核对 |
 
 **定价口径**:落地价 =(亚马逊单价 + 运费)× 区间倍率,按**配送方式**(FBA/FBM)
@@ -450,7 +462,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 | `alloc_audit` | | 动工前的存量审计 + 数据探针(只读) |
 | `alloc_products` | | 产品分体检 |
 | `alloc_stores` | | 店铺经营水平体检 |
-| `alloc_plan` | 危 | 产品分配方案 |
+| `alloc_plan` | 危 | 产品分配方案。`-p from_sheet=1` 点名分配(产品分配表);`-p from_csv=<店铺,ASIN 清单>` 定向清单只落占用、不写上架表(先 `--dry-run`;不过闸一次报全、整批拒绝) |
 | `alloc_push` | 危 | 已落占用 → 追加进飞书上架表 A/B 两列(分配链与上架链的接口) |
 | `alloc_backfill` | 危 一 | 存量在线商品 → 占用台账 |
 | `claim_audit` | | 占用台账对账:已落的占用现在还站得住吗 |
@@ -473,6 +485,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 | `db_init` | | 执行 `refdata/schema.sql` 建五 schema(幂等)+ 只读角色 |
 | `init_data_root` | | 初始化 `<DATA_ROOT>` 目录结构与 `.env` 模板(幂等) |
 | `ping_stores` | | 端到端验收:读凭证表 → 每店经代理调只读端点 → 汇总 |
+| `egress_preview` | | **只读**预览:每家店会走代理 / 直连 / 还是因代理半配被拦;点名「本次改动新增进名单」与「启用从未勾过」的店(出口规则改动的配套闸,见 plan.md 2026-10-21) |
 | `launchd_install` | 危 | 生成高频链的 launchd plist(装完就是真调度) |
 | `skill_export` | | 生成智能体定时任务的技能包(从调度表渲染) |
 | `cleanup_history_import` | 一 | 旧问题商品三笔历史入库 |
@@ -545,6 +558,7 @@ vi ~/walmart_data/.env                  # 填飞书凭据、代理、DSN 等(密
 createdb walmart_data                   # PostgreSQL 17
 python cli.py db_init                   # 五 schema + 只读角色(幂等)
 # 飞书建「店铺凭证表」,app_token/table_id 填进 .env(字段名见 registry/resources.py)
+python cli.py egress_preview            # 只读:先看清谁走代理、谁直连、谁被拦
 python cli.py ping_stores               # 每店经代理连通沃尔玛 = 地基就绪
 ```
 

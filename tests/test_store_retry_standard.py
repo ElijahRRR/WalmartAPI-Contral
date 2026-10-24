@@ -227,6 +227,12 @@ def test_classify_names_the_actual_culprit():
     assert store_retry.diagnose(
         _client.StoreProxyError("T", ProtocolError("Malformed reply"))) \
         == "代理波动"
+    # ★ 没配代理、走直连的店(2026-10-21 起允许):同一个异常类,但归「网络未达」。
+    # 报成「代理无效/代理波动」会把人指去改一个根本不存在的代理配置。
+    assert store_retry.diagnose(_client.StoreProxyError(
+        "T", httpx.ConnectError("timed out"), direct=True)) == "网络未达"
+    assert store_retry.diagnose(_client.StoreProxyError(
+        "T", httpx.ProxyError("Invalid username/password"), direct=True)) == "网络未达"
     # 沃尔玛端点回了状态码(api 层 "返回 {status}" 格式):与本地无关
     assert store_retry.diagnose(RuntimeError(
         "GET /v3/items 返回 500(店铺 X): {}")) == "沃尔玛500"
@@ -632,6 +638,7 @@ def test_withdraw_sql_carries_the_exclude_stores_clause():
 
     from services import dispositions as ds
     assert "NOT (d.store = ANY(%(exclude)s::text[]))" in ds._WITHDRAW_SQL
+    # 空 keep 分支 2026-10-22 提成模块级常量(让参数铸型守门扫得到)
+    assert "NOT (d.store = ANY(%(exclude)s::text[]))" in ds._WITHDRAW_ALL_SQL
     src = inspect.getsource(ds.withdraw_stale)
-    assert src.count("NOT (d.store = ANY(%(exclude)s::text[]))") >= 1  # 空 keep 分支
-    assert "exclude_stores" in src
+    assert "_WITHDRAW_ALL_SQL" in src and "exclude_stores" in src

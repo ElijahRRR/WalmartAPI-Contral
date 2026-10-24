@@ -58,7 +58,7 @@ def run(params: dict) -> str:
         return "⚠ 缺参数:-p store=<店铺名>(对哪家店探测)"
     matched = stores_svc.load_stores(filter_names=[name])
     if not matched:
-        return f"⚠ 店铺 {name} 不在可调用列表里(未启用/没配代理/没凭证?)"
+        return f"⚠ 店铺 {name} 不在可调用列表里(未启用/没凭证/代理只填了一半?)"
     store = matched[0]
     lines = [f"多仓实测探针 · {name}(全部只读)"]
 

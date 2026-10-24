@@ -598,10 +598,11 @@ def test_is_settled(body, settled):
 def test_refresh_targets_sql_gates():
     from workflows import product_refresh as pr
     # 只推在线 + PUBLISHED + 店铺 ACTIVE(无 KPI 记录 fail-open);跨店去重
+    # (按身份键 GROUP BY —— CTE 里的 DISTINCT ON 是取每店最新一行,不是这一层)
     assert "missing_since IS NULL" in pr._SQL_TARGETS
     assert "published_status = 'PUBLISHED'" in pr._SQL_TARGETS
     assert "s.store_status IS NULL OR upper(s.store_status) = 'ACTIVE'" in pr._SQL_TARGETS
-    assert "SELECT DISTINCT" in pr._SQL_TARGETS
+    assert pr._SQL_TARGETS.rstrip().endswith("GROUP BY 1\nORDER BY 1")
     assert "coalesce(ls.source_key, w.sku)" in pr._SQL_TARGETS
     assert pr.TIMEOUT_HOURS == 1 and pr.DANGEROUS is True
 
@@ -631,7 +632,7 @@ def test_refresh_filters_non_asin_skus(monkeypatch):
         def __enter__(self): return self
         def __exit__(self, *a): return False
         def execute(self, sql, params=None): pass
-        def fetchall(self): return [(s,) for s in skus]
+        def fetchall(self): return [(s, True) for s in skus]
 
     class _Conn:
         def __enter__(self): return self
@@ -639,9 +640,71 @@ def test_refresh_filters_non_asin_skus(monkeypatch):
         def cursor(self): return _C()
 
     monkeypatch.setattr(pr.db, "pg_conn", lambda: _Conn())
-    ok, dropped = pr._targets()
+    monkeypatch.setattr(pr.stores_svc, "enabled_or_note", lambda: ({"T1"}, ""))
+    ok, dropped, note = pr._targets()
     # 11 位、小写、自定义编码、空串全过滤掉
-    assert ok == ["B0ABCDEFGH", "B0Z9Y8X7W6"] and dropped == 4
+    assert ok == ["B0ABCDEFGH", "B0Z9Y8X7W6"] and dropped == 4 and note == ""
+
+
+def test_refresh_skips_stores_whose_credentials_are_not_enabled(monkeypatch):
+    """凭证没勾「启用」的店不推采集(所有者 2026-10-22):它的在架行是冻结的,
+    推了只是白耗采集预算。①判不出(名录读不到 / 空集)不剔 —— 参数传 NULL。
+
+    剔掉几个要报出来(首行):只挂在停用店上的 ASIN(wanted=False)不推、计数;
+    同一 ASIN 只要还有一家启用店在架就照推(SQL 按 ASIN bool_or)。"""
+    from workflows import product_refresh as pr
+
+    assert "%(enabled)s::text[] IS NULL\n               OR w.store = ANY(%(enabled)s::text[])" \
+        in pr._SQL_TARGETS
+    assert "bool_or(" in pr._SQL_TARGETS and "GROUP BY 1" in pr._SQL_TARGETS
+    seen = {}
+    rows = [("B0ABCDEFGH", True), ("B0Z9Y8X7W6", False), ("B0QQQQQQQQ", False),
+            ("WM-CUSTOM-01", False)]   # 非 ASIN 形态的停用店行不计进"不推"
+
+    class _C:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def execute(self, sql, params=None): seen["params"] = params
+        def fetchall(self): return rows
+
+    class _Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def cursor(self): return _C()
+
+    monkeypatch.setattr(pr.db, "pg_conn", lambda: _Conn())
+    monkeypatch.setattr(pr.stores_svc, "enabled_or_note", lambda: ({"T2", "T1"}, ""))
+    ok, dropped, note = pr._targets()
+    assert seen["params"] == {"enabled": ["T1", "T2"]}
+    assert ok == ["B0ABCDEFGH"] and dropped == 0
+    assert note == "凭证未启用的店独有的 ASIN 2 个不推"
+    monkeypatch.setattr(pr.stores_svc, "enabled_or_note",
+                        lambda: (None, "⚠ 在营名录读不到(FeishuError),本轮不按「启用」剔店"))
+    rows[:] = [("B0ABCDEFGH", True), ("B0Z9Y8X7W6", True)]   # NULL 时 SQL 全给 True
+    ok, _d, note = pr._targets()
+    assert seen["params"] == {"enabled": None} and ok == ["B0ABCDEFGH", "B0Z9Y8X7W6"]
+    assert note == "⚠ 在营名录读不到(FeishuError),本轮不按「启用」剔店"
+
+
+def test_refresh_first_line_names_the_roster_drop(monkeypatch):
+    """①剔掉的 ASIN 个数 / 名录判不出的喊话都在**首行**(链通知只显示首行)。"""
+    from workflows import product_refresh as pr
+
+    monkeypatch.setattr(pr, "_targets", lambda: (
+        ["B0ABCDEFGH"], 0, "凭证未启用的店独有的 ASIN 2 个不推"))
+    monkeypatch.setattr(pr, "_check_open", list)
+    first = pr.run({}).splitlines()[0]
+    assert "[DRY-RUN]" in first and "凭证未启用的店独有的 ASIN 2 个不推" in first
+
+    monkeypatch.setattr(pr.scraper, "submit_batch",
+                        lambda name, chunk: {"batch_id": 7, "inserted": len(chunk)})
+    monkeypatch.setattr(pr.batches, "prioritize", lambda name, bid: None)
+    monkeypatch.setattr(pr.batches, "record", lambda *a, **k: None)
+    first = pr.run({"execute": 1}).splitlines()[0]
+    assert first.startswith("全量重推:1/1") and "ASIN 2 个不推" in first
+
+    monkeypatch.setattr(pr, "_targets", lambda: ([], 0, "凭证未启用的店独有的 ASIN 3 个不推"))
+    assert "ASIN 3 个不推" in pr.run({}).splitlines()[0]
 
 
 def test_snapshot_carries_shipping_null_is_not_zero():

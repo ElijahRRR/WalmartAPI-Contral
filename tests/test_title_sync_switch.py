@@ -14,7 +14,7 @@ import re
 from pathlib import Path
 
 from services import maintenance_intents as mi
-from tests.test_maintenance import _row, _wire
+from tests.test_maintenance import _row, _wire, _zero
 from workflows import maintenance as mw
 
 
@@ -64,3 +64,26 @@ def test_executor_claims_titles_again_when_on(monkeypatch):
     out = mw.run({"execute": True})
     assert set(seen["actions"]) == set(mw.dispositions.MAINT_ACTIONS)
     assert "标题维护已整路停闸" not in out
+
+
+def test_halt_note_never_becomes_the_executors_first_line(monkeypatch):
+    """⚠ 停闸行不许当执行件首行(2026-10-19 对抗核验抓到的阻断项)。
+
+    cli 约定:摘要首行以 ⛔ 开头 = 前提不成立、什么都没做 ⇒ 判 refused、链停、
+    problem_product_cleanup 被跳过、链尾重赛不触发 —— 而 feed 其实已经发出去了。
+    落定前移到扫描件之前,首行恰好被「上一轮落定」占着,这个坑一直被盖住。
+    真跑 / dry-run / 无建议三种情形都要钉。
+    """
+    import cli
+
+    monkeypatch.setattr(mi, "TITLE_SYNC", False)
+    for intents, params in ((_zero(2), {"execute": True}),
+                            (_zero(2), {"execute": False}),
+                            ([], {"execute": True})):
+        _wire(monkeypatch, intents)
+        out = mw.run(params)
+        first = out.lstrip().splitlines()[0]
+        assert not first.startswith(cli.REFUSED_MARK), (params, first)
+        assert cli.REFUSED_MARK not in out.split("\n")[0], (params, first)
+        assert "标题维护已整路停闸" in out                 # 停闸照样天天见人
+

@@ -566,7 +566,7 @@ def wired(monkeypatch):
 
 PICK_COLS = ["order_line_id", "store", "sku", "product_name", "qty",
              "product_amount", "shipping_amount", "postal_code",
-             "sale_status", "audit_status", "audit_detail"]
+             "sale_status", "audit_status", "audit_detail", "created_at"]
 
 
 def test_run_end_to_end_pass(wired, monkeypatch):
@@ -990,12 +990,136 @@ def test_sql_selects_every_column_the_rules_read():
     from workflows import order_audit as wf
     for sql in (wf._PICK_SQL, wf._ONE_SQL):
         for col in ("order_line_id", "sku", "product_name", "qty",
-                    "product_amount", "postal_code", "audit_status"):
+                    "product_amount", "postal_code", "audit_status",
+                    "created_at"):              # 新鲜闸的行级锚点(2026-10-17)
             assert col in sql, f"待审查询漏了 {col}"
     for col in ("price", "stock_count", "delivery_days", "shipping",
                 "shipping_raw", "buybox", "scrape_params", "raw",
-                "outcome", "title"):
+                "outcome", "title", "source_id"):
         assert col in wf._SNAP_SQL, f"快照查询漏了 {col}"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  新鲜规则 + 截图同源(所有者 2026-10-17「每次的数据都是新鲜的」)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def test_snapshot_query_only_accepts_own_requests():
+    """审核链只用自己请求之后落地的快照。
+
+    10-17 事故:订单 10:20 进库,审核 10:21 借用了旧系统 09:45 采的同邮编快照
+    —— 价是 35 分钟前的,而截图没有本链台账可关联。快照查询 JOIN 台账、只收
+    请求之后落地的那些:没请求过的组合一行都不回 ⇒ 待采集 ⇒ 本轮自己采。
+    """
+    from workflows import order_audit as wf
+    sql = wf._SNAP_SQL
+    assert "JOIN ops.audit_scrape a" in sql
+    assert "a.zip = s.scrape_params ->> 'zipcode'" in sql
+    assert "s.scraped_at >= a.requested_at" in sql
+    assert "a.batch_name AS audit_batch" in sql
+    assert "a.requested_at AS audit_requested_at" in sql
+
+
+def test_judge_all_rescrapes_when_request_predates_the_order(wired, monkeypatch):
+    """同对上一单那次采集不算这一单的:请求早于本行进库 ⇒ 视同无快照 ⇒ 重采。"""
+    wf, _ = wired
+    t0 = datetime(2026, 10, 17, 10, 0, tzinfo=timezone.utc)
+    snap = _snap(audit_requested_at=t0, batch_name="wm-audit-1")
+    monkeypatch.setattr(wf, "_snapshots",
+                        lambda conn, lines: {("B0TEST0001", "10001"): snap})
+    monkeypatch.setattr(wf, "_scrape_fails", lambda conn, lines: {})
+    late = dict(LINE, created_at=t0 + timedelta(minutes=20))   # 请求在前,订单在后
+    results, want = wf._judge_all(None, [late], blacklist=set(), suppliers=SUPPLIERS)
+    assert results[0][1].status == rules.MANUAL and results[0][1].rescrape
+    assert want == [("B0TEST0001", "10001")]
+    early = dict(LINE, created_at=t0 - timedelta(minutes=20))  # 订单在前,请求在后
+    results, want = wf._judge_all(None, [early], blacklist=set(), suppliers=SUPPLIERS)
+    assert results[0][1].status == rules.PASS and want == []
+
+
+def test_fresh_gate_does_not_judge_without_timestamps():
+    """缺任一时间戳不判(生产两列都 NOT NULL;夹具/历史行才会缺),别把能判的行误扣成待采集。"""
+    from workflows import order_audit as wf
+    t0 = datetime(2026, 10, 17, 10, 0, tzinfo=timezone.utc)
+    assert wf._fresh_for({}, {"audit_requested_at": t0})
+    assert wf._fresh_for({"created_at": t0}, {})
+    assert wf._fresh_for({"created_at": "2026"}, {"audit_requested_at": t0})   # 类型混杂不冒险
+
+
+def test_snapshots_prefer_own_batch_over_newer_foreign(wired):
+    """本链请求之后旧系统又采了一次(更新):仍取本链自己那批 —— 截图与审核依据同一次采集。"""
+    wf, _ = wired
+    cols = ["asin", "price", "stock_count", "delivery_days", "shipping",
+            "shipping_raw", "buybox", "scrape_params", "raw", "outcome",
+            "scraped_at", "source_id", "title", "audit_batch", "audit_requested_at"]
+    req = datetime(2026, 10, 17, 10, 21, tzinfo=timezone.utc)
+    own = ("B0TEST0001", 10, 1, 1, 0.0, "FREE", {},
+           {"zipcode": "10001", "parse_engine": "a"},
+           {"is_fba": "FBA", "batch_name": "wm-audit-X"}, "ok",
+           req + timedelta(minutes=4), "sid-own", "T", "wm-audit-X", req)
+    foreign = ("B0TEST0001", 99, 1, 1, 0.0, "FREE", {},
+               {"zipcode": "10001", "parse_engine": "b"},
+               {"is_fba": "FBA", "batch_name": "batch_20261017_102900"}, "ok",
+               req + timedelta(minutes=9), "sid-foreign", "T", "wm-audit-X", req)
+    for order in ([own, foreign], [foreign, own]):
+        conn = FakeConn({"FROM catalog.snapshots s": (cols, order)})
+        snaps = wf._snapshots(conn, [{"sku": "B0TEST0001"}])
+        got = snaps[("B0TEST0001", "10001")]
+        assert got["source_id"] == "sid-own" and got["batch_name"] == "wm-audit-X"
+
+
+def test_judge_records_snapshot_provenance():
+    """结论里记下判定用的是哪一批、哪一条采集:取图沿它找,事后能追。"""
+    res = rules.judge(LINE, _snap(batch_name="wm-audit-X", source_id="sid-1"),
+                      SUPPLIERS, set())
+    assert res.detail["batch_name"] == "wm-audit-X"
+    assert res.detail["source_id"] == "sid-1"
+
+
+def test_payload_takes_batch_from_detail_before_ledger(wired, monkeypatch):
+    """取图先按结论里记的批次;没记的老行才回落台账按 (ASIN,邮编) 查。"""
+    wf, _ = wired
+    conn = FakeConn({
+        "FROM ops.audit_scrape": (["asin", "zip", "batch_name"],
+                                  [("B0TEST0001", "10001", "wm-audit-NEW")]),
+        "FROM ops.scrape_batches": (["batch_name"],
+                                    [("wm-audit-OLD",), ("wm-audit-NEW",)]),
+    })
+    asked: list = []
+    monkeypatch.setattr(wf.scraper, "screenshot_list",
+                        lambda name: asked.append(name) or [])
+    rows = [{"order_line_id": "PO1|SKU1", "audit_status": rules.PASS,
+             "audit_detail": {"asin": "B0TEST0001", "zip": "10001",
+                              "batch_name": "wm-audit-OLD"}},
+            {"order_line_id": "PO2|SKU1", "audit_status": rules.PASS,
+             "audit_detail": {"asin": "B0TEST0001", "zip": "10001"}}]   # 老行
+    _, tally = wf._payload(conn, rows)
+    assert set(asked) == {"wm-audit-OLD", "wm-audit-NEW"}
+    assert tally["waiting"] == 2 and tally["no_batch"] == 0
+    # 台账只为老行查过(新行不该再按 (ASIN,邮编) 去问台账)
+    ledger_calls = [a for s_, a in conn.executed if "FROM ops.audit_scrape" in s_]
+    assert ledger_calls == [{"asins": ["B0TEST0001"], "zips": ["10001"]}]
+
+
+def test_payload_skips_ledger_query_when_every_row_has_provenance(wired, monkeypatch):
+    wf, _ = wired
+    conn = FakeConn({"FROM ops.scrape_batches": (["batch_name"], [("wm-audit-X",)])})
+    monkeypatch.setattr(wf.scraper, "screenshot_list", lambda name: [])
+    rows = [{"order_line_id": "PO1|SKU1", "audit_status": rules.PASS,
+             "audit_detail": {"asin": "B0TEST0001", "zip": "10001",
+                              "batch_name": "wm-audit-X"}}]
+    wf._payload(conn, rows)
+    assert not [s_ for s_, _a in conn.executed if "FROM ops.audit_scrape" in s_]
+
+
+def test_mark_pending_resets_retry_window_after_done():
+    """上次请求已 done 的组合再被请求 = 新订单的新需求,72h 重试窗口从头算。"""
+    from workflows import order_audit as wf
+    assert "ops.audit_scrape.state = 'done'" in wf._MARK_PENDING_SQL
+
+
+def test_orphan_shots_skip_rows_with_provenance():
+    from workflows import order_audit as wf
+    assert "coalesce(l.audit_detail ->> 'batch_name', '') = ''" in wf._ORPHAN_SHOTS_SQL
 
 
 # ══════════════════════════════════════════════════════════════════════════════

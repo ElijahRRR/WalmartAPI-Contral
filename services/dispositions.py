@@ -342,6 +342,25 @@ def suggest_many(conn, rows: list[dict]) -> int:
 # 回填,但别让这条 SQL 依赖它跑过 —— 漏回填的行会永远撤不掉且不报错)。
 # ⚠ keep 比对用**该来源自己记的动作**:破坏组撞车时行上的 action 可能已被
 # 升格(retire → delete),拿升格后的动作去比对方的 keep 清单必然对不上。
+# 空 keep = 该来源(该范围内)的 suggested 全撤。⚠ 模块级常量,不许写回函数里的
+# 内联字符串:test_every_sql_param_is_cast 只扫模块级 _xxSQL,内联的那份连
+# `jsonb_build_object('withdrawn_reason', %(why)s…)` 这种生产实炸过的写法都拦不住
+_WITHDRAW_ALL_SQL = """
+UPDATE ops.dispositions d
+SET sources = d.sources - %(source)s::text,
+    status = CASE WHEN (d.sources - %(source)s::text) = '{}'::jsonb
+                  THEN 'withdrawn' ELSE d.status END,
+    settled_at = CASE WHEN (d.sources - %(source)s::text) = '{}'::jsonb
+                      THEN now() ELSE d.settled_at END,
+    detail = d.detail || jsonb_build_object('withdrawn_reason', %(why)s::text)
+WHERE d.status = 'suggested'
+  AND (jsonb_exists(d.sources, %(source)s::text)
+       OR (d.sources = '{}'::jsonb AND d.source = %(source)s::text))
+  AND (%(store)s::text IS NULL OR d.store = %(store)s::text)
+  AND NOT (d.store = ANY(%(exclude)s::text[]))
+RETURNING d.status
+"""
+
 _WITHDRAW_SQL = """
 UPDATE ops.dispositions d
 SET sources = d.sources - %(source)s::text,
@@ -396,25 +415,9 @@ def withdraw_stale(conn, source: str, keep: list[tuple], why: str,
     with conn.cursor() as cur:
         if not keep:
             # 本轮一条都不建议 = 该来源(该范围内)的 suggested 全撤
-            cur.execute(
-                "UPDATE ops.dispositions d "
-                "SET sources = d.sources - %(source)s::text, "
-                "    status = CASE WHEN (d.sources - %(source)s::text) "
-                "                       = '{}'::jsonb "
-                "                  THEN 'withdrawn' ELSE d.status END, "
-                "    settled_at = CASE WHEN (d.sources - %(source)s::text) "
-                "                           = '{}'::jsonb "
-                "                      THEN now() ELSE d.settled_at END "
-                "WHERE d.status = 'suggested' "
-                "  AND (jsonb_exists(d.sources, %(source)s::text) "
-                "       OR (d.sources = '{}'::jsonb "
-                "           AND d.source = %(source)s::text)) "
-                "  AND (%(store)s::text IS NULL "
-                "       OR d.store = %(store)s::text) "
-                "  AND NOT (d.store = ANY(%(exclude)s::text[])) "
-                "RETURNING d.status",
-                {"source": source, "store": store,
-                 "exclude": list(exclude_stores or [])})
+            cur.execute(_WITHDRAW_ALL_SQL,
+                        {"source": source, "store": store, "why": why,
+                         "exclude": list(exclude_stores or [])})
             return sum(1 for (st,) in cur.fetchall() if st == "withdrawn")
         cur.execute(_WITHDRAW_SQL, {
             "source": source, "why": why, "store": store,
@@ -779,7 +782,8 @@ WHERE d.status = 'executing'
 # 落定宽限(2026-08-26,链尾重赛引入的时间压缩):此前"提交"与"下一次重新
 # 观测"天然隔 16~24 小时,判据只需 last_seen_at > executed_at;链尾重赛把
 # 这个间隔压到十几分钟 —— 主链 14:50 刚提交的 MP_MAINTENANCE 还在沃尔玛
-# 队列里,15:05 重赛的 catalog_sync 刷新观测、15:15 重赛的 maintenance 落定,
+# 队列里,15:05 重赛的 catalog_sync 刷新观测、15:15 重赛的 maintenance_scan 落定
+# (2026-10-19 起落定在扫描件写建议之前;此前在执行件 maintenance 开头),
 # 会把"太早看"谎报成 ineffective(销案后行卡 executing,该 SKU 白丢一天)。
 # 2 小时 > 价格 feed SLA(15 分钟)与 MP_MAINTENANCE 常规处理时长;正常
 # 隔日节奏(16~24h)完全不受影响。破坏侧本就有 48h 宽限(verify_deletions)。

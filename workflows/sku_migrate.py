@@ -827,7 +827,7 @@ def _probe_shadows(store_name: str, rows: list[dict]) -> list[str]:
                 f"会拿一次抖动去弃码/改 UPC/迁处置键,而且不报错)"]
     if store is None:
         return [f"  ⚠ 影子探测失败(店铺不可调用),{len(rows)} 条按 double 处理:"
-                f"{store_name} 不在可调用列表里(未启用/没配代理/没凭证)"]
+                f"{store_name} 不在可调用列表里(未启用/没凭证/代理只填了一半)"]
     fails: dict[str, int] = {}
     for r in rows:
         try:
@@ -1753,7 +1753,7 @@ def run(params: dict) -> str:
     if ok and not settle_only:
         store = _store_of() if cands else None     # 本轮唯一取凭证的地方
         if cands and store is None:
-            warns.append(f"  ⚠ {store_name} 不在可调用列表里(未启用/没配代理/没凭证),"
+            warns.append(f"  ⚠ {store_name} 不在可调用列表里(未启用/没凭证/代理只填了一半),"
                          f"本轮 {len(cands)} 个候选一个都没发")
         elif cands or not execute:
             mig_counts, mig_lines = _migrate(store or {"name": store_name},

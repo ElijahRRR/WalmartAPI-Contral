@@ -1904,7 +1904,8 @@ suggested 就与它做的事对不上;**不留别名、不留两个函数** —�
   「无未了结破坏建议」挑选时就剔掉了),真出现了由 `executing_actions_on` 点名人工。
 - **迁过去之后不加任何新的落定代码**:`settle_maintenance` 的现有规则(新码
   `last_seen_at > executed_at + 2h` 之后按现值比 `detail->>'new'`)自然收尾 ——
-  A171 那条 691466 会在下一次 maintenance 的落定里判成 `confirmed`(16.78 == 16.78)。
+  A171 那条 691466 会在下一次 maintenance 的落定里判成 `confirmed`(16.78 == 16.78)
+  (2026-10-19 起落定在 maintenance_scan 写建议之前,不再在执行件 maintenance 里)。
   `expire_executing` **不动**,仍是最终兜底。
 - `workflows/sku_migrate._confirm`:先取 `executing_actions_on`(**必须在迁键之前**,
   之后就读不到了),再调 `rekey_open`;摘要按组分开说 —— 维护组「旧码名下 executing

@@ -669,6 +669,8 @@ order_line_id = 'ol_' + sha256(po_id + '\x1f' + sku)[:24]
     "ship_days": 3, "seller": "Acme", "amz_title": "...",
     "shipping": 0.0, "shipping_raw": "FREE",      // NULL 表示没采到,不是免运费
     "scraped_at": "...",
+    "batch_name": "wm-audit-20261017-102105",     // 判定用的快照来自本链哪一批(截图沿它取,2026-10-17)
+    "source_id": "...",                           // 采集侧记录 ID,事后可追到那一条采集
     "supplier": "甲", "rate": 1.0,                // 本行实际套用的采购方与汇率
     "price_cap": 75.0, "cost": 54.0,
     "title_similarity": 0.9673,                   // →「标题相似度」列
@@ -1197,6 +1199,33 @@ CREATE TABLE ops.node_validations (
 两个常量只在 `store_limits` 出生。排障:`SELECT * FROM ops.node_validations ORDER BY validated_at`
 看每家配置店最近一次被认过的时间;行不存在 = 从没认过(新填 / 填错被抹)。
 
+### ops.ship_node_requests(建仓请求台账,2026-10-24)
+
+`node_create` 的防重状态(所有者定稿 2026-10-24 建仓转正,`docs/multi_node_plan.md` 同日节)。
+`POST shipnodes` 不幂等(重发 = 重名建两个仓),所以**先 INSERT pending 再调接口**。
+
+```sql
+CREATE TABLE ops.ship_node_requests (
+    id              bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    store           text NOT NULL,
+    ship_node_name  text NOT NULL,        -- 防重键(同店同名不重建)
+    payload         jsonb NOT NULL,       -- 发出去的 shipNode[] 元素原文
+    status          text NOT NULL,        -- pending / created / failed
+    ship_node       text,                 -- 沃尔玛生成的 FC ID(created 时有)
+    note            text,                 -- 被拒原文 / 反查结论
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    settled_at      timestamptz
+);
+CREATE INDEX ship_node_requests_open_idx ON ops.ship_node_requests (store, ship_node_name, status);
+```
+
+状态机:`pending → created | failed`。200 ⇒ created;4xx ⇒ failed(确认未达);网络中断 /
+5xx / 200 读不出节点 ⇒ **留 pending**。下次对同店同仓名重跑:先 `GET shipnodes` 反查,在册 ⇒
+收编 created;不在且超 `services/ship_nodes.PENDING_GRACE_MINUTES`(10 分钟)⇒ failed
+「反查未见」后才允许重发;期内 ⇒ 该店本轮按兵不动。**唯一读写者 `services/ship_nodes`**。
+排障:`SELECT * FROM ops.ship_node_requests ORDER BY id DESC` —— 一家店建过几次仓、哪次被拒
+为什么,全在 note。
+
 ### ops.dispositions(处置建议台账:「建议」与「执行」的分界面)
 
 两条链共用一张表:`maintenance_scan`/`problem_scan` 写建议,
@@ -1214,6 +1243,7 @@ CREATE TABLE ops.node_validations (
 | `detail->'atoms'` | 这条建议的逐原子归类 `[{code, policy_name, text}]`(2026-09-10,problem_scan 写) | 与 `problem_categorized` 事件同款;`category` 列只是主码,复合原文还带哪些原子(「End Date 过期; 禁售」)看这里。维护链的建议行不带这个键 |
 | `sources` | 每个支撑来源各一格:`{来源: {action, code, reason, at}}` | 展示用的 reason/category 由 `claim()` 按它现算(单来源逐字不变,多来源拼成「维护:… \| 审核:…」);`reason`/`category` 两列是**首次建议**的病历,不再被后写方覆盖 |
 | `detail->>'settled_by'` | **是谁判的**这条落定 | 破坏类三种来源(2026-09-09):`delete_verified`/`delete_not_effective` = 观测判;`receipt_gone` = 回执码 ∈ `registry.resources.WALMART_ERR_ITEM_GONE`(沃尔玛说这个 SKU 已经不在了 ⇒ confirmed,**不论回执 status** —— QARTH「No matching record」是 status=success 带回来的);`receipt_failed` = 回执 failed/missing(含 WFS 不许删等永久拒)⇒ ineffective;`receipt_none`(2026-09-25)= 回执**没给结论**(overdue / unrecognized / unreadable)⇒ ineffective 关单,不是失败。维护三类是 `observed`/`value_unchanged`,超期放行是 `expired`。同时并进 `detail` 的还有 `receipt_status`/`error_code`/`error_desc`(截 300),查账不用再回 `ops.feed_items` 翻 |
+| `detail->>'withdrawn_reason'` | **为什么撤**这条建议 | `withdraw_stale` 调用方传的原因原文:「本轮扫描不再建议(限 X)」= 商品自己恢复正常了;「店铺不维护(凭证未启用 / 店铺已终止)」(2026-10-22,维护链)/「店铺不处置(…)」(同日,问题商品链 scan / audit 来源)= 整店不维护。两个分支都写(空 keep 分支此前漏写)。⚠ 合并行只撤掉自己那一格、仍为 suggested 时也带这个键 —— 它不代表 status=withdrawn |
 
 改码(批次 3)只准经两个积木碰这张表:`dispositions.open_executing_count`
 (前置闸:改码前该店必须无 `executing` 行 —— 它等的观测判决会随身份列一起换掉,
@@ -1244,6 +1274,15 @@ WHERE feed_id IS NOT NULL` —— 按 feed 反查处置行(实际结果取目标
 `problem_scan` 对顽固件同时建议 retire 与 delete(双 feed 齐发),合成一条会让
 其中一个的落定结果覆盖另一个。「破坏类存在即压制同 SKU 的维护类」不靠索引,
 靠 `claim()`(索引管不了跨行的条件,而且压制必须与两个扫描件谁先跑无关)。
+
+⚠ **这条索引决定了落定必须在写建议之前**(2026-10-19):同键已有 `executing` 行时
+`suggest_many` 的 upsert 是 no-op(`ON CONFLICT … DO UPDATE … WHERE status='suggested'`)。
+维护三类的落定(`settle_maintenance` + `expire_executing`)因此在 **`maintenance_scan`
+写建议之前、同一事务内**调;此前放在执行件 `maintenance` 开头(链序在扫描件之后),
+天天要改的 SKU 被砍成隔天一次(D 日提交 → D+1 扫描撞 executing 写不进 → 执行件才落定
+→ D+2 才重新建议)。破坏类的落定(`settle`)仍在 `problem_product_cleanup` 开头 ——
+删除不需要天天重发,观测核验期限内(删除 72h / 停用 48h,`feed_track` 期限表)挡住
+重复建议正是想要的;最坏只是把重删推迟一天(拿不准就不删)。
 
 ## audit — 审核域(2026-08-13 批次 A,迁自 walmart-audit-system)
 

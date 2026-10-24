@@ -192,7 +192,7 @@ stockzero 静默失效(P0)、库存永久重写循环 + settle 恒 ineffective(P
 **校验失败的店整店跳过、不回落 Virtual Node** —— 与维护链同一条口径。
 
 **Runbook(人工步骤,顺序是硬约束)**:
-1. 建仓(Seller Center 或 API)→ 记下 FC ID;
+1. 建仓:`python cli.py node_create -p store=<店> -p name=… …`(先 `--dry-run`;2026-10-24 起,参数见 `services/ship_nodes.PARAM_HELP`)或 Seller Center → 记下摘要里的 FC ID;
 2. 配运费模板并做 (SKU×模板×FC) 映射 → **等 4 小时**;
 3. 限额表「维护仓库」填 FC ID;
 4. `python cli.py maintenance_scan -p preview=1` 确认该店意图带 ship_node、
@@ -262,7 +262,7 @@ stockzero 静默失效(P0)、库存永久重写循环 + settle 恒 ineffective(P
 ## 8. 明确不做
 
 - 不动 WFS(读写都不碰;WFS 库存归沃尔玛管)。
-- 不自动建仓、不自动做运费模板映射(人工 runbook)。
+- ~~不自动建仓~~ **建仓改由 `node_create` 执行(2026-10-24 所有者定稿,见文末同日节)**:仍是人给信息、人手动触发,永不进调度;**不自动做运费模板映射、不自动填「维护仓库」**(人工 runbook)。
 - 不依赖 legacy 端点的"默认节点"语义(官方无定义)。
 - 不做存量 SKU 搬仓、不做一品多仓分配。
 
@@ -371,3 +371,61 @@ WARNING **全部**是「发货节点列表读不到(店铺代理故障 …)」�
 首跳,但整段在全局 `_token_lock` 内,照写会让一家坏店把 24 并发的换 token 全卡住
 ~100s —— 要做得先把重试挪到锁外或按 client_id 分锁。有了记忆之后,这条对受管仓
 校验已不关键。
+
+## 2026-10-24 建仓转正:`node_create`(所有者定稿,推翻 §8「不自动建仓」)
+
+**所有者原话**:「建仓是在我有需要的时候给信息并手动执行创建的」;追问两条实证:
+「国内仓收的」;L001 的 `GET shipnodes` 只有一个 `VIRTUAL` 节点 `10003116860`,
+地址 `country: "CN"`、`state: "CQ"`、`timeZone: "CST"`,**没有 `shippingDetails` 键**
+(不是 `[]` 也不是 `null`)。
+
+**定稿**:仍是人触发、人给信息,只是从 Seller Center 点鼠标换成 cli 一条命令;
+什么时候建、建在哪、叫什么全部当场由人给(`-p`,不建飞书表:低频手动动作,建表
+三道工序比敲命令还多,而且表里长期放着「待建」会诱使哪条链将来去自动消费它)。
+**运费模板绑定与「维护仓库」切换仍然人工**(两者是独立决策,摘要提醒顺序:
+配模板 → 等 4 小时 → 再填 FC ID)。
+
+**官方端点(2026-10-24 核验 create-fulfillment-center / get-carrier-methods)**:
+`POST /v3/settings/shipping/shipnodes`,10/min;body `{"shipNodeHeader":{"version":"1.2"},
+"shipNode":[{…}]}`;必填 `shipNodeName / status / timeZone / postalAddress(addressLine1,
+city, state, country, postalCode) / 至少一种 shipping method`;可选 `customNodeId /
+distributorSupportedServices / shippingDetails[].twoDayShipping[]{carrierMethodName,
+carrierMethodType} / calendarDayConfiguration{standardProcessingSchedule.<sunday…saturday>
+{isWorkingDay, cutOffTime "HH:MM"}, additionalDaysOff["YYYY-MM-DD"]}`;响应数组带生成的
+`shipNode`(17 位数字)与 `nodeType: PHYSICAL`。原件 `refdata/specs/ship_node_create_1.2_sample.json`,
+守门测试拿它校"我们发的键官方样例里都有"。承运商取值查 `GET /v3/settings/shipping/carriers`(10/min)。
+
+**官方文档空白与实测(首跑 2026-10-24 13:45,L001贾林红,结果回填)**:
+1. ✅ **`distributorSupportedServices` 不能为 null**(首跑 400 原文:`shipNode object has
+   invalid data: distributorSupportedServices can't be null`)。首版「可选项没给就不带键」
+   对这个键是错的;改为**缺省发空数组 `[]`**(官方 schema 该键唯一允许值 `TWO_DAY_DELIVERY`,
+   国内仓不该承诺两日达,所以缺省空而不是填它)。`[]` 收不收是**第二次真跑要验的**:
+   被拒就只能 `-p services=TWO_DAY_DELIVERY`,那时要所有者拍板承诺不承诺。
+2. ✅ **`shippingDetails` 也不能为 null**(第二次真跑 14:27,400 原文:`shippingDetails
+   can't be null`;同次证实 `distributorSupportedServices: []` **被收**,校验才走到了下一项)。
+   同款处理:不填 `-p carrier=` 就发 `shippingDetails: []`。`[]` 收不收是**第三次真跑要验的**;
+   官方 schema 里它的子键只有 `twoDayShipping`,填承运商 = 声明两日达的承运方式,国内仓
+   不该缺省声明。Seller Center 建的中山仓(谭总12)是唯一被收过的实体仓样本,`node_probe`
+   能打出它这两个键的真实取值,照抄最稳。被拒原文进摘要与台账(首版只进日志,已修:
+   `safe_post_ex(error_body=True)` opt-in,老调用方契约不变)。
+3. 官方 schema(reference/createfulfillmentcenter,2026-10-24 核验):`timeZone` 枚举
+   PST/MST/CST/EST/PDT/MDT/CDT/EDT/ADT/NDT/GMT/CET/TRT/IST/CTT/HKT/SGT/ICT/JST/KST/VST/CLT
+   (`services/ship_nodes.TIME_ZONES`,发前校验);`postalAddress` 还有 `addressLine2`
+   (`-p address2=`);`calendarDayConfiguration` 一旦带就两个子键都必填、七天齐、
+   `cutOffTime` 缺省 14:00。`customNodeId` 唯一性仍没写,防重键仍是**仓名**。
+4. 国内仓 `country=CN`、`state=CQ`、`tz=CST` 首跑**没被嫌弃**(400 只点名了 services),
+   照抄 L001 VIRTUAL 节点的写法成立。
+
+**落地**(一条实现路径,见各文件头注):
+| 关注点 | 唯一出处 |
+|---|---|
+| 接口 | `api/settings.create_ship_node`(不重试;200 成功 / 4xx `RuntimeError` 确认未达 / None·5xx·200 读不出 `ShipNodeOutcomeUnknown` 不明;成功清 `list_ship_nodes` 缓存)、`list_carrier_methods` |
+| 载荷组装与校验 | `services/ship_nodes.build_node`(纯函数;可选项没给就不带键) |
+| 防重键 | `ship_nodes.find_existing`(仓名忽略大小写与多余空白;customNodeId 辅助) |
+| 台账 | `ops.ship_node_requests`(先 pending 再 POST;不明留 pending;`reconcile_pending` 下次按名反查:在册收编 / 超 `PENDING_GRACE_MINUTES`=10 判「反查未见」才许重发 / 期内按兵不动) |
+| 工作流 | `workflows/node_create`(DANGEROUS,不进调度;`-p store=A,B` 多店同仓;店维失败标准 `store_retry.fan_out`,补试跑同一函数、先查重后发) |
+| 事件 | `store_events.SHIP_NODE_CREATED`(governance/info,一仓一条) |
+| 配额 | `_client._RATE_BUCKETS` `settings.shipnodes.create` / `settings.carriers` 各 8/min 持久桶 |
+
+⚠ 多店共用同一仓库地址是账户关联信号,与多店共用代理同性质:摘要点名、**不拦**
+(2026-10-21 口径:共享出口的关联风险由所有者承担,代码只负责看得见)。

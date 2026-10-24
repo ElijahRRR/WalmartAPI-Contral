@@ -174,3 +174,56 @@ def test_store_dead_error_call_sites_have_two_args():
             if name == "StoreDeadError" and len(node.args) + len(node.keywords) != 2:
                 bad.append(f"{path}:{node.lineno} 传了 {len(node.args)} 个参数")
     assert not bad, "StoreDeadError 参数个数不对:\n" + "\n".join(bad)
+
+
+# ── 出口契约:proxy=None 即直连(所有者定稿 2026-10-21)──────────────────
+
+def test_none_proxy_means_direct_and_empty_string_never_reaches_httpx():
+    """★ `proxy=None` = 合法的直连;`""`/空白也归一成 None。
+
+    为什么要钉:`httpx.HTTPTransport(proxy="")` 抛
+    `ValueError: Unknown scheme for proxy URL URL('')` —— 两者只差一个空串,
+    一个正常直连、一个在 transport 构造期崩掉,而报错信息跟"哪家店填错了"
+    毫无关系。`services/stores` 只会产出 URL 或 None,这道归一是给手搓
+    store dict 的调用方(测试、一次性脚本)兜底的。
+    """
+    assert _client._norm_proxy(None) is None
+    assert _client._norm_proxy("") is None
+    assert _client._norm_proxy("   ") is None
+    assert _client._norm_proxy(" socks5://h:1 ") == "socks5://h:1"
+    # 直连 client 建得出来(httpx 真的接受 proxy=None),且空串与 None 同一桶
+    c1 = _client._get_client(None)
+    c2 = _client._get_client("")
+    assert c1 is c2
+    assert list(_client._client_pool) == [""]
+
+
+def test_stores_sharing_one_proxy_share_one_client():
+    """多店共用一个代理(2026-10-21 起允许)⇒ 共用一条长连接,握手复用。
+
+    池化维度是**代理**而不是店,是刻意的:按店池化会让每家店各做一次 SOCKS
+    握手(旧仓就是这么慢的)。代价写在 `_get_client` 头注里。
+    """
+    a = _client._get_client("socks5://u:p@1.2.3.4:1080")
+    b = _client._get_client("socks5://u:p@1.2.3.4:1080")
+    other = _client._get_client("socks5://u:p@5.6.7.8:1080")
+    assert a is b and a is not other
+    assert len(_client._client_pool) == 2
+
+
+def test_store_proxy_error_direct_flag_still_catchable_as_proxy_error():
+    """直连店的出口故障仍必须被 `except httpx.ProxyError` 接住。
+
+    不接住就重演 2026-08-26 事故:传输层异常穿到各 workflow 的泛化异常桶 →
+    一家店的网络抖动判整轮失败(而不是这家店缺席)。所以 `direct=True` 只改
+    **给人看的归类词**(store_retry.diagnose),不改异常的继承位置。
+    """
+    err = _client.StoreProxyError("client_id=abc…", httpx.ConnectError("boom"),
+                                  direct=True)
+    assert isinstance(err, httpx.ProxyError)
+    assert err.direct is True
+    assert "直连出口故障" in str(err)
+    assert isinstance(err, _client.PROXY_ERRORS)
+    # 默认仍是"代理故障",老调用点一个字不用改
+    assert _client.StoreProxyError("x", httpx.ConnectError("b")).direct is False
+    assert "店铺代理故障" in str(_client.StoreProxyError("x", httpx.ConnectError("b")))

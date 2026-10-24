@@ -6,7 +6,8 @@
   python cli.py order_audit -p stores=店铺A,店铺B
   python cli.py order_audit -p line=<order_line_id>   # 单行重审(忽略窗口)
   python cli.py order_audit -p recheck=1       # 连终局结论的行一起重审(钓鱼行除外)
-  python cli.py order_audit -p scrape=0        # 不推采集(只对账 + 判定)
+  python cli.py order_audit -p scrape=0        # 不推采集(只对账 + 判定;没为这一单
+                                               # 采过的行判不了,新鲜规则见下)
   python cli.py order_audit -p push=0          # 只判定落库,不回写飞书
   python cli.py order_audit -p wait=0          # 不等采集(推完就回写,结论滞后一轮)
   python cli.py order_audit -p refill_shots=1  # 为台账无批次记录的行重采一次(只为补图)
@@ -58,8 +59,18 @@ product_refresh 那条链(维护/上架用的快照)还是靠它摄。
   拿旧配置继续算钱比不出结论危险得多。
 
 采集接入(2026-08-09 接线,2026-08-10 按所有者实测定稿):
-- 审核输入来自 catalog.latest_snapshot 里**该订单收件邮编那一组**快照,两层
-  JOIN 取标题(services.order_audit.from_snapshot 是唯一翻译点)。
+- 审核输入来自 catalog.snapshots 里**该订单收件邮编那一组**、且是**本链自己
+  请求之后落地的**快照(_SNAP_SQL JOIN 采集台账 ops.audit_scrape;
+  services.order_audit.from_snapshot 是唯一翻译点)。
+- **新鲜的定义**(所有者 2026-10-17 定稿「每次的数据都是新鲜的」):这一单进库
+  之后、审核链为这对 (ASIN, 邮编) **自己采的**。两道闸:快照晚于台账最近一次
+  请求(SQL),那次请求晚于本行 created_at(_fresh_for)。没为它采过的组合视同
+  无快照 ⇒ 待采集 ⇒ 本轮推采集;别的链 / 旧系统碰巧采过同邮编**不借用**
+  (10-17 事故:订单 10:20 进库,审核 10:21 借用了旧系统 09:45 采的快照 ——
+  价是 35 分钟前的,而截图没有本链台账可关联,永远贴不上)。同一小时内同对的
+  多单共用一次采集;下一小时再来一单就再采一次。同对多份快照先认**本链自己
+  那批**(采集原文 batch_name 对得上台账)再比新旧 —— 截图与审核依据必须来自
+  同一次采集。judge 把 batch_name / source_id 落进 audit_detail,取图沿它找。
 - **快照超 24 小时视同没有**:审单看的是价格/库存/货期,这几个字段变得快;
   拿昨天以前的价格算限价,和拿错邮编的价格性质相近。
 - **什么会进待采清单**:由 judge 显式标记 `rescrape` 的四种——没快照 /
@@ -192,10 +203,12 @@ _SHOT_GRACE_SEC = 180          # 数据采完后额外等截图的上限(所有�
 # ⚠ asin/order_date/po_id 三列**判定链本身不用**(judge/_save 全按列名取值,
 # 多给无碍),是钓鱼订单入账要的:asin 免得每条都从 SKU 现解、po_id 与下单
 # 时间是事件 detail 的溯源锚(单号后 8 位进摘要,人一眼能在飞书里对上)。
+# created_at(2026-10-17):新鲜闸的行级锚点 —— 本行进库时刻,早于它的采集请求
+# 不算这一单的(_fresh_for)
 _PICK_SQL = """
 SELECT order_line_id, store, sku, asin, po_id, order_date, product_name, qty,
        product_amount, shipping_amount, postal_code, sale_status, audit_status,
-       audit_detail
+       audit_detail, created_at
 FROM orders.order_lines
 WHERE order_date >= now() - make_interval(days => %(days)s)
   AND coalesce(sale_status, '') <> 'Cancelled'
@@ -207,7 +220,7 @@ ORDER BY order_date DESC
 _ONE_SQL = """
 SELECT order_line_id, store, sku, asin, po_id, order_date, product_name, qty,
        product_amount, shipping_amount, postal_code, sale_status, audit_status,
-       audit_detail
+       audit_detail, created_at
 FROM orders.order_lines WHERE order_line_id = %(line)s
 """
 
@@ -220,9 +233,15 @@ WHERE order_date >= now() - make_interval(days => %(days)s)
   {store_filter}
 """
 
-# 按 (asin, 邮编) 取最新快照:scrape_params 里的邮编参与"最新值"分组,
-# 故同一 ASIN 不同邮编互不覆盖(catalog.latest_snapshot 的设计初衷,这里就地
-# 按同一个分组键 DISTINCT ON)。
+# 按 (asin, 邮编) 取**本链请求之后**落地的最新快照(所有者 2026-10-17 定稿
+# 「每次的数据都是新鲜的」):JOIN 采集台账 ops.audit_scrape,只收
+# `scraped_at >= 该组合最近一次请求时刻` 的快照 —— 与 _SETTLE_SQL 认落定是
+# 同一条判据。没请求过的组合一行都不回 ⇒ 判成待采集 ⇒ 本轮推采集;别的链 /
+# 旧系统碰巧采过同邮编也不借用(10-17 事故:借来的快照没有本链台账,截图永远
+# 关联不上;而且借到的是 35 分钟前别人采的价)。行级的"那次请求必须晚于这一单
+# 进库"在 _judge_all 里按 line.created_at 判(_fresh_for)。
+# scrape_params 里的邮编参与"最新值"分组,故同一 ASIN 不同邮编互不覆盖(就地
+# 按 catalog.latest_snapshot 的分组键 DISTINCT ON)。
 # 标题在身份层(products),两层 JOIN 才拿得到——商品一致性要用它。
 # ⚠ 不读 latest_snapshot 视图(2026-09-26 全仓慢查询排查;本条每小时跑一到两次):
 #   视图的新鲜度条件压不进去,每个 ASIN 都把全部历史快照读出来排序再扔掉 24 小时
@@ -232,12 +251,16 @@ _SNAP_SQL = """
 SELECT DISTINCT ON (s.asin, s.scrape_params)
        s.asin, s.price, s.stock_count, s.stock_state, s.delivery_days,
        s.shipping, s.shipping_raw, s.buybox,
-       s.scrape_params, s.raw, s.outcome, s.scraped_at, p.title
+       s.scrape_params, s.raw, s.outcome, s.scraped_at, s.source_id, p.title,
+       a.batch_name AS audit_batch, a.requested_at AS audit_requested_at
 FROM catalog.snapshots s
+JOIN ops.audit_scrape a
+       ON a.asin = s.asin AND a.zip = s.scrape_params ->> 'zipcode'
 LEFT JOIN catalog.products p
        ON p.marketplace = s.marketplace AND p.asin = s.asin
 WHERE s.marketplace = 'US' AND s.asin = ANY(%(asins)s)
   AND s.scraped_at >= now() - make_interval(hours => %(fresh)s)
+  AND s.scraped_at >= a.requested_at
 ORDER BY s.asin, s.scrape_params, s.scraped_at DESC
 """
 
@@ -385,8 +408,11 @@ ON CONFLICT (asin, zip) DO UPDATE SET
     attempts = ops.audit_scrape.attempts + 1,
     -- 上次推送已过期 ⇒ 这是新一轮需求,重试窗口从头算;否则保持原点,
     -- 好让"重试三天"真的是三天,而不是每推一次就续三天
+    -- 上次请求已落定(done)也算新需求(2026-10-17):同对来了新订单要新鲜数据,
+    -- 重试窗口不该从上一单那次起算,否则这一单采不出来时提前被判"已放弃"
     first_requested_at = CASE
-        WHEN ops.audit_scrape.requested_at
+        WHEN ops.audit_scrape.state = 'done'
+          OR ops.audit_scrape.requested_at
              < now() - make_interval(hours => %(fresh)s) THEN now()
         ELSE ops.audit_scrape.first_requested_at END
 """
@@ -446,13 +472,15 @@ def _snapshots(conn, lines: list[dict]) -> dict[tuple[str, str], dict]:
     一次取回窗口内全部 ASIN 的最新快照,再按邮编分组落位——邮编不匹配的
     快照直接丢弃(**绝不拿别的邮编的价格当本单依据**,旧系统硬校验语义)。
 
-    两条取值纪律:
+    三条取值纪律:
+    - **只用本链自己请求之后落地的**(SQL 里 JOIN 台账,2026-10-17):没为这对
+      组合请求过就一行都没有 ⇒ 待采集。行级的"请求晚于本行进库"在 _judge_all 判。
     - **超 24 小时的快照视同没有**(SQL 里过滤):审单看的是价格/库存/货期,
       这几个字段变得快;拿昨天以前的价格算限价,和拿错邮编的价格性质相近。
-    - **同一 (ASIN, 邮编) 可能有多行**:latest_snapshot 按整个 scrape_params
-      jsonb 分组,而它还含 zip_observed / parse_engine 等——同一邮编换了解析
-      引擎就是另一组,各留各的最新。所以这里必须按 scraped_at **取最新那条**,
-      不能让字典后写覆盖先写(那等于随机挑一条,时好时坏且无法复现)。
+    - **同一 (ASIN, 邮编) 可能有多行**:按整个 scrape_params jsonb 分组,而它
+      还含 zip_observed / parse_engine 等——同一邮编换了解析引擎就是另一组,各留
+      各的最新。所以这里必须显式选(_prefer):先认本链自己那批,再按 scraped_at
+      取最新,不能让字典后写覆盖先写(那等于随机挑一条,时好时坏且无法复现)。
     """
     asins = sorted({a for a in (rules.line_asin(r) for r in lines) if a})
     if not asins:
@@ -468,10 +496,47 @@ def _snapshots(conn, lines: list[dict]) -> dict[tuple[str, str], dict]:
             continue
         key = ((snap["asin"] or "").upper(), snap["zip"])
         cur_best = out.get(key)
-        if cur_best is None or _newer(snap.get("scraped_at"),
-                                      cur_best.get("scraped_at")):
+        if cur_best is None or _prefer(snap, cur_best):
             out[key] = snap
     return out
+
+
+def _is_own(snap: dict) -> bool:
+    """输入:快照 → 输出:采集原文里的批次名是否对得上台账批次(原文没带批次名即 False)。"""
+    own = snap.get("scrape_batch")
+    return bool(own) and own == snap.get("batch_name")
+
+
+def _prefer(cand: dict, best: dict) -> bool:
+    """输入:候选快照 + 当前最优 → 输出:候选是否该顶替。
+
+    先看是不是**本链自己那批**采的(_is_own),再比新旧。同一对 (ASIN,邮编) 在
+    本链请求之后,旧系统可能又采了一次 —— 它更新,但拿它判就与截图不是同一次
+    采集了(所有者 2026-10-17:截图与审核依据来自同一次采集)。采集原文不带
+    批次名时两边都不是 own,这一档不生效,退回纯比新旧。
+    """
+    own_c, own_b = _is_own(cand), _is_own(best)
+    if own_c != own_b:
+        return own_c
+    return _newer(cand.get("scraped_at"), best.get("scraped_at"))
+
+
+def _fresh_for(line: dict, snap: dict) -> bool:
+    """输入:订单行 + 候选快照 → 输出:这份快照对这一单算不算新鲜。
+
+    新鲜 = 本链为这对 (ASIN, 邮编) 的**最近一次请求晚于这一单进库**(created_at)。
+    快照本身已由 _SNAP_SQL 保证晚于那次请求,两条合起来就是「这一单来了之后、
+    审核链自己采的」(所有者 2026-10-17)。同一小时内同对的多单共用一次采集;
+    下一小时再来一单,请求在它进库之前 ⇒ 不算 ⇒ 再采一次。
+    缺任一时间戳不判(生产两列都 NOT NULL,只有单测夹具会缺)。
+    """
+    req, created = snap.get("audit_requested_at"), line.get("created_at")
+    if req is None or created is None:
+        return True
+    try:
+        return req >= created
+    except TypeError:               # 类型混杂(字符串 vs datetime):不冒险判
+        return True
 
 
 def _newer(a, b) -> bool:
@@ -509,10 +574,16 @@ def _judge_all(conn, lines: list[dict], blacklist, suppliers):
     fails = _scrape_fails(conn, lines)
     results: list = []
     want: list = []
+    stale_for_line = 0
     for line in lines:
         asin = rules.line_asin(line)
         zip5 = rules.norm_zip(line.get("postal_code"))
         snap = snaps.get((asin, zip5)) if zip5 else None
+        if snap is not None and not _fresh_for(line, snap):
+            # 上一单那次采集不算这一单的(新鲜规则,2026-10-17):视同无快照,
+            # 让 judge 标 rescrape、本轮为这一单再采一次
+            stale_for_line += 1
+            snap = None
         res = rules.judge(line, snap, suppliers, blacklist,
                           scrape_fail=fails.get((asin, zip5)))
         # 该不该重采由 judge 显式标记(res.rescrape):没快照、outcome≠ok、
@@ -522,6 +593,9 @@ def _judge_all(conn, lines: list[dict], blacklist, suppliers):
         if res.rescrape and asin and zip5:
             want.append((asin, zip5))
         results.append((line, res))
+    if stale_for_line:
+        logger.info("新鲜闸:%d 行的快照来自本行进库之前的请求,视同无快照重采",
+                    stale_for_line)
     return results, want
 
 
@@ -1108,9 +1182,9 @@ def _settled_batches(conn, names: set) -> set:
 
 
 
-# 有结论、有 (ASIN,邮编)、但台账里没有对应批次记录的组合 —— 这些行的截图
-# **永远取不回来**:增量导出的记录不带批次名(契约字段表没这一项),
-# 台账 batch_name 是唯一抓手,行没了就只能重采一次重新生成。
+# 有结论、有 (ASIN,邮编)、结论里没记批次、台账里也没有对应批次记录的组合 ——
+# 这些行的截图**永远取不回来**:取图的抓手只有两个,结论里的 batch_name
+# (2026-10-17 起 judge 落)和台账 batch_name,两个都没有就只能重采一次重新生成。
 # 只在 -p refill_shots=1 时用:每个组合要烧一次采集配额,不该默认发生。
 _ORPHAN_SHOTS_SQL = """
 SELECT DISTINCT l.audit_detail ->> 'asin' AS asin,
@@ -1120,6 +1194,7 @@ WHERE l.order_date >= now() - make_interval(days => %(days)s)
   AND l.audit_status IS NOT NULL
   AND coalesce(l.audit_detail ->> 'asin', '') <> ''
   AND coalesce(l.audit_detail ->> 'zip', '')  <> ''
+  AND coalesce(l.audit_detail ->> 'batch_name', '') = ''
   {store_filter}
   AND NOT EXISTS (SELECT 1 FROM ops.audit_scrape a
                   WHERE a.asin = l.audit_detail ->> 'asin'
@@ -1145,23 +1220,34 @@ def _payload(conn, rows: list[dict]) -> tuple[dict[str, dict], dict]:
     (`batch_of.get(...)` 拿到 None 就静默不写这一列),缺一半图只能靠人
     盯着飞书发现。四个桶各是不同的病,处置也不同:
 
-    - `no_batch` —— 台账里没有这个 (ASIN,邮编) 的批次记录 ⇒ **这张图永远
-      取不回来**。增量导出的记录里不带批次名(契约字段表没有这一项),
-      台账是唯一抓手;台账行被删掉/从未写过,就只能靠重采重新生成。
+    - `no_batch` —— 结论里没记批次、台账里也没有这个 (ASIN,邮编) 的批次记录
+      ⇒ **这张图永远取不回来**,只能靠重采重新生成(-p refill_shots=1)。
       **它不会自愈**:judge 只在缺价格/货期/运费时标 rescrape,缺图不标。
+
+    批次来源**先取结论里记的** `detail.batch_name`(2026-10-17 起 judge 落:
+    截图与审核依据来自同一次采集;10-17 事故正是审核借了别的批次的数据、
+    取图却只认本链台账)。没记的是老行,回落台账按 (ASIN,邮编) 查 —— 兜底
+    三要件:同函数内、日志计数、条件明确(detail 缺 batch_name)。
     - `not_settled` —— 批次还在跑,或 ops.scrape_batches 里没这批的行。下轮再来。
     - `waiting` —— 图还没截好 / 已记墓碑。下轮再来或就这样了。
     - `ok` —— 拿到 file_token 写进去了。
     """
     f = resources.ORDER_SALES_AUDIT.fields
-    batch_of = _batch_names(conn, rows)
-    settled = _settled_batches(conn, set(batch_of.values()))
+    details = {r["order_line_id"]: _detail(r) for r in rows}
+    legacy = [r for r in rows if not details[r["order_line_id"]].get("batch_name")]
+    batch_of = _batch_names(conn, legacy) if legacy else {}
+    if legacy:
+        logger.info("截图来源回落台账:%d 行结论未记批次(2026-10-17 前判的)",
+                    len(legacy))
+    names = ({d.get("batch_name") for d in details.values() if d.get("batch_name")}
+             | set(batch_of.values()))
+    settled = _settled_batches(conn, names)
     shots = _shot_index(settled)
     tally = {"ok": 0, "no_batch": 0, "not_settled": 0, "waiting": 0}
     out: dict[str, dict] = {}
     for r in rows:
-        d = _detail(r)
         key = r["order_line_id"]
+        d = details[key]
         fields = {
             f.audit_status: r["audit_status"],
             f.script_audit: d.get("note"),
@@ -1178,7 +1264,7 @@ def _payload(conn, rows: list[dict]) -> tuple[dict[str, dict], dict]:
         asin = (d.get("asin") or "").upper()
         token = None
         if asin and d.get("zip"):
-            batch = batch_of.get((d.get("asin"), d.get("zip")))
+            batch = d.get("batch_name") or batch_of.get((d.get("asin"), d.get("zip")))
             if not batch:
                 tally["no_batch"] += 1
             elif batch not in settled:

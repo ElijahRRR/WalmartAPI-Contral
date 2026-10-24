@@ -8,8 +8,18 @@
   safe_post_ex()   带状态码/headers 的 POST
   safe_put_ex()    带状态码/headers 的 PUT
 
-安全铁律:所有沃尔玛调用必须走本文件,每店铺固定出口代理,严禁直连——
-每个店铺凭证绑定固定出口 IP,直连会导致店铺关联封号。
+安全铁律:所有沃尔玛调用必须走本文件。出口怎么走由**凭证表**决定,
+本层只执行,不自己判(所有者定稿 2026-10-21):
+  · `proxy` 是 URL  → 必须经这个代理发出,**不许因为连不上就改直连**
+                      (换条链路重试 = 用裸连替代理,风险翻面);
+  · `proxy is None` → 直连(凭证表那家店没填代理)。
+`None` 的来源**只有** `services/stores.proxy_of` 一处;代理填了一半的店在那里
+就被整店拦下,不会走到本层。api 层对 proxy 不做任何补默认值、不做任何回退。
+
+为什么这件事要写在这儿:每个店铺凭证原本绑定固定出口 IP,共享出口会被沃尔玛
+用来做店铺关联。2026-10-21 之前本层的规则是"严禁直连",现在改成"凭证表没填
+代理才直连、填了就必须走",**多店共用一个代理也被明确允许** —— 承担关联风险
+的人是所有者,代码的责任是**忠实执行 + 每轮点名**(点名在 services/stores._log_egress)。
 
 店铺凭证的读取不在本层(见 services/stores.py):本层不碰飞书、不碰 xlsx。
 
@@ -79,12 +89,20 @@ class StoreProxyError(httpx.ProxyError):
     一处都不用改。与 StoreDeadError 的语义分工:凭证死是**确定性**的
     (重试只会再死一次),代理故障是**可重试**的(隧道抖动/代理商瞬断)——
     店级重试标准(所有者定稿 2026-08-26)只补试后者。
+
+    `direct=True` = 这家店**没配代理、走的是直连**(2026-10-21 起允许),故障与
+    代理商无关。仍然子类化 `ProxyError` 是刻意的:全仓那些
+    `except (StoreDeadError, httpx.ProxyError)` 分支必须照样接住它 —— 不接住就
+    重演 2026-08-26 事故(传输层异常穿到 workflow 的泛化桶 → 整链停摆)。
+    只有**报给人看的归类词**按 `direct` 分流(`store_retry.diagnose`):直连店归
+    「网络未达」(看本机出口),不许报成「代理无效」把人指去改一个不存在的代理。
     """
 
-    def __init__(self, store_hint: str, cause: Exception):
+    def __init__(self, store_hint: str, cause: Exception, direct: bool = False):
         self.cause = cause
-        super().__init__(f"店铺代理故障({store_hint}):"
-                         f"{cause.__class__.__name__}: {cause}")
+        self.direct = direct
+        super().__init__(f"{'直连出口故障' if direct else '店铺代理故障'}"
+                         f"({store_hint}):{cause.__class__.__name__}: {cause}")
 
 
 #: workflow 分类分支的唯一判据元组(「这是店级代理/网络故障」)。
@@ -116,7 +134,8 @@ def backoff(attempt: int) -> float:
 _token_cache: dict = {}
 _token_lock = threading.Lock()
 
-# proxy URL → 长连接 httpx.Client(按代理维度池化,复用 TCP/TLS/SOCKS 握手)
+# proxy URL → 长连接 httpx.Client(按代理维度池化,复用 TCP/TLS/SOCKS 握手)。
+# key `""` = 直连那一桶(没配代理的店共用它,见 _norm_proxy)。
 _client_pool: dict = {}
 _pool_lock = threading.Lock()
 
@@ -144,6 +163,19 @@ def base_url() -> str:
 # ══════════════════════════════════════════════════════════════════════════════
 
 
+def _norm_proxy(proxy: str | None) -> str | None:
+    """代理值归一:空串/纯空白 → `None`(= 直连)。
+
+    ⚠ 为什么必须有这一步:`httpx.HTTPTransport(proxy="")` 直接抛
+    `ValueError: Unknown scheme for proxy URL URL('')`,而 `proxy=None` 是**合法
+    的直连**。两者只差一个空串,后果却是 transport 构造期崩掉 —— 而且崩在
+    _get_client 里,错误信息跟"哪家店的凭证填错了"一点关系都没有。
+    `services/stores` 产出的只会是 URL 或 None,这道归一是给手搓 store dict 的
+    调用方(测试、一次性脚本)兜底的。
+    """
+    return (proxy or "").strip() or None
+
+
 def _build_transport(proxy: str | None) -> httpx.BaseTransport:
     """transport 构造单独成函数,测试用 httpx.MockTransport 替换此处。"""
     return httpx.HTTPTransport(
@@ -157,11 +189,17 @@ def _build_transport(proxy: str | None) -> httpx.BaseTransport:
 def _get_client(proxy: str | None) -> httpx.Client:
     """按代理 URL 维度复用 httpx.Client,避免每次请求重新握手。
 
+    ⚠ 池化维度是**代理**,不是店:多店共用一个代理(2026-10-21 起允许)就共用
+    这一条 client —— 握手复用是好事,代价是 `_invalidate_client` 会把同代理的
+    兄弟店连接一起剔掉(下次请求重建,`代理波动` → 串行补试能自愈)。**别改成
+    按店池化**:那样每家店各做一次 SOCKS 握手,旧仓就是这么慢的。
+
     transport 层启用:
       - HTTP/2(多路复用;协商失败自动回落 H1.1)
       - retries=2(连接级失败:DNS / TCP / TLS 握手自动重试,便宜)
       - limits 写在 transport 上(httpx.Client 收到自定义 transport 后会忽略顶层 limits)
     """
+    proxy = _norm_proxy(proxy)
     key = proxy or ""
     client = _client_pool.get(key)
     if client is not None and not client.is_closed:
@@ -184,7 +222,7 @@ def _invalidate_client(proxy: str | None) -> None:
     HTTP/2 共享连接进入 GOAWAY 后所有 stream 都失败。下一次 _get_client 会
     建一个全新连接,把 dead state 抛掉。
     """
-    key = proxy or ""
+    key = _norm_proxy(proxy) or ""
     with _pool_lock:
         client = _client_pool.pop(key, None)
     if client is not None:
@@ -254,6 +292,10 @@ _RATE_BUCKETS: dict[str, tuple[int, float]] = {
     "feeds.post.MP_INVENTORY": (40, 3600.0),    # 官方 50/hour(多仓批次 2 启用;与 v1.4 各自独立桶)
     "settings.partnerprofile": (40, 60.0),      # 官方 50/min(tsv:166),lru 缓存后每店仅首次调
     "settings.shipnodes": (40, 60.0),           # 官方 50/min(tsv:152),同样 lru 缓存
+    # 建仓两件(2026-10-24 所有者定稿:建仓由 node_create 按人给的信息手动执行):
+    # 都是官方 10/min ⇒ 上限 ≤10 自动落稀缺桶跨进程共享;一次建仓每店各调一次
+    "settings.carriers": (8, 60.0),             # GET /v3/settings/shipping/carriers 官方 10/min(tsv:165)
+    "settings.shipnodes.create": (8, 60.0),     # POST /v3/settings/shipping/shipnodes 官方 10/min(tsv:155)
     "prices.put": (80, 3600.0),                 # PUT /v3/price 官方 100/hour(旧 README 200/min 是错的)
     "inventory.put": (160, 60.0),               # PUT /v3/inventory 官方 200/min
     # ⚠ 分节点写与 legacy 写**共用官方那 200/min 吗?官方未明**。分桶登记是
@@ -511,7 +553,8 @@ def get_token(client_id, client_secret, proxy):
             # 收口成 StoreProxyError(⊂ httpx.ProxyError),分类分支按"该店代理坏"
             # 处理;连接池同步剔除,坏连接不留给下一家店
             _invalidate_client(proxy)
-            raise StoreProxyError(f"client_id={client_id[:6]}…", e) from e
+            raise StoreProxyError(f"client_id={client_id[:6]}…", e,
+                                  direct=_norm_proxy(proxy) is None) from e
         # 换 token 阶段的 400/401/403 = 这套凭证被拒,与业务端点的 401/403 同类,
         # 一律转 StoreDeadError 交给调用方"跳过全店"。
         # ⚠ 沃尔玛在 client_credentials 授权失败时回的是 **400**(不是 401),
@@ -602,13 +645,19 @@ def _log(msg: str, level: int = logging.WARNING) -> None:
 
 
 def _request_ex(method, url, token, client_id, proxy, *,
-                json_body=None, params=None, timeout=30, max_retries=0):
+                json_body=None, params=None, timeout=30, max_retries=0,
+                error_body=False):
     """
     统一的请求实现。返回 (status, headers, data)。
 
     - status:      HTTP 状态码 int;网络/超时异常时为 None
     - headers:     dict(lower-case key → str);异常时为 {}
     - data:        解析后的 JSON dict;非 2xx 或解析失败时为 None
+    - error_body:  **opt-in**(2026-10-24):非 2xx 时把响应体也当 data 返回
+                   (JSON 解析得出就是 JSON;否则 {"text": 前 500 字})。缺省 False,
+                   所有老调用方契约不变。给"被拒原因要进摘要/台账"的写接口用 ——
+                   建仓首跑实见 400 原文只在日志里,摘要与台账记的都是 None,人要
+                   翻日志才知道沃尔玛嫌弃的是哪个字段。
 
     不抛异常、不 raise_for_status,让调用方按 status 自行决定后续动作。
 
@@ -719,6 +768,11 @@ def _request_ex(method, url, token, client_id, proxy, *,
             if body_snip:
                 msg += f": {body_snip}"
             _log(msg, level=logging.INFO)
+            if error_body:
+                try:
+                    data = resp.json()
+                except Exception:                      # noqa: BLE001 —— 非 JSON 错误页照样带回
+                    data = {"text": resp.text[:500]}
 
         return status, headers, data
 
@@ -740,8 +794,10 @@ def safe_get_ex(url, token, client_id, proxy, params=None, timeout=30, max_retri
                        params=params, timeout=timeout, max_retries=max_retries)
 
 
-def safe_post_ex(url, token, client_id, proxy, json_body=None, params=None, timeout=30, max_retries=0):
-    """POST 请求,返回 (status, headers, data)。语义同 safe_get_ex。
+def safe_post_ex(url, token, client_id, proxy, json_body=None, params=None, timeout=30,
+                 max_retries=0, error_body=False):
+    """POST 请求,返回 (status, headers, data)。语义同 safe_get_ex;`error_body=True`
+    时非 2xx 的响应体随 data 带回(见 _request_ex)。
 
     ⚠ **默认 max_retries=0 是有意的** —— POST 非幂等,自动重试会造成重复提交
     (feed 重复 / refund 重复 / shipping 重复)。要重试就显式传,并自己保证
@@ -752,7 +808,7 @@ def safe_post_ex(url, token, client_id, proxy, json_body=None, params=None, time
     """
     return _request_ex("POST", url, token, client_id, proxy,
                        json_body=json_body, params=params, timeout=timeout,
-                       max_retries=max_retries)
+                       max_retries=max_retries, error_body=error_body)
 
 
 def safe_put_ex(url, token, client_id, proxy, json_body=None, params=None, timeout=30):

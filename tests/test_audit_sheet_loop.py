@@ -1127,3 +1127,68 @@ def test_claim_from_sheet_says_unlimited_when_no_limit_given(monkeypatch):
     # 账要说全:补采救回来的那些也在这一轮判(_close_gap 跑在判定之前)
     assert "补采救回来的还会加进来" in body
     assert "只判" not in body
+
+
+def test_explicit_refresh_validates_before_scraper_and_uses_empty_sheet(monkeypatch):
+    import pytest
+    monkeypatch.setattr(pa, "_cap_by_connections", lambda n: (n, ""))
+    seen = []
+    def gap(want, sheet_rows, execute, wait_min, force):
+        seen.append((want, sheet_rows, execute, force))
+        raise RuntimeError("gap reached")
+    monkeypatch.setattr(pa, "_close_gap", gap)
+    with pytest.raises(ValueError):
+        pa.run({"refresh": "1", "asins": "bad", "execute": True})
+    with pytest.raises(ValueError):
+        pa.run({"refresh": "1", "asins": "B0AAAA0001", "typo": 1, "execute": True})
+    assert not seen
+    with pytest.raises(RuntimeError, match="gap reached"):
+        pa.run({"refresh": "1", "asins": "B0AAAA0001", "execute": False})
+    assert seen == [(["B0AAAA0001"], [], False, True)]
+
+
+def test_named_refresh_reports_reasons_in_the_summary_not_a_sheet(monkeypatch):
+    """refresh=1 点名刷新没有表行(sheet_rows=[]):仍采不回来的**逐个原因进摘要**。
+    此前原因算出来就扔(写给空表),摘要还照搬"写进表格「具体内容」、下轮重试"
+    —— 既没有表、也没有下一轮会自动领它(2026-10-22 复核)。"""
+    notes = []
+    _stub(monkeypatch, [_BEFORE, _AFTER_PART], pushed=[], notes=notes,
+          failures={"B0GONE0001": "captcha"})
+    out = "\n".join(pa._close_gap(_WANT, [], True, 20, force=True))
+    assert "点名刷新(-p refresh=1)" in out and "-p force=1" not in out
+    assert "仍缺 1 个:逐个原因见下" in out
+    assert "B0GONE0001:未采集(库里没有这个 ASIN)" in out and "验证码" in out
+    assert "表格" not in out and "下轮" not in out and notes == []
+
+
+def test_named_refresh_gap_wait_zero_does_not_promise_a_next_round(monkeypatch):
+    _stub(monkeypatch, [_BEFORE, _BEFORE], pushed=[], notes=[])
+    out = "\n".join(pa._close_gap(_WANT, [], True, 0, force=True))
+    assert "采完后重跑本命令再审" in out
+    assert "B0THIN0001:采集降级(采到了但没有标题);已推采集(gap_wait=0 只推不等),采完后重跑本命令" in out
+    assert "下轮" not in out and "下一轮" not in out and "表格" not in out
+
+
+def test_named_refresh_timeout_and_hold_do_not_promise_a_next_round(monkeypatch):
+    """超时没等到、12 小时内刚采过(hold)两种,点名刷新里都不许说"下轮"。"""
+    _stub(monkeypatch, [_BEFORE, _BEFORE], pushed=[], notes=[],
+          settle=("等采集:0/1 批落定,1 批超 20 分钟仍在跑", 1))
+    out = "\n".join(pa._close_gap(_WANT, [], True, 20, force=True))
+    assert "超时仍在跑:审不了的本次判不了(采完后重跑本命令)" in out
+    assert "已推采集但等了 20 分钟没等到,采完后重跑本命令" in out
+    assert "下轮" not in out and "表格" not in out
+    held = [_st("B0THIN0001", title=False, seen=_T0, outcome="ok", fresh=True)]
+    _stub(monkeypatch, [held, held], pushed=[], notes=[])
+    out = "\n".join(pa._close_gap(["B0THIN0001"], [], True, 20, force=True))
+    assert "不重推(原因见下)" in out and "12 小时后再跑本命令" in out
+    assert "下轮" not in out and "表格" not in out
+
+
+def test_sheet_mode_wording_is_unchanged_by_the_named_branch(monkeypatch):
+    """上架表模式一字不动:hold / 超时的原措辞照旧(下轮再看 / 下轮重试 / 理由写表)。"""
+    notes = []
+    _stub(monkeypatch, [_BEFORE, _BEFORE], pushed=[], notes=notes,
+          settle=("等采集:0/1 批落定,1 批超 20 分钟仍在跑", 1))
+    out = "\n".join(pa._close_gap(_WANT, _ROWS, True, 20))
+    assert "退回下轮审" in out and "理由写进表格「具体内容」列,下轮重试" in out
+    assert any("没等到,下轮重试" in t for _r, t in notes)

@@ -812,3 +812,31 @@ def test_the_observed_verdict_wins_over_the_receipt_one(pg):
         cur.execute("SELECT status, detail ->> 'settled_by' FROM"
                     " ops.dispositions WHERE store = %s", (_DSTORE,))
         assert cur.fetchone() == ("confirmed", "delete_verified")
+
+
+@needs_pg
+def test_closed_store_withdraw_stamps_its_reason_and_spares_the_rest(pg):
+    """不维护店的整店撤销(2026-10-22):keep=[] 那支真 SQL 把原因写进
+    detail.withdrawn_reason;别店的行、已提交的行一根手指都不碰;随后的通用撤销
+    排除这家店,原因不会被「本轮扫描不再建议」盖掉。"""
+    other = "DISP_T2"
+    with pg.cursor() as cur:
+        for st, sku, status in ((_DSTORE, "K_SUG", "suggested"),
+                                (_DSTORE, "K_EXEC", "executing"),
+                                (other, "K_OTHER", "suggested")):
+            cur.execute("INSERT INTO ops.dispositions (store, sku, source, action,"
+                        " status) VALUES (%s, %s, 'maint', 'price', %s)",
+                        (st, sku, status))
+    n = ds.withdraw_stale(pg, "maint", [], why="店铺不维护(凭证未启用)",
+                          store=_DSTORE)
+    assert n == 1
+    ds.withdraw_stale(pg, "maint", [(other, "K_OTHER", "price")],
+                      why="本轮扫描不再建议", exclude_stores=[_DSTORE])
+    with pg.cursor() as cur:
+        cur.execute("SELECT store, sku, status, detail ->> 'withdrawn_reason'"
+                    " FROM ops.dispositions WHERE store = ANY(%s) ORDER BY sku",
+                    ([_DSTORE, other],))
+        assert cur.fetchall() == [
+            (_DSTORE, "K_EXEC", "executing", None),
+            (other, "K_OTHER", "suggested", None),
+            (_DSTORE, "K_SUG", "withdrawn", "店铺不维护(凭证未启用)")]

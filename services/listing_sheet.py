@@ -169,9 +169,22 @@ def _ranges(row_from: int, fields: list[str],
 
 def _row_ranges(updates: list[tuple[int, list]],
                 fields: list[str]) -> list[tuple[str, list[list]]]:
-    """输入:[(行号, 等长值序列)] + 字段序列 → 输出:逐行展开的 [(A1范围, 值矩阵)]。"""
+    """输入:[(行号, 等长值序列)] + 字段序列 → 输出:按段位次分组的 [(A1范围, 值矩阵)]。
+
+    分组是为了让写通道能把同列的连续行粘成一段(见 `sheet_layout.rows_ranges`);
+    多段写入时 `fields` 的顺序就是段的落地顺序。
+    """
     return sheet_layout.row_ranges(resources.LISTING_SHEET, _index_map(),
                                    updates, fields)
+
+
+def _rows_ranges(rows: list[tuple[int, list[str], list]]
+                 ) -> list[tuple[str, list[list]]]:
+    """输入:[(行号, 该行字段序列, 等长值序列)] → 输出:按段位次分组的 [(A1范围, 值矩阵)]。
+
+    给"每行字段不一定相同"的写入用(`write_submit_cols` 有的行带 SKU、有的不带)。
+    """
+    return sheet_layout.rows_ranges(resources.LISTING_SHEET, _index_map(), rows)
 
 
 def read_rows(upto: str | None = None) -> list[dict]:
@@ -303,6 +316,12 @@ def write_submit_cols(updates: list[tuple[int, list]], execute: bool = True) -> 
     分两次写,中间崩掉就留下「已提交但无码」的行,而回执反哺器正是靠 SKU 找行
     (row_sku),那一行的 上架结果/报错/feed查询日期 就永不回填。空值不写
     (不产生空段),批次 1 的调用方仍传八值,写出的 range 与改造前同形。
+
+    ★ 段按位次分组发出(2026-10-20,`_rows_ranges`):逐行交错时写通道一段都
+    粘不起来,2000 行要 40 个请求;分组后同列连续行粘成一段,1 个请求写完。
+    **SKU 排在字段最前**,所以含 SKU 的那一段整列先落地、「是否上架/feedid」
+    那一段后落地:写入跨多个请求时中途失败,最多留下"有码未标上架"的行,
+    不会出现"已标上架却没有码"。
     """
     if not updates:
         return 0
@@ -312,14 +331,14 @@ def write_submit_cols(updates: list[tuple[int, list]], execute: bool = True) -> 
         if len(updates) > 20:
             logger.info("[DRY-RUN] …另有 %d 行省略", len(updates) - 20)
         return 0
-    ranges = []
+    rows = []
     for r, vals in updates:
         sku = str(vals[8]).strip() if len(vals) > 8 and vals[8] else ""
         fields, row = list(_SUBMIT_FIELDS), list(vals[:8])
         if sku:
             fields, row = ["sku"] + fields, [sku] + row
-        ranges += _ranges(r, fields, [row])
-    feishu.sheet_write_ranges(resources.LISTING_SHEET, ranges)
+        rows.append((r, fields, row))
+    feishu.sheet_write_ranges(resources.LISTING_SHEET, _rows_ranges(rows))
     return len(updates)
 
 

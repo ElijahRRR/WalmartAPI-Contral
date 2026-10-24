@@ -82,8 +82,9 @@ def diagnose(err: Exception) -> str:
                  → 找代理商;补试与链尾重赛常能自愈
       沃尔玛NNN  沃尔玛端点回了 HTTP NNN(429=配额、5xx=沃尔玛侧故障)
                  → 看配额/等沃尔玛,与本地无关
-      网络未达   请求经 api 层自动重试后仍没打到(状态码 None)
-                 → 网络/代理链路,看该店代理与出口
+      网络未达   请求经 api 层自动重试后仍没打到(状态码 None),**或**没配
+                 代理的直连店出口不通(2026-10-21 起允许直连)
+                 → 配了代理的看该店代理与出口;直连的看本机出口网络
       其他       以上都不是 → 看该工作流日志全文
 
     ⚠ 「沃尔玛NNN/网络未达」靠匹配 **api 层自家的报错格式**(items.py 等的
@@ -93,6 +94,10 @@ def diagnose(err: Exception) -> str:
     if isinstance(err, _client.StoreDeadError):
         return "凭证失效"
     if isinstance(err, _client.PROXY_ERRORS):
+        # 这家店没配代理、走的是直连(2026-10-21 起允许):故障与代理商无关,
+        # 报「代理无效」会把人指去改一个根本不存在的代理配置。
+        if getattr(err, "direct", False):
+            return "网络未达"
         msg = str(err).lower()
         if any(mark in msg for mark in _PROXY_DEAD_MARKS):
             return "代理无效"

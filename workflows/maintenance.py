@@ -8,12 +8,13 @@
   python cli.py maintenance -p resync_sheet=1    # 只补维护记录表(写表炸过之后)
   python cli.py maintenance -p prune_sheet=1     # 只裁维护记录表(默认留 7 天)
 
-**本工作流不再做任何决策**(批次四,所有者定稿 2026-08-16)。它只做四件事:
-  ① 落定上一轮:维护三类按"线上值改过来了没有";
-  ② 超期放行:3 天没等到 catalog_sync 复核的 executing 行放行(见下);
-  ③ 领取 ops.dispositions 里 **action ∈ (title, price, inventory)** 且
+**本工作流不再做任何决策**(批次四,所有者定稿 2026-08-16)。它只做两件事:
+  ① 领取 ops.dispositions 里 **action ∈ (title, price, inventory)** 且
      status='suggested' 的建议行;
-  ④ 按 (店铺, 动作) 分桶提交,提交成功的转 executing 并落 feed_id。
+  ② 按 (店铺, 动作) 分桶提交,提交成功的转 executing 并落 feed_id。
+上一轮的落定与超期放行**归 maintenance_scan**,在它写建议之前调(2026-10-19
+前移,原因见 maintenance_scan 写建议那段注释):放在本文件开头时,扫描件先撞
+executing 写不进、本文件才落定 ⇒ 天天要改的 SKU 被砍成隔天一次。
 
 ⚠ **本工作流不再发任何删除 feed**(所有者定稿 2026-08-24)。破坏动作
 (delete/retire)全部归 `problem_product_cleanup` —— 两个执行件都能发
@@ -31,11 +32,10 @@ DELETE_ITEM 的时候,配额、在途防重、病历口径各有一套,同一个
 ⚠ **调度顺序是硬约束**:catalog_sync → product_refresh → maintenance_scan →
 本工作流。没跑 scan 就跑本工作流 = 消费上一轮的陈旧建议(或者什么都没有)。
 
-⚠ **超期放行不是洁癖**:ops.dispositions 的部分唯一索引只允许同
-(店铺,SKU,动作) 有一条未落定行。executing 行永远不落定 = 那个 SKU 的那类维护
-**永久停摆且完全静默**(扫描件照常算出意图,upsert 撞索引写不进去,rowcount 0)。
-等不到观测的常见原因:商品下架了(walmart_items 缺席,JOIN 不上)、
-catalog_sync 连着几轮没扫到那家店。
+⚠ **本文件提交出去的行要靠 maintenance_scan 收尾**:ops.dispositions 的部分
+唯一索引只允许同 (店铺,SKU,动作) 有一条未落定行,executing 行不落定 = 那个 SKU
+的那类维护停摆。落定(按观测)与超期放行(3 天没等到观测)都在扫描件写建议
+之前做,见 services/dispositions.settle_maintenance / expire_executing。
 
 路由(旧系统实证,原样保留):单店 改价 ≤5 / 改库存 ≤10 走单品 PUT(结果当场
 已知),超过走 feed;标题无同步接口永远 MP_MAINTENANCE feed。单店内
@@ -56,8 +56,10 @@ _one_store,首轮已成功的部分会被在途防重(feed 路由)或绝对赋�
     outcome=dedup,本文件如实计数);
   · 建议行本身的防重 → ops.dispositions 的部分唯一索引 + claim() 只取 suggested;
   · 生效确认 → settle_maintenance()(标题/价格/库存,比对
-    catalog.walmart_items 的现值)。删除类的落定归 problem_product_cleanup,
-    本文件不再调 settle() —— 两个执行件都调会把同一批落定报两遍。
+    catalog.walmart_items 的现值)**归 maintenance_scan**,在它写建议之前调
+    (2026-10-19 前移:放在本文件开头时,扫描件先撞 executing 写不进、本文件
+    才落定 ⇒ 天天要改的 SKU 被砍成隔天一次)。本文件**不落定任何东西**;
+    删除类的落定归 problem_product_cleanup。
 
 维护记录(registry.MAINT_SHEET,电子表格「维护记录」工作表,只追加,11 列):
   **本轮领到的每一条建议都写一行**,不只是提交成功的那些 —— 所有者要的是
@@ -280,35 +282,13 @@ def _submit_kind(store: dict, kind: str, items: list[dict], today: str,
                                         failed_word="提交被拒"))
 
 
-def _settle(lines: list[str]) -> None:
-    """上一轮落定 + 超期放行,结果写进摘要。任何失败只告警不阻断本轮提交。
-
-    ⚠ **只落定维护三类**。删除/停用/反补的落定(dispositions.settle,按观测
-    事件判)归 problem_product_cleanup —— 两个执行件都调会把同一批落定报两遍,
-    人对账时会以为生效数翻倍。
-    """
-    with db.pg_conn() as conn:
-        maint = dispositions.settle_maintenance(conn)   # 三类:按线上现值
-        expired = dispositions.expire_executing(conn)
-    ok = maint["confirmed"]
-    bad = maint["ineffective"]
-    if ok or bad:
-        lines.append(f"上一轮落定:生效 {ok},**未生效 {bad}**"
-                     f"(提交成功但 catalog_sync 复核时线上值没变,"
-                     f"下轮 maintenance_scan 会重新建议)")
-    if expired:
-        lines.append(f"⚠ 超期放行 {expired} 条(超 {dispositions.EXPIRE_DAYS} 天"
-                     f"没等到 catalog_sync 复核 —— 多半是商品已下架;"
-                     f"不放行会把这些 SKU 的该类维护永久堵住)")
-
-
 def _write_sheet(all_records: list[tuple], lines: list[str]) -> None:
     """维护记录写表 + 裁剪。收口在 services.maint_sheet.publish(两个执行件共用)。"""
     maint_sheet.publish(all_records, lines)
 
 
 def run(params: dict) -> str:
-    """输入:params(execute/store/only/resync_sheet)→ 输出:落定 + 提交摘要。"""
+    """输入:params(execute/store/only/resync_sheet)→ 输出:领取 + 提交摘要。"""
     if params.get("resync_sheet"):
         # 只补表,不算维护动作:提交成功但写表炸了之后的恢复路径
         return maint_sheet.resync_from_ledger()
@@ -323,8 +303,8 @@ def run(params: dict) -> str:
                    if only == "delete" else ""))
 
     lines: list[str] = []
-    if execute:
-        _settle(lines)
+    # 落定(上一轮 executing → confirmed/ineffective)**不在这里**:归 maintenance_scan,
+    # 在它写建议之前(2026-10-19,见头注「生效确认」)。这里再落定一遍就是双轨
     # 标题整路停闸(所有者 2026-09-05,唯一出处 mi.TITLE_SYNC):执行件也不领
     # 存量 title 建议 —— 只停生成侧的话,库里已有的 suggested 行下一轮照样被领走
     # 提交,停闸就只停了一半。留在 suggested 不撤:恢复后它们还在。
@@ -374,11 +354,14 @@ def run(params: dict) -> str:
                     for it in held_node]
 
     mode = "" if execute else "🧪 [DRY-RUN] "
-    if not mi.TITLE_SYNC:
-        # 停闸必须天天见人(静默关闭 = 没人记得它关着)
-        lines.append(f"  ⛔ 标题维护已整路停闸(所有者 2026-09-05):本轮不领 title 建议,"
-                     f"库里 {n_title_held} 条 title 建议留在 suggested 不动;"
-                     f"改价/改库存照常。恢复条件见 services/maintenance_intents.TITLE_SYNC")
+    # 停闸必须天天见人(静默关闭 = 没人记得它关着)。⚠ 用 ⚠ 不用 ⛔,而且**排在
+    # 结论行之后**:cli 约定首行以 ⛔ 开头 = 前提不成立、什么都没做(判 refused,
+    # 链停、problem_product_cleanup 被跳过、不触发链尾重赛)。2026-10-19 之前首行
+    # 恰好被「上一轮落定」那行占着,落定前移到扫描件后它就会天天当首行
+    title_note = ("" if mi.TITLE_SYNC else
+                  f"  ⚠ 标题维护已整路停闸(所有者 2026-09-05):本轮不领 title 建议,"
+                  f"库里 {n_title_held} 条 title 建议留在 suggested 不动;"
+                  f"改价/改库存照常。恢复条件见 services/maintenance_intents.TITLE_SYNC")
     if not intents:
         if execute and held_records:
             # 领到的全被第二道闸扣下:没有可提交的,但扣下的行照样进表
@@ -389,7 +372,7 @@ def run(params: dict) -> str:
             f"(catalog_sync → maintenance_scan → 本工作流,顺序是硬约束)"
             + (f";⚠ 另有 {n_sup} 条被压制(这些 SKU 挂着待执行的删除/停用,"
                f"要删的东西不再花配额去改;执行归 problem_product_cleanup)"
-               if n_sup else "")])
+               if n_sup else "")] + ([title_note] if title_note else []))
 
     # 分桶件在 services.dispositions(两个执行件共用,2026-08-27 上移):
     # 「未知动作即抛」的宁炸不吞判据原样在里面(conventions §三的安全闸)
@@ -406,6 +389,8 @@ def run(params: dict) -> str:
                  f"价格 {n_kind['price']},库存 {n_kind['inventory']}"
                  + (f";因同 SKU 待删/待停用被压制 {n_sup} 条"
                     f"(留在建议表,删除没生效的话下轮还在)" if n_sup else ""))
+    if title_note:
+        lines.append(title_note)
 
     if not execute:
         # 执行件的 dry-run 只回答"要提交什么、走哪条路由"。
@@ -598,5 +583,5 @@ def run(params: dict) -> str:
     all_records = [r for name in sorted(records_by_store)
                    for r in records_by_store[name]]
     _write_sheet(all_records, lines)
-    lines.append("生效确认在下一轮本工作流开头(等 catalog_sync 重新观测)")
+    lines.append("生效确认在下一轮 maintenance_scan 写建议之前(等 catalog_sync 重新观测)")
     return "\n".join(lines)

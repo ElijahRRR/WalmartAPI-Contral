@@ -645,13 +645,19 @@ def _log(msg: str, level: int = logging.WARNING) -> None:
 
 
 def _request_ex(method, url, token, client_id, proxy, *,
-                json_body=None, params=None, timeout=30, max_retries=0):
+                json_body=None, params=None, timeout=30, max_retries=0,
+                error_body=False):
     """
     统一的请求实现。返回 (status, headers, data)。
 
     - status:      HTTP 状态码 int;网络/超时异常时为 None
     - headers:     dict(lower-case key → str);异常时为 {}
     - data:        解析后的 JSON dict;非 2xx 或解析失败时为 None
+    - error_body:  **opt-in**(2026-10-24):非 2xx 时把响应体也当 data 返回
+                   (JSON 解析得出就是 JSON;否则 {"text": 前 500 字})。缺省 False,
+                   所有老调用方契约不变。给"被拒原因要进摘要/台账"的写接口用 ——
+                   建仓首跑实见 400 原文只在日志里,摘要与台账记的都是 None,人要
+                   翻日志才知道沃尔玛嫌弃的是哪个字段。
 
     不抛异常、不 raise_for_status,让调用方按 status 自行决定后续动作。
 
@@ -762,6 +768,11 @@ def _request_ex(method, url, token, client_id, proxy, *,
             if body_snip:
                 msg += f": {body_snip}"
             _log(msg, level=logging.INFO)
+            if error_body:
+                try:
+                    data = resp.json()
+                except Exception:                      # noqa: BLE001 —— 非 JSON 错误页照样带回
+                    data = {"text": resp.text[:500]}
 
         return status, headers, data
 
@@ -783,8 +794,10 @@ def safe_get_ex(url, token, client_id, proxy, params=None, timeout=30, max_retri
                        params=params, timeout=timeout, max_retries=max_retries)
 
 
-def safe_post_ex(url, token, client_id, proxy, json_body=None, params=None, timeout=30, max_retries=0):
-    """POST 请求,返回 (status, headers, data)。语义同 safe_get_ex。
+def safe_post_ex(url, token, client_id, proxy, json_body=None, params=None, timeout=30,
+                 max_retries=0, error_body=False):
+    """POST 请求,返回 (status, headers, data)。语义同 safe_get_ex;`error_body=True`
+    时非 2xx 的响应体随 data 带回(见 _request_ex)。
 
     ⚠ **默认 max_retries=0 是有意的** —— POST 非幂等,自动重试会造成重复提交
     (feed 重复 / refund 重复 / shipping 重复)。要重试就显式传,并自己保证
@@ -795,7 +808,7 @@ def safe_post_ex(url, token, client_id, proxy, json_body=None, params=None, time
     """
     return _request_ex("POST", url, token, client_id, proxy,
                        json_body=json_body, params=params, timeout=timeout,
-                       max_retries=max_retries)
+                       max_retries=max_retries, error_body=error_body)
 
 
 def safe_put_ex(url, token, client_id, proxy, json_body=None, params=None, timeout=30):

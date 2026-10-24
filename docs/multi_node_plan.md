@@ -395,12 +395,22 @@ carrierMethodType} / calendarDayConfiguration{standardProcessingSchedule.<sunday
 `shipNode`(17 位数字)与 `nodeType: PHYSICAL`。原件 `refdata/specs/ship_node_create_1.2_sample.json`,
 守门测试拿它校"我们发的键官方样例里都有"。承运商取值查 `GET /v3/settings/shipping/carriers`(10/min)。
 
-**官方文档空白(待第一次真建时实测,结果回填本节)**:
-1. `shippingDetails` 样例只有 `twoDayShipping` 一档,不提供两日达的仓怎么填没写;
-   本仓**不填 `-p carrier=` 就不带这个键**,被拒会把 400 原文报出来,再按报错补。
-   L001 的 VIRTUAL 节点没有这个键,但那是沃尔玛建的,不能据此推断 POST 可以不带。
-2. `customNodeId` 是否强制唯一没写,所以防重键是**仓名**(同店同名不重建),customNodeId 只作辅助匹配。
-3. 国内仓 `country` 填 `CN` 还是 `CHN`:L001 是 `CN`(沃尔玛自己建的 VIRTUAL 节点),照抄。
+**官方文档空白与实测(首跑 2026-10-24 13:45,L001贾林红,结果回填)**:
+1. ✅ **`distributorSupportedServices` 不能为 null**(首跑 400 原文:`shipNode object has
+   invalid data: distributorSupportedServices can't be null`)。首版「可选项没给就不带键」
+   对这个键是错的;改为**缺省发空数组 `[]`**(官方 schema 该键唯一允许值 `TWO_DAY_DELIVERY`,
+   国内仓不该承诺两日达,所以缺省空而不是填它)。`[]` 收不收是**第二次真跑要验的**:
+   被拒就只能 `-p services=TWO_DAY_DELIVERY`,那时要所有者拍板承诺不承诺。
+2. `shippingDetails` 没带,首跑的 400 没嫌它(校验可能逐项报,不排除下一个就是它)。
+   不填 `-p carrier=` 仍不带这个键,被拒原文会进摘要与台账(首版只进日志,已修:
+   `safe_post_ex(error_body=True)` opt-in,老调用方契约不变)。
+3. 官方 schema(reference/createfulfillmentcenter,2026-10-24 核验):`timeZone` 枚举
+   PST/MST/CST/EST/PDT/MDT/CDT/EDT/ADT/NDT/GMT/CET/TRT/IST/CTT/HKT/SGT/ICT/JST/KST/VST/CLT
+   (`services/ship_nodes.TIME_ZONES`,发前校验);`postalAddress` 还有 `addressLine2`
+   (`-p address2=`);`calendarDayConfiguration` 一旦带就两个子键都必填、七天齐、
+   `cutOffTime` 缺省 14:00。`customNodeId` 唯一性仍没写,防重键仍是**仓名**。
+4. 国内仓 `country=CN`、`state=CQ`、`tz=CST` 首跑**没被嫌弃**(400 只点名了 services),
+   照抄 L001 VIRTUAL 节点的写法成立。
 
 **落地**(一条实现路径,见各文件头注):
 | 关注点 | 唯一出处 |

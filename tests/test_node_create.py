@@ -61,10 +61,22 @@ def test_full_payload_uses_only_keys_from_the_official_sample():
     assert node["calendarDayConfiguration"]["additionalDaysOff"] == ["2026-12-25"]
 
 
-def test_minimal_payload_carries_no_invented_optional_keys():
-    """可选项没给就不带键:官方样例里有的键我们不替所有者编值。"""
+def test_minimal_payload_carries_no_invented_optional_keys_but_services_is_always_present():
+    """可选项没给就不带键 —— 唯一例外 distributorSupportedServices:2026-10-24 首跑实证
+    (L001贾林红 400「can't be null」)它必须在,不提供两日达就发空数组。"""
     node = ship_nodes.build_node(_MIN)
-    assert set(node) == {"shipNodeName", "status", "timeZone", "postalAddress"}
+    assert set(node) == {"shipNodeName", "status", "timeZone", "postalAddress",
+                         "distributorSupportedServices"}
+    assert node["distributorSupportedServices"] == []
+    assert "addressLine2" not in node["postalAddress"]
+
+
+def test_address2_and_services_are_normalized_when_given():
+    node = ship_nodes.build_node({**_MIN, "address2": " 3-5 ", "services": "two_day_delivery",
+                                  "tz": "cst"})
+    assert node["postalAddress"]["addressLine2"] == "3-5"     # 官方 schema 的字段名
+    assert node["distributorSupportedServices"] == ["TWO_DAY_DELIVERY"]
+    assert node["timeZone"] == "CST"
 
 
 @pytest.mark.parametrize("bad, word", [
@@ -75,6 +87,8 @@ def test_minimal_payload_carries_no_invented_optional_keys():
     ({**_MIN, "workdays": "mon-fri", "cutoff": "25:00"}, "HH:MM"),
     ({**_MIN, "workdays": "mon,xyz", "cutoff": "11:30"}, "认不出"),
     ({**_MIN, "days_off": "2026/12/25"}, "YYYY-MM-DD"),
+    ({**_MIN, "tz": "Asia/Shanghai"}, "timeZone 枚举"),
+    ({**_MIN, "services": "STANDARD"}, "官方允许值"),
 ])
 def test_spec_errors_name_the_offending_field(bad, word):
     with pytest.raises(ship_nodes.SpecError, match=word):
@@ -107,8 +121,9 @@ def _wire_api(monkeypatch, status, data, calls):
     monkeypatch.setattr(settings_api._client, "base_url", lambda: "https://x")
 
     def post(url, token, client_id, proxy, json_body=None, params=None,
-             timeout=30, max_retries=0):
-        calls.append({"url": url, "body": json_body, "max_retries": max_retries})
+             timeout=30, max_retries=0, error_body=False):
+        calls.append({"url": url, "body": json_body, "max_retries": max_retries,
+                      "error_body": error_body})
         return status, {}, data
 
     monkeypatch.setattr(settings_api._client, "safe_post_ex", post)
@@ -126,6 +141,7 @@ def test_create_ship_node_posts_official_envelope_without_retries_and_clears_cac
     assert got["shipNode"] == "91539778610008065"
     assert calls[0]["url"].endswith("/v3/settings/shipping/shipnodes")
     assert calls[0]["max_retries"] == 0                 # POST 不幂等,不自动重试
+    assert calls[0]["error_body"] is True               # 被拒原因要进摘要与台账,不能只在日志里
     assert calls[0]["body"] == {"shipNodeHeader": {"version": _SAMPLE["shipNodeHeader"]["version"]},
                                 "shipNode": [node]}
     assert cleared == [1]                               # 同进程紧接着的校验要看得见新仓
@@ -148,6 +164,39 @@ def test_create_ship_node_signals_rejected_vs_unknown(monkeypatch, status, data,
         with pytest.raises(RuntimeError) as ei:
             settings_api.create_ship_node(_store(), ship_nodes.build_node(_MIN))
         assert not isinstance(ei.value, settings_api.ShipNodeOutcomeUnknown)
+
+
+def test_rejection_message_carries_walmart_field_and_description(monkeypatch):
+    """2026-10-24 首跑:摘要与台账记的是「400: None」,原因只在日志 —— 这条把原文钉进异常文案。"""
+    body = {"errors": [{"code": "INVALID_REQUEST_CONTENT.INVALID_REQUEST", "field": "shipNode",
+                        "description": "shipNode object has invalid data: "
+                                       "distributorSupportedServices can't be null",
+                        "severity": "ERROR"}]}
+    _wire_api(monkeypatch, 400, body, [])
+    with pytest.raises(RuntimeError, match=r"400: \[shipNode\] .*can't be null"):
+        settings_api.create_ship_node(_store(), ship_nodes.build_node(_MIN))
+    assert settings_api._error_text({"text": "<html>Akamai</html>"}) == "<html>Akamai</html>"
+    assert settings_api._error_text(None) == "None"
+
+
+def test_request_ex_returns_error_body_only_when_opted_in(monkeypatch):
+    class _Resp:
+        status_code, content, text = 400, b"x", '{"errors":[{"description":"bad"}]}'
+        headers = {}
+
+        def json(self):
+            return {"errors": [{"description": "bad"}]}
+
+    class _Client:
+        def request(self, *a, **k):
+            return _Resp()
+
+    monkeypatch.setattr(_client, "_get_client", lambda proxy: _Client())
+    monkeypatch.setattr(_client, "make_headers", lambda t, c: {})
+    st, _, data = _client._request_ex("POST", "https://x/y", "tok", "cid", None)
+    assert (st, data) == (400, None)                     # 老契约不变
+    st, _, data = _client._request_ex("POST", "https://x/y", "tok", "cid", None, error_body=True)
+    assert (st, data) == (400, {"errors": [{"description": "bad"}]})
 
 
 def test_list_carrier_methods_accepts_bare_array_and_raises_on_empty(monkeypatch):

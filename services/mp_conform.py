@@ -11,6 +11,7 @@
   4 fix_invalid_enums     非法枚举值(必填换 enum[0],非必填直接删)
   4b ensure_variant_bag   变体三件套自洽(给一半会被拒;单品 isPrimary=Yes)
   5 strip_unknown         剔除 spec 外字段(additionalProperties=false 会拒)
+  5a fix_array_items      数组元素是对象:剔元素内 spec 外子字段、删缺子字段必填的元素
   6 clean_state_restrictions  清 LLM 幻觉的 stateRestrictions
   7 drop_empty_optional   删非必填空值
   8 drop_min_items        删数组长度 < minItems 的非必填字段
@@ -19,7 +20,7 @@
 
 对应的沃尔玛错误码(注释即事故档案,别删):
   EXT_DATA_ERROR_50716566635066  类型不对(要 JSONArray / JSONObject / Number)
-  EXT_DATA_ERROR_72600149546850  条件必填缺失
+  EXT_DATA_ERROR_72600149546850  条件必填缺失;数组元素子字段必填缺失(fabricContent)
   EXT_DATA_ERROR_60670554076755  字段不在 spec 里(如 Orderable.productName)
   EXT_DATA_ERROR_74086950555651  必填且最小长度 1(如 color)
   EXT_DATA_ERROR_49505365506868  URL 数组被填了 'No' 之类占位
@@ -726,6 +727,59 @@ def strip_unknown(spec: dict, ospec: dict, visible: dict, orderable: dict
     return nv, no, dropped
 
 
+def fix_array_items(spec: dict, section: dict) -> tuple[dict, list[str]]:
+    """输入:spec + 一段载荷 → 输出:(元素对齐后的段, 说明)。只管「数组元素是对象」的字段。
+
+    2026-10-24 生产实证(装饰枕套 fabricContent,同一载荷连拒三次):LLM 在元素里
+    写了 spec 外的子字段(fabricMaterialName),而元素必填的 materialName /
+    materialPercentage 一个没给。strip_unknown 只看顶层键,元素内部从没人查,
+    整条直达沃尔玛被拒(EXT_DATA_ERROR_72600149546850,同时报「不是有效字段」)。
+      ① 元素 schema 是 additionalProperties=false 时,剔掉 spec 外的子字段;
+      ② 剔完缺元素必填(空值也算缺)的元素整个删掉 —— 发出去必拒,留着没用;
+      ③ 元素删光了:非必填字段整字段删(少一个可选属性,换整条能过);
+         必填字段留空数组,交 validate 拦下不提交(省 UPC 与配额)。
+    每一处删改都进说明,不静默。
+    """
+    props = _props(spec)
+    required = _required(spec)
+    out, notes = dict(section), []
+    for name, val in section.items():
+        prop = props.get(name) or {}
+        items = prop.get("items") if _type_of(prop) == "array" else None
+        sub = items.get("properties") if isinstance(items, dict) else None
+        if not isinstance(sub, dict) or not isinstance(val, list):
+            continue
+        closed = items.get("additionalProperties") is False
+        need = [k for k in (items.get("required") or []) if k in sub]
+        kept, n_bad = [], 0
+        for el in val:
+            if not isinstance(el, dict):
+                n_bad += 1
+                continue
+            if closed:
+                extra = sorted(k for k in el if k not in sub)
+                if extra:
+                    el = {k: v for k, v in el.items() if k in sub}
+                    notes.append(f"{name}: 元素里 spec 外的子字段 {extra} 已剔除")
+            if any(el.get(k) in (None, "", []) for k in need):
+                n_bad += 1
+                continue
+            kept.append(el)
+        if not n_bad and kept == val:
+            continue
+        if n_bad:
+            notes.append(f"{name}: {n_bad} 个元素缺子字段必填 {need} 或不是对象,已删")
+        if kept:
+            out[name] = kept
+        elif name in required:
+            out[name] = []
+            notes.append(f"{name}: 元素全部无效(必填,交 validate 拦下)")
+        else:
+            del out[name]
+            notes.append(f"{name}: 元素全部无效,非必填整字段删除")
+    return out, notes
+
+
 def clean_state_restrictions(orderable: dict) -> tuple[dict, list[str]]:
     """输入:orderable → 输出:(清理后的 orderable, 说明)。
 
@@ -932,6 +986,10 @@ def conform(spec: dict | None, ospec: dict | None, visible: dict,
             spec, {"properties": {k: {} for k in orderable}},
             visible, orderable)
     notes += n
+    visible, n = fix_array_items(spec, visible);             notes += n
+    if _props(ospec):
+        orderable, n = fix_array_items(ospec, orderable)
+        notes += [f"orderable:{x}" for x in n]
     orderable, n = clean_state_restrictions(orderable);     notes += n
     visible, orderable, n = drop_empty_optional(spec, ospec, visible, orderable)
     notes += n

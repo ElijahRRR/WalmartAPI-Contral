@@ -114,16 +114,47 @@ def test_write_submit_cols_ninth_value_writes_the_sku_column(monkeypatch):
                         lambda s, ups: (sent.extend(ups), len(ups))[1])
     eight = ["标题", "9.9", 3, "19.9", "Yes", "F1", "2026-09-02", ""]
     listing_sheet.write_submit_cols([(2, eight)])
-    assert [r for r, _ in sent] == ["D2:D2", "J2:P2"]      # 标题 + 提交七列
-    assert sent[1][1] == [eight[1:]]
+    # 标题 + 提交七列 + 回执三列(新 feed 在途,同一次清空,见下一个用例)
+    assert [r for r, _ in sent] == ["D2:D2", "J2:S2"]
+    assert sent[1][1] == [eight[1:] + ["", "", ""]]
     sent.clear()
     listing_sheet.write_submit_cols([(3, eight + ["A0X1Y2Z3W4V5"])])
     # SKU 与标题在今天的表里相邻 ⇒ 粘成一段,值仍各归各位
-    assert [r for r, _ in sent] == ["C3:D3", "J3:P3"]
+    assert [r for r, _ in sent] == ["C3:D3", "J3:S3"]
     assert sent[0][1] == [["A0X1Y2Z3W4V5", "标题"]]
     sent.clear()
     listing_sheet.write_submit_cols([(4, eight + [""])])   # 空第 9 值不写
-    assert [r for r, _ in sent] == ["D4:D4", "J4:P4"]
+    assert [r for r, _ in sent] == ["D4:D4", "J4:S4"]
+
+
+def test_write_submit_cols_clears_stale_receipt_when_a_new_feed_goes_out(monkeypatch):
+    """2026-10-24 生产实证(A109黄威威 B0H59WHW42):FAILED 行重排后又提交两次,
+    表上 feedid/上架日期 是第三次的,上架结果/报错/feed查询日期 却还是第一次的
+    (10-04 早于 上架日期 10-06)。反哺器只跟 上架结果 为空/处理中 的行,旧
+    FAILED 挡住了后两次回执。新 feed 在途(Yes / Unknown)时同一次清掉回执三列;
+    提交被拒(No)没有新 feed,回执三列不动。"""
+    sent = []
+    monkeypatch.setattr(feishu, "sheet_write_ranges",
+                        lambda s, ups: (sent.extend(ups), len(ups))[1])
+    lay = listing_sheet.layout()
+    receipt_cols = {lay[f] for f in ("list_result", "list_fail_reason",
+                                     "feed_check_date")}
+
+    def _cols(rng):
+        a, b = (x.rstrip("0123456789") for x in rng.split(":"))
+        return {c for c in receipt_cols if a <= c <= b}
+
+    for listed, clears in (("Yes", True), ("Unknown", True), ("No", False)):
+        sent.clear()
+        listing_sheet.write_submit_cols(
+            [(5, ["", "", "", "", listed, "", "2026-10-24", "x", "S1"])])
+        touched = set().union(*(_cols(r) for r, _ in sent))
+        assert (touched == receipt_cols) is clears, listed
+        if clears:
+            vals = dict(zip(["list_result", "list_fail_reason", "feed_check_date"],
+                            sent[-1][1][0][-3:]))
+            assert vals == {"list_result": "", "list_fail_reason": "",
+                            "feed_check_date": ""}
 
 
 def test_clear_for_relist_never_clears_the_sku_column(monkeypatch):
@@ -449,6 +480,58 @@ def test_failed_rows_requeue_until_cap(monkeypatch):
     assert retry[0]["feed_id"] == "" and retry[0]["list_result"] == ""
     solo = [_sheet_row(2)]
     assert ln._retry_rows(solo, fake_verdicts(solo)) == ([], [])
+
+
+def test_requeue_invalid_field_releases_only_capped_rows_whose_last_error_matches(
+        monkeypatch):
+    """一次性放行(所有者 2026-10-24):数组子字段映射缺陷修好后,因「不是有效字段」
+    连拒三次而达上限的行再给一轮;别的原因达上限的照旧停手;不传参数行为不变。"""
+    rows = [
+        _sheet_row(2, asin="B0FABRIC01", list_result="FAILED",
+                   feed_id="F1", listed="Yes"),          # 3 次,最近一次=不是有效字段
+        _sheet_row(3, asin="B0OTHER001", list_result="FAILED",
+                   feed_id="F2", listed="Yes"),          # 3 次,别的原因
+        _sheet_row(4, asin="B0RETRY01", list_result="FAILED",
+                   feed_id="F3", listed="Yes"),          # 1 次 → 正常重试
+    ]
+    seen: list = []
+
+    class _Cur:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+        def execute(self, sql, args):
+            seen.append(sql)
+            self.sql = sql
+            if "feed_item_errors" in sql:
+                assert "%%is not a valid field%%" in sql    # psycopg 具名参数里 % 要转义
+                assert "f.workflow = 'list_new'" in sql
+                assert set(args) == {"stores", "asins"}
+                assert sorted(args["asins"]) == ["B0FABRIC01", "B0OTHER001"]
+
+        def fetchall(self):
+            if "feed_item_errors" in self.sql:
+                return [("T1", "B0FABRIC01")]
+            return [("T1", "B0FABRIC01", 3), ("T1", "B0OTHER001", 3),
+                    ("T1", "B0RETRY01", 1)]
+
+    class _Conn:
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def cursor(self): return _Cur()
+
+    monkeypatch.setattr(ln.db, "pg_conn", lambda: _Conn())
+    retry, exhausted = ln._retry_rows(rows, fake_verdicts(rows),
+                                      requeue_invalid_field=True)
+    assert sorted(r["asin"] for r in retry) == ["B0FABRIC01", "B0RETRY01"]
+    assert [r["asin"] for r in retry if r.get("_requeued")] == ["B0FABRIC01"]
+    assert exhausted == [("T1", "B0OTHER001")]
+    # 不传参数:不查报错表,两条达上限的都停手(与改动前逐字相同)
+    seen.clear()
+    retry, exhausted = ln._retry_rows(rows, fake_verdicts(rows))
+    assert [r["asin"] for r in retry] == ["B0RETRY01"]
+    assert sorted(exhausted) == [("T1", "B0FABRIC01"), ("T1", "B0OTHER001")]
+    assert not any("feed_item_errors" in s for s in seen)
 
 
 def test_list_new_skips_when_shipping_missing(monkeypatch):

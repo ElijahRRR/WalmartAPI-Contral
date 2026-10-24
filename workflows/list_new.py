@@ -11,6 +11,10 @@
                                              # 实际还会按 PG 连接余量钳制)
   python cli.py list_new -p submit_jitter_ms=0  # 提交期起跑抖动(毫秒,默认 800;
                                              # 0=关。去同步,不降并发)
+  python cli.py list_new -p requeue_invalid_field=1 --dry-run
+                                             # 一次性放行:重试已达上限、但最近一次
+                                             # 失败是「不是有效字段」的行再给一轮
+                                             # (2026-10-24 数组子字段映射缺陷的善后)
 
 驱动表 = 上架表(registry.LISTING_SHEET,21 列;**列按表头名定位**,见
 services/listing_sheet.layout,列顺序随所有者调整,代码不跟着改):领任务条件
@@ -867,9 +871,42 @@ GROUP BY t.store, t.asin
 """
 
 
-def _retry_rows(rows: list[dict], verdicts: dict
+# 最近一次 list_new 上架提交失败、且报错里有「不是有效字段」的 (店铺, 身份键)。
+# 给 `-p requeue_invalid_field=1` 用(一次性放行,所有者 2026-10-24):这一类
+# 是**我们自己的映射缺陷**(数组元素子字段名靠 LLM 猜,见 mp_mapper._field_block
+# 与 mp_conform.fix_array_items),同一载荷重发必然同拒,三次重试被白白烧光。
+# 缺陷修好后这批行再给一轮;只认「最近一次」失败 —— 放行后若换成别的错误,
+# 下一轮就不再命中,不会变成无限重试。身份键口径与 _SQL_ATTEMPTS 相同。
+# ⚠ LIKE 的 % 在 psycopg 具名参数 SQL 里要写成 %%。
+_SQL_LAST_INVALID_FIELD = """
+WITH t AS (
+    SELECT * FROM unnest(%(stores)s::text[], %(asins)s::text[]) AS t(store, asin)
+),
+last AS (
+    SELECT DISTINCT ON (t.store, t.asin) t.store, t.asin, f.feed_id, f.sku, f.status
+    FROM ops.feed_items f
+    LEFT JOIN catalog.listing_sources ls
+      ON ls.store = f.store AND ls.sku = f.sku AND ls.source_type = 'amz'
+    JOIN t ON f.store = t.store AND coalesce(ls.source_key, f.sku) = t.asin
+    WHERE f.feed_type = 'MP_ITEM' AND f.workflow = 'list_new'
+    ORDER BY t.store, t.asin, f.submitted_at DESC
+)
+SELECT l.store, l.asin
+FROM last l
+WHERE l.status = 'failed'
+  AND EXISTS (SELECT 1 FROM ops.feed_item_errors x
+              WHERE x.feed_id = l.feed_id AND x.sku = l.sku
+                AND x.description LIKE '%%is not a valid field%%')
+"""
+
+
+def _retry_rows(rows: list[dict], verdicts: dict,
+                requeue_invalid_field: bool = False
                 ) -> tuple[list[dict], list[tuple[str, str]]]:
-    """输入:上架表全部行 → 输出:(可重试行, 已达上限行)。
+    """输入:上架表全部行(+ 是否一次性放行「不是有效字段」类)→ 输出:(可重试行, 已达上限行)。
+
+    `requeue_invalid_field=True`:已达上限、但最近一次失败是「不是有效字段」的行
+    再给一轮(见 _SQL_LAST_INVALID_FIELD),这些行带 `_requeued=True`。
 
     O=FAILED 的行要**重新排队**:失败原因多半是可修的(UPC 撞库领新号即可、
     字段问题改完 mapper 即可),旧系统靠 main 看 N=DATA_ERROR 接回重试。
@@ -891,14 +928,28 @@ def _retry_rows(rows: list[dict], verdicts: dict
                      "asins": [r["asin"] for r in cand],
                      "abandoned": product_events.SKU_ABANDONED})
         tried = {(s, k): int(n) for s, k, n in cur.fetchall()}
+        over = [r for r in cand
+                if tried.get((r["store"], r["asin"]), 0) >= MAX_LIST_ATTEMPTS]
+        release: set = set()
+        if requeue_invalid_field and over:
+            cur.execute(_SQL_LAST_INVALID_FIELD,
+                        {"stores": [r["store"] for r in over],
+                         "asins": [r["asin"] for r in over]})
+            release = {(s, k) for s, k in cur.fetchall()}
     retry, exhausted = [], []
     for r in cand:
-        if tried.get((r["store"], r["asin"]), 0) >= MAX_LIST_ATTEMPTS:
-            exhausted.append((r["store"], r["asin"]))
-            continue
+        key = (r["store"], r["asin"])
+        requeued = False
+        if tried.get(key, 0) >= MAX_LIST_ATTEMPTS:
+            if key not in release:
+                exhausted.append(key)
+                continue
+            requeued = True
         # 重新排队:清掉上一轮的 feedid/结果,让主链当新行处理
-        retry.append({**_with_pt(r, verdicts),
-                      "feed_id": "", "listed": "", "list_result": ""})
+        row = {**_with_pt(r, verdicts), "feed_id": "", "listed": "", "list_result": ""}
+        if requeued:
+            row["_requeued"] = True
+        retry.append(row)
     return retry, exhausted
 
 
@@ -1716,11 +1767,16 @@ def run(params: dict) -> str:
             n_unaudited += 1
             audit_reasons.append(
                 (r["rownum"], f"审核未过:{st or '未审'}(过审后自动续上)"))
-    retry, exhausted = _retry_rows(rows, verdicts)
+    retry, exhausted = _retry_rows(
+        rows, verdicts,
+        requeue_invalid_field=str(params.get("requeue_invalid_field", "")) in ("1", "true"))
+    n_requeued = sum(1 for r in retry if r.get("_requeued"))
     pending = fresh + retry
     mode = "" if execute else "🧪 [DRY-RUN] "
     lines = [f"{mode}上架表 {len(rows)} 行:待上架 {len(pending)}"
-             + (f"(其中重试 {len(retry)})" if retry else "")]
+             + (f"(其中重试 {len(retry)}"
+                + (f",含达上限后一次性放行 {n_requeued}" if n_requeued else "")
+                + ")" if retry else "")]
     if n_unaudited or n_rejected:
         # ⚠ 必须点名:审核闸从"读表「审核结果」"改成"读库"之后,**没审过的行会静默
         # 消失在待上架里**。不说的话表现是"表里明明有几百行却一行也不上"

@@ -352,3 +352,64 @@ def test_no_other_unknown_orderable_field_survives():
         _SPEC, _OSPEC, {}, {"sku": "S1", "SkuUpdateNow": "Yes", "whatever": 1})
     assert "SkuUpdateNow" not in o and "whatever" not in o
     assert set(dropped) == {"orderable.SkuUpdateNow", "orderable.whatever"}
+
+
+# ── 数组元素是对象:元素内部也按 spec 收口(2026-10-24 装饰枕套 fabricContent)──
+
+_FABRIC = {"type": "array", "minItems": 1, "items": {
+    "type": "object", "additionalProperties": False,
+    "required": ["materialPercentage", "materialName"],
+    "properties": {"materialPercentage": {"type": "number"},
+                   "materialName": {"type": "string"}}}}
+
+
+def test_array_item_invented_sub_fields_drop_optional_field():
+    """生产原样:LLM 编出 fabricMaterialName/Percentage,元素必填一个没给 →
+    剔掉编出来的子字段后元素无效 → 非必填整字段删(换整条能过,不再连拒三次)。"""
+    spec = {"required": [], "properties": {"fabricContent": _FABRIC}}
+    vis = {"fabricContent": [{"fabricMaterialName": "Polyester",
+                              "fabricMaterialPercentage": 100}]}
+    out, notes = mc.fix_array_items(spec, vis)
+    assert "fabricContent" not in out
+    assert any("fabricMaterialName" in n for n in notes)
+    assert any("非必填整字段删除" in n for n in notes)
+
+
+def test_array_item_extra_keys_stripped_valid_elements_kept():
+    spec = {"required": [], "properties": {"fabricContent": _FABRIC}}
+    vis = {"fabricContent": [
+        {"materialName": "Cotton", "materialPercentage": 60, "note": "x"},
+        {"materialName": "Linen"},                     # 缺 materialPercentage
+        "Polyester"]}                                  # 不是对象
+    out, notes = mc.fix_array_items(spec, vis)
+    assert out["fabricContent"] == [{"materialName": "Cotton",
+                                     "materialPercentage": 60}]
+    assert any("2 个元素" in n for n in notes)
+
+
+def test_array_item_all_invalid_required_field_blocked_by_validate():
+    """必填字段元素全无效:留空数组交 validate 拦下 —— 不提交,省 UPC 与配额。"""
+    spec = {"required": ["fabricContent"],
+            "properties": {"fabricContent": _FABRIC}}
+    v, o, notes, missing = mc.conform(
+        spec, _OSPEC, {"fabricContent": [{"fabricMaterialName": "Polyester"}]},
+        {"sku": "S1", "price": 9.9})
+    assert "visible.fabricContent" in missing
+
+
+def test_array_item_valid_payload_untouched():
+    spec = {"required": [], "properties": {"fabricContent": _FABRIC}}
+    vis = {"fabricContent": [{"materialName": "Cotton", "materialPercentage": 100}]}
+    out, notes = mc.fix_array_items(spec, vis)
+    assert out == vis and notes == []
+
+
+def test_array_item_open_schema_keeps_extra_keys():
+    """元素 schema 没声明 additionalProperties=false 的不剔子字段(只删缺必填的)。"""
+    open_items = {"type": "array", "items": {
+        "type": "object", "required": ["materialName"],
+        "properties": {"materialName": {"type": "string"}}}}
+    spec = {"required": [], "properties": {"f": open_items}}
+    vis = {"f": [{"materialName": "Cotton", "extra": 1}]}
+    out, notes = mc.fix_array_items(spec, vis)
+    assert out == vis and notes == []

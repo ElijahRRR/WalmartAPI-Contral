@@ -387,17 +387,36 @@ def _field_block(name: str, meta: dict, required: bool) -> dict:
         it: dict = {"type": items.get("type") or "string"}
         if "enum" in items:
             it["enum"] = items["enum"][:30]
+        # 数组元素是对象时把**子字段名**也送上(2026-10-24 生产实证:装饰枕套
+        # fabricContent = [{materialName, materialPercentage}],此前只送
+        # items.type=object,LLM 照标题「Fabric Material Name」自己编出
+        # fabricMaterialName,同一载荷连拒三次 EXT_DATA_ERROR_72600149546850)。
+        # 键名与 object 字段同款(object_properties / object_required),系统提示词
+        # 第 4 条原样适用 —— 提示词正文不改,缓存只对含这类字段的 PT 失效一次。
+        isub = items.get("properties")
+        if isinstance(isub, dict):
+            it["object_properties"] = _sub_fields(isub)
+            if items.get("required"):
+                it["object_required"] = items["required"]
         f["items"] = it
     sub = meta.get("properties")
     if isinstance(sub, dict):
-        f["object_properties"] = {
-            sn: {"type": (sd or {}).get("type") or "string",
-                 **({"enum": sd["enum"][:15]} if isinstance(sd, dict)
-                    and "enum" in sd else {})}
-            for sn, sd in list(sub.items())[:20] if isinstance(sd, dict)}
+        f["object_properties"] = _sub_fields(sub)
         if meta.get("required"):
             f["object_required"] = meta["required"]
     return f
+
+
+def _sub_fields(sub: dict) -> dict:
+    """输入:object 的 properties → 输出:给 LLM 的子字段块 {子字段: {type[, enum]}}。
+
+    object 字段与「数组元素是对象」两处共用,同一份口径(前 20 个子字段,
+    enum 前 15 个值)。⚠ 输出形状一变,含 object 字段的 PT 缓存全部作废重打。
+    """
+    return {sn: {"type": (sd or {}).get("type") or "string",
+                 **({"enum": sd["enum"][:15]} if isinstance(sd, dict)
+                    and "enum" in sd else {})}
+            for sn, sd in list(sub.items())[:20] if isinstance(sd, dict)}
 
 
 def _fields_for_llm(spec: dict | None, skip: tuple,

@@ -292,6 +292,55 @@ def test_llm_messages_rich_metadata_and_orderable_section():
     assert '"orderable"' in msgs[0]["content"]      # 两段式输出要求
 
 
+def test_array_of_objects_sends_item_sub_field_names():
+    """2026-10-24 生产实证(A109黄威威 装饰枕套,同一载荷连拒三次):fabricContent
+    是「对象数组」,子字段叫 materialName / materialPercentage(官方 0703、0829 两版
+    spec 一致)。此前只送 items.type=object,LLM 按标题编出 fabricMaterialName。
+    现在元素的子字段名、类型与元素必填一起送,键名与 object 字段同款。"""
+    import json
+    fabric = {"type": "array", "minItems": 1, "items": {
+        "type": "object", "additionalProperties": False,
+        "required": ["materialPercentage", "materialName"],
+        "properties": {
+            "materialPercentage": {"title": "Fabric Material Percentage",
+                                   "type": "number"},
+            "materialName": {"title": "Fabric Material Name",
+                             "type": "string"}}}}
+    spec = {"required": [], "properties": {"fabricContent": fabric}}
+    body = json.loads(m.build_llm_messages("Decorative Pillow Covers", spec,
+                                           {"title": "x"})[1]["content"])
+    it = body["visible_optional"]["fabricContent"]["items"]
+    assert it["type"] == "object"
+    assert it["object_properties"] == {"materialPercentage": {"type": "number"},
+                                       "materialName": {"type": "string"}}
+    assert it["object_required"] == ["materialPercentage", "materialName"]
+
+
+def test_object_field_block_shape_unchanged():
+    """object 字段的块形状与改动前逐字相同(变了 = 含 object 字段的 PT 缓存全部作废)。"""
+    meta = {"type": "object", "required": ["measure", "unit"], "properties": {
+        "measure": {"type": "number"},
+        "unit": {"type": "string", "enum": ["lb", "oz"]}}}
+    assert m._field_block("assembledProductWeight", meta, True) == {
+        "type": "object", "required": True,
+        "object_properties": {"measure": {"type": "number"},
+                              "unit": {"type": "string", "enum": ["lb", "oz"]}},
+        "object_required": ["measure", "unit"]}
+    # 元素是标量的数组不多出任何键
+    assert m._field_block("occasion", {"type": "array", "items": {
+        "type": "string", "enum": ["A"]}}, False) == {
+        "type": "array", "items": {"type": "string", "enum": ["A"]}}
+
+
+def test_system_prompt_text_untouched_by_item_sub_fields():
+    """提示词正文不随本改动变化:缓存键含 messages,正文一改全部缓存作废重打。"""
+    a = m.build_llm_messages("X", {"properties": {}}, {"title": "x"})[0]["content"]
+    b = m.build_llm_messages("X", {"properties": {"f": {"type": "array", "items": {
+        "type": "object", "properties": {"k": {"type": "string"}}}}}},
+        {"title": "x"})[0]["content"]
+    assert a == b
+
+
 def test_split_llm_output_two_part_and_legacy_flat():
     v, o = m.split_llm_output({"visible": {"color": "Red"},
                                "orderable": {"netContent": {}}})

@@ -7,6 +7,10 @@
                                                     # 拿不准规模先跑它,摘要会报"共 N 个"
   python cli.py product_audit -p limit=2000                # 要限量才给(不给 = 全判)
   python cli.py product_audit -p asins=B0A,B0B             # 指定 ASIN(无视现有结论强审)
+  python cli.py product_audit -p asins=B0A,B0B -p refresh=1  # 点名新品:12 小时内没有快照的先同轮
+                                                           # 补采→摄取→再审(刚采过的不重推,沿用
+                                                           # 采集冷却);不与 from_sheet 混用;仍采
+                                                           # 不回的逐个原因进摘要(前 30 个)
   python cli.py product_audit -p mode=backfill             # 补刷:只审无结论,历史结论直接采用
   python cli.py product_audit -p mode=pending              # 待定专刷:只重判 pending,无退避
   python cli.py product_audit -p mode=nonpass              # **非 pass 全量重判**(rejected+
@@ -1137,8 +1141,9 @@ class _GapPlan:
     n_concluded: int = 0       # push 里库里已有结论的(只有重审开才会有)
 
 
-def _plan_gap(state: dict[str, _GapRow], force: bool) -> _GapPlan:
-    """输入:库里现状 + 重审开关 → 输出:推谁、扣谁(所有者定稿 2026-09-10)。
+def _plan_gap(state: dict[str, _GapRow], force: bool,
+              hold_next: str = "下轮再看") -> _GapPlan:
+    """输入:库里现状 + 重审开关(+ hold 行的下一步)→ 输出:推谁、扣谁(所有者定稿 2026-09-10)。
 
     · 重审关(缺省):推「没有结论(未审/pending)且 N 小时内没有快照」的;
     · 重审开(`-p force=1`):推「N 小时内没有快照」的全部待审 ASIN(含已有结论的)。
@@ -1155,7 +1160,7 @@ def _plan_gap(state: dict[str, _GapRow], force: bool) -> _GapPlan:
                 plan.hold[asin] = (
                     f"{_FRESH_HOURS} 小时内已采过(结局 {r.outcome or 'ok'}"
                     f"{',' + cn if cn else ''},{_fmt_seen(r.last_seen)}),"
-                    f"本轮不重推,下轮再看")
+                    f"本轮不重推,{hold_next}")
             continue
         if r.concluded and not force:
             continue
@@ -1171,9 +1176,10 @@ def _plan_gap(state: dict[str, _GapRow], force: bool) -> _GapPlan:
     return plan
 
 
-def _push_gap(gap: list[str], stamp: str, out: list[str]
+def _push_gap(gap: list[str], stamp: str, out: list[str],
+              fail_note: str = "表格照样写原因,下轮重推"
               ) -> tuple[list[tuple[str, object]], dict[str, str]]:
-    """输入:要推的 ASIN + 时间戳 → 输出:([(批次名, batch_id)], {推送失败的 asin: 错误})。
+    """输入:要推的 ASIN + 时间戳(+ 推送失败的括注)→ 输出:([(批次名, batch_id)], {推送失败的 asin: 错误})。
 
     批次名 `audit_gap_<北京时间戳>`(2026-09-10 起;此前按日界):同一天再跑不会撞名。
     日界命名的病:手动跑过一次、表里再换一批品,新品撞名 409 被"沿用既有批次",
@@ -1212,7 +1218,7 @@ def _push_gap(gap: list[str], stamp: str, out: list[str]
                                   str(e)[:200])
             for a in chunk:
                 failed[a] = str(e)[:120]
-            out.append(f"  ❌ {name} 推送失败:{e}(表格照样写原因,下轮重推)")
+            out.append(f"  ❌ {name} 推送失败:{e}({fail_note})")
     return sent, failed
 
 
@@ -1316,7 +1322,11 @@ def _close_gap(want: list[str], sheet_rows: list[dict], execute: bool,
         return []
     out: list[str] = []
     state = _gap_state(want)
-    plan = _plan_gap(state, force)
+    # 没有表行 = `-p asins= -p refresh=1` 点名刷新(唯一传空 sheet_rows 的入口):
+    # 没有「具体内容」列可写,也没有"下轮"会自动领它 —— 下一步只能是人重跑本命令
+    plan = _plan_gap(state, force,
+                     hold_next=(f"{_FRESH_HOURS} 小时后再跑本命令" if not sheet_rows
+                                else "下轮再看"))
     if plan.push or plan.hold:
         _run_gap_round(want, state, plan, force, sheet_rows, execute, wait_min,
                        out)
@@ -1357,14 +1367,19 @@ def _run_gap_round(want: list[str], state: dict[str, _GapRow], plan: _GapPlan,
                    wait_min: int, out: list[str]) -> None:
     """输入:本轮计划 + 上下文 → 输出:无(摘要写进 out)。见 `_close_gap` 头注。"""
     stamp = datetime.now(kpi.CN_TZ).strftime("%Y%m%dT%H%M%S")
+    # 点名刷新(sheet_rows 为空,见 `_close_gap`):措辞不能照搬上架表那套
+    named = not sheet_rows
+    nxt = "采完后重跑本命令" if named else None
     head = (f"⚠ 审不了 {plan.n_broken} 个 ASIN(不在库 {plan.n_absent} / "
             f"无标题 {plan.n_broken - plan.n_absent}),待审但快照过旧 {plan.n_stale} 个"
             f" → 推采集 {len(plan.push)} 个({_FRESH_HOURS} 小时内没有快照的)"
-            + (f";⚡ 重审开(-p force=1):含库里已有结论的 {plan.n_concluded} 个"
+            + (f";⚡ 点名刷新(-p refresh=1):含库里已有结论的 {plan.n_concluded} 个"
+               if force and named else
+               f";⚡ 重审开(-p force=1):含库里已有结论的 {plan.n_concluded} 个"
                if force else ";重审关:库里已有结论的不推"))
     if plan.hold:
         head += (f";另有 {len(plan.hold)} 个审不了但 {_FRESH_HOURS} 小时内刚采过,"
-                 f"不重推(理由写表)")
+                 f"不重推({'原因见下' if named else '理由写表'})")
     out.append(head)
     broken_push = {a for a in plan.push if state[a].broken}
     if not plan.push:
@@ -1376,7 +1391,8 @@ def _run_gap_round(want: list[str], state: dict[str, _GapRow], plan: _GapPlan,
     if not execute:
         out.append(f"  真跑时会推采集批次 {_GAP_PREFIX}{stamp}、等它采完"
                    f"(最多 {wait_min} 分钟)、就地按批摄取,**采回来的这一轮就审掉**;"
-                   f"审不了又没等到的把理由写进表格「具体内容」列(dry-run 一格未写)")
+                   + ("审不了又没等到的逐个报原因" if named else
+                      "审不了又没等到的把理由写进表格「具体内容」列(dry-run 一格未写)"))
         reasons = {a: f"将推采集 {_GAP_PREFIX}{stamp}(dry-run,未推)"
                    for a in broken_push}
         reasons.update(plan.hold)
@@ -1385,19 +1401,26 @@ def _run_gap_round(want: list[str], state: dict[str, _GapRow], plan: _GapPlan,
                   reasons, stamp, execute, out)
         return
 
-    sent, push_failed = _push_gap(plan.push, stamp, out)
+    sent, push_failed = _push_gap(
+        plan.push, stamp, out,
+        fail_note="原因见下,重跑本命令重推" if named else "表格照样写原因,下轮重推")
     if not sent:
-        out.append("  一个批次都没推成:审不了的这些行本轮判不了,理由照写")
+        out.append("  一个批次都没推成:审不了的这些行本轮判不了,"
+                   + ("原因见下" if named else "理由照写"))
     elif wait_min <= 0:
-        out.append(f"  gap_wait=0:只推不等,审不了的这批退回下轮审"
-                   f"(采回来在 {', '.join(n for n, _ in sent)},下一轮自动捞起)")
+        out.append("  gap_wait=0:只推不等,"
+                   + (f"审不了的这批本次判不了(采回来在 {', '.join(n for n, _ in sent)},"
+                      f"采完后重跑本命令再审)" if named else
+                      f"审不了的这批退回下轮审(采回来在 {', '.join(n for n, _ in sent)},"
+                      f"下一轮自动捞起)"))
     else:
         line, stuck = scrape_batches.wait_settled([n for n, _ in sent],
                                                   wait_min)
         out.append(f"  {line}")
         if stuck:
-            out.append(f"  ⚠ {stuck} 个批次超时仍在跑:审不了的退回下轮审,"
-                       f"在库的用现有数据审(已采到的下面就摄进来)")
+            out.append(f"  ⚠ {stuck} 个批次超时仍在跑:审不了的"
+                       + ("本次判不了(采完后重跑本命令)," if named else "退回下轮审,")
+                       + "在库的用现有数据审(已采到的下面就摄进来)")
         out.append(f"  {_ingest_batches([n for n, _ in sent])}")
 
     # ④ 复查:摄取之后谁回来了、谁还审不了。**必须重查库** —— 拿推送前那份
@@ -1414,17 +1437,21 @@ def _run_gap_round(want: list[str], state: dict[str, _GapRow], plan: _GapPlan,
                    f",没等到的 {plan.n_stale - refreshed} 个用现有数据审")
     still = {a for a in want if after[a].broken and not after[a].concluded}
     if still:
-        out.append(f"  ⚠ 仍缺 {len(still)} 个:理由写进表格「具体内容」列,下轮重试")
+        out.append(f"  ⚠ 仍缺 {len(still)} 个:" + ("逐个原因见下,采回来后重跑本命令" if named
+                                                  else "理由写进表格「具体内容」列,下轮重试"))
     reasons = _explain_still(still, plan, state, after, sent, push_failed,
-                             wait_min)
+                             wait_min, nxt=nxt)
     _note_gap(sheet_rows, still, {a for a in still if not after[a].in_db},
               reasons, stamp, execute, out)
 
 
 def _explain_still(still: set, plan: _GapPlan, before: dict[str, _GapRow],
                    after: dict[str, _GapRow], sent: list[tuple[str, object]],
-                   push_failed: dict[str, str], wait_min: int) -> dict[str, str]:
-    """输入:仍审不了的 ASIN + 本轮上下文 → 输出:{asin: 一句真话}。
+                   push_failed: dict[str, str], wait_min: int,
+                   nxt: str | None = None) -> dict[str, str]:
+    """输入:仍审不了的 ASIN + 本轮上下文(+ 下一步怎么办)→ 输出:{asin: 一句真话}。
+
+    `nxt` 不给 = 上架表模式的原措辞(下轮重试 / 下轮再看);点名刷新给「采完后重跑本命令」。
 
     优先级:推送失败 > 新鲜期内没推 > 本轮采回来的结局(not_found 等)> 采集侧
     失败明细(error_type)> 推了没等到。此前四种失败都写"已推采集但本轮没等到":
@@ -1447,11 +1474,11 @@ def _explain_still(still: set, plan: _GapPlan, before: dict[str, _GapRow],
         elif a in by_batch:
             out[a] = f"采集失败:{by_batch[a]}"
         elif a in pushed and wait_min <= 0:
-            out[a] = "已推采集(gap_wait=0 只推不等),下轮重试"
+            out[a] = f"已推采集(gap_wait=0 只推不等),{nxt or '下轮重试'}"
         elif a in pushed:
-            out[a] = f"已推采集但等了 {wait_min} 分钟没等到,下轮重试"
+            out[a] = f"已推采集但等了 {wait_min} 分钟没等到,{nxt or '下轮重试'}"
         else:
-            out[a] = "本轮没推(不在推送范围),下轮再看"
+            out[a] = f"本轮没推(不在推送范围),{nxt or '下轮再看'}"
     return out
 
 
@@ -1466,6 +1493,15 @@ def _note_gap(sheet_rows: list[dict], still: set, absent: set,
     而表面上"表里写着原因呢"。
     """
     if not still:
+        return
+    if not sheet_rows:
+        # 点名刷新(refresh=1):没有表行可写,原因直接进摘要 —— 写给空表等于算完就扔
+        for a in sorted(still)[:30]:
+            why = ("未采集(库里没有这个 ASIN)" if a in absent
+                   else "采集降级(采到了但没有标题)")
+            out.append(f"    · {a}:{why};{reasons.get(a) or '原因未知'}")
+        if len(still) > 30:
+            out.append(f"    …另有 {len(still) - 30} 个")
         return
     notes = []
     for r in sheet_rows:

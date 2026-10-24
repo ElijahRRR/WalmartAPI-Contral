@@ -1254,7 +1254,7 @@ Bicycle Spokes / Fishing Hooks / Aquarium Decor / Cheese Making Supplies,
 | `alloc_stores` | 否 | **店铺侧体检**:在售天数归一的三个经营指标 + 缺口 + 货位值,回答"这家店还能吃多少货" | `alloc_店铺经营水平.csv` |
 | `alloc_products` | 否 | **产品侧体检**:漏斗、五个信号的覆盖率、分数分布。⚠ 覆盖率那栏最要紧 —— 权重再合理,信号采不到就是空的 | `alloc_产品分.csv` |
 | `alloc_backfill` | **是** | **一次性回填**:把已经在线的商品倒推成占用台账,让新系统认得存量 | 落 `catalog.claims` |
-| `alloc_plan` | **是** | **主流程**:出这一轮的分配方案并落占用。全链唯一会大批量落不可逆占用的地方。**`-p from_sheet=1` = 点名分配**(口径 #19):候选池换成飞书「产品分配表」点名的 ASIN,结局逐行回写表 | `alloc_分配方案.csv` + `alloc_未入选.csv` + `alloc_品牌组.csv`,落 `catalog.claims`;点名模式:`alloc_点名分配.csv` + 回写产品分配表 16 列,占用 source=`alloc_plan_sheet` |
+| `alloc_plan` | **是** | **主流程**:出这一轮的分配方案并落占用。全链唯一会大批量落不可逆占用的地方。**`-p from_sheet=1` = 点名分配**(口径 #19):候选池换成飞书「产品分配表」点名的 ASIN,结局逐行回写表 | `alloc_分配方案.csv` + `alloc_未入选.csv` + `alloc_品牌组.csv`,落 `catalog.claims`;点名模式:`alloc_点名分配.csv` + 回写产品分配表 16 列,占用 source=`alloc_plan_sheet`;**`-p from_csv=` 定向清单**:只落占用,source=`alloc_plan_csv`(见文末 2026-10-22 节) |
 | `alloc_push` | **是** | **接口**:把已落占用的货追加进飞书上架表 A/B 两列(E 留空即待审) | 写飞书上架表 |
 | `claim_audit` | 否 | **台账对账**:已落的占用现在还站得住吗(店的类目/渠道后来改过)。⚠ **只判类目与渠道两道闸,不判货期** —— 改了「配送时长限制」它报不出来 | `alloc_该释放占用.csv` + 可直接粘的 `store_release` 命令 |
 | `store_release` | **是** | **撤**:整店 / 点名品牌 / 点名 ASIN / `-p from_csv=` 批量释放 / **`-p dead=1` 批量清死店**(凭证表里没有的店) | 改 `catalog.claims`;整店释放时一并标 `walmart_items` 下线 |
@@ -1379,3 +1379,14 @@ python cli.py alloc_plan -p from_sheet=1 -p cutoff=30  # 临时加一条淘汰�
 from_sheet/batch/cutoff 混用。释放仍只走 store_release，并限定原占用店。
 数字目标和容量列兼容飞书公式结果 `{"type":2,"value":[7000]}`，空结果仍为
 未配置，明确的 0 仍为不接货。
+
+同日复核补正:按**键在不在**分派 —— `-p from_csv=` 给空值(变量没展开)直接炸,
+不再静默掉进全库分配;`days / sales_days / as_of / export` 在这条路上不起作用,
+同样不许混用。dry-run 报「将落品牌 N + 产品 M 条」(只数真会新落的;已在本店名下
+的单列「不重落」)并点名新落品牌排他去哪家店(列前 20 个)。
+不过闸的**一次报全**再整批拒绝:不在池的带原因(不在库 / 未审核 / 审核未过 /
+落地价 / 库存…,与 from_sheet 的「未分配原因」同一出处);店级不成立的店(不在
+范围 / 容量未填或为 0),它的行照查已在架 / 占用冲突 / 品牌分两店 / 风控,只跳过
+类目 / 货期 / 渠道三道店铺谓词;品牌两条冲突都写明是哪一行。
+CSV:表头带空格、Excel 留下的 `,` 空行照读;短行 / 坏行整份拒绝并报行号;
+非 UTF-8 明说「另存为 CSV UTF-8」。

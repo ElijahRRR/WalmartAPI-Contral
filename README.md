@@ -341,7 +341,7 @@ Made in USA 五条硬拒,外加一条 0 分软证据(品牌黑名单扫文案,**
 
 | 工作流 | | 做什么 |
 |---|---|---|
-| `product_audit` | 危 调 | 审核主流程。判定落 `audit.audit_runs`/`audit_hits`,结论写 `catalog.products` 五列。`-p from_sheet=1` 由上架表驱动并把结论投影回表 D~I(标题/PT/结果/类别/具体内容/日期);缺数据的行**同轮**推采集 → 等采完 → 就地摄取 → 本轮判掉。加 `-p force=1` 则 F 列(审核结果)为空的**一律重判**(库里已有结论的也重判,不是回填);`-p repts=1` 按**飞书类目表判据变更**取候选(risk_sync 落的台账,不看版本号) |
+| `product_audit` | 危 调 | 审核主流程。判定落 `audit.audit_runs`/`audit_hits`,结论写 `catalog.products` 五列。`-p from_sheet=1` 由上架表驱动并把结论投影回表 D~I(标题/PT/结果/类别/具体内容/日期);缺数据的行**同轮**推采集 → 等采完 → 就地摄取 → 本轮判掉。加 `-p force=1` 则 F 列(审核结果)为空的**一律重判**(库里已有结论的也重判,不是回填);`-p repts=1` 按**飞书类目表判据变更**取候选(risk_sync 落的台账,不看版本号);`-p asins=A,B -p refresh=1` 点名新品:12 小时内没有快照的先同轮补采再审(12 小时内刚采过的不重推,沿用采集冷却),不与 from_sheet 混用,仍采不回的逐个原因进摘要(前 30 个) |
 | `audit_why` | | 这个 ASIN 为什么是这个结论(只读排查) |
 | `audit_replay` | | **回放评估**(手动跑,不进调度):拿沃尔玛自己的裁决考现在这条链。反例 = `walmart_items.unpublished_reasons` 归类主码 ∈ POLICY/IP/CONTENT/BRAND/PROHIBITED_FINAL 的下架品(期望 reject,期望类别按 `error_taxonomy` 抽出的政策名 join 政策表;PT_WRONG/GATED 不进集),正例 = 在架在售且从没给过下架原因的品(期望 pass);`sku→asin` 走 `services/sku_asin`。每个样本调**与生产同一条** `audit_rules.audit_one`,与沃尔玛裁决 / 旧链最近一次 `audit_runs` 三方对照,出召回、类别准确率 + 混淆表、**正例误伤新旧并排**(所有者底线:新链不高于旧链)、新旧一致率、按置信分层错误率、pending 分层、成本与耗时。⚠ **只写** `audit.replay_results` 与 `<DATA_ROOT>/reports/audit_replay.txt`(判定链自己会写 `llm_cache`,那是缓存);`catalog.products`/`audit_runs`/`audit_hits`/事件/飞书**一个字都不碰**。`--dry-run` = 抽样 + 规模 + 预估成本,零 LLM。参数 `neg`(600)/`pos`(400)/`seed`/`tag`/`workers`/`limit_per_category`。⚠ **样本身份是 `run_tag` 不是 `seed`**:该 tag 已有行就**重放那一批 asin**(候选面 `walmart_items` 天天被 catalog_sync 重写,同 seed 隔天已不是同一批);**旧链基线**取每个 asin 最近一次 `audit_version` 不是当前版本的 `audit_runs` 行(那一列 2026-09-02 B2 补,否则 `mode=stale` 跑过之后就是新链自己跟自己比)|
 | `audit_calibrate` | | 双跑校准报告 |
@@ -462,7 +462,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 | `alloc_audit` | | 动工前的存量审计 + 数据探针(只读) |
 | `alloc_products` | | 产品分体检 |
 | `alloc_stores` | | 店铺经营水平体检 |
-| `alloc_plan` | 危 | 产品分配方案 |
+| `alloc_plan` | 危 | 产品分配方案。`-p from_sheet=1` 点名分配(产品分配表);`-p from_csv=<店铺,ASIN 清单>` 定向清单只落占用、不写上架表(先 `--dry-run`;不过闸一次报全、整批拒绝) |
 | `alloc_push` | 危 | 已落占用 → 追加进飞书上架表 A/B 两列(分配链与上架链的接口) |
 | `alloc_backfill` | 危 一 | 存量在线商品 → 占用台账 |
 | `claim_audit` | | 占用台账对账:已落的占用现在还站得住吗 |

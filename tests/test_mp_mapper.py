@@ -292,6 +292,55 @@ def test_llm_messages_rich_metadata_and_orderable_section():
     assert '"orderable"' in msgs[0]["content"]      # 两段式输出要求
 
 
+def test_array_of_objects_sends_item_sub_field_names():
+    """2026-10-24 生产实证(A109黄威威 装饰枕套,同一载荷连拒三次):fabricContent
+    是「对象数组」,子字段叫 materialName / materialPercentage(官方 0703、0829 两版
+    spec 一致)。此前只送 items.type=object,LLM 按标题编出 fabricMaterialName。
+    现在元素的子字段名、类型与元素必填一起送,键名与 object 字段同款。"""
+    import json
+    fabric = {"type": "array", "minItems": 1, "items": {
+        "type": "object", "additionalProperties": False,
+        "required": ["materialPercentage", "materialName"],
+        "properties": {
+            "materialPercentage": {"title": "Fabric Material Percentage",
+                                   "type": "number"},
+            "materialName": {"title": "Fabric Material Name",
+                             "type": "string"}}}}
+    spec = {"required": [], "properties": {"fabricContent": fabric}}
+    body = json.loads(m.build_llm_messages("Decorative Pillow Covers", spec,
+                                           {"title": "x"})[1]["content"])
+    it = body["visible_optional"]["fabricContent"]["items"]
+    assert it["type"] == "object"
+    assert it["object_properties"] == {"materialPercentage": {"type": "number"},
+                                       "materialName": {"type": "string"}}
+    assert it["object_required"] == ["materialPercentage", "materialName"]
+
+
+def test_object_field_block_shape_unchanged():
+    """object 字段的块形状与改动前逐字相同(变了 = 含 object 字段的 PT 缓存全部作废)。"""
+    meta = {"type": "object", "required": ["measure", "unit"], "properties": {
+        "measure": {"type": "number"},
+        "unit": {"type": "string", "enum": ["lb", "oz"]}}}
+    assert m._field_block("assembledProductWeight", meta, True) == {
+        "type": "object", "required": True,
+        "object_properties": {"measure": {"type": "number"},
+                              "unit": {"type": "string", "enum": ["lb", "oz"]}},
+        "object_required": ["measure", "unit"]}
+    # 元素是标量的数组不多出任何键
+    assert m._field_block("occasion", {"type": "array", "items": {
+        "type": "string", "enum": ["A"]}}, False) == {
+        "type": "array", "items": {"type": "string", "enum": ["A"]}}
+
+
+def test_system_prompt_text_untouched_by_item_sub_fields():
+    """提示词正文不随本改动变化:缓存键含 messages,正文一改全部缓存作废重打。"""
+    a = m.build_llm_messages("X", {"properties": {}}, {"title": "x"})[0]["content"]
+    b = m.build_llm_messages("X", {"properties": {"f": {"type": "array", "items": {
+        "type": "object", "properties": {"k": {"type": "string"}}}}}},
+        {"title": "x"})[0]["content"]
+    assert a == b
+
+
 def test_split_llm_output_two_part_and_legacy_flat():
     v, o = m.split_llm_output({"visible": {"color": "Red"},
                                "orderable": {"netContent": {}}})
@@ -499,3 +548,50 @@ def test_unit_word_is_read_even_when_followed_by_punctuation_or_a_second_measure
     assert m._parse_weight_value("item weight: 600g / 1.3lb")[1] == "parsed"
     assert m._parse_weight_value("5 克") == (None, "unknown_unit")
     assert m._parse_weight_value("300") == (None, "no_unit")
+
+
+_ORDERABLE_WITH_OBJECT_ARRAYS = {"required": [], "properties": {
+    "stateRestrictions": {"type": "array", "items": {
+        "type": "object", "additionalProperties": False,
+        "properties": {"stateRestrictionsText": {"type": "string"},
+                       "zipCodes": {"type": "string"}}}},
+    "externalProductIdentifier": {"type": "array", "items": {
+        "type": "object", "additionalProperties": False,
+        "required": ["externalProductIdType", "externalProductId"],
+        "properties": {"externalProductIdType": {"type": "string",
+                                                 "enum": ["ASIN", "MLID"]},
+                       "externalProductId": {"type": "string"}}}}}}
+
+
+def test_orderable_blocks_never_carry_item_sub_fields():
+    """Orderable spec 所有 PT 共用:它的对象数组(stateRestrictions /
+    externalProductIdentifier)多出子字段块 ⇒ 每个 PT 的 messages 与复用签名都变
+    ⇒ 全量缓存作废;externalProductIdentifier 的填法还等于教 LLM 交出 ASIN。
+    (2026-10-24 对抗审查实证)"""
+    import json
+    spec = {"required": ["color"], "properties": {"color": {"type": "string"}}}
+    user = m.build_llm_messages("X", spec, {"title": "x"},
+                                ospec=_ORDERABLE_WITH_OBJECT_ARRAYS)[1]["content"]
+    assert "object_properties" not in user and "ASIN" not in user
+    body = json.loads(user)
+    assert body["orderable_optional"]["externalProductIdentifier"] == {
+        "type": "array", "items": {"type": "object"}}
+    # 复用签名与「Orderable 不送子字段」口径一致:和没有子字段时的签名相同
+    bare = {"required": [], "properties": {
+        k: {"type": "array", "items": {"type": "object"}}
+        for k in _ORDERABLE_WITH_OBJECT_ARRAYS["properties"]}}
+    prod = {"title": "x", "brand": "b", "category": "c"}
+    assert m.reuse_sig("X", spec, prod, _ORDERABLE_WITH_OBJECT_ARRAYS) == \
+        m.reuse_sig("X", spec, prod, bare)
+
+
+def test_build_orderable_drops_llm_external_product_identifier():
+    """LLM 若照采集资料把亚马逊 ASIN 填进 externalProductIdentifier,出参上丢掉:
+    来源隐藏(sku_plan §0),发出去收不回。"""
+    o = m.build_orderable("S1", "012345678905", 19.9, 5, "PID", {"attrs": {}},
+                          llm_fields={"externalProductIdentifier": [
+                              {"externalProductIdType": "ASIN",
+                               "externalProductId": "B0PARENT01"}],
+                              "IsPreorder": "No"})
+    assert "externalProductIdentifier" not in o
+    assert o["IsPreorder"] == "No"

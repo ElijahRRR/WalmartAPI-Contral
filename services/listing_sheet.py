@@ -299,6 +299,9 @@ _SUBMIT_FIELDS = ["list_title", "amz_price", "stock", "walmart_price",
 _LISTED_FIELDS = ["listed", "feed_id", "list_date", "not_listed_reason"]
 #: 回执三列(反哺器的专属域)。
 _RECEIPT_FIELDS = ["list_result", "list_fail_reason", "feed_check_date"]
+#: 提交结果里「有新 feed 在途」的两种 是否上架 值:写它们时同一次清掉回执三列
+#: (见 write_submit_cols)。提交被拒(No)没有新 feed,回执三列不动。
+_FRESH_FEED_LISTED = ("Yes", "Unknown")
 #: 清列/自愈一次写满的七列 = 提交结果四列 + 回执三列。
 #: **不含 SKU**(清列不是弃码点)、不含人工域与审核域。
 _RECEIPT_CLEAR_FIELDS = _LISTED_FIELDS + _RECEIPT_FIELDS
@@ -337,6 +340,15 @@ def write_submit_cols(updates: list[tuple[int, list]], execute: bool = True) -> 
         fields, row = list(_SUBMIT_FIELDS), list(vals[:8])
         if sku:
             fields, row = ["sku"] + fields, [sku] + row
+        if str(vals[4]).strip() in _FRESH_FEED_LISTED:
+            # 新 feed 已经(可能)在途:同一次写清掉上一轮的回执三列。
+            # 2026-10-24 生产实证(A109黄威威 装饰枕套):FAILED 行被 list_new
+            # 重排后又提交了两次,表上 feedid/上架日期 换成了新的,上架结果/报错/
+            # feed查询日期 却还是第一次的 —— 反哺器只跟 上架结果 ∈ PENDING_O 的行,
+            # 旧的 FAILED 挡在那里,后两次回执一条也没写回;行还一直读作 FAILED,
+            # 被 _retry_rows 反复重排直到次数上限。清空后 上架结果="" 即回到
+            # 反哺器的跟踪面,新回执照常落表。
+            fields, row = fields + _RECEIPT_FIELDS, row + [""] * len(_RECEIPT_FIELDS)
         rows.append((r, fields, row))
     feishu.sheet_write_ranges(resources.LISTING_SHEET, _rows_ranges(rows))
     return len(updates)

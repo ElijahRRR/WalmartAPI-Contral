@@ -79,6 +79,38 @@ TRO 跨仓边界(暂放)。
 maintenance/list_new)→ 按域停旧切换。
 **✅ 2026-08-17 全部完成** —— 验收记录见 `docs/production_cutover.md` §九。
 
+### 2026-10-24 上架「对象数组」字段子字段名靠猜 → 连拒三次;重提后表上回执卡旧值
+
+起因(所有者在上架表看到 feed查询日期 10-04 早于 上架日期 10-06,A109黄威威
+B0H59WHW42 装饰枕套):台账里这一行 10-04/05/06 提交三次,三次同拒
+`EXT_DATA_ERROR_72600149546850`。官方 spec(0703、0829 两版一致)里 `fabricContent`
+是对象数组,元素子字段 `materialName` / `materialPercentage` 必填;我们给 LLM 的字段块
+只写了 `items.type=object`,LLM 照标题编出 `fabricMaterialName`;mp_conform 也不看元素
+内部。同一载荷走缓存原样重发,三次烧光重试上限。官方 spec 里带 `fabricContent` 的 PT
+有 724 个。表上那一格则是另一个缺陷:重提只写 feedid/上架日期,回执三列留着第一次的
+FAILED,反哺器只跟「上架结果」为空/处理中的行,后两次回执一条没写回。
+
+四处修复:
+- `mp_mapper._field_block`:数组元素是对象时送上子字段(`items.object_properties` /
+  `items.object_required`,键名与 object 字段同款)。提示词正文不改;**Orderable 段不送**
+  (所有 PT 共用,送了就全量缓存作废,且 externalProductIdentifier 的填法等于教 LLM 交出
+  ASIN)。按 0829 spec 实测:6973 个 PT 里只有 1761 个(Visible 里含这类字段的)提示词
+  变化、缓存失效一次,其余 5212 个逐字节不变。
+- `mp_mapper.build_orderable`:LLM 出参里的 `externalProductIdentifier` 一律丢弃并告警
+  (来源隐藏;只丢出参、不动提示词,不触发缓存失效)。
+- `mp_conform.fix_array_items`(工序 5a):元素 schema 封闭时剔 spec 外子字段;缺元素
+  必填的元素删掉;删光了非必填整字段删、必填(**含条件必填**,如 upholstered=Yes ⇒
+  fabricContent)进缺失清单不提交。
+- `listing_sheet.write_submit_cols`:写 是否上架=Yes/Unknown(新 feed 在途)时同一次清空
+  上架结果/报错/feed查询日期,新回执照常落表(即 feed_ledger_v2_design C21 的那一条,先行落地)。
+  ⚠ Unknown 行的回执仍可能被 heal_unknown 用**上一次**提交的回执回填(既有缺口,
+  C22,本次未动)。
+- `list_new`:open_rows 与重试通道在「No / 无 feedid / FAILED」行上重叠,同一行进两次
+  队列 ⇒ 去重,保留新行那份(既有问题,一次性放行会多一条命中路径)。
+- `list_new -p requeue_invalid_field=1`:**一次性放行**。重试已达上限、且台账里最近一次
+  list_new 提交的报错含「is not a valid field」的行再给一轮;只认最近一次,换了错误就不再
+  命中,不会无限重试。先 `--dry-run` 看摘要首行「含达上限后一次性放行 N」。
+
 ### 2026-10-24 建仓转正:`node_create` 给店铺账户新建物流中心(所有者定稿)
 
 **所有者原话**:「我需要一个给账户添加物流中心的功能」;追问定稿:「建仓是在我有需要的

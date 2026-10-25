@@ -203,8 +203,13 @@ FEED_SPEC_VERSIONS = {
     #   "不再必填"(partTerminologyID 24 / condition 20 / …),只放松不收紧。
     #
     # 2026-10-25 从 20260608 切到 20260829(所有者:先升最新版、再做兼容修复;
-    # 0608 已从官方版本表消失)。0608 原件只在所有者机器上,0608→0829 的实测差集
-    # 以那边 `spec_split -p diff=1` 的输出为准;**代理口径 0703→0829**(沙箱实测):
+    # 0608 已从官方版本表消失)。所有者机器 `spec_split -p diff=1` 实测 0608→0829
+    # (2026-10-25,自检 6973/6973):PT 6951 → 6973(+22,样例多为汽配;零消失);
+    #   Orderable 23 → 23 字段、5 → 5 必填;顶层必填有变化的 PT 7 个 —— 新增必填
+    #   size 2 个 PT、vehicleType 1(汽配,不做)、metal_content / millesimal_fineness
+    #   各 1(Precious Metals);不再必填 vehicleType 2 / number_of_lugs 1 /
+    #   vehicleRimSize 1 / recommendedUses 1。
+    # Visible 层细节看沙箱里的**代理口径 0703→0829**(0608 原件不在沙箱):
     #   PT 6967 → 6973(+6:Fashion Cover-Ups / Scarves / Fresh、Frozen 果蔬 4 个;
     #   零消失零改名);Orderable 逐字节相同(23 字段 / 5 必填);顶层必填只有
     #   Pool Chemicals.recommendedUses 放松;官方 0803→0829 差异报告为空。

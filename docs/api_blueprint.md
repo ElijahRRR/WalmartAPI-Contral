@@ -300,8 +300,10 @@ version 字符串全部进 registry(不准散落硬编码),且**必须定期核�
 仅 DELETE_ITEM 的 5.0.20250919 仍是现值(2026-08-05 核验)。来源:官方 Item spec versioning and diff reporting 页。
 **2026-10-25 换版到 5.0.20260829-12_49_39-api(MP_ITEM 与 MP_MAINTENANCE 同日;所有者:先升最新版、再做兼容修复)**。
 官方版本表当日:推荐 0829 / 上一版 0803 / 不推荐 0703,我们在用的 0608 **已整版不在表上**(两个 feed 都是)。
-0608 原件只在所有者机器上,0608→0829 的实测差集以那边 `spec_split -p diff=1` 的输出为准;沙箱里能量的是
-**代理口径 0703→0829**:PT 6967→6973(+6:Fashion Cover-Ups、Scarves、Fresh/Frozen Fruits、Fresh/Frozen Vegetables;
+**所有者机器实测 0608→0829**(`spec_split -p diff=1`,自检 6973/6973):PT 6951→6973(+22,样例多为汽配;零消失),
+Orderable 23→23 字段、5→5 必填,顶层必填有变化的 PT 7 个 —— 新增必填 size(2 个 PT)、vehicleType(1,汽配不做)、
+metal_content / millesimal_fineness(各 1,Precious Metals);不再必填 vehicleType 2、number_of_lugs 1、vehicleRimSize 1、
+recommendedUses 1。0608 原件不在沙箱,Visible 层细节用的是**代理口径 0703→0829**:PT 6967→6973(+6:Fashion Cover-Ups、Scarves、Fresh/Frozen Fruits、Fresh/Frozen Vegetables;
 零消失零改名),Orderable 逐字节相同(23 字段 / 5 必填,含 SkuUpdate/ProductIdUpdate、无 specProductType),
 顶层必填只有 Pool Chemicals 的 recommendedUses 放松;官方 0803→0829 差异报告为空。Visible 层的变化:
 新增可选字段 `condition_notes`(3454 个 PT,minLength 25,不交给 LLM)、Wristwatches / CD Recorders /

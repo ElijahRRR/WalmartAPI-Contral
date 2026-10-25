@@ -85,8 +85,9 @@ maintenance/list_new)→ 按域停旧切换。
 放行前的核对 —— 报错字段几乎全是 `fabricContent` 子字段名(LLM 编的),与规范版本无关;
 但核对时发现在用的 0608 已从官方版本表整版消失(推荐 0829 / 上一版 0803 / 不推荐 0703),
 MP_MAINTENANCE 的 header 也是 0608。两个 feed 同日换到 0829。数字与换版步骤见 registry
-`FEED_SPEC_VERSIONS` 注释和 `docs/api_blueprint.md` §5.1(代理口径 0703→0829;0608→0829 的
-实测差集以所有者机器上 `spec_split -p diff=1` 为准)。顺序是**先拆后切**:新版目录没拆好就
+`FEED_SPEC_VERSIONS` 注释和 `docs/api_blueprint.md` §5.1。所有者机器实测 0608→0829:PT 6951→6973
+(+22、零消失),Orderable 23/5 不变,新增必填只涉及 5 个 PT(size 2、汽配 vehicleType 1、
+Precious Metals 2 个字段),判定可以切。顺序是**先拆后切**:新版目录没拆好就
 拉到改了版本串的代码,`pt_spec` 抛 FileNotFoundError、上架链全停(真遇上了:`spec_split -p base=<旧目录>`
 直接拆进 registry 指着的空目录,不手改 registry)。回退:MP_ITEM 改回 0608 一个串只作短期应急 ——
 0608 与 MP_MAINTENANCE 一样已不在官方表上,长期回退版是表上的 0803;MP_MAINTENANCE 不回退(维护载荷

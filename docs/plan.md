@@ -90,9 +90,14 @@ Red Flora 2 条、Red 2 条,同色不同尺寸在变体选择里一模一样。�
 
 所有者定:① 新上架时同一变体组里每个取值组合只留一条,撞了的**改按单品上架**(不进组,
 商品照常上);② 存量 860 个组**先不动**(要动时 MP_MAINTENANCE 有 `removeVariantGroup`)。
-实现 `list_new._drop_dup_combos`(跑在重映射之后、主变体去重之前):与本组在架兄弟(沃尔玛
-回传的 groupingAttributes,只比值不比名)或本轮同族先到者(ASIN 字母序)的取值集合相同或互相
-包含即算撞,改 `mode=single, code=dup_combo`,摘要「变体」一栏计数。
+实现 `list_new._drop_dup_combos`(跑在重映射之后、主变体去重之前),按**发出去的值**比
+(`mp_conform.variant_sent_pairs`,与载荷层同一份逐属性校验):与在架兄弟比值的多重集(沃尔玛
+回传 groupingAttributes 的属性名与我们的对不上),与本轮同族比 (属性名, 值);相同或互相包含即撞,
+改 `mode=single, code=dup_combo`。本轮同族维度多的先、再按 ASIN 字母序先到先留。对抗审查
+另修三处:单品的自占位组号(组号 = 自己 SKU)不再被当成变体组;已有在架兄弟的家族不再凭本轮
+数据剔「全同」维度;`check_spec` 预检改用最终决策,不再重算。已知边界:同一天先后两次上架,
+前一次刚提交、还没被 catalog_sync 收进 walmart_items 的兄弟看不见 —— 小批量试跑后要等
+catalog_sync 再全量。
 
 ### 2026-10-25 MP_ITEM / MP_MAINTENANCE spec 换版 20260608 → 20260829
 

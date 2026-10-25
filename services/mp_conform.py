@@ -593,6 +593,32 @@ def _coerce_variant_value(prop: dict, val):
     return None         # boolean 及一切认不出的类型:不猜,剔掉这个属性
 
 
+def variant_sent_pairs(props: dict, attr_pairs) -> tuple[list, list[str]]:
+    """输入:spec 属性 + 变体决策的 (属性名, 原始取值) → 输出:(实际会发的 (属性名, 取值), 剔除说明)。
+
+    `_apply_variant_plan` 逐属性三道校验的唯一实现(属性名在本 PT 枚举内 / 属性在
+    spec 登记 / 取值过 enum 与类型,'2 Pack' 抽成 2),单个不过只剔它。
+    list_new 判组内撞值也用它 —— 撞不撞要按**发出去的值**比,不是亚马逊原始串。
+    """
+    enum = variant_attr_enum(props)
+    allowed = {str(e) for e in enum} if enum else None
+    kept: list[tuple[str, object]] = []
+    dropped: list[str] = []
+    for name, raw in attr_pairs:
+        if allowed is not None and name not in allowed:
+            dropped.append(f"{name}(不在本 PT 枚举内)")
+            continue
+        if name not in props:
+            dropped.append(f"{name}(本 PT 无此属性,差异值无处可写)")
+            continue
+        val = _coerce_variant_value(props[name], raw)
+        if val is None:
+            dropped.append(f"{name}={raw!r}(值不合本属性的 enum/类型)")
+            continue
+        kept.append((name, val))
+    return kept, dropped
+
+
 def _apply_variant_plan(props: dict, in_spec: list, visible: dict,
                         plan: dict) -> tuple[dict, list[str]]:
     """输入:spec 属性 + 三件套在册列表 + visible + 变体决策 → 输出:(visible, 说明)。
@@ -623,22 +649,7 @@ def _apply_variant_plan(props: dict, in_spec: list, visible: dict,
         for k in in_spec:
             visible.pop(k, None)
         return None, ["变体组号缺失(上游未发号),退单品口径"]
-    enum = variant_attr_enum(props)
-    allowed = {str(e) for e in enum} if enum else None
-    kept: list[tuple[str, object]] = []
-    dropped: list[str] = []
-    for name, raw in (plan.get("attr_pairs") or []):
-        if allowed is not None and name not in allowed:
-            dropped.append(f"{name}(不在本 PT 枚举内)")
-            continue
-        if name not in props:
-            dropped.append(f"{name}(本 PT 无此属性,差异值无处可写)")
-            continue
-        val = _coerce_variant_value(props[name], raw)
-        if val is None:
-            dropped.append(f"{name}={raw!r}(值不合本属性的 enum/类型)")
-            continue
-        kept.append((name, val))
+    kept, dropped = variant_sent_pairs(props, plan.get("attr_pairs") or [])
     if not kept:
         # ⚠ **只 pop 掉三件套就 return 是不够的**(2026-08-17 审查修):spec 把
         # 三件套列为必填的 PT,pop 完就直接 return 会让 validate 每轮都报

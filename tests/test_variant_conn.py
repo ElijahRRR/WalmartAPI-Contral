@@ -300,9 +300,11 @@ def test_member_clashing_with_a_listed_sibling_lists_as_single(monkeypatch):
     groupingAttributes(属性名是 actual_color,只比值不比名,不分大小写)。
     """
     grouping = [{"name": "actual_color", "value": "Rich Gold"}]
-    conn = _Conn(rows=[("SKU1", "GP4GVR4B42EB", "No", grouping),
-                       ("SKU2", "OTHER_GROUP", "Yes",
-                        [{"name": "actual_color", "value": "Navy"}])])
+    # SKU2 是单品:spec 必填三件套时 mp_conform 拿它自己的 SKU 占位组号、主变体 Yes
+    # —— 它不是变体组,不能提供组号、不能冒充主变体、它的 Navy 也不算撞
+    conn = _Conn(rows=[("SKU2", "SKU2", "Yes",
+                        [{"name": "actual_color", "value": "Navy"}]),
+                       ("SKU1", "GP4GVR4B42EB", "No", grouping)])
     monkeypatch.setattr(ln.db, "pg_conn", _fake_pg(conn))
     monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {
         "variantAttributeNames": {"type": "array",
@@ -316,6 +318,6 @@ def test_member_clashing_with_a_listed_sibling_lists_as_single(monkeypatch):
     clash, navy = ready[0]["_vplan"], ready[1]["_vplan"]
     assert clash["mode"] == "single" and clash["code"] == "dup_combo"
     assert "在架兄弟" in clash["reason"] and clash["is_primary"] is False
-    # 只比本组(GP4GVR4B42EB)的在架兄弟:别的组里的 Navy 不算撞
     assert navy["mode"] == "variant" and navy["group_id"] == "GP4GVR4B42EB"
+    assert navy["is_primary"] is True          # 占位单品的 Yes 不算本族已有主变体
     assert n_var["dup_combo"] == 1

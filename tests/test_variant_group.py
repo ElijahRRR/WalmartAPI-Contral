@@ -522,10 +522,20 @@ def test_family_lookup_matches_through_the_registry():
     assert "abandoned_at" not in sql
 
 
-def test_same_round_members_with_the_same_combo_keep_only_the_first():
+def _dup_spec(monkeypatch, **types):
+    """撞值按发出去的值比(mp_conform.variant_sent_pairs),要一份 PT spec。"""
+    from workflows import list_new as ln
+    props = {"variantAttributeNames": {"type": "array",
+                                       "items": {"enum": sorted(types)}}}
+    props.update({n: {"type": t} for n, t in types.items()})
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": props})
+
+
+def test_same_round_members_with_the_same_combo_keep_only_the_first(monkeypatch):
     """本轮同族两条取值组合相同(同色不同尺寸、尺寸映不上被剔):按 ASIN 字母序
     先到先留,后到的改按单品上架;不同取值的照常进组(所有者 2026-10-25 定)。"""
     from workflows import list_new as ln
+    _dup_spec(monkeypatch, color="string")
     rows = [_vrow("B0BLUE0002", [("color", "Blue Flora")]),
             _vrow("B0BLUE0001", [("color", "blue flora ")]),
             _vrow("B0RED00001", [("color", "Red")])]
@@ -542,24 +552,25 @@ def test_same_round_members_with_the_same_combo_keep_only_the_first():
     assert all(r["_vplan"]["mode"] == "variant" for r in rows2)
 
 
-def test_combo_contained_in_a_listed_sibling_counts_as_a_clash():
+def test_combo_contained_in_a_listed_sibling_counts_as_a_clash(monkeypatch):
     """在架兄弟声明了 color+尺寸、新成员这轮只映上 color:它在组里同样分不出来,
     算撞;取值不被包含的照常进组。空的在架组合(回传缺字段)不能让全员都撞。"""
     from workflows import list_new as ln
+    _dup_spec(monkeypatch, color="string")
     clash = _vrow("A1", [("color", "Rich Gold")])
-    clash["_vplan"]["listed_combos"] = [frozenset({"rich gold", "king"}),
-                                        frozenset()]
+    clash["_vplan"]["listed_combos"] = [("king", "rich gold"), ()]
     fine = _vrow("A2", [("color", "Green")])
     ln._drop_dup_combos([clash, fine])
     assert clash["_vplan"]["code"] == "dup_combo"
     assert fine["_vplan"]["mode"] == "variant"
 
 
-def test_dup_combo_runs_before_primary_dedupe():
+def test_dup_combo_runs_before_primary_dedupe(monkeypatch):
     """被改成单品的行不能再占主变体名额:撞值判定必须在主变体去重之前。"""
     import inspect
 
     from workflows import list_new as ln
+    _dup_spec(monkeypatch, color="string")
     src = inspect.getsource(ln._plan_variants)
     assert src.index("_remap_unmapped_dims(ready)") < src.index("_drop_dup_combos(ready)") \
         < src.index("_dedupe_primary(ready)")
@@ -569,3 +580,89 @@ def test_dup_combo_runs_before_primary_dedupe():
     ln._dedupe_primary(rows)
     prim = [r["asin"] for r in rows if r["_vplan"]["is_primary"]]
     assert prim == ["B0A"] and rows[1]["_vplan"]["is_primary"] is False
+
+
+def test_dup_check_compares_what_is_sent_not_raw_amazon_strings(monkeypatch):
+    """按一致化后**发出去的值**比(2026-10-25 对抗审查):'2 Pack' 发出去是 2,
+    与在架兄弟回传的 2 撞;PT 不认的取值会被剔掉,剩下的才是组合。"""
+    from workflows import list_new as ln
+    props = {"variantAttributeNames": {"type": "array", "items": {
+                 "enum": ["color", "multipackQuantity"]}},
+             "color": {"type": "string", "enum": ["Navy", "Red"]},
+             "multipackQuantity": {"type": "integer"}}
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": props})
+    a = _vrow("A1", [("color", "Navy"), ("multipackQuantity", "2 Pack")])
+    a["_vplan"]["listed_combos"] = [("2", "navy")]
+    ln._drop_dup_combos([a])
+    assert a["_vplan"]["code"] == "dup_combo"
+    # 本轮两条:颜色都不在枚举内被剔,剩下的 multipackQuantity 都是 2 ⇒ 撞
+    b = _vrow("B1", [("color", "Chartreuse"), ("multipackQuantity", "2 Pack")])
+    c = _vrow("B2", [("color", "Lime"), ("multipackQuantity", "2 Count")])
+    ln._drop_dup_combos([b, c])
+    assert [b["_vplan"]["mode"], c["_vplan"]["mode"]] == ["variant", "single"]
+    # 一个属性都发不出去的行一致化时本来就退单品:不占名额,也不撞别人
+    d = _vrow("D1", [("color", "Chartreuse")])
+    e = _vrow("D2", [("color", "Lime")])
+    ln._drop_dup_combos([d, e])
+    assert d["_vplan"]["mode"] == e["_vplan"]["mode"] == "variant"
+
+
+def test_same_round_compares_names_and_values(monkeypatch):
+    """本轮同族属性名可靠,按 (名, 值) 比:对调、同值不同属性都不算撞;
+    同一 ASIN 在表上贴了两行不算自己撞自己。"""
+    from workflows import list_new as ln
+    _dup_spec(monkeypatch, color="string", lensColor="string")
+    rows = [_vrow("B01", [("color", "Black"), ("lensColor", "Gray")]),
+            _vrow("B02", [("color", "Gray"), ("lensColor", "Black")]),
+            _vrow("B03", [("color", "Black"), ("lensColor", "Black")]),
+            _vrow("B03", [("color", "Black"), ("lensColor", "Black")])]
+    ln._drop_dup_combos(rows)
+    assert all(r["_vplan"]["mode"] == "variant" for r in rows)
+
+
+def test_member_missing_a_dimension_does_not_push_out_complete_siblings(monkeypatch):
+    """包含关系不传递:维度齐全的先留,缺维度的那条退单品;不能因为它 ASIN 排前
+    就把 Red/S、Red/M 两个真不同的兄弟一起挤出去。"""
+    from workflows import list_new as ln
+    _dup_spec(monkeypatch, color="string", size="string")
+    rows = [_vrow("B0A", [("color", "Red")]),
+            _vrow("B0B", [("color", "Red"), ("size", "S")]),
+            _vrow("B0C", [("color", "Red"), ("size", "M")])]
+    ln._drop_dup_combos(rows)
+    assert [r["_vplan"]["mode"] for r in rows] == ["single", "variant", "variant"]
+
+
+def test_round_alone_does_not_strip_a_dim_the_listed_group_uses(monkeypatch):
+    """在架 Red/King、Blue/King,本轮 Red/Queen、Blue/Queen:本轮 size 全同不等于
+    组内全同,不剔;两条都是真不同的组合,照常进组(2026-10-25 对抗审查)。
+    在架只有 color 一维时,本轮两条 Blue Flora 先到先留、后到的退单品。"""
+    from workflows import list_new as ln
+    _dup_spec(monkeypatch, color="string", size="string")
+    listed = [("blue", "king"), ("king", "red")]
+    rows = [_vrow("B0RQ", [("color", "Red"), ("size", "Queen")]),
+            _vrow("B0BQ", [("color", "Blue"), ("size", "Queen")])]
+    for r in rows:
+        r["_vplan"]["listed_combos"] = listed
+    ln._drop_degenerate_dims(rows)
+    ln._drop_dup_combos(rows)
+    for r in rows:
+        assert r["_vplan"]["mode"] == "variant"
+        assert [n for n, _ in r["_vplan"]["attr_pairs"]] == ["color", "size"]
+    _dup_spec(monkeypatch, color="string")
+    rows = [_vrow("B0BF1", [("color", "Blue Flora")]),
+            _vrow("B0BF2", [("color", "Blue Flora")])]
+    for r in rows:
+        r["_vplan"]["listed_combos"] = [("red flora",)]
+    ln._drop_degenerate_dims(rows)
+    ln._drop_dup_combos(rows)
+    assert [(r["_vplan"]["mode"], r["_vplan"]["code"]) for r in rows] == \
+        [("variant", "variant"), ("single", "dup_combo")]
+
+
+def test_multi_dim_counter_only_counts_rows_sent_as_variants():
+    """「其中多维」= 按多维发出去的变体行;撞值退成单品的行保留 attr_pairs,不能算进去。"""
+    import inspect
+
+    from workflows import list_new as ln
+    src = inspect.getsource(ln._plan_variants)
+    assert 'vp.get("mode") == "variant" and len(vp.get("attr_pairs") or ()) > 1' in src

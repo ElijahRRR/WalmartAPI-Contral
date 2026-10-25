@@ -973,6 +973,7 @@ LEFT JOIN catalog.listing_sources ls
   ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
 WHERE w.store = %(store)s AND w.missing_since IS NULL
   AND coalesce(ls.source_key, w.sku) = ANY(%(asins)s::text[])
+ORDER BY w.sku
 """
 
 
@@ -999,10 +1000,14 @@ def _variant_plan(conn, store: str, r: dict, spec) -> dict:
                 cur.execute(_FAMILY_LISTED_SQL,
                             {"store": store, "asins": [a for a in fam
                                                        if a != r["asin"]]})
-                for _sku, g, prim, grouping in cur.fetchall():
-                    gid = gid or (str(g) if g else "")
+                for sku_, g, prim, grouping in cur.fetchall():
+                    if not g or str(g) == str(sku_):
+                        # 单品(含 spec 必填三件套时 mp_conform 用自己 SKU 占位的
+                        # 那种组号)不是变体组:不提供组号、不算主变体、不参与撞值
+                        continue
+                    gid = gid or str(g)
                     has_primary = has_primary or str(prim).lower() in ("yes", "true")
-                    listed.append((str(g or ""), grouping))
+                    listed.append((str(g), grouping))
         except Exception as e:      # noqa: BLE001
             logger.warning("%s 查同族在架信息失败(按本店无同族处理): %s",
                            r["asin"], e)
@@ -1012,24 +1017,46 @@ def _variant_plan(conn, store: str, r: dict, spec) -> dict:
         r["asin"], p.get("variant_attributes"), p.get("variation_asins"),
         p.get("parent_asin"), enum,
         existing_group_id=gid, family_has_primary=has_primary)
-    # 在架兄弟在这个组里已经占了哪些取值组合(_drop_dup_combos 拿它判撞值)
+    # 在架兄弟已经占了哪些取值组合(_drop_dup_combos 拿它判撞值)。取本族**全部**
+    # 真变体组的并集:真正进哪个组由发号登记表定(mint_group_code ①),与这里查到
+    # 的第一个组号未必一致;并集只会多拦不会漏拦
     plan["listed_combos"] = [
         c for c in (_combo_key(a.get("value") for a in grouping
                                if isinstance(a, dict))
-                    for g, grouping in listed
-                    if gid and g == gid and isinstance(grouping, list))
+                    for _g, grouping in listed if isinstance(grouping, list))
         if c]
     return plan
 
 
-def _combo_key(values) -> frozenset:
-    """输入:一个成员声明的变体取值 → 输出:比较用的取值集合(去空白、不分大小写)。
+def _norm_variant_value(v) -> str:
+    """输入:一个变体取值(亚马逊原串 / 一致化后的值 / 沃尔玛回传值)→ 输出:比较用的串。
+
+    去空白、不分大小写;array 型属性一致化后包了一层 → 拆开;整数值统一成整数串
+    (一致化把 '2 Pack' 抽成 2,沃尔玛回传可能是 2 / 2.0 / '2')。
+    """
+    if isinstance(v, list) and len(v) == 1:
+        v = v[0]
+    if isinstance(v, bool):
+        return str(v).casefold()
+    if isinstance(v, (int, float)) and float(v).is_integer():
+        return str(int(v))
+    s = str(v).strip().casefold()
+    try:
+        f = float(s)
+    except ValueError:
+        return s
+    return str(int(f)) if f.is_integer() else s
+
+
+def _combo_key(values) -> tuple:
+    """输入:一个成员声明的变体取值 → 输出:比较用的取值多重集(排序元组)。
 
     只比**值不比属性名**:在架兄弟的取值来自沃尔玛回传的 groupingAttributes,属性名
     是沃尔玛内部名(color 回来叫 actual_color),与我们发的名字对不上,值是原样回来的。
+    保留重复(color=Natural、pattern=Natural 是两个值,不并成一个)。
     """
-    return frozenset(v for v in (str(x).strip().casefold() for x in values
-                                 if x is not None) if v)
+    return tuple(sorted(v for v in (_norm_variant_value(x) for x in values
+                                    if x is not None) if v))
 
 
 def _plan_variants(ready: list[dict], n_var: dict) -> None:
@@ -1071,7 +1098,7 @@ def _plan_variants(ready: list[dict], n_var: dict) -> None:
         if not vp:
             continue
         n_var[vp["code"]] += 1
-        if len(vp.get("attr_pairs") or ()) > 1:
+        if vp.get("mode") == "variant" and len(vp.get("attr_pairs") or ()) > 1:
             # 多维发出的行数:这一栏为 0 而库里明明有 color+size 的家族,
             # 就是多维那条链没生效(2026-08-17 补齐后的验收点)
             n_var["其中多维"] += 1
@@ -1113,6 +1140,12 @@ def _drop_degenerate_dims(ready: list[dict]) -> None:
         if len(rows) < 2:
             continue                     # 一条判不出组内差异,不动
         names = [n for n, _ in rows[0]["_vplan"]["attr_pairs"]]
+        if any(len(c) >= len(names) for r in rows
+               for c in (r["_vplan"].get("listed_combos") or ())):
+            # 本轮只是组的一部分:在架兄弟声明了不少于本轮的维度,本轮全同 ≠ 组内全同
+            # (在架 Red/King、Blue/King,本轮 Red/Queen、Blue/Queen —— 剔了 size 就
+            # 撞上在架兄弟)。真撞值交给 _drop_dup_combos(2026-10-25 对抗审查)
+            continue
         for name in names:
             vals = {str(dict(r["_vplan"]["attr_pairs"]).get(name))
                     for r in rows if name in dict(r["_vplan"]["attr_pairs"])}
@@ -1278,11 +1311,18 @@ def _drop_dup_combos(ready: list[dict]) -> None:
     定了先不动)。`_drop_degenerate_dims` 只管「某维度组内全同」,管不到这种「剩下
     的组合撞了」。
 
-    撞值判据(取值集合,见 `_combo_key`):与在架兄弟或本轮同族先到的成员**相同、
-    或一方包含另一方** —— 包含也算:在架兄弟声明了 color+尺寸、新成员这轮只映上
-    color 时,它在组里同样分不出来。本轮同族按 ASIN 字母序先到先留(与
-    `_dedupe_primary` 同序,重跑结果不漂)。
-    必须跑在 `_dedupe_primary` 之前:被改成单品的行不能再占主变体名额。
+    撞值按**发出去的值**比(`mp_conform.variant_sent_pairs`:剔掉 PT 不认的属性、
+    '2 Pack' 抽成 2;一个都不剩的行一致化时本来就退单品,不占也不撞):
+      · 与**在架兄弟**比值的多重集(沃尔玛回传的属性名与我们的对不上),相同或一方
+        包含另一方即撞 —— 包含也算:在架兄弟声明了 color+尺寸、新成员这轮只映上
+        color 时,它在组里同样分不出来;
+      · 与**本轮同族**比 (属性名, 值) 对,同样相同或包含即撞;同一 ASIN 在表上贴了
+        两行时不算自己撞自己。
+    本轮同族维度多的先、同维度按 ASIN 字母序先到先留(重跑结果不漂;缺维度的那条
+    不会把维度齐全的兄弟挤出去)。必须跑在 `_dedupe_primary` 之前:被改成单品的行
+    不能再占主变体名额。
+    已知边界:同一天先后两次上架,前一次刚提交、还没被 catalog_sync 收进
+    walmart_items 的兄弟看不见(它们的组号已登记,取值没地方查)。
     """
     by_family: dict[tuple, list[dict]] = {}
     for r in ready:
@@ -1293,24 +1333,33 @@ def _drop_dup_combos(ready: list[dict]) -> None:
     for (store, fkey), rows in sorted(by_family.items(),
                                       key=lambda kv: (str(kv[0][0]),
                                                       str(kv[0][1]))):
-        # 空组合(回传缺 groupingAttributes)不参与:空集被谁都「包含」,会让全员都撞
-        taken: list[tuple[frozenset, str]] = [
-            (c, "在架兄弟") for r in rows
-            for c in (r["_vplan"].get("listed_combos") or ()) if c]
-        for r in sorted(rows, key=lambda x: x["asin"]):
-            vp = r["_vplan"]
-            mine = _combo_key(v for _, v in vp["attr_pairs"])
-            hit = next((who for c, who in taken
-                        if mine and (mine <= c or c <= mine)), "")
-            if not hit:
-                taken.append((mine, f"本轮同族 {r['asin']}"))
+        listed = [collections.Counter(c) for r in rows
+                  for c in (r["_vplan"].get("listed_combos") or ()) if c]
+        cand = []
+        for r in rows:
+            props = (pt_spec.load_pt(r.get("product_type") or "") or {}
+                     ).get("properties") or {}
+            sent, _ = mp_conform.variant_sent_pairs(props, r["_vplan"]["attr_pairs"])
+            cand.append((r, frozenset((n, _norm_variant_value(v)) for n, v in sent)))
+        seen: list[tuple[frozenset, str]] = []
+        for r, pairs in sorted(cand, key=lambda x: (-len(x[1]), x[0]["asin"])):
+            if not pairs:
                 continue
-            vals = ",".join(f"{n}={v}" for n, v in vp["attr_pairs"])
+            vals = collections.Counter(v for _, v in pairs)
+            hit = "在架兄弟" if any(not (vals - c) or not (c - vals)
+                                    for c in listed) else ""
+            hit = hit or next((f"本轮同族 {a}" for p, a in seen
+                               if a != r["asin"] and (pairs <= p or p <= pairs)), "")
+            if not hit:
+                seen.append((pairs, r["asin"]))
+                continue
+            vp = r["_vplan"]
+            shown = ",".join(f"{n}={v}" for n, v in vp["attr_pairs"])
             logger.warning("变体家族 %s(%s)%s 的取值 %s 与%s撞了,改按单品上架",
-                           fkey, store, r["asin"], vals, hit)
+                           fkey, store, r["asin"], shown, hit)
             r["_vplan"] = {**vp, "mode": "single", "code": "dup_combo",
                            "is_primary": False,
-                           "reason": f"组内取值 {vals} 与{hit}撞了,按单品上架"}
+                           "reason": f"组内取值 {shown} 与{hit}撞了,按单品上架"}
 
 
 def _dedupe_primary(ready: list[dict]) -> None:
@@ -1406,7 +1455,9 @@ def _spec_precheck(ready: list[dict]) -> str:
             orderable = mp_mapper.build_orderable(
                 ph, _UPC_PLACEHOLDER, r["_price"], r["_qty"], "0",
                 pt=r["product_type"], product=r["_p"], llm_fields=llm_o)
-            vp = _variant_plan(conn, r.get("store") or "", r, spec)
+            # 用 _plan_variants 定下来的那份(剔全同维度/重映射/撞值退单品/主变体去重
+            # 都在里面),与真跑 conform 收到的同一份;不在这里重算
+            vp = r.get("_vplan")
             if vp and vp.get("mode") == "variant" and not vp.get("group_id"):
                 # 组号真跑时才发(mint_group_code 是写库函数,空跑不许调),这里
                 # 只给载荷一个形态合法的占位串走完一致化。**只填副本**,

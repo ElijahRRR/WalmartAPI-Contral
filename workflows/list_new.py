@@ -966,7 +966,8 @@ def _retry_rows(rows: list[dict], verdicts: dict,
 # conventions §九)。
 _FAMILY_LISTED_SQL = """
 SELECT w.sku, w.variant_group_id,
-       coalesce(w.variant_group_info->>'isPrimary', '') AS is_primary
+       coalesce(w.variant_group_info->>'isPrimary', '') AS is_primary,
+       w.variant_group_info->'groupingAttributes' AS grouping
 FROM catalog.walmart_items w
 LEFT JOIN catalog.listing_sources ls
   ON ls.store = w.store AND ls.sku = w.sku AND ls.source_type = 'amz'
@@ -991,24 +992,44 @@ def _variant_plan(conn, store: str, r: dict, spec) -> dict:
     p = r.get("_p") or {}
     fam = variant_group.parse_family(p.get("variation_asins"), r["asin"])
     gid, has_primary = "", False
+    listed: list[tuple[str, object]] = []
     if store and len(fam) > 1:
         try:
             with conn.cursor() as cur:
                 cur.execute(_FAMILY_LISTED_SQL,
                             {"store": store, "asins": [a for a in fam
                                                        if a != r["asin"]]})
-                for _sku, g, prim in cur.fetchall():
+                for _sku, g, prim, grouping in cur.fetchall():
                     gid = gid or (str(g) if g else "")
                     has_primary = has_primary or str(prim).lower() in ("yes", "true")
+                    listed.append((str(g or ""), grouping))
         except Exception as e:      # noqa: BLE001
             logger.warning("%s 查同族在架信息失败(按本店无同族处理): %s",
                            r["asin"], e)
     props = (spec or {}).get("properties") or {}
     enum = mp_conform.variant_attr_enum(props)
-    return variant_group.plan(
+    plan = variant_group.plan(
         r["asin"], p.get("variant_attributes"), p.get("variation_asins"),
         p.get("parent_asin"), enum,
         existing_group_id=gid, family_has_primary=has_primary)
+    # 在架兄弟在这个组里已经占了哪些取值组合(_drop_dup_combos 拿它判撞值)
+    plan["listed_combos"] = [
+        c for c in (_combo_key(a.get("value") for a in grouping
+                               if isinstance(a, dict))
+                    for g, grouping in listed
+                    if gid and g == gid and isinstance(grouping, list))
+        if c]
+    return plan
+
+
+def _combo_key(values) -> frozenset:
+    """输入:一个成员声明的变体取值 → 输出:比较用的取值集合(去空白、不分大小写)。
+
+    只比**值不比属性名**:在架兄弟的取值来自沃尔玛回传的 groupingAttributes,属性名
+    是沃尔玛内部名(color 回来叫 actual_color),与我们发的名字对不上,值是原样回来的。
+    """
+    return frozenset(v for v in (str(x).strip().casefold() for x in values
+                                 if x is not None) if v)
 
 
 def _plan_variants(ready: list[dict], n_var: dict) -> None:
@@ -1043,6 +1064,7 @@ def _plan_variants(ready: list[dict], n_var: dict) -> None:
                 r["_vplan"] = None
     _drop_degenerate_dims(ready)
     _remap_unmapped_dims(ready)
+    _drop_dup_combos(ready)
     _dedupe_primary(ready)
     for r in ready:
         vp = r.get("_vplan")
@@ -1243,6 +1265,52 @@ def _mark(rows: list[dict], field: str, value: str) -> None:
     for r in rows:
         vp = r["_vplan"]
         r["_vplan"] = {**vp, field: sorted(set(vp.get(field) or ()) | {value})}
+
+
+def _drop_dup_combos(ready: list[dict]) -> None:
+    """输入:带 _vplan 的待提交行 → 输出:无(就地把组内取值组合撞了的成员改按单品)。
+
+    所有者 2026-10-25 定:**同一变体组里每个取值组合只留一条,撞了的改按单品上架**
+    (不进组,商品照常上)。起因是 Bed Runners:沃尔玛这个 PT 的变体属性只有
+    character/color/multipackQuantity/pattern/theme,没有尺寸 —— 亚马逊 color×size
+    的家族剔掉 size 后,同色不同尺寸在沃尔玛变体选择里一模一样(组 GP4GVR4B42EB
+    在架 Blue Flora 3 条、Red Flora 2 条;全店 860 个组 1576 个重复成员,存量所有者
+    定了先不动)。`_drop_degenerate_dims` 只管「某维度组内全同」,管不到这种「剩下
+    的组合撞了」。
+
+    撞值判据(取值集合,见 `_combo_key`):与在架兄弟或本轮同族先到的成员**相同、
+    或一方包含另一方** —— 包含也算:在架兄弟声明了 color+尺寸、新成员这轮只映上
+    color 时,它在组里同样分不出来。本轮同族按 ASIN 字母序先到先留(与
+    `_dedupe_primary` 同序,重跑结果不漂)。
+    必须跑在 `_dedupe_primary` 之前:被改成单品的行不能再占主变体名额。
+    """
+    by_family: dict[tuple, list[dict]] = {}
+    for r in ready:
+        vp = r.get("_vplan")
+        if vp and vp.get("mode") == "variant" and vp.get("attr_pairs"):
+            by_family.setdefault((r.get("store"), vp.get("family_key")),
+                                 []).append(r)
+    for (store, fkey), rows in sorted(by_family.items(),
+                                      key=lambda kv: (str(kv[0][0]),
+                                                      str(kv[0][1]))):
+        # 空组合(回传缺 groupingAttributes)不参与:空集被谁都「包含」,会让全员都撞
+        taken: list[tuple[frozenset, str]] = [
+            (c, "在架兄弟") for r in rows
+            for c in (r["_vplan"].get("listed_combos") or ()) if c]
+        for r in sorted(rows, key=lambda x: x["asin"]):
+            vp = r["_vplan"]
+            mine = _combo_key(v for _, v in vp["attr_pairs"])
+            hit = next((who for c, who in taken
+                        if mine and (mine <= c or c <= mine)), "")
+            if not hit:
+                taken.append((mine, f"本轮同族 {r['asin']}"))
+                continue
+            vals = ",".join(f"{n}={v}" for n, v in vp["attr_pairs"])
+            logger.warning("变体家族 %s(%s)%s 的取值 %s 与%s撞了,改按单品上架",
+                           fkey, store, r["asin"], vals, hit)
+            r["_vplan"] = {**vp, "mode": "single", "code": "dup_combo",
+                           "is_primary": False,
+                           "reason": f"组内取值 {vals} 与{hit}撞了,按单品上架"}
 
 
 def _dedupe_primary(ready: list[dict]) -> None:

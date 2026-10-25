@@ -79,7 +79,7 @@ def test_family_lookup_actually_runs_its_query(monkeypatch):
     是库里在架兄弟的那个(2026-09-07 起本模块只可能给出这一个来源的组号:
     派生那条路已删,新家族的号在 `_prep_rows` 的抽码事务里发)。
     """
-    conn = _Conn(rows=[("B0SIB", "LEGACY_GID", "Yes")])
+    conn = _Conn(rows=[("B0SIB", "LEGACY_GID", "Yes", None)])
     monkeypatch.setattr(ln.db, "pg_conn", _fake_pg(conn))
     monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {
         "variantAttributeNames": {"type": "array",
@@ -289,3 +289,33 @@ def test_variant_enum_is_read_regardless_of_declared_type():
     # 声明了 array 的正常形态照旧
     assert mc.variant_attr_enum({"variantAttributeNames": {
         "type": "array", "items": {"enum": ["color"]}}}) == ["color"]
+
+
+def test_member_clashing_with_a_listed_sibling_lists_as_single(monkeypatch):
+    """所有者 2026-10-25 定:组内取值组合撞了的成员改按单品上架。
+
+    实例(81刘何秀 组 GP4GVR4B42EB,Bed Runners):沃尔玛这个 PT 没有尺寸变体属性,
+    亚马逊 color×size 剔掉 size 后只剩 color;在架兄弟已经有一条 Rich Gold,新来的
+    Rich Gold(King)再进组就和它分不出来。在架兄弟的取值来自沃尔玛回传的
+    groupingAttributes(属性名是 actual_color,只比值不比名,不分大小写)。
+    """
+    grouping = [{"name": "actual_color", "value": "Rich Gold"}]
+    conn = _Conn(rows=[("SKU1", "GP4GVR4B42EB", "No", grouping),
+                       ("SKU2", "OTHER_GROUP", "Yes",
+                        [{"name": "actual_color", "value": "Navy"}])])
+    monkeypatch.setattr(ln.db, "pg_conn", _fake_pg(conn))
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {
+        "variantAttributeNames": {"type": "array",
+                                  "items": {"enum": ["color"]}},
+        "color": {"type": "string"}}})
+    ready = [_row("B0GTT2Q5CX", "B0SIB1,B0SIB2",
+                  attrs="color_name=rich gold|size_name=King"),
+             _row("B0NAVY0001", "B0SIB1,B0SIB2", attrs="color_name=Navy")]
+    n_var = collections.defaultdict(int)
+    ln._plan_variants(ready, n_var)
+    clash, navy = ready[0]["_vplan"], ready[1]["_vplan"]
+    assert clash["mode"] == "single" and clash["code"] == "dup_combo"
+    assert "在架兄弟" in clash["reason"] and clash["is_primary"] is False
+    # 只比本组(GP4GVR4B42EB)的在架兄弟:别的组里的 Navy 不算撞
+    assert navy["mode"] == "variant" and navy["group_id"] == "GP4GVR4B42EB"
+    assert n_var["dup_combo"] == 1

@@ -79,6 +79,21 @@ TRO 跨仓边界(暂放)。
 maintenance/list_new)→ 按域停旧切换。
 **✅ 2026-08-17 全部完成** —— 验收记录见 `docs/production_cutover.md` §九。
 
+### 2026-10-25 变体组内取值组合撞了 → 改按单品上架(所有者定稿)
+
+起因(所有者看换版后的预检):81刘何秀 B0GTT2Q5CX(Bed Runners)亚马逊是 color×size,
+沃尔玛这个 PT 的变体属性只有 character/color/multipackQuantity/pattern/theme,size 映不上被剔,
+只按 color=Rich Gold 进组 GP4GVR4B42EB —— 组里已在架一条 Rich Gold,另有 Blue Flora 3 条、
+Red Flora 2 条、Red 2 条,同色不同尺寸在变体选择里一模一样。全店铺量出 860 个组、1576 个
+重复成员(Bookcases / File Cabinets / Laundry Baskets / Benches 居多)。`_drop_degenerate_dims`
+只管「某维度组内全同」,管不到「剔掉映不上的维度后剩下的组合撞了」,也不看在架兄弟。
+
+所有者定:① 新上架时同一变体组里每个取值组合只留一条,撞了的**改按单品上架**(不进组,
+商品照常上);② 存量 860 个组**先不动**(要动时 MP_MAINTENANCE 有 `removeVariantGroup`)。
+实现 `list_new._drop_dup_combos`(跑在重映射之后、主变体去重之前):与本组在架兄弟(沃尔玛
+回传的 groupingAttributes,只比值不比名)或本轮同族先到者(ASIN 字母序)的取值集合相同或互相
+包含即算撞,改 `mode=single, code=dup_combo`,摘要「变体」一栏计数。
+
 ### 2026-10-25 MP_ITEM / MP_MAINTENANCE spec 换版 20260608 → 20260829
 
 所有者原话:「我认为应该先升级最新版再做兼容修复」。起因是 10-24 那批 `is not a valid field`

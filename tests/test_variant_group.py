@@ -520,3 +520,52 @@ def test_family_lookup_matches_through_the_registry():
     assert "ls.source_type = 'amz'" in sql
     assert "%(skus)s" not in sql
     assert "abandoned_at" not in sql
+
+
+def test_same_round_members_with_the_same_combo_keep_only_the_first():
+    """本轮同族两条取值组合相同(同色不同尺寸、尺寸映不上被剔):按 ASIN 字母序
+    先到先留,后到的改按单品上架;不同取值的照常进组(所有者 2026-10-25 定)。"""
+    from workflows import list_new as ln
+    rows = [_vrow("B0BLUE0002", [("color", "Blue Flora")]),
+            _vrow("B0BLUE0001", [("color", "blue flora ")]),
+            _vrow("B0RED00001", [("color", "Red")])]
+    ln._drop_dup_combos(rows)
+    modes = {r["asin"]: (r["_vplan"]["mode"], r["_vplan"]["code"]) for r in rows}
+    assert modes == {"B0BLUE0001": ("variant", "variant"),
+                     "B0BLUE0002": ("single", "dup_combo"),
+                     "B0RED00001": ("variant", "variant")}
+    assert "本轮同族 B0BLUE0001" in rows[0]["_vplan"]["reason"]
+    # 不同家族的同色不算撞
+    rows2 = [_vrow("A1", [("color", "Red")], fkey="P0FAM00001"),
+             _vrow("A2", [("color", "Red")], fkey="P0FAM00002")]
+    ln._drop_dup_combos(rows2)
+    assert all(r["_vplan"]["mode"] == "variant" for r in rows2)
+
+
+def test_combo_contained_in_a_listed_sibling_counts_as_a_clash():
+    """在架兄弟声明了 color+尺寸、新成员这轮只映上 color:它在组里同样分不出来,
+    算撞;取值不被包含的照常进组。空的在架组合(回传缺字段)不能让全员都撞。"""
+    from workflows import list_new as ln
+    clash = _vrow("A1", [("color", "Rich Gold")])
+    clash["_vplan"]["listed_combos"] = [frozenset({"rich gold", "king"}),
+                                        frozenset()]
+    fine = _vrow("A2", [("color", "Green")])
+    ln._drop_dup_combos([clash, fine])
+    assert clash["_vplan"]["code"] == "dup_combo"
+    assert fine["_vplan"]["mode"] == "variant"
+
+
+def test_dup_combo_runs_before_primary_dedupe():
+    """被改成单品的行不能再占主变体名额:撞值判定必须在主变体去重之前。"""
+    import inspect
+
+    from workflows import list_new as ln
+    src = inspect.getsource(ln._plan_variants)
+    assert src.index("_remap_unmapped_dims(ready)") < src.index("_drop_dup_combos(ready)") \
+        < src.index("_dedupe_primary(ready)")
+    rows = [_vrow("B0A", [("color", "Red")]), _vrow("B0B", [("color", "Red")]),
+            _vrow("B0C", [("color", "Blue")])]
+    ln._drop_dup_combos(rows)
+    ln._dedupe_primary(rows)
+    prim = [r["asin"] for r in rows if r["_vplan"]["is_primary"]]
+    assert prim == ["B0A"] and rows[1]["_vplan"]["is_primary"] is False

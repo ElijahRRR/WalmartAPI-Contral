@@ -111,6 +111,33 @@ def test_refuses_to_overwrite_the_live_spec_dir(tmp_path):
         wf.run({"src": str(src), "out": str(paths.mp_item_spec_dir())})
 
 
+def test_refuses_maintenance_spec_file(tmp_path):
+    """MP_MAINTENANCE 原件与 MP_ITEM 同版本号同结构,拆它会成功、目录名也一样
+    —— 上架链就拿 20 字段 / 2 必填的维护版 Orderable 去校验(2026-10-25 换 0829)。"""
+    from workflows import spec_split as wf
+    src = tmp_path / "5.0.20260829-12_49_39-api_MP_MAINTENANCE_0_0_en.json"
+    src.write_bytes(_spec({"W": {"required": ["a"]}}))
+    with pytest.raises(ValueError, match="MP_MAINTENANCE"):
+        wf.run({"src": str(src), "out": str(tmp_path / "out"), "dry_run": True})
+    assert wf._feed_from("5.0.20260829-12_49_39-api_MP_ITEM_0_0_en.json") == "MP_ITEM"
+    assert wf._feed_from("自己改过名.json") == ""
+
+
+def test_refuses_version_not_in_header_enum(tmp_path):
+    """文件名的版本串决定目录名 = 切换后 feed header 报的版本;原件 header
+    不认这个值就是改过名的文件,拆进去就名不副实。"""
+    from workflows import spec_split as wf
+    src = tmp_path / "5.0.20260829-12_49_39-api_MP_ITEM_0_0_en.json"
+    header = {"properties": {"version": {"enum": ["5.0.20260703-18_22_27-api"]}}}
+    src.write_bytes(_spec({"W": {"required": ["a"]}}, header=header))
+    with pytest.raises(ValueError, match="version enum"):
+        wf.run({"src": str(src), "out": str(tmp_path / "out"), "dry_run": True})
+    header["properties"]["version"]["enum"] = ["5.0.20260829-12_49_39-api"]
+    src.write_bytes(_spec({"W": {"required": ["a"]}}, header=header))
+    assert "发现 PT 1 个" in wf.run({"src": str(src), "out": str(tmp_path / "out"),
+                                    "dry_run": True})
+
+
 def test_refuses_nonempty_dir_without_replace(tmp_path):
     from workflows import spec_split as wf
     src = tmp_path / "5.0.20260608-18_15_07-api_MP_ITEM_0_0_en.json"

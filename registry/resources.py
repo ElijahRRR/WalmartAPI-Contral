@@ -153,14 +153,25 @@ VARIANT_GROUP_LETTER = "G"
 #  沃尔玛 feed 规范(蓝图 §5.1 定稿;全项目唯一出处,旧系统同一版本号抄了 3 份)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ⚠ 官方版本表约 4-6 周滚动一版,需定期核对(2026-08-05 核验):
-#   DELETE_ITEM 的 5.0.20250919 仍是官方现值;MP_MAINTENANCE 用官方当前推荐值
-#   (旧系统在用的 5.0.20260304 已过时);RETIRE_ITEM 官方 guide 已消失仅存枚举,
-#   版本 1.0 为旧系统实测值,迁移 daily_cleanup 前必须实测端点仍可用。
+# ⚠ 官方版本表约 4-6 周滚动一版,需定期核对。各行核验日期不同:
+#   · 2026-08-05 核验:DELETE_ITEM 的 5.0.20250919 仍是官方现值;RETIRE_ITEM 官方
+#     guide 已消失仅存枚举,版本 1.0 为旧系统实测值,迁移 daily_cleanup 前必须实测
+#     端点仍可用。
+#   · 2026-10-25 核验(MP_ITEM / MP_MAINTENANCE):官方表 推荐 0829 / 上一版 0803 /
+#     不推荐 0703,我们在用的 0608 **已不在表上** —— 两个同日切到推荐版 0829。
 FEED_SPEC_VERSIONS = {
     "DELETE_ITEM": "5.0.20250919-16_45_47-api",
     "RETIRE_ITEM": "1.0",
-    "MP_MAINTENANCE": "5.0.20260608-18_15_07-api",
+    # 维护(weight_fix 在用;维护链的标题载荷也走它,标题意图目前整路停用)。
+    # 2026-10-25 与 MP_ITEM 同日 0608 → 0829(0608 已从官方表消失)。0829 实测
+    # 与摘录逐项对得上:Orderable
+    # 20 个属性名同序、required=[sku, productIdentifiers]、additionalProperties=
+    # false,sku/productIdentifiers/ShippingWeight 三个 schema 一字不差;无
+    # SkuUpdate/ProductIdUpdate(改码走 MP_ITEM_MATCH)。原件摘录
+    # `refdata/specs/MP_MAINTENANCE_5.0.20260829-12_49_39-api.orderable_excerpt.json`,
+    # 守门 tests/test_weight_fix.py:本串必须落在摘录 header 的 version enum 里。
+    # **不回退**:0608 官方已不列,回退等于发一个不存在的版本。
+    "MP_MAINTENANCE": "5.0.20260829-12_49_39-api",
     "price": "1.7",         # PriceFeed 无外层包装(加 PriceFeed 包装→ERROR,旧实证)
     "inventory": "1.4",     # InventoryFeed,Inventory 首字母大写(小写→0503009)
     # 分节点批量库存(多仓批次 2 启用)。⚠ **1.5 的 key 小写**
@@ -189,7 +200,19 @@ FEED_SPEC_VERSIONS = {
     #   顶层必填有变化的 PT 仅 48 个;**新增必填只有 center_bore、影响 1 个 PT**
     #   (轮毂中心孔径,汽车整顶级不做,实际影响为零);其余 5 个字段全是
     #   "不再必填"(partTerminologyID 24 / condition 20 / …),只放松不收紧。
-    "MP_ITEM": "5.0.20260608-18_15_07-api",
+    #
+    # 2026-10-25 从 20260608 切到 20260829(所有者:先升最新版、再做兼容修复;
+    # 0608 已从官方版本表消失)。0608 原件只在所有者机器上,0608→0829 的实测差集
+    # 以那边 `spec_split -p diff=1` 的输出为准;**代理口径 0703→0829**(沙箱实测):
+    #   PT 6967 → 6973(+6:Fashion Cover-Ups / Scarves / Fresh、Frozen 果蔬 4 个;
+    #   零消失零改名);Orderable 逐字节相同(23 字段 / 5 必填);顶层必填只有
+    #   Pool Chemicals.recommendedUses 放松;官方 0803→0829 差异报告为空。
+    #   Visible 层:新增可选字段 condition_notes(3454 个 PT,minLength 25,兼容
+    #   修复里不交给 LLM);Wristwatches / CD Recorders / Dog Waste Bag Dispensers
+    #   新增 anyOf 形条件必填(兼容修复:mp_conform.evaluate_if 支持 anyOf/allOf/not)。
+    # ⚠ 切换顺序:**先拆后切** —— 新版目录没拆好就改这个串,pt_spec 抛
+    # FileNotFoundError、上架链全停。回退只回这一个串(0608 目录留在盘上)。
+    "MP_ITEM": "5.0.20260829-12_49_39-api",
 }
 
 # 沃尔玛错误码登记(蓝图 §5.4;业务代码禁止散落字符串字面量)

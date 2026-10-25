@@ -1,13 +1,50 @@
 {
  "_provenance": {
-  "what": "官方 MP_MAINTENANCE 规范原件的摘录(只摘 Orderable 段;原件含 6700+ PT 的 Visible,约 100MB,不进仓)",
-  "url": "https://developer.walmart.com/file/mp/us/MP_MAINTENANCE.zip",
-  "zip_sha256": "743e5684a7952da39cb3c5aa37f917486f4827b310f056df954699c94d47acb7",
-  "file_in_zip": "5.0.20260703-18_22_27-api_MP_MAINTENANCE_0_0_en.json",
+  "what": "官方 MP_MAINTENANCE 规范原件的摘录(只摘 header 与 Orderable 段;原件含 6974 个 PT 的 Visible,zip 约 106MB、解压 423MB,不进仓)",
+  "url": "https://developer.walmart.com/file/mp/us/Consolidated_Schema_File_MP_MAINTENANCE_OCT26.zip",
+  "zip_sha256": "36445ee4182733a00a2b5a4ac654b8cf08801996341da804e507b12ec748dbd0",
+  "file_in_zip": "5.0.20260829-12_49_39-api_MP_MAINTENANCE_0_0_en.json",
   "spec_version_enum": [
-   "5.0.20260703-18_22_27-api"
+   "5.0.20260829-12_49_39-api"
   ],
-  "extracted": "2026-10-16,脚本逐键拷贝,未改值"
+  "extracted": "2026-10-25,脚本逐键拷贝,未改值"
+ },
+ "MPItemFeedHeader": {
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "additionalProperties": false,
+  "type": "object",
+  "title": "MPItemFeedHeader",
+  "properties": {
+   "businessUnit": {
+    "type": "string",
+    "title": "Business Unit",
+    "enum": [
+     "SAMSCLUB",
+     "WALMART_CA",
+     "WALMART_US",
+     "ASDA_GM"
+    ]
+   },
+   "locale": {
+    "type": "string",
+    "title": "Locale",
+    "enum": [
+     "en"
+    ]
+   },
+   "version": {
+    "type": "string",
+    "title": "Spec Version",
+    "enum": [
+     "5.0.20260829-12_49_39-api"
+    ]
+   }
+  },
+  "required": [
+   "businessUnit",
+   "locale",
+   "version"
+  ]
  },
  "MPItem_item": {
   "properties": [

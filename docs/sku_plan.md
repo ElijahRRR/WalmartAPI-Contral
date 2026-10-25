@@ -1119,6 +1119,12 @@ A085朱丽霖 899 条 executing,而这是 13:00 三条链齐发之后的常态)�
 | MP_MAINTENANCE | 5.0.20260501 / 5.0.20260703 | 同上 | 同上 | 0 次 |
 | MP_ITEM | 5.0.20260703-18_22_27-api | 同上 | 23 个属性,required 含 price/ShippingWeight/COO | **1 次**(还有 `ProductIdUpdate`) |
 
+> 2026-10-25 补(换版):`FEED_SPEC_VERSIONS` 的 MP_MAINTENANCE / MP_ITEM 已同日换到
+> 5.0.20260829-12_49_39-api,上表 0608 行是 2026-09-05 时 header 里的那一版(0608 官方已不再列出)。
+> 0829 实测:两份 `MPItemFeedHeader` 仍 required=[businessUnit, locale, version]、
+> additionalProperties=false;MP_MAINTENANCE Orderable 仍 20 个属性、SkuUpdate/ProductIdUpdate 0 次;
+> MP_ITEM Orderable 仍 23 个属性、含 SkuUpdate/ProductIdUpdate、无 specProductType。下面三条结论在 0829 下不变。
+
 三条结论:
 ① **MP_MAINTENANCE 与 MP_ITEM 是两份独立 spec,Orderable 布局不同**。§9.6 那条
    「schema 含 SkuUpdate ⇒ 形态 A 依据成立」的推断错了 —— 它看的是所有者上传的

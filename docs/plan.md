@@ -79,6 +79,19 @@ TRO 跨仓边界(暂放)。
 maintenance/list_new)→ 按域停旧切换。
 **✅ 2026-08-17 全部完成** —— 验收记录见 `docs/production_cutover.md` §九。
 
+### 2026-10-25 MP_ITEM / MP_MAINTENANCE spec 换版 20260608 → 20260829
+
+所有者原话:「我认为应该先升级最新版再做兼容修复」。起因是 10-24 那批 `is not a valid field`
+放行前的核对 —— 报错字段几乎全是 `fabricContent` 子字段名(LLM 编的),与规范版本无关;
+但核对时发现在用的 0608 已从官方版本表整版消失(推荐 0829 / 上一版 0803 / 不推荐 0703),
+MP_MAINTENANCE 的 header 也是 0608。两个 feed 同日换到 0829。数字与换版步骤见 registry
+`FEED_SPEC_VERSIONS` 注释和 `docs/api_blueprint.md` §5.1(代理口径 0703→0829;0608→0829 的
+实测差集以所有者机器上 `spec_split -p diff=1` 为准)。顺序是**先拆后切**:新版目录没拆好就
+拉到改了版本串的代码,`pt_spec` 抛 FileNotFoundError、上架链全停。回退:MP_ITEM 只改回一个串;
+MP_MAINTENANCE 不回退(0608 官方已不列)。
+顺带两道换版防呆(`spec_split`):源文件名是别的 feed(同版本号的 MP_MAINTENANCE 原件结构路径
+相同,拆它会成功)直接拒;文件名版本串不在原件 header 的 version enum 里直接拒。
+
 ### 2026-10-24 上架「对象数组」字段子字段名靠猜 → 连拒三次;重提后表上回执卡旧值
 
 起因(所有者在上架表看到 feed查询日期 10-04 早于 上架日期 10-06,A109黄威威

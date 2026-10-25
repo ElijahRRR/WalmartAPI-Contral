@@ -40,10 +40,25 @@ logger = logging.getLogger("workflows.spec_split")
 
 # 旧仓命名:5.0.20260304-22_45_32-api_MP_ITEM_0_0_en.json
 _VER_RE = re.compile(r"(\d+\.\d+\.\d{8}-\d{2}_\d{2}_\d{2}-api)")
+# 官方同一版本号下各 feed 一份原件,文件名只差 feed 名:
+# 5.0.20260829-12_49_39-api_MP_MAINTENANCE_0_0_en.json
+_FEED_RE = re.compile(r"-api_([A-Z][A-Z_]*?)_\d+_\d+_[a-z]{2}\.json$")
 
 
 def _version_from(src: str) -> str:
     m = _VER_RE.search(os.path.basename(src))
+    return m.group(1) if m else ""
+
+
+def _feed_from(src: str) -> str:
+    """输入:源文件路径 → 输出:文件名里的 feed 名(认不出返回 "")。
+
+    MP_MAINTENANCE 原件与 MP_ITEM 同版本号、同结构路径,拆它**照样成功**,
+    目录名也一样(按版本串命名)—— 但 Orderable 是 20 字段 / 2 必填的维护版,
+    上架链拿它校验就再也拦不住缺价格、缺重量的载荷。只看文件名能拦下的错,
+    就在文件名上拦。
+    """
+    m = _FEED_RE.search(os.path.basename(src))
     return m.group(1) if m else ""
 
 
@@ -143,6 +158,10 @@ def run(params: dict) -> str:
 
     if not os.path.exists(src):
         raise FileNotFoundError(f"源文件不存在:{src}")
+    feed = _feed_from(src)
+    if feed and feed != "MP_ITEM":
+        raise ValueError(f"源文件是 {feed} 的规范,不是 MP_ITEM:{src}"
+                         f"(同一版本号各 feed 各有一份原件,要用 *_MP_ITEM_0_0_en.json)")
     size = os.path.getsize(src)
     ver = _version_from(src)
     lines += [f"源文件:{src}({size / 1024 / 1024:.0f} MB)",
@@ -177,6 +196,14 @@ def run(params: dict) -> str:
                 head_obj = {}
                 lines.append("  ⚠ 找不到 MPItemFeedHeader 段,_header.json 留空"
                              "(旧仓产物里有这一份,不影响加载器)")
+            # 目录名(= registry 版本串 = feed header 的 version)必须是原件
+            # header 认的那个值;文件被改过名就会拆进一个名不副实的目录
+            h_enum = (((head_obj.get("properties") or {}).get("version") or {})
+                      .get("enum") or [])
+            if ver and h_enum and ver not in h_enum:
+                raise ValueError(f"文件名里的版本串 {ver} 不在原件 header 的 "
+                                 f"version enum {h_enum} 里 —— 按它命名目录,"
+                                 f"切换后 feed header 报的版本与 spec 对不上")
             o_req = list(ord_obj.get("required") or [])
             o_props = list(ord_obj.get("properties") or {})
             lines.append(f"Orderable:字段 {len(o_props)} / 必填 {len(o_req)};"

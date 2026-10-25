@@ -286,8 +286,8 @@ item 年龄过滤(`services/maintenance_intents` 只有观测窗口过滤)——
 
 | feedType | header | version(旧系统实测在用) | item 结构 | 切片上限(实践值) |
 |---|---|---|---|---|
-| MP_ITEM | MPItemFeedHeader{businessUnit,locale,version} **只准 3 字段** | 5.0.20260608-18_15_07-api(2026-08-20 换版,完整时间戳,"5.0"拒收) | MPItem[{Visible:{PT:{}},Orderable:{}}] | 2000 条+24MB(单店打包后按此切片) |
-| MP_MAINTENANCE | 同上 | 同上 | 同上(Visible 可空) | 1000 条+24MB |
+| MP_ITEM | MPItemFeedHeader{businessUnit,locale,version} **只准 3 字段** | 5.0.20260829-12_49_39-api(2026-10-25 换版;上一版 0608 自 2026-08-20 起用;完整时间戳,"5.0"拒收) | MPItem[{Visible:{PT:{}},Orderable:{}}] | 2000 条+24MB(单店打包后按此切片) |
+| MP_MAINTENANCE | 同上 | 5.0.20260829-12_49_39-api(2026-10-25 与 MP_ITEM 同日换版;摘录 `refdata/specs/MP_MAINTENANCE_5.0.20260829-12_49_39-api.orderable_excerpt.json`) | 同上(Visible 可空) | 1000 条+24MB |
 | MP_ITEM_MATCH | MPItemFeedHeader{businessUnit,locale,version} **只准 3 字段**(v5 原件 required 三个 + `additionalProperties:false`) | **5.0.20260607-22_38_54-api**(2026-09-07 升 v5,v4.2 同日退役;出处 = 官方规范原件 `refdata/specs/MP_ITEM_MATCH_5.0.20260607-22_38_54-api.json` 的 version enum)| MPItem[{Item:{}}] —— **仍是 Item 包装**,不是 MP_ITEM 的 Orderable/Visible 分段;Item required = productIdentifiers/sku/condition/ShippingWeight/price,可选 inventory[{quantity,fulfillmentCenterID}] / productName / mainImageUrl / externalProductIdentifier / stateRestrictions / productSecondaryImageURL / restoredProductIdentifier | 1000 条 |
 | DELETE_ITEM | ItemFeedHeader{locale,version,businessUnit}(官方示例同名,已核验) | 5.0.20250919-16_45_47-api(**仍是官方现值**) | Item[{Deletable:{sku}}] | 官方 400KB;定稿 350KB+2500 条双约束 |
 | RETIRE_ITEM | RetireItemHeader{feedDate,version} | 1.0(不是 1.5;feedDate 必须真 UTC)⚠官方 guide 已消失,仅存枚举,**迁移前实测** | RetireItem[{sku}] | 1000 条+350KB(按 DELETE_ITEM 同档保守) |
@@ -297,12 +297,39 @@ item 年龄过滤(`services/maintenance_intents` 只有观测窗口过滤)——
 
 version 字符串全部进 registry(不准散落硬编码),且**必须定期核对**:官方版本表约 4-6 周滚动一版(观察值,官方无更新频率承诺),
 旧仓库在用的 MP_ITEM/MP_MAINTENANCE 版本 5.0.20260304 已过时(官方当前 5.0.20260608-18_15_07-api);**MP_MAINTENANCE 早已切,MP_ITEM 2026-08-20 切**。换版前用 `spec_split -p diff=1` 量过差集:PT 6951→6951 零增零减,Orderable 24→23(仅移除可选的 specProductType),顶层必填有变化的 PT 仅 48 个,**新增必填只有 center_bore、影响 1 个 PT**(轮毂中心孔径,汽车整顶级不做),其余 5 个字段全是「不再必填」。
-仅 DELETE_ITEM 的 5.0.20250919 仍是现值。来源:官方 Item spec versioning and diff reporting 页。
+仅 DELETE_ITEM 的 5.0.20250919 仍是现值(2026-08-05 核验)。来源:官方 Item spec versioning and diff reporting 页。
+**2026-10-25 换版到 5.0.20260829-12_49_39-api(MP_ITEM 与 MP_MAINTENANCE 同日;所有者:先升最新版、再做兼容修复)**。
+官方版本表当日:推荐 0829 / 上一版 0803 / 不推荐 0703,我们在用的 0608 **已整版不在表上**(两个 feed 都是)。
+0608 原件只在所有者机器上,0608→0829 的实测差集以那边 `spec_split -p diff=1` 的输出为准;沙箱里能量的是
+**代理口径 0703→0829**:PT 6967→6973(+6:Fashion Cover-Ups、Scarves、Fresh/Frozen Fruits、Fresh/Frozen Vegetables;
+零消失零改名),Orderable 逐字节相同(23 字段 / 5 必填,含 SkuUpdate/ProductIdUpdate、无 specProductType),
+顶层必填只有 Pool Chemicals 的 recommendedUses 放松;官方 0803→0829 差异报告为空。Visible 层的变化:
+新增可选字段 `condition_notes`(3454 个 PT,minLength 25,不交给 LLM)、Wristwatches / CD Recorders /
+Dog Waste Bag Dispensers 新增 anyOf 形条件必填(`mp_conform.evaluate_if` 已支持 anyOf/allOf/not)、
+`input_and_output_type`→`inputsAndOutputs`(10 个 PT)、batterySize 等枚举改写(CRV3→CR-V3 等数百个 PT)
+—— 字段块变了的 PT 提示词随之变,LLM 缓存按 PT 失效重打一次(代理口径约 1104 个 PT;Orderable 段不变,
+不会全量失效)。MP_MAINTENANCE 0829:Orderable 仍 20 个属性同序、required=[sku, productIdentifiers]、
+additionalProperties=false,摘录的三个字段 schema 一字不差,另有 allOf「IsPreorder=Yes ⇒ releaseDate」;
+仍无 SkuUpdate/ProductIdUpdate。原件 sha256:Consolidated_Schema_File_MP_ITEM_OCT26.zip
+`8adf7f84e2a4d99f9a36ab5e477ad3fdb80ab9fdfd32a4f8c8283fab27c8a769`,
+Consolidated_Schema_File_MP_MAINTENANCE_OCT26.zip `36445ee4182733a00a2b5a4ac654b8cf08801996341da804e507b12ec748dbd0`。
+
+**spec 换版步骤**(2026-10-25 起;MP_ITEM 的版本串同时决定 header 与 spec 目录,**先拆后切**):
+1. 官方 zip 解压到单独空目录,`python cli.py spec_split -p src=<…>_MP_ITEM_0_0_en.json -p diff=1`
+   (只认 MP_ITEM 原件,文件名版本串须在原件 header enum 里;与在用目录并排写,自检 + 差集两行都要看:
+   消失 PT、新增顶层必填、Orderable 变化任一出现先停下评估)。
+2. `python cli.py pt_spec_sync -p spec_dir=<新目录> --dry-run`(单独跑一次,只看对账,不写库)。
+3. 改 registry `FEED_SPEC_VERSIONS`、拉代码;`python cli.py catalog_health` 看「E PT 拆分文件」全部就位,
+   `python cli.py list_new --dry-run` 不出「MP_ITEM spec 未就位」。
+4. 切换后的派生物:`pt_spec_sync`(先 --dry-run)→ `pt_census -p only=准入漏了` → 飞书类目表补新 PT 的
+   准入状态 → `risk_sync` → `product_audit -p repts=1` / `-p mode=pending`(先 --dry-run)→
+   `catmap_prune --dry-run`(核过再真跑)。
+5. 旧版目录留在盘上备回退:MP_ITEM 回退只改回一个串;MP_MAINTENANCE 只在旧版仍在官方表上时才可回退。
 数值字段一律 round 到 ≤2 位小数(sanitize 兜底,Walmart 拒收 >2 位)。
 endDate/日期字段必须 ISO DateTime(spec 声称 yyyy-mm-dd 实际拒收)。
 MP_MAINTENANCE 官方明确限制:**COO(原产国)不可改**;必填仅 SKU+GTIN,其余可选(partial update)。
 **SkuUpdate(改 SKU)的官方出处**(2026-09-02 查证,SKU 改造批次 3 登记):CA 侧 [Manage items](https://developer.walmart.com/ca-marketplace/docs/manage-items) 明写「look for the SkuUpdate attribute in the payload and set it to Yes … provide the new SKU」;匹配键是 **Product ID 不是 SKU**([CA Update an item's SKU](https://marketplacelearn.walmart.com/ca/guides/Catalog%20management/Item%20management/update-an-item-s-sku):「Enter the correct SKU for that Product ID」「You are not allowed to submit two SKUs with the same Product Identifier」),生效 15 分钟~4 小时,WFS 的 item 不能改 SKU。US 侧 [Update my existing items](https://developer.walmart.com/us-marketplace/docs/update-my-existing-items) 只讲 MP_MAINTENANCE 做部分更新(「requires only the SKU and GTIN attributes」),**未点名 SkuUpdate** ——所以「US 的 MP_MAINTENANCE 最小载荷能否改码」列为**待单品实测**(docs/sku_plan.md §4 六件之 1、2);实测前 `sku_migrate` 只许 --dry-run。
-**2026-09-05 定案(官方 spec 原件 + 生产实测)**:US MP_MAINTENANCE 5.0(20260501/0608/0703 三版)的 Orderable **没有 `SkuUpdate`**(20 个属性,additionalProperties=false),`SkuUpdate`/`ProductIdUpdate` 只在 **MP_ITEM** 的 Orderable 里;MP_MAINTENANCE 与 MP_ITEM 是**两份独立 spec、布局不同**(仓内只下载 MP_ITEM 一份,看不出差别)。带 SkuUpdate 的维护 feed 回执 SUCCESS 但被静默丢弃(2026-09-04 两条生产实证)。**改码必须走 setup 类 feed**(MP_ITEM 全量 + SkuUpdate=Yes,或 Seller Center「Match items」底层的 MP_ITEM_MATCH),见 docs/sku_plan.md §9.10。
+**2026-09-05 定案(官方 spec 原件 + 生产实测)**:US MP_MAINTENANCE 5.0(20260501/0608/0703 三版)的 Orderable **没有 `SkuUpdate`**(20 个属性,additionalProperties=false),`SkuUpdate`/`ProductIdUpdate` 只在 **MP_ITEM** 的 Orderable 里;MP_MAINTENANCE 与 MP_ITEM 是**两份独立 spec、布局不同**(仓内只下载 MP_ITEM 一份,看不出差别)。带 SkuUpdate 的维护 feed 回执 SUCCESS 但被静默丢弃(2026-09-04 两条生产实证;0829 同样无 SkuUpdate/ProductIdUpdate,2026-10-25 实测)。**改码必须走 setup 类 feed**(MP_ITEM 全量 + SkuUpdate=Yes,或 Seller Center「Match items」底层的 MP_ITEM_MATCH),见 docs/sku_plan.md §9.10。
 **2026-09-06 改码通道定案:`MP_ITEM_MATCH`**(所有者 Seller Center 实测,feed `18D2A25BB3895D7096CF1357C17C2A36@AYYBBwA`;详见 docs/sku_plan.md §9.12)。机制是「**同 GTIN + 新 SKU + `processMode=REPLACE`**」在**同一个 item 上原地换码** —— 探针:新旧码 wpid 相同、库存跟着过来(模板库存列为空)、价格不变、旧码 GET 404、feed 1 条 SUCCESS。**载荷里没有 `SkuUpdate`**:换码是 REPLACE 的机械后果不是开关,所以 `SkuUpdate` 在本仓已全部删除(`mp_mapper.build_sku_update_item` / `build_orderable(sku_update=)` / `mp_conform` 的放行分支)。⚠ REPLACE 会**覆盖**载荷里给到的每个字段,所以 `price` 必须把**现挂价原样发回去**,采不到现价的行不许发(判据在 `workflows/sku_migrate._CONDS` 的「有现挂价格」);`ShippingWeight`(单位**磅**,后台那一栏是 Shipping Weight (lbs))则**有意重写**成 `mp_mapper.shipping_weight_ex` 的新口径值 —— 单位从采集数据里读、不猜,解析不出或 > 11 磅写 1 磅(所有者 2026-09-06 定稿,详见 sku_plan §9.12)。配额吃 `feeds.post.MP_ITEM_MATCH`(15/h,与跟卖链 match_listing 共享)。模板顺带给出**沃尔玛 SKU 规格:Alphanumeric, 50 characters**。~~⚠ 仓里这条通道是 **v4.2**(sellingChannel header),模板是 v5.0;v4.2 能否同样换码由第一级投放(limit=1)实测定。~~ **已结**:v4.2 实测能原地换码(2026-09-06 第一级投放),但载荷里没有库存字段、REPLACE 把「没带」当 0 写。
 **2026-09-07 升 v5(v4.2 退役,跟卖链与改码链一起升,不留双轨)**:依据是所有者从开发者门户下载、已放进仓的**官方规范原件** `refdata/specs/MP_ITEM_MATCH_5.0.20260607-22_38_54-api.json`(draft-07)。三件事:① header 换成 businessUnit 制**三字段封闭**(v4.2 的 `{processMode, subset, sellingChannel}` 在 v5 规范里根本不存在 —— REPLACE 语义没变,只是不再由 header 的开关表达);② 条目仍是 `{Item:{}}` 包装;③ Item 多了可选 `inventory[{quantity, fulfillmentCenterID}]`(array,minItems 1,项两字段闭集)⇒ **改码 feed 自己把库存带过去**,FC 走 `services/store_limits.listing_fc`(上架链同一入口)——**这是改码链写库存的唯一一条路**,定案时那条 `_restore_inventory` 起初降为兜底、2026-09-07 由所有者定稿**整段删除**(同一份数据不走第二条写路径,见 docs/sku_plan.md §9.12「定案不再回写库存」);跟卖链**不带**(行为逐字不变)。版本串取原件 version enum(只有这一个值,与 MP_ITEM 一样带 `-api` 后缀);所有者 2026-09-06 用 Seller Center 模板(版本串 `5.0.20260703-18_22_27`)上传成功过,但可下载的 API 原件是 0607 版,**以原件为准,试点若被拒再议**。守门:`tests/test_match_spec_v5.py` 现读原件校 header/Item/inventory 的键集合与 enum(`additionalProperties:false` 靠它拦)。
 
@@ -533,3 +560,4 @@ rate-limiting / error-codes),四条结论:
    但族级迁移可能无预告带走它——防御:断供即改走价格 feed(单品 PUT 与批量 feed 已是双轨显式函数)。
 6. MP_MAINTENANCE 能否改价格/库存无官方明文——以 Get Spec 拉回的 schema 是否含相应字段为准。
 7. 提交过时 spec version 的后果官方未写——registry 登记 + 每次上架季度性核对版本表。
+   (2026-10-25 实见:在用的 0608 已从官方版本表整版消失,后果仍无官方明文;本次直接升 0829。)

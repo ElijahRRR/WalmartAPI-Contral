@@ -155,6 +155,27 @@
 > (#153 逐字:「**第二次真跑**实证不能为 null」⇒ 沙箱只跑一次不算核过)、
 > 枚举字段按官方枚举校验、**被拒原文进摘要与台账**;并明确上架链缺
 > `merchantLocationKey` 时**只拒不自动建仓**。
+> **2026-10-25 对齐 main #143+#155**:两条都是**载荷校验**的教训,改在
+> §6.4/§6.5/§6.1/§5.2 四处。🔴 §6.4 加四块:**「容器在」≠「子字段齐」**(#143 实证
+> `fabricContent` 对象数组的元素必填没人看,10-04/05/06 三次同拒同一个码、烧光重试
+> 上限;剔元素删光 ≠ 必填字段可省;同载荷撞同码两次就是没进展)、**条件必填也算必填
+> 且要在归一化之后再判一遍**(#155 的 `evaluate_if` 把写在 `anyOf/allOf/not` 里的
+> 条件一律判成立 ⇒ 2026-08-12 起每条商品都带 `releaseDate=当天`、全新手表要填空的
+> `restoredProductIdentifier`;`_refill_conditional` 又挖出"工序 2-4 自己造出触发值"
+> 的二层洞,42 例从照发必拒改成本地拦截)、**成色说明类字段显式跳过**(#155 的
+> `VISIBLE_LLM_SKIP`;并记"常量放在哪决定爆炸半径")、**"另一平台标识符"一律在出参处
+> 丢弃**(#143 的 `ORDERABLE_LLM_DENY`:`externalProductIdentifier` 的官方填法就是
+> ASIN,送进提示词等于教 LLM 把货源交出去——§3.3 ④ 只堵了 SKU 一个字段)。
+> 🔴 §6.5 加三条:**「请求没发出」是独立一档不许记成「拒收」**(#143 实见代理 TLS EOF
+> 被写成"被拒 1 条(看日志里的 HTTP 响应)"而日志里没有响应;同载荷串行补试一遍
+> **不算**自动兜底,界限是"换方法"才算;publish 不幂等但"没发出 = 没被调用过")、
+> **并集选行会选重**(`_drop_dup_retry`,去重要带明确赢家)、**修完 bug 的放行要显式
+> 参数 + 只认最近一次错误 + 一轮即止**(`-p requeue_invalid_field=1`,不许整体清零
+> 重试上限)。🔴 §6.1 加**重提要在同一次写入里清掉上一轮回执列**(#143:回执日期早于
+> 提交日期 ⇒ 反哺器判成旧回执整行跳过,后两次回执一次都没写回)。🔴 §5.2 加**写缓存
+> 前核响应自报的身份**(#155 的 spec_split 防呆:结构相同的东西写错键是静默成功)+
+> **差集必须显式给基线**("跟自己比只会报无变化"是假绿)。§七 #5 加子字段/条件必填
+> 探针;§八 P1-4 加三格验收。
 > ⚠ 本文引用的仓库行号以 **2026-09-23 的 main(06140c3)** 为快照(§2.1/§2.2/
 > §3.2 已按它重定位;其余节仍是 09-07 快照),批次实施时现场重定位。
 
@@ -756,6 +777,17 @@ tree_version) 行 ⇒ 拉`(promote 平日随时发生,挂在哨兵上会让新�
 版本变更日叠加全量复拉;🔴 `fetchItemAspects` 显式禁用(gzip 二进制可超
 100MB,spec 还自相矛盾声明 json)。版本变更时映射表体检(active 行存在性+
 is_leaf,不过标 stale 摘要首行点名;`getExpiredCategories` 登记不实现)。
+🔴 **写缓存前要核响应自报的身份:形状相同的东西写错键是静默成功
+(2026-10-25 对齐 main #155)**:#155 给 `spec_split` 补了两道换版防呆,理由逐字是
+「源文件是**别的 feed**(同版本号的 MP_MAINTENANCE 原件**结构路径相同**、拆它
+**会成功**)直接拒」「文件名版本串不在原件 header 的 version enum 里直接拒」。
+taxonomy/aspects 是同一个形状:不同 category、不同 marketplace、不同 treeVersion
+的响应**长得一模一样**,按"请求时用的三元组"当键写进去,**写错了不会报错**。定稿:
+落 `(marketplace_id, category_id, tree_version)` 行之前,先核**响应自己回的**
+`categoryTreeId` / `categoryTreeVersion`(以及 aspects 响应里回echo 的类目)与要写
+的键一致,不一致**拒写并点名**,不是"以请求为准"。⚠ 同批另一条:版本变更日的映射
+表体检要**显式给比较基线**——#155 的差集必须 `-p base=` 指旧目录,
+**"跟自己比只会报无变化"是假绿不是通过**。
 
 ### 5.3 类目映射测试链(拍板 ⑨;同构沃尔玛 catmap_suggest→promote)
 
@@ -889,6 +921,15 @@ range**。
 最后**——顺序反了就会出现 conventions 点名的那种行:沃尔玛侧是「已提交但无码」,
 eBay 侧对位是「标了已上架却没有 offerId/listingId」。⚠ 这张表不是去重判据
 (§6.5 的谓词走库不走表),但**人排查时就看它**,顺序错了等于给人一张会骗人的表。
+🔴 **重提必须在同一次写入里清掉上一轮的回执列(2026-10-25 对齐 main #143)**:
+#143 的生产形状——上架表上 `feed查询日期`(10-04)**早于** `上架日期`(10-06):
+重提时只写了 feedid/上架日期,**回执三列留着第一次的 FAILED**,反哺器按"回执比提交
+旧就是旧回执"的口径**跳过该行**,于是后两次的回执**一次都没写回**(人看表就是
+"10-06 提交的那次至今没结果")。修法 `listing_sheet.write_submit_cols`:
+`是否上架=Yes/Unknown`(新 feed 在途)时**同一次写入**清空 上架结果/报错/
+feed查询日期。eBay 上架表的列是同构的,定稿:**新一轮的提交标记与上一轮的结论列
+必须在同一次写入里一起落**——这是 ①② 之外的**第三层**后果:段序对了、ensure_cols
+也对了,但**旧结论没清**,下游的"新旧比较"就把新回执判成旧的而静默跳过。
 
 ### 6.2 双闸配额与熔断
 
@@ -960,6 +1001,72 @@ eBay 侧对位是「标了已上架却没有 offerId/listingId」。⚠ 这张�
   `aspectApplicableTo=PRODUCT` 的卖家改不了硬塞被静默忽略;
   `valueConstraints` 非空一期 fail-closed);响应 listingId;errors 结构
   errorId/domain/category/message/parameters。
+- 🔴 **「容器在」不等于「子字段齐」:校验必须进到元素内部(2026-10-25 对齐
+  main #143)**:#143 的生产实证(A109黄威威 B0H59WHW42 装饰枕套)——官方 spec 里
+  `fabricContent` 是**对象数组**,元素子字段 `materialName`/`materialPercentage`
+  必填;给 LLM 的字段块只写到 `items.type=object`,LLM 照标题编出了
+  `fabricMaterialName`;而收口那层(`mp_conform`)**不看元素内部**,于是缓存原样
+  重发,**10-04/05/06 三次同拒同一个码 `EXT_DATA_ERROR_72600149546850`、烧光重试
+  上限**。修法两头都补:字段块送 `items.object_properties / object_required`,收口
+  加 `fix_array_items`(元素 schema 封闭时剔 spec 外子字段、删缺元素必填的元素;
+  **删光了**非必填整字段删、必填**交 validate 拦下不提交**)。
+  eBay 对位同形且更密:`packageWeightAndSize.weight{value,unit}` /
+  `dimensions{length,width,height,unit}`、`availability.shipToLocationAvailability`、
+  `shippingCostOverrides[]`、`pricingSummary.price{value,currency}` 全是「父容器
+  在、子字段缺一个就整条被拒」的形状;而 `docs/ebay_phase1_reference.md` §1 的字段
+  表**只到容器名**,子字段必填性要按 §七 的实测回抄。定稿三条:① 校验器**递归**
+  进元素与子对象,不许只断言容器存在;② 剔无效元素时**删光 ≠ 该字段可以不要**
+  ——必填容器删空要进缺失清单不提交(与 §6.3「出界不上」同向);③ **同载荷撞同一
+  个 errorId 两次以上就是没有进展**,停下来点名,不许再烧重试额度(#143 的三次
+  同拒就是这么来的)。
+- 🔴 **条件必填也算必填,而且要在「最终载荷」上再判一遍(2026-10-25 对齐
+  main #143 + #155)**:两层,第二层是 main 自己对抗审查才挖出来的。
+  ① **条件必填不是可选**(#143):`fix_array_items` 起初只认顶层 `required`,把
+  「`upholstered=Yes` ⇒ `fabricContent`」「`powerType=Battery` ⇒ `volts`」这类
+  条件必填当可选删掉照发 ⇒ 必拒。
+  ② **条件判错方向的代价是"给每条商品填上不该填的值"**(#155):
+  `mp_conform.evaluate_if` 此前只看 `required`/`properties`,**条件整个写在
+  `anyOf`/`allOf`/`not` 里的 `if` 一律判成立**——Orderable 的「`IsPreorder=Yes`
+  ⇒ `releaseDate`」恒成立,**2026-08-12 起每个商品都带 `releaseDate=当天`**;
+  0829 新增的 Wristwatches「`condition=Restored Premium` ⇒
+  `restoredProductIdentifier`」会**给每块全新手表填一个空 ID,必拒**;约 60 个 PT
+  的签名/鉴定/prop65/证书类字段被占位值填上。所以**判不出条件形态时的失败方向是
+  「不设限」**(首次出现记 warning + `UNKNOWN_IF_KEYWORDS` 计数),**不是「当条件
+  成立并拿占位值填上」**。
+  ③ 🔴 **判完还要在归一化之后再判一遍**(#155 的 `_refill_conditional`,工序 4a):
+  条件必填在工序 1 按原值判,**工序 2-4 会再造出或改形触发值**(`['Yes']`→`'Yes'`、
+  漏给的必填兜成 `enum[0]`),最终载荷里条件成立而 then 字段没人填 → 还是
+  72600149546850。实测代价:0829 全量对比中 **42 例从「照发必拒」改成本地拦截,
+  新增未拦错误 0**。
+  eBay 对位**必须照搬第 ③ 条**,因为本设计的归一化步骤同样会造值:#153 的「数组型
+  可选字段缺省发 `[]`」、枚举字段兜缺省、本节的重量缺省、`store_limits.stock_for`
+  的封顶——任何一步都可能让一条条件必填**成立**。定稿:`ebay_conform` 的终检跑在
+  **即将发出的那个 body 上**(三步链各自一份),不是跑在中间对象上;补填完的字段
+  **再过一次类型与枚举**。⚠ 据此把上面「只读 `aspectRequired`」收窄为:
+  `aspectRequired` 是**下限不是全集**,值依赖型必填(eBay 侧如 `condition=USED_*`
+  ⇒ `conditionDescription`、auction ⇒ `auctionStartPrice`)成立即必填,**但永不拿
+  占位值填**——填不出就不上架。
+- 🔴 **成色说明类字段显式跳过,不让任何填充器碰(2026-10-25 对齐 main #155)**:
+  0829 新增 `condition_notes`(3454 个 PT 可选、`minLength` 25 的二手/翻新成色
+  说明),main 的处置是 `mp_mapper.VISIBLE_LLM_SKIP`——**提示词与复用签名同口径
+  跳过**、`finalize_visible` 丢弃。eBay 一期 `condition` 固定 `NEW`,对位的
+  `conditionDescription` / `conditionDescriptors` **同样显式跳过**:不是"碰巧没
+  填",是写进跳过清单并跟一条守门断言。⚠ 并记 #155 的**选址**教训:这个清单
+  **不许并进拼进系统提示词的那个常量**(`SYSTEM_OWNED_FIELDS`),改它 = 全量提示词
+  缓存作废;**常量放在哪决定爆炸半径**。同理 #143 的 `item_subfields=False` 与
+  `reuse_sig` 是**同一次改动**(提示词与缓存签名必须同口径;Orderable 段忘了这条
+  就是"全量缓存作废",实测 6973 个 PT 里只该变 1761 个)。
+- 🔴 **无货源红线:任何"另一平台标识符"字段都要在出参处丢掉,不是靠提示词约束
+  (2026-10-25 对齐 main #143 对抗审查)**:#143 发现 Orderable spec 的
+  `externalProductIdentifier`(对象数组,官方填法就是 **ASIN/MLID + 编号**)一旦把
+  子字段块送进提示词,**等于手把手教 LLM 把亚马逊 ASIN 交给沃尔玛**;修法是在
+  `build_orderable` **丢弃 LLM 出参里的该字段并告警**(`ORDERABLE_LLM_DENY`),
+  **只动出参、不动提示词**(动提示词 = 全量缓存作废,见上条)。
+  ⚠ 本文 §3.3 ④ 只说了"SKU 不拿 ASIN",**那只堵住一个字段**:真正的暴露面是
+  **凡语义为「另一平台的商品标识」的字段**——eBay 侧 `product.epid` / `mpn` /
+  aspects 自由文本 / `offer.listingDescription`(无货源下极易从亚马逊页面整段抄
+  来)。定稿:这类字段进一张**出参拒绝清单**,由 `ebay_conform` 在**载荷落地前**
+  丢弃并计数(计数要在摘要里看得见),**不靠"提示词里写了别填"**——提示词不是约束。
 - **bulk 207 Multi-Status**:逐条读 `responses[].statusCode`;失败行只按
   原方法补交一次。一期**先走单条端点**,bulk 留签名(保序性沙箱 C5)。
 
@@ -1076,6 +1183,36 @@ eBay 侧对位是「标了已上架却没有 offerId/listingId」。⚠ 这张�
   "PUBLISHED" 当"在卖":二期建 eBay 对位的实际结果表时,照 `feed_effects`
   的三条形状(唯一写入方 / 判一次不改 / 只出复核清单不挂自动化),**不许**
   做成"未生效就自动重发"。
+- 🔴 **「请求没发出」是独立一档,不许记成「平台拒收」(2026-10-25 对齐
+  main #143)**:#143 的生产实见(2026-10-16,A085朱丽霖)——代理 TLS 握手 EOF,
+  `submit_feed` 标 retryable(**请求根本没发出**),摘要却写「被拒 1 条(看日志里的
+  HTTP 响应)」而**日志里根本没有响应**,而且**没有补试**。修法:retryable 切片
+  单独计为「请求没发出」,抛 `_NotSent` 交 `store_retry.fan_out` **串行补试一遍**
+  (同一载荷;台账 failed 行可重占,已提交的切片被防重拦成 dedup);补试仍失败则
+  摘要**首行**点名「N 条请求没发出:取 token / 代理阶段失败」;**沃尔玛明确 4xx
+  拒收照旧不补试**,措辞改为「沃尔玛拒收」。
+  ⚠ 这条与安全红线「写操作永不自动兜底」**不矛盾**,界限要记准:**兜底 = 换方法 /
+  换路径重试**;这里是**同一方法、同一载荷、补试一遍**,而且前提正是 §6.5 上面那条
+  `post_started_at IS NULL`(确定没发出)的同一格证据。
+  eBay 对位:三步链每步都要把「取令牌失败 / 代理失败 / 连接阶段失败」与「eBay 回了
+  4xx + errors[]」**分开计数、分开措辞**,前者进店维标准的串行补试一遍,后者
+  **永不补试**。⚠ 三步链有一处要额外说死:`publishOffer` **不幂等**,但"请求没
+  发出"意味着**它根本没被调用过**,所以这是它唯一可以直接重发的情形;凡拿不出
+  "没发出"证据的 publish,一律人判(与 `reconcile_pending` 第 ③ 条同口径)。
+- 🔴 **并集选行会"选重",去重要带明确赢家(2026-10-25 对齐 main #143)**:上面
+  定的"选行面取并集"有个后续坑——#143 里 `open_rows` 与 `_retry_rows` **在
+  No / 无 feedid / FAILED 的行上重叠**,同一行**进两次队列**(修法
+  `_drop_dup_retry`,**保留 fresh 那份**)。eBay 对位:并集之后按行身份
+  (account, sku) 去重并**写明保留哪一份**——去重是选行的一部分,不是事后补救;
+  否则同一 SKU 一轮里被提交两次,代价还是重复 listing + 烧掉的 UPC。
+- 🔴 **载荷 bug 修好之后的"放行"要有界、点名、只认最近一次(2026-10-25 对齐
+  main #143)**:#143 修完字段块之后,此前已被同一个 bug 烧光重试上限的行需要再给
+  一轮,main 的形状是 `list_new -p requeue_invalid_field=1`——**参数显式开启**
+  (不是缺省)、**只认最近一次 list_new 提交报错含「is not a valid field」的行**、
+  **一轮即止**(头注写死"不会无限重试")。eBay 对位照此形状:修了 `ebay_conform`
+  之后的重放走一个**显式参数 + 最近一次错误码匹配 + 一轮即止**的放行口,**不许把
+  重试上限整体清零**(清零 = 把所有历史失败一起放出来,里面混着真拒收的)。
+  ⚠ 这个参数本身也吃 §3.4 的「清单类 `-p` 空值即炸」。
 - 自适应降档一期不做(`api/ebay/_client` 已有官方处方 429 读 reset,
   workflow 层再做=两套限流;头注防补)。起跑抖动保留(应用桶全账号共享)。
 
@@ -1109,7 +1246,10 @@ api 留签名。要做=+4~5 人日,四项前置:①UPC 结构裁决落地(本文
 4. publish 六刀砍必填(parameters[] 是否点名字段/条目级 vs 账号级/图片非
    https 落哪个码——不是 190204);
 5. C6 aspects 载荷形状与 `aspectApplicableTo` ITEM/PRODUCT 过滤(conform
-   关键路径,不实测只能靠推断);
+   关键路径,不实测只能靠推断);**同批打两发「子字段/条件必填」探针**(#143/#155):
+   父容器在而子字段缺一个(如 `weight` 只给 value 不给 unit)打一次、条件必填成立
+   而 then 字段空着打一次——要的是**错误码与 `parameters[]` 是否点名到子字段**
+   (决定 §6.4 递归校验器的报错粒度);
 6. C5 bulk 207:responses[] 保序性与是否带回 sku;
 7. product.description 4000 上限;
 8. getOffers 参数面:sku 必传 + **marketplace_id/format 过滤参数是否存在**
@@ -1129,7 +1269,7 @@ api 留签名。要做=+4~5 人日,四项前置:①UPC 结构裁决落地(本文
 | P1-1 | _http 抽取+registry(含 platforms.py/飞书两表)+ebay_accounts+_client+tokens+authorize+runbook+文档勘误回改 | 7 | 沃尔玛 pytest 全绿(18 处 monkeypatch 例外清单)/sandbox 与 production 各铸令牌+getRateLimits/进程超时 90.0 冒烟/账号互斥断言单测(含停用店名反例)/state 不符抛错单测/**`is_enabled` 字段缺失 ⇒ 不启用单测(§3.4)**/**代理三岔单测:填齐必走 / 全空直连 / 半配整账号拒跑,外加「没勾启用 ⇒ 配了代理也不连」的顺序回归**/**出口预览(对位 `egress_preview`)跑一次,人眼核对每账号最终走哪个出口** |
 | P1-2 | 全部 DDL(**含 `upc_usage` 对位部分索引,§2.2**)+claims/upc 改造+台账谓词补全+**risk_trace 四证据源谓词(§4.4)**+events 契约 | 7 | db_init 两跑(**记录是否踩到 `lock_timeout 30s`,§4.5**)+六格对拍+读 SQL count·md5 对拍+**取号/烧号 EXPLAIN 走 `upc_usage` 部分索引**/沃尔玛上架与分配链 --dry-run 摘要逐字一致(claims 13 读+4 写+4 事件桥、upc 7 写+6 读投影,**含 `alloc_plan` 的 `-p from_sheet=1` 点名与 #149 的 CSV 点名两条额外路径**——预期红清单按 §2.1/§2.2 的现场重核数,别按旧稿的 9+2)/UPC 三级取号+烧号保护+「烧后重上领新号」单测/飞书 UPC 表投影逐行对拍/browse_node_id 空行占比落数+**「沃尔玛在架但 audit_status 为 NULL/pending」的条数落数(§2.3)**/**risk_trace 展开结果不含 eBay 账号**(造 claims+listing_sources+product_events 三条 eBay 行) |
 | P1-3 | bootstrap+taxonomy+catmap 测试链+account_health | 6 | sandbox 户口链重入两遍/生产拉真树+版本哨兵/aspects 解耦拉取(新 promote 类目当日拿到 aspects)/promote 三格(缺省中、入料只吃高、置高路径逐条点名)/refresh 探活停链 |
-| P1-4 | 中立抽取(3)+admission/conform/pricing+api 两文件+list_new+submit_poll+**`refdata/ebay_slas.tsv`(官方期限登记表,§6.5)**+飞书投影 | 15 | 沙箱清单 13 项完成/sandbox 端到端 3 SKU PUBLISHED/防重三态+熔断+双闸+重试闸单测/**抽码即登记单测**(eBay 行落 `listing_sources` 且 `abandoned_at IS NULL`、码形符 `OPAQUE_SQL_PREDICATE`、`-p dry_run` 走 `DRYRUN_PLACEHOLDER` 不落码)/**残局单测:造一条「`feed_log` pending 但无 `feed_items` 行」,断言 `list_new` 下一轮不选中该 SKU、`submit_poll` 的选行面选得中它**/--dry-run 人眼确认/中立抽取后沃尔玛输出逐字不变 |
+| P1-4 | 中立抽取(3)+admission/conform/pricing+api 两文件+list_new+submit_poll+**`refdata/ebay_slas.tsv`(官方期限登记表,§6.5)**+飞书投影 | 15 | 沙箱清单 13 项完成/sandbox 端到端 3 SKU PUBLISHED/防重三态+熔断+双闸+重试闸单测/**抽码即登记单测**(eBay 行落 `listing_sources` 且 `abandoned_at IS NULL`、码形符 `OPAQUE_SQL_PREDICATE`、`-p dry_run` 走 `DRYRUN_PLACEHOLDER` 不落码)/**残局单测:造一条「`feed_log` pending 但无 `feed_items` 行」,断言 `list_new` 下一轮不选中该 SKU、`submit_poll` 的选行面选得中它**/**终检跑在「即将发出的 body」上单测**(造一条归一化才触发的条件必填:`['Yes']`→`'Yes'` 或枚举兜缺省,断言拦下而不是照发,§6.4)/**「请求没发出」与「eBay 拒收」分档单测**(取令牌/代理阶段失败 ⇒ 串行补试一遍并首行点名;4xx+errors[] ⇒ 不补试,§6.5)/**出参拒绝清单单测**(ASIN 等另一平台标识符在载荷落地前被丢弃并计数,§6.4)/--dry-run 人眼确认/中立抽取后沃尔玛输出逐字不变 |
 | P1-5 | 生产单账号试点 | 2+观察 | 首批 ≤10 条人工放行类目/真实 PUBLISHED/错误账收官/两周观察后再谈放量。**界定:试点 ≠ ebay_plan 批次 10;试点期不拉订单、库内无买家数据,不触发合规订阅义务;放量、拉订单、提额之前批次 11 仍是硬门槛** |
 
 合计 **≈37 人日 + 2 周试点观察**。P1-3 的 taxonomy 半批**编码**可与 P1-2

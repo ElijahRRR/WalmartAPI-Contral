@@ -321,3 +321,66 @@ def test_member_clashing_with_a_listed_sibling_lists_as_single(monkeypatch):
     assert navy["mode"] == "variant" and navy["group_id"] == "GP4GVR4B42EB"
     assert navy["is_primary"] is True          # 占位单品的 Yes 不算本族已有主变体
     assert n_var["dup_combo"] == 1
+
+
+def test_anchor_group_named_after_its_first_member_is_a_real_group(monkeypatch):
+    """组号 = 自己 SKU 只在**没有别的兄弟挂在这个号上**时才是单品占位。早年以单品
+    A 为锚建起来的组(A 主变体 + C 挂在 A 的号上)是真组:A 的主变体身份、A 的取值
+    都要算(对抗审查复核)。"""
+    shelf = [("ASKUAAAAAAAA", "ASKUAAAAAAAA", "true",
+              [{"name": "actual_color", "value": "Red"}]),
+             ("ASKUCCCCCCCC", "ASKUAAAAAAAA", "No",
+              [{"name": "actual_color", "value": "Blue"}])]
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {
+        "variantAttributeNames": {"type": "array",
+                                  "items": {"enum": ["color"]}},
+        "color": {"type": "string"}}})
+    for color, mode in (("Green", "variant"), ("Red", "single")):
+        conn = _Conn(rows=shelf)
+        monkeypatch.setattr(ln.db, "pg_conn", _fake_pg(conn))
+        ready = [_row("B0NEW00001", "B0SIBA,B0SIBC", attrs=f"color_name={color}")]
+        ln._plan_variants(ready, collections.defaultdict(int))
+        vp = ready[0]["_vplan"]
+        assert vp["mode"] == mode, color
+        if mode == "variant":
+            assert vp["group_id"] == "ASKUAAAAAAAA" and vp["is_primary"] is False
+
+
+def test_lone_member_is_remapped_when_listed_siblings_declare_more_dims(monkeypatch):
+    """在架兄弟是 color+multipackQuantity(早先多成员那轮靠重映射映上的),本轮
+    只来一个、或几个取值全同:映不上的那维照样送重映射,不然只剩 color、成了在架
+    组合的子集被误判撞值(对抗审查复核)。"""
+    monkeypatch.setattr(ln.db, "pg_conn", _fake_pg(_Conn()))
+    props = {"variantAttributeNames": {"type": "array", "items": {
+                 "enum": ["color", "multipackQuantity"]}},
+             "color": {"type": "string"},
+             "multipackQuantity": {"type": "integer"}}
+    monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": props})
+    calls = []
+
+    def _llm(c, pt, dim, values, enum):
+        calls.append(dim)
+        return ("multipackQuantity", dict(values))
+    monkeypatch.setattr(ln.variant_remap, "llm_remap", _llm)
+    listed = [("4", "red"), ("4", "blue")]
+
+    def _rows(*specs):
+        out = []
+        for asin, attrs in specs:
+            r = _row(asin, "B0SIB1", attrs=attrs)
+            r["_vplan"] = {**vg.plan(asin, attrs, "B0SIB1", "P0",
+                                     ["color", "multipackQuantity"]),
+                           "listed_combos": listed}
+            out.append(r)
+        return out
+    lone = _rows(("B0RED00006", "color_name=Red|style_name=6 Pack"))
+    pair = _rows(("B0RED00006", "color_name=Red|style_name=6 Pack"),
+                 ("B0BLU00006", "color_name=Blue|style_name=6 Pack"))
+    for rows in (lone, pair):
+        ln._drop_degenerate_dims(rows)
+        ln._remap_unmapped_dims(rows)
+        ln._drop_dup_combos(rows)
+        for r in rows:
+            assert r["_vplan"]["mode"] == "variant", r["asin"]
+            assert dict(r["_vplan"]["attr_pairs"])["multipackQuantity"] == "6 Pack"
+    assert calls == ["style_name", "style_name"]

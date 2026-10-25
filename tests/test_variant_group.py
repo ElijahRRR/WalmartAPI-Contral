@@ -666,3 +666,21 @@ def test_multi_dim_counter_only_counts_rows_sent_as_variants():
     from workflows import list_new as ln
     src = inspect.getsource(ln._plan_variants)
     assert 'vp.get("mode") == "variant" and len(vp.get("attr_pairs") or ()) > 1' in src
+
+
+def test_zero_padded_sizes_are_different_values(monkeypatch):
+    """'00' / '0' / '000' 是女装三个不同尺码(clothingSize 是无枚举字符串,原样发出),
+    不许按数字并成一个;'2.0' 与 '2' 才是同一个值(对抗审查复核)。"""
+    from workflows import list_new as ln
+    _dup_spec(monkeypatch, color="string", clothingSize="string")
+    rows = [_vrow("B0A1", [("color", "Black"), ("clothingSize", "00")]),
+            _vrow("B0A2", [("color", "Black"), ("clothingSize", "0")]),
+            _vrow("B0A3", [("color", "Black"), ("clothingSize", "000")])]
+    ln._drop_dup_combos(rows)
+    assert all(r["_vplan"]["mode"] == "variant" for r in rows)
+    shelf = _vrow("B0A4", [("color", "Black"), ("clothingSize", "0")])
+    shelf["_vplan"]["listed_combos"] = [("00", "black")]
+    ln._drop_dup_combos([shelf])
+    assert shelf["_vplan"]["mode"] == "variant"
+    assert ln._norm_variant_value("2.0") == ln._norm_variant_value(2) == "2"
+    assert ln._norm_variant_value("07") == "07"

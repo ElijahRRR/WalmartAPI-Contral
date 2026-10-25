@@ -104,6 +104,7 @@ import collections
 import contextlib
 import logging
 import random
+import re
 import threading
 import time
 from datetime import datetime
@@ -1000,10 +1001,14 @@ def _variant_plan(conn, store: str, r: dict, spec) -> dict:
                 cur.execute(_FAMILY_LISTED_SQL,
                             {"store": store, "asins": [a for a in fam
                                                        if a != r["asin"]]})
-                for sku_, g, prim, grouping in cur.fetchall():
-                    if not g or str(g) == str(sku_):
+                fetched = cur.fetchall()
+                carriers = collections.Counter(str(g) for _s, g, *_ in fetched if g)
+                for sku_, g, prim, grouping in fetched:
+                    if not g or (str(g) == str(sku_) and carriers[str(g)] == 1):
                         # 单品(含 spec 必填三件套时 mp_conform 用自己 SKU 占位的
-                        # 那种组号)不是变体组:不提供组号、不算主变体、不参与撞值
+                        # 那种组号)不是变体组:不提供组号、不算主变体、不参与撞值。
+                        # 组号等于自己 SKU、但还有别的兄弟挂在这个号上 = 早年以它
+                        # 为锚建起来的真组,照常算(对抗审查复核)
                         continue
                     gid = gid or str(g)
                     has_primary = has_primary or str(prim).lower() in ("yes", "true")
@@ -1028,6 +1033,9 @@ def _variant_plan(conn, store: str, r: dict, spec) -> dict:
     return plan
 
 
+_ZERO_FRACTION_RE = re.compile(r"([+-]?(?:0|[1-9]\d*))\.0+")
+
+
 def _norm_variant_value(v) -> str:
     """输入:一个变体取值(亚马逊原串 / 一致化后的值 / 沃尔玛回传值)→ 输出:比较用的串。
 
@@ -1041,11 +1049,10 @@ def _norm_variant_value(v) -> str:
     if isinstance(v, (int, float)) and float(v).is_integer():
         return str(int(v))
     s = str(v).strip().casefold()
-    try:
-        f = float(s)
-    except ValueError:
-        return s
-    return str(int(f)) if f.is_integer() else s
+    # 只把 '2.0' 这种写法归成 '2';'00' / '0' / '000' 是女装三个不同尺码,
+    # '07'、'+2'、'1e3' 也都原样(对抗审查复核:float() 一刀切会把它们并掉)
+    m = _ZERO_FRACTION_RE.fullmatch(s)
+    return m.group(1) if m else s
 
 
 def _combo_key(values) -> tuple:
@@ -1220,13 +1227,20 @@ def _remap_unmapped_dims(ready: list[dict]) -> None:
             if not enum:
                 continue
             used = {n for n, _ in (rows[0]["_vplan"].get("attr_pairs") or ())}
+            # 在架兄弟声明的维度比本轮映上的多 ⇒ 本轮只是组的一部分,映不上的那维在组里
+            # 很可能是有差异的(早先多成员那一轮靠重映射映上了):本轮取值全同不能当没
+            # 差异,只看见 1 个成员也照样问(同 PT 同维度同枚举走 llm_cache,一般命中)。
+            # 不这样做,剩下的维度就成了在架组合的子集,被 _drop_dup_combos 判撞
+            wider = any(len(c) > len(used) for r in rows
+                        for c in (r["_vplan"].get("listed_combos") or ()))
             raw = {r["asin"]: variant_group.parse_attrs(
                 (r.get("_p") or {}).get("variant_attributes")) for r in rows}
             for dim in sorted(set(rows[0]["_vplan"]["unmapped_dims"])):
                 values = {a: v[dim] for a, v in raw.items() if dim in v}
                 if len(values) < len(rows):
                     continue            # 有成员没这个维度,不是整组的共同维度
-                if len(rows) > 1 and len({str(v) for v in values.values()}) < 2:
+                if (len(rows) > 1 and not wider
+                        and len({str(v) for v in values.values()}) < 2):
                     _mark(rows, "degenerate_dims", dim)
                     logger.info("变体家族 %s 的 %s 取值全同,不送重映射", fkey, dim)
                     continue
@@ -1237,7 +1251,7 @@ def _remap_unmapped_dims(ready: list[dict]) -> None:
                 # 头注的事故说明),而这里的异常**没有 except 兜着**,会一路
                 # 冒到 run() 让整条 list_new 失败(dry-run 也一样)
                 got = variant_remap.hardcoded(pt, dim, values, enum)
-                if not got and len(rows) > 1:
+                if not got and (len(rows) > 1 or wider):
                     if conn is None:
                         conn = stack.enter_context(db.pg_conn())
                     got = variant_remap.llm_remap(conn, pt, dim, values, enum)
@@ -1321,8 +1335,10 @@ def _drop_dup_combos(ready: list[dict]) -> None:
     本轮同族维度多的先、同维度按 ASIN 字母序先到先留(重跑结果不漂;缺维度的那条
     不会把维度齐全的兄弟挤出去)。必须跑在 `_dedupe_primary` 之前:被改成单品的行
     不能再占主变体名额。
-    已知边界:同一天先后两次上架,前一次刚提交、还没被 catalog_sync 收进
-    walmart_items 的兄弟看不见(它们的组号已登记,取值没地方查)。
+    已知边界(所有者知情,不补):① 同一天先后两次上架,前一次刚提交、还没被
+    catalog_sync 收进 walmart_items 的兄弟看不见(组号已登记,取值没地方查);
+    ② 先到先留的那条若在预备期掉队(标题不足/必填缺失/没领到 UPC)或被沃尔玛拒,
+    被它挤下的兄弟仍按单品上,不回补。
     """
     by_family: dict[tuple, list[dict]] = {}
     for r in ready:

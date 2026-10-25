@@ -91,6 +91,10 @@ MP_MAINTENANCE 的 header 也是 0608。两个 feed 同日换到 0829。数字�
 MP_MAINTENANCE 不回退(0608 官方已不列)。
 顺带两道换版防呆(`spec_split`):源文件名是别的 feed(同版本号的 MP_MAINTENANCE 原件结构路径
 相同,拆它会成功)直接拒;文件名版本串不在原件 header 的 version enum 里直接拒。
+兼容修复(第二个提交,详见 `docs/listing_plan.md`「2026-10-25 换 spec 0829 的兼容修复」):
+`mp_conform.evaluate_if` 补 anyOf/allOf/not —— 顺带查出 2026-08-12 起每个商品都多带了
+releaseDate(预售才需要);新字段 `condition_notes` 不交给 LLM。两件都与版本无关,回退 0608
+也不用撤。LLM 缓存:代理口径 1104 个 PT 的提示词随新版字段块变化、各重打一次,系统提示词不变。
 
 ### 2026-10-24 上架「对象数组」字段子字段名靠猜 → 连拒三次;重提后表上回执卡旧值
 

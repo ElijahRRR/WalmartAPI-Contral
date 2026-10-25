@@ -118,6 +118,15 @@ SYSTEM_OWNED_FIELDS = (
     "swatchImages",
 )
 
+# 不交给 LLM、LLM 写了也丢的 Visible 字段(与系统字段不同:没人填它,就是不发)。
+# condition_notes:0829 新增,3454 个 PT 有、全部可选,只出现在 condition 有非全新
+# 枚举的 PT 里(描述二手/翻新的成色细节),minLength 25 —— 我们只上全新品;交给 LLM
+# 它会占掉一个可选名额、挤出有用字段,还会写出 'Brand new' 这种不足 25 字符的值
+# 被拒。**故意不并进 SYSTEM_OWNED_FIELDS**:那个元组拼进了系统提示词,改它等于
+# 全部 PT 的缓存作废;reuse_sig 与 build_llm_messages 必须一起跳过它。每次换版
+# 复核它仍是可选(变成必填就得改成由系统给值)。
+VISIBLE_LLM_SKIP = ("condition_notes",)
+
 _BRAND_NOISE = ("unbranded", "n/a", "unknown", "generic", "")
 
 
@@ -330,7 +339,7 @@ def finalize_visible(pt: str, llm_attrs: dict, spec: dict | None,
         if k in DANGEROUS_DOC_FIELDS or k.endswith(_DOC_SUFFIX):
             del attrs[k]
     # 系统后处理字段:LLM 输出一律丢弃(swatchImages 这类 LLM 给标量会被拒)
-    for k in SYSTEM_OWNED_FIELDS:
+    for k in SYSTEM_OWNED_FIELDS + VISIBLE_LLM_SKIP:
         attrs.pop(k, None)
     props = (spec or {}).get("properties") or {}
     # 文案强制用亚马逊原文(去品牌名);无产品数据时保持旧行为。
@@ -506,7 +515,7 @@ def reuse_sig(pt: str, spec: dict | None, product: dict,
     """
     import hashlib as _hashlib
     import json as _json
-    v_req, v_opt = _fields_for_llm(spec, SYSTEM_OWNED_FIELDS, 20)
+    v_req, v_opt = _fields_for_llm(spec, SYSTEM_OWNED_FIELDS + VISIBLE_LLM_SKIP, 20)
     o_req, o_opt = _fields_for_llm(ospec, ORDERABLE_SYSTEM_FIELDS, 10,
                                    item_subfields=False)
     raw = _json.dumps(
@@ -586,7 +595,7 @@ def build_llm_messages(pt: str, spec: dict | None, product: dict,
         没人填。红线仍由 finalize_visible/mp_conform 兜底执行。
     """
     import json as _json
-    v_req, v_opt = _fields_for_llm(spec, SYSTEM_OWNED_FIELDS, 20)
+    v_req, v_opt = _fields_for_llm(spec, SYSTEM_OWNED_FIELDS + VISIBLE_LLM_SKIP, 20)
     o_req, o_opt = _fields_for_llm(ospec, ORDERABLE_SYSTEM_FIELDS, 10,
                                    item_subfields=False)
     sys = (

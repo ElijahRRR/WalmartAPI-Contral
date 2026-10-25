@@ -30,6 +30,7 @@
   IB.VALIDATION.DATA.001         object 子字段 enum 非法(如 unit='ft')
 """
 
+import collections
 import logging
 import re
 from datetime import datetime, timezone
@@ -214,15 +215,60 @@ def _type_fallback(ftype: str):
     return None
 
 
+# evaluate_if 认得的条件写法(2026-10-25 按 0829 全量 6973 个 PT + Orderable 实测:
+# if 层只出现 required/properties/anyOf/allOf/not,properties.X 只出现
+# type/enum/contains,contains 里只出现 type/enum/required/properties)。
+_IF_KEYS = frozenset({"required", "properties", "anyOf", "allOf", "not"})
+_IF_PROP_KEYS = frozenset({"type", "enum", "contains"})
+_IF_CONTAINS_KEYS = frozenset({"type", "enum", "required", "properties"})
+#: 遇到上面以外的写法的次数(键 = 关键字路径)。真兜底:按「不设限」处理(与支持
+#: 它之前的判定一致),但每种写法首次出现记 warning —— spec 换版带来新写法时
+#: 判定不许静默改变,要有人看见再补。
+UNKNOWN_IF_KEYWORDS: collections.Counter = collections.Counter()
+
+
+def _note_unknown_if_keys(keys, allowed: frozenset, where: str) -> None:
+    for k in keys:
+        if k in allowed:
+            continue
+        UNKNOWN_IF_KEYWORDS[where + k] += 1
+        if UNKNOWN_IF_KEYWORDS[where + k] == 1:
+            logger.warning("evaluate_if 遇到未支持的条件写法 %r,按不设限处理"
+                           "(spec 换版带来的新写法,需补判定)", where + k)
+
+
+def _contains_hit(sub: dict, el) -> bool:
+    """输入:contains 子模式 + 一个数组元素 → 输出:该元素是否满足子模式。
+
+    enum 要命中;带 required/properties 的(Orderable 的 inventory 那种)元素
+    必须是对象且逐项满足 —— 只取这两个键递归,type 不当成未知写法。
+    """
+    enum = sub.get("enum")
+    if enum is not None and el not in enum:
+        return False
+    if sub.get("required") or sub.get("properties"):
+        if not isinstance(el, dict):
+            return False
+        return evaluate_if({k: sub[k] for k in ("required", "properties") if k in sub}, el)
+    return True
+
+
 def evaluate_if(if_clause: dict, visible: dict) -> bool:
     """输入:JSON Schema if 子句 + visible → 输出:条件是否成立。
 
-    支持 spec 实际用到的子集:required / properties.X.{enum,type,contains.enum}。
+    支持 spec 实际用到的写法(见 _IF_KEYS):required / properties.X.{enum,type,
+    contains} / anyOf / allOf / not,组合子递归。
+    2026-10-25 补 anyOf/allOf/not:此前只看 required/properties,条件全写在
+    anyOf 里的 if 一律判「成立」—— Orderable「IsPreorder=Yes ⇒ releaseDate」
+    让**每个**商品都带上 releaseDate,0829 新增的 Wristwatches「condition=
+    Restored Premium ⇒ restoredProductIdentifier」会给每块手表填一个空 ID 必拒。
     """
+    _note_unknown_if_keys(if_clause, _IF_KEYS, "")
     for r in if_clause.get("required", []):
         if visible.get(r) in _EMPTY:
             return False
     for fname, fcond in (if_clause.get("properties") or {}).items():
+        _note_unknown_if_keys(fcond, _IF_PROP_KEYS, "properties.*.")
         v = visible.get(fname)
         enum = fcond.get("enum")
         if enum is not None and v not in enum:
@@ -238,11 +284,20 @@ def evaluate_if(if_clause: dict, visible: dict) -> bool:
             return False
         contains = fcond.get("contains") or {}
         if contains:
+            _note_unknown_if_keys(contains, _IF_CONTAINS_KEYS, "contains.")
             if not isinstance(v, list):
                 return False
-            sub_enum = contains.get("enum")
-            if sub_enum and not any(x in sub_enum for x in v):
+            if not any(_contains_hit(contains, x) for x in v):
                 return False
+    branches = [b for b in if_clause.get("allOf") or [] if isinstance(b, dict)]
+    if not all(evaluate_if(b, visible) for b in branches):
+        return False
+    branches = [b for b in if_clause.get("anyOf") or [] if isinstance(b, dict)]
+    if branches and not any(evaluate_if(b, visible) for b in branches):
+        return False
+    neg = if_clause.get("not")
+    if isinstance(neg, dict) and evaluate_if(neg, visible):
+        return False
     return True
 
 

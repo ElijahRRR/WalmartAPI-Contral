@@ -595,3 +595,47 @@ def test_build_orderable_drops_llm_external_product_identifier():
                               "IsPreorder": "No"})
     assert "externalProductIdentifier" not in o
     assert o["IsPreorder"] == "No"
+
+
+# ── condition_notes(0829 新增可选字段):不交给 LLM、LLM 写了也丢 ─────────────
+
+def _spec_with_condition_notes(n_other_optional: int) -> dict:
+    props = {f"opt{i:02d}": {"type": "string"} for i in range(3)}
+    props["condition_notes"] = {"title": "Condition Notes", "type": "string",
+                                "minLength": 25, "maxLength": 1000}
+    props.update({f"opt{i:02d}": {"type": "string"} for i in range(3, n_other_optional)})
+    return {"required": [], "properties": props}
+
+
+def test_condition_notes_never_offered_to_the_llm():
+    """0829 新增 condition_notes(3454 个 PT,全部可选,minLength 25,描述二手/翻新
+    成色):给 LLM 会占掉一个可选名额、挤出有用字段,还会写出不足 25 字符的值被拒。
+    跳过它之后,原本被挤出窗口的第 20 个可选字段回到窗口里。"""
+    import json
+    spec = _spec_with_condition_notes(21)
+    body = json.loads(m.build_llm_messages("Cups", spec, {"title": "x"})[1]["content"])
+    assert "condition_notes" not in body["visible_required"]
+    assert "condition_notes" not in body["visible_optional"]
+    assert len(body["visible_optional"]) == 20 and "opt19" in body["visible_optional"]
+    # 复用签名与提示词同口径:有没有 condition_notes,其余字段相同的签名一致
+    prod = {"title": "x", "brand": "b", "category": "c"}
+    without = {"required": [], "properties": {
+        k: v for k, v in spec["properties"].items() if k != "condition_notes"}}
+    assert m.reuse_sig("Cups", spec, prod) == m.reuse_sig("Cups", without, prod)
+
+
+def test_condition_notes_from_llm_is_dropped():
+    spec = _spec_with_condition_notes(3)
+    v = m.finalize_visible("Cups", {"condition_notes": "Brand new", "opt00": "x"}, spec)
+    assert "condition_notes" not in v and v["opt00"] == "x"
+
+
+def test_condition_notes_skip_keeps_caches_of_other_pts():
+    """没有 condition_notes 的 PT:字段块逐字不变;系统提示词也不变
+    (VISIBLE_LLM_SKIP 故意不并进 SYSTEM_OWNED_FIELDS —— 那个元组拼进了提示词)。"""
+    spec = {"required": ["color"], "properties": {
+        "color": {"type": "string"}, "size": {"type": "string"}}}
+    assert m._fields_for_llm(spec, m.SYSTEM_OWNED_FIELDS + m.VISIBLE_LLM_SKIP, 20) == \
+        m._fields_for_llm(spec, m.SYSTEM_OWNED_FIELDS, 20)
+    sys_prompt = m.build_llm_messages("X", spec, {"title": "x"})[0]["content"]
+    assert "condition_notes" not in sys_prompt

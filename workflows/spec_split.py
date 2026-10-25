@@ -6,6 +6,9 @@
   python cli.py spec_split -p src=<同上> -p out=<目录>      # 指定输出目录
   python cli.py spec_split -p src=<同上> -p diff=1          # 拆完与现用版做差集
   python cli.py spec_split -p out=<已拆好的目录> -p diff=1   # 只对账(已拆过就不重拆)
+  python cli.py spec_split -p src=<同上> -p diff=1 -p base=<旧版目录>
+      # 已经拉了改版本串的代码、新版目录还没拆:直接拆进 registry 指着的那个空目录,
+      # 差集对 base(registry 已不指旧版,没有"在用版"可比)
 
 为什么要它(docs/legacy_survey.md:1535/1665):官方 MP_ITEM v5 是**一个 450MB 的
 单 JSON**,`json.load` 膨胀成约 1.3GB Python 对象 —— 旧系统跑 5048 行 xlsx 时
@@ -17,7 +20,8 @@ RSS 飙到 12GB 直接 OOM。旧仓用 `tools/split_mp_item_spec.py` 拆成一�
 
 安全:
   · 目标目录默认按**源文件名里的版本串**新建,与在用的那份**并排放**,
-    不覆盖(上架链此刻正读着在用的那份,拆坏了就上不了架);
+    不覆盖(上架链此刻正读着在用的那份,拆坏了就上不了架);registry 指着的
+    目录**还没拆好**(先拉了代码)时允许拆进去 —— 上架链此刻本就读不到 spec;
   · 目录已存在且非空 → 拒绝,要覆盖得显式 `-p replace=1`;
   · 拆完自检:PT 数、Orderable 必填、`_pt_index` 能否逐个回读。
   · `-p diff=1` 与现用版做差集 —— **换版前必须看的那个数**:新版新增了哪些
@@ -31,7 +35,7 @@ import mmap
 import os
 import re
 
-from registry import paths, resources
+from registry import paths
 from services import pt_spec, spec_split as ss
 
 DANGEROUS = False       # 只读源文件 + 只写新建的 spec 目录,不碰沃尔玛也不碰库
@@ -97,8 +101,9 @@ def _diff_lines(new_dir: str, cur_dir: str) -> list[str]:
     finally:
         pt_spec.use_spec_dir(None)
 
-    out = [f"── 换版差集:在用版 {resources.FEED_SPEC_VERSIONS['MP_ITEM']}"
-           f" {len(old_pts)} 个 PT → 新版 {len(new_pts)} 个",
+    out = [f"── 换版差集:{os.path.basename(os.path.normpath(cur_dir))}"
+           f" {len(old_pts)} 个 PT → {os.path.basename(os.path.normpath(new_dir))}"
+           f" {len(new_pts)} 个",
            f"   新增 PT {len(new_pts - old_pts)} 个;消失 PT {len(old_pts - new_pts)} 个"]
     for tag, xs in (("新增样例", sorted(new_pts - old_pts)[:5]),
                     ("消失样例", sorted(old_pts - new_pts)[:5])):
@@ -142,6 +147,7 @@ def run(params: dict) -> str:
     src = os.path.expanduser(str(params.get("src", "")).strip())
     out = str(params.get("out", "")).strip()
     want_diff = str(params.get("diff", "")).strip() == "1"
+    base = os.path.expanduser(str(params.get("base", "")).strip())
     # 已经拆好的目录 + 只想对账:不重拆(重拆要 -p replace=1,而覆盖一份已经
     # 自检通过的目录纯属多余风险)
     only_diff = bool(out and want_diff and not src
@@ -152,7 +158,7 @@ def run(params: dict) -> str:
     lines = []
     if only_diff:
         out_dir = os.path.expanduser(out)
-        cur_dir = str(paths.mp_item_spec_dir())
+        cur_dir = base or str(paths.mp_item_spec_dir())
         lines.append(f"只对账(目录已拆好,不重拆):{out_dir}")
         return "\n".join(lines + _diff_lines(out_dir, cur_dir))
 
@@ -175,9 +181,18 @@ def run(params: dict) -> str:
         raise ValueError("文件名里解析不出版本串,请用 -p out=<目录> 指定输出目录")
     cur_dir = str(paths.mp_item_spec_dir())
     if os.path.abspath(out_dir) == os.path.abspath(cur_dir):
-        raise ValueError(
-            f"拒绝写进**上架链正在用的那份 spec 目录**({cur_dir})——"
-            f"新版要与在用版并排放,验完再改 registry 的版本串切换")
+        if os.path.exists(os.path.join(cur_dir, "_pt_index.json")):
+            raise ValueError(
+                f"拒绝写进**上架链正在用的那份 spec 目录**({cur_dir})——"
+                f"新版要与在用版并排放,验完再改 registry 的版本串切换")
+        # 先拉了改版本串的代码、目录还没拆:上架链此刻本就读不到 spec,拆进去
+        # 弄不坏任何在用的东西。差集只能对 base —— 拿它跟自己比只会报「无变化」
+        if want_diff and not base:
+            raise ValueError(
+                f"registry 已指向 {cur_dir},但它还没拆好;要差集请加 "
+                f"-p base=<旧版目录>(如 specs/MP_ITEM/5.0.20260608-18_15_07-api)")
+    if base:
+        cur_dir = base
     lines.append(f"输出目录:{out_dir}"
                  + ("(与在用版并排,registry 不动)" if not dry_run else ""))
 

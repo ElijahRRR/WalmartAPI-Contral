@@ -170,7 +170,8 @@ FEED_SPEC_VERSIONS = {
     # SkuUpdate/ProductIdUpdate(改码走 MP_ITEM_MATCH)。原件摘录
     # `refdata/specs/MP_MAINTENANCE_5.0.20260829-12_49_39-api.orderable_excerpt.json`,
     # 守门 tests/test_weight_fix.py:本串必须落在摘录 header 的 version enum 里。
-    # **不回退**:0608 官方已不列,回退等于发一个不存在的版本。
+    # **不回退**:维护载荷用到的字段 0829 一字未变,没有回退的理由;0608 已不在官方表上,
+    # 摘录也已换成 0829(守门测试会拦只回一处)。
     "MP_MAINTENANCE": "5.0.20260829-12_49_39-api",
     "price": "1.7",         # PriceFeed 无外层包装(加 PriceFeed 包装→ERROR,旧实证)
     "inventory": "1.4",     # InventoryFeed,Inventory 首字母大写(小写→0503009)
@@ -211,7 +212,10 @@ FEED_SPEC_VERSIONS = {
     #   修复里不交给 LLM);Wristwatches / CD Recorders / Dog Waste Bag Dispensers
     #   新增 anyOf 形条件必填(兼容修复:mp_conform.evaluate_if 支持 anyOf/allOf/not)。
     # ⚠ 切换顺序:**先拆后切** —— 新版目录没拆好就改这个串,pt_spec 抛
-    # FileNotFoundError、上架链全停。回退只回这一个串(0608 目录留在盘上)。
+    # FileNotFoundError、上架链全停(已经这样了:spec_split -p base=<旧目录> 直接
+    # 拆进空目录,别手改本串)。应急回退:改回 0608 这一个串(0608 目录留在盘上);
+    # 但 0608 与 MP_MAINTENANCE 一样已不在官方表上,只作短期止血,长期回退版是
+    # 表上的 0803(先拆再改串)。
     "MP_ITEM": "5.0.20260829-12_49_39-api",
 }
 

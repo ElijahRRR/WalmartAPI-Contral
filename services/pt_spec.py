@@ -44,12 +44,10 @@ def _spec_dir():
     d = paths.mp_item_spec_dir()
     if not (d / "_pt_index.json").exists():
         raise FileNotFoundError(
-            f"MP_ITEM spec 未就位:{d}/_pt_index.json 不存在。"
-            f"顺序是**先拆后切**:先把 registry FEED_SPEC_VERSIONS['MP_ITEM'] 改回"
-            f"目录已就位的那一版,再 `python cli.py spec_split -p src=<官方 "
-            f"<版本串>_MP_ITEM_0_0_en.json> -p diff=1`(zip 先解压;文件名里要有"
-            f"版本串,否则加 -p out=),自检与差集看过再改版本串"
-            f"(spec_split 拒绝写进在用目录,所以不能先改串再拆)")
+            f"MP_ITEM spec 未就位:{d}/_pt_index.json 不存在(版本串已改、新版还没拆)。"
+            f"别改 registry,直接拆进这个目录:`python cli.py spec_split -p src=<官方 "
+            f"<版本串>_MP_ITEM_0_0_en.json> -p diff=1 -p base=<旧版目录>`"
+            f"(zip 先解压到空目录;自检与差集都要看;拆好之前上架链停着)")
     return d
 
 

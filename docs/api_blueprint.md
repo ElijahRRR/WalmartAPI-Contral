@@ -315,16 +315,26 @@ additionalProperties=false,摘录的三个字段 schema 一字不差,另有 allO
 Consolidated_Schema_File_MP_MAINTENANCE_OCT26.zip `36445ee4182733a00a2b5a4ac654b8cf08801996341da804e507b12ec748dbd0`。
 
 **spec 换版步骤**(2026-10-25 起;MP_ITEM 的版本串同时决定 header 与 spec 目录,**先拆后切**):
-1. 官方 zip 解压到单独空目录,`python cli.py spec_split -p src=<…>_MP_ITEM_0_0_en.json -p diff=1`
-   (只认 MP_ITEM 原件,文件名版本串须在原件 header enum 里;与在用目录并排写,自检 + 差集两行都要看:
-   消失 PT、新增顶层必填、Orderable 变化任一出现先停下评估)。
+1. 官方 zip 解压到单独空目录,在生产机**拉代码之前**跑
+   `python cli.py spec_split -p src=<…>_MP_ITEM_0_0_en.json -p diff=1`(与在用目录并排写)。
+   自检 + 差集两行都要看:消失 PT、新增顶层必填、Orderable 变化任一出现先停下评估。
+   新版 spec_split 只认 MP_ITEM 原件、文件名版本串须在原件 header enum 里;⚠ **0608→0829 这一次**
+   跑的还是拉代码前的旧 spec_split,两道防呆都没有 —— 人工核:文件名以 `_MP_ITEM_0_0_en.json`
+   结尾(不是 `_MP_MAINTENANCE_`),输出是「发现 PT 6973」「Orderable:字段 23 / 必填 5」;
+   20 字段 / 2 必填 = 拆成了维护原件,删掉该目录重拆。
 2. `python cli.py pt_spec_sync -p spec_dir=<新目录> --dry-run`(单独跑一次,只看对账,不写库)。
-3. 改 registry `FEED_SPEC_VERSIONS`、拉代码;`python cli.py catalog_health` 看「E PT 拆分文件」全部就位,
-   `python cli.py list_new --dry-run` 不出「MP_ITEM spec 未就位」。
+3. 合并改版本串的提交、生产机 `git pull`(不要本地手改 registry,pull 会冲突);
+   `python cli.py catalog_health` 看「E PT 拆分文件」全部就位,`python cli.py list_new --dry-run`
+   不出「MP_ITEM spec 未就位」。
+   已经先 pull 了、新版还没拆(上架链此刻停着):别改 registry,直接
+   `python cli.py spec_split -p src=<…>_MP_ITEM_0_0_en.json -p diff=1 -p base=<旧版目录>` 拆进 registry
+   指着的那个空目录(差集对 base)。
 4. 切换后的派生物:`pt_spec_sync`(先 --dry-run)→ `pt_census -p only=准入漏了` → 飞书类目表补新 PT 的
    准入状态 → `risk_sync` → `product_audit -p repts=1` / `-p mode=pending`(先 --dry-run)→
    `catmap_prune --dry-run`(核过再真跑)。
-5. 旧版目录留在盘上备回退:MP_ITEM 回退只改回一个串;MP_MAINTENANCE 只在旧版仍在官方表上时才可回退。
+5. 回退:旧版目录留在盘上。回退目标应仍在官方表上 —— 0608 已不在表上(与 MP_MAINTENANCE 同一处境),
+   MP_ITEM 改回 0608 只作 0829 出事时的短期应急(header 与 spec 目录随一个串一起回);要留长期回退版,
+   先按步骤 1 把表上的 0803 拆好。MP_MAINTENANCE 不回退(维护载荷用到的字段 0829 一字未变,没有回退的理由)。
 数值字段一律 round 到 ≤2 位小数(sanitize 兜底,Walmart 拒收 >2 位)。
 endDate/日期字段必须 ISO DateTime(spec 声称 yyyy-mm-dd 实际拒收)。
 MP_MAINTENANCE 官方明确限制:**COO(原产国)不可改**;必填仅 SKU+GTIN,其余可选(partial update)。

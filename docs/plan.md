@@ -87,13 +87,17 @@ maintenance/list_new)→ 按域停旧切换。
 MP_MAINTENANCE 的 header 也是 0608。两个 feed 同日换到 0829。数字与换版步骤见 registry
 `FEED_SPEC_VERSIONS` 注释和 `docs/api_blueprint.md` §5.1(代理口径 0703→0829;0608→0829 的
 实测差集以所有者机器上 `spec_split -p diff=1` 为准)。顺序是**先拆后切**:新版目录没拆好就
-拉到改了版本串的代码,`pt_spec` 抛 FileNotFoundError、上架链全停。回退:MP_ITEM 只改回一个串;
-MP_MAINTENANCE 不回退(0608 官方已不列)。
+拉到改了版本串的代码,`pt_spec` 抛 FileNotFoundError、上架链全停(真遇上了:`spec_split -p base=<旧目录>`
+直接拆进 registry 指着的空目录,不手改 registry)。回退:MP_ITEM 改回 0608 一个串只作短期应急 ——
+0608 与 MP_MAINTENANCE 一样已不在官方表上,长期回退版是表上的 0803;MP_MAINTENANCE 不回退(维护载荷
+用到的字段 0829 一字未变)。
 顺带两道换版防呆(`spec_split`):源文件名是别的 feed(同版本号的 MP_MAINTENANCE 原件结构路径
-相同,拆它会成功)直接拒;文件名版本串不在原件 header 的 version enum 里直接拒。
+相同,拆它会成功)直接拒;文件名版本串不在原件 header 的 version enum 里直接拒。**这两道从下一次换版
+起才生效**:这一次在生产机上是拉代码前用旧 spec_split 拆的,文件名与「Orderable 23 / 5」靠人工核。
 兼容修复(第二个提交,详见 `docs/listing_plan.md`「2026-10-25 换 spec 0829 的兼容修复」):
 `mp_conform.evaluate_if` 补 anyOf/allOf/not —— 顺带查出 2026-08-12 起每个商品都多带了
-releaseDate(预售才需要);新字段 `condition_notes` 不交给 LLM。两件都与版本无关,回退 0608
+releaseDate(预售才需要);新字段 `condition_notes` 不交给 LLM;条件必填在类型/枚举纠正后按
+最终形态再判一遍(判对 anyOf 之后露出来的工序缺口,对抗审查实证)。三件都与版本无关,回退旧版
 也不用撤。LLM 缓存:代理口径 1104 个 PT 的提示词随新版字段块变化、各重打一次,系统提示词不变。
 
 ### 2026-10-24 上架「对象数组」字段子字段名靠猜 → 连拒三次;重提后表上回执卡旧值

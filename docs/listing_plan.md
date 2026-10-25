@@ -179,8 +179,14 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
   restoredProductIdentifier」会给每块全新手表填一个空 ID 必拒;③ 约 60 个 PT 的
   签名/鉴定/prop65/证书类字段被占位值填上(autographedBy、grading_company 等)。
   0829 全量 6973 个 PT 空 LLM 产出实测:新增不合规 0、新增拦截 0,Wristwatches 转好;
-  0703 同样 0 回退(回退 0608 时这条不用撤)。spec 再出新的条件写法:按不设限处理
+  0703 同样 0 回退(回退旧版时这条不用撤)。spec 再出新的条件写法:按不设限处理
   (与支持前一致)+ 首次出现记 warning、计数在 `UNKNOWN_IF_KEYWORDS`。
+- 条件必填在工序 2-4(必填兜底 / 类型纠正 / 枚举纠正)之后按最终形态**再判一遍**
+  (`_refill_conditional`,补了再过一遍类型与枚举)。判对 anyOf/allOf 之后,这个工序缺口
+  不再被「恒成立」盖住:LLM 给 autographed=['Yes'] 被拆成 'Yes'、漏给的必填
+  loadPosition 被兜成 'Front Load',条件在最终载荷里成立,then 字段却没人填 → 72600149546850。
+  0829 全量(空产出 6973 例 + 错形态触发 142 例)对比 origin/main:新增未拦错误 0;
+  42 例改为本地拦截(origin/main 照发、沃尔玛必拒,现在省 UPC)。
 - `condition_notes`(0829 新增,3454 个 PT 可选,minLength 25,二手/翻新成色说明):
   不交给 LLM(`mp_mapper.VISIBLE_LLM_SKIP`,提示词与复用签名同口径),LLM 写了
   `finalize_visible` 也丢。故意不并进 SYSTEM_OWNED_FIELDS(那个元组拼进系统提示词,

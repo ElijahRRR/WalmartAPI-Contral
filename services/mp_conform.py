@@ -9,6 +9,7 @@
   2 fill_missing_required 顶层必填兜底(闭枚举优先 No/None/Not Applicable)
   3 fix_type_mismatches   类型不匹配(标量包成 array / object 子 enum 纠正)
   4 fix_invalid_enums     非法枚举值(必填换 enum[0],非必填直接删)
+  4a _refill_conditional  按 2-4 改过的最终形态再判一遍条件必填(补了再过类型/枚举)
   4b ensure_variant_bag   变体三件套自洽(给一半会被拒;单品 isPrimary=Yes)
   5 strip_unknown         剔除 spec 外字段(additionalProperties=false 会拒)
   5a fix_array_items      数组元素是对象:剔元素内 spec 外子字段、删缺子字段必填的元素
@@ -1003,6 +1004,24 @@ def clamp_max_length(spec: dict | None, section: dict
     return out, notes
 
 
+def _refill_conditional(spec: dict, section: dict) -> tuple[dict, list[str]]:
+    """输入:spec + 已过类型/枚举一致化的一段 → 输出:(按最终形态补齐条件必填后的一段, 说明)。
+
+    条件必填在工序 1 按 LLM 原值判,工序 2-4 会再造出或改形触发值:必填兜底
+    给了 enum[0]、['Yes'] 拆成 'Yes'、'Rack Mount' 包成数组、'Front-Load' 换成
+    'Front Load' —— 最终载荷里条件成立,then 字段却没人填,沃尔玛 72600149546850
+    拒收(validate 只查顶层必填,拦不住)。所以按最终形态再判一遍;补了东西就再过
+    一遍类型与枚举(白名单兜底不看 PT 枚举,单补不纠会新添枚举错)。
+    2026-10-25 对抗审查实证:evaluate_if 支持 anyOf/allOf 之前这些条件恒成立、
+    then 字段恒被填,这个工序缺口被盖住了。
+    """
+    section, notes = fill_known_required(spec, section)
+    if notes:
+        section, n = fix_type_mismatches(spec, section);    notes += n
+        section, n = fix_invalid_enums(spec, section);      notes += n
+    return section, notes
+
+
 def conform(spec: dict | None, ospec: dict | None, visible: dict,
             orderable: dict, sku: str = "", variant: dict | None = None
             ) -> tuple[dict, dict, list[str], list[str]]:
@@ -1024,6 +1043,7 @@ def conform(spec: dict | None, ospec: dict | None, visible: dict,
     visible, n = fill_missing_required(spec, visible);      notes += n
     visible, n = fix_type_mismatches(spec, visible);        notes += n
     visible, n = fix_invalid_enums(spec, visible);          notes += n
+    visible, n = _refill_conditional(spec, visible);        notes += n
     visible, n = clamp_max_length(spec, visible);           notes += n
     if _props(ospec):
         # Orderable 段同样过条件必填/类型/枚举一致化(2026-08-12 旧仓对照:
@@ -1034,6 +1054,8 @@ def conform(spec: dict | None, ospec: dict | None, visible: dict,
         orderable, n = fix_type_mismatches(ospec, orderable)
         notes += [f"orderable:{x}" for x in n]
         orderable, n = fix_invalid_enums(ospec, orderable)
+        notes += [f"orderable:{x}" for x in n]
+        orderable, n = _refill_conditional(ospec, orderable)
         notes += [f"orderable:{x}" for x in n]
         orderable, n = clamp_max_length(ospec, orderable)
         notes += [f"orderable:{x}" for x in n]

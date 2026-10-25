@@ -519,3 +519,33 @@ def test_if_unknown_keyword_logged_and_not_restricting(caplog):
         mc.evaluate_if({"oneOf": [{"required": ["x"]}]}, {})
     assert mc.UNKNOWN_IF_KEYWORDS["oneOf"] == 2
     assert sum("oneOf" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_conditional_required_rejudged_after_type_and_enum_fixes():
+    """条件必填在工序 1 按 LLM 原值判;工序 2-4 改形/补值后条件才成立的,要按最终
+    形态再判一遍(2026-10-25 对抗审查:anyOf/allOf 判对之后,这个工序缺口不再被
+    「恒成立」盖住 —— ['Yes'] 拆成 'Yes'、缺的必填被兜成 enum[0],then 字段没人填,
+    沃尔玛 72600149546850 拒收,validate 只查顶层必填拦不住)。"""
+    spec = {"required": ["loadPosition"], "properties": {
+        "autographed": {"type": "string", "enum": ["No", "Yes"]},
+        "autographedBy": {"type": "string"},
+        "loadPosition": {"type": "string", "enum": ["Front Load", "Top Load"]},
+        "opening_width": {"type": "string"}},
+        "allOf": [
+            {"if": {"anyOf": [{"properties": {"autographed": {
+                "type": "string", "enum": ["Yes"]}}, "required": ["autographed"]}]},
+             "then": {"required": ["autographedBy"]}},
+            {"if": {"anyOf": [{"properties": {"loadPosition": {
+                "type": "string", "enum": ["Front Load"]}}, "required": ["loadPosition"]}]},
+             "then": {"required": ["opening_width"]}}]}
+    # 错形态的触发值:LLM 给数组,工序 3 拆成标量后条件才成立
+    v, o, notes, missing = mc.conform(spec, {}, {"autographed": ["Yes"],
+                                                  "loadPosition": "Top Load"}, {})
+    assert v["autographed"] == "Yes" and v["autographedBy"]
+    # 触发字段是 LLM 漏给的必填:工序 2 兜成 enum[0] 'Front Load' 后条件才成立
+    v, o, notes, missing = mc.conform(spec, {}, {}, {})
+    assert v["loadPosition"] == "Front Load" and v["opening_width"]
+    # 条件不成立就不补
+    v, o, notes, missing = mc.conform(spec, {}, {"autographed": "No",
+                                                  "loadPosition": "Top Load"}, {})
+    assert "autographedBy" not in v and "opening_width" not in v

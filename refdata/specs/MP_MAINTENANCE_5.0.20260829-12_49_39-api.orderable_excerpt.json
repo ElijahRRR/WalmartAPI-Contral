@@ -1,6 +1,6 @@
 {
  "_provenance": {
-  "what": "官方 MP_MAINTENANCE 规范原件的摘录(只摘 header 与 Orderable 段;原件含 6974 个 PT 的 Visible,zip 约 106MB、解压 423MB,不进仓)",
+  "what": "官方 MP_MAINTENANCE 规范原件的摘录(只摘 header 与 Orderable 段;原件 Visible 含 6973 个 PT + 1 个通用 default 分支(共 6974 项),zip 约 106MB、解压 423MB,不进仓)",
   "url": "https://developer.walmart.com/file/mp/us/Consolidated_Schema_File_MP_MAINTENANCE_OCT26.zip",
   "zip_sha256": "36445ee4182733a00a2b5a4ac654b8cf08801996341da804e507b12ec748dbd0",
   "file_in_zip": "5.0.20260829-12_49_39-api_MP_MAINTENANCE_0_0_en.json",

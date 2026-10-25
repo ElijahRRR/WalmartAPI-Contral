@@ -1,7 +1,7 @@
 """MP_ITEM 按 PT 拆分 spec 加载器(listing L2c)。
 
 目录:registry.paths.mp_item_spec_dir()(<DATA_ROOT>/specs/MP_ITEM/<版本>/),
-内容为旧仓库 MPSetup_by_pt 拆分产物:_pt_index.json + _orderable.json +
+内容为 workflows/spec_split 拆分产物(与旧仓 MPSetup_by_pt 同格式):_pt_index.json + _orderable.json +
 逐 PT json——451MB 单文件 json.load 膨胀 1.3GB 触发 OOM 的历史事故,
 解法就是按 PT 拆 + lru_cache(旧 maxsize=512 约 50MB 常驻,原值沿用)。
 """
@@ -44,9 +44,10 @@ def _spec_dir():
     d = paths.mp_item_spec_dir()
     if not (d / "_pt_index.json").exists():
         raise FileNotFoundError(
-            f"MP_ITEM spec 未就位:{d}/_pt_index.json 不存在。"
-            f"请把旧仓库 walmart_official_specs/MPSetup_by_pt/ 的全部内容"
-            f"拷入该目录(含 _pt_index.json/_orderable.json/各 PT json)")
+            f"MP_ITEM spec 未就位:{d}/_pt_index.json 不存在(版本串已改、新版还没拆)。"
+            f"别改 registry,直接拆进这个目录:`python cli.py spec_split -p src=<官方 "
+            f"<版本串>_MP_ITEM_0_0_en.json> -p diff=1 -p base=<旧版目录>`"
+            f"(zip 先解压到空目录;自检与差集都要看;拆好之前上架链停着)")
     return d
 
 

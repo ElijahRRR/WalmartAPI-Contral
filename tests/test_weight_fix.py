@@ -1,6 +1,7 @@
 """weight_fix:按名单把已上架商品的发货重量改成固定值(临时工具,所有者 2026-10-16)。
 
-钉住四件事:载荷键集合在官方 MP_MAINTENANCE 规范原件(摘录)之内、只改重量;
+钉住五件事:header 版本串落在官方原件(摘录)的 version enum 里;
+载荷键集合在官方 MP_MAINTENANCE 规范原件(摘录)之内、只改重量;
 名单只认「店铺」「SKU」两列;查不到 / 没 UPC / 不可调用的店不发且点名;
 dry-run 一条不发,真跑走 feed 台账(workflow=weight_fix)。
 """
@@ -8,15 +9,17 @@ dry-run 一条不发,真跑走 feed 台账(workflow=weight_fix)。
 import contextlib
 import csv
 import json
+import re
 from pathlib import Path
 
 import pytest
 
 from api import feeds
+from registry import resources
 from workflows import weight_fix as wf
 
 _EXCERPT = (Path(__file__).resolve().parent.parent / "refdata" / "specs"
-            / "MP_MAINTENANCE_5.0.20260703-18_22_27-api.orderable_excerpt.json")
+            / "MP_MAINTENANCE_5.0.20260829-12_49_39-api.orderable_excerpt.json")
 
 
 def _spec():
@@ -28,6 +31,17 @@ def _store(name):
 
 
 # ── 载荷对照官方规范原件 ─────────────────────────────────────────────────────
+
+def test_maint_header_version_pinned_to_official_excerpt():
+    """registry 的 MP_MAINTENANCE 版本串必须在摘录 header 的 version enum 里,
+    摘录文件名与出处记录也指同一版(2026-10-25:header 发 0608、摘录却是 0703,
+    两边错开一个多月没人发现 —— 换版时三处一起换,这条拦住只换一处)。"""
+    spec = _spec()
+    enum = spec["MPItemFeedHeader"]["properties"]["version"]["enum"]
+    assert resources.FEED_SPEC_VERSIONS["MP_MAINTENANCE"] in enum
+    assert re.search(r"\d+\.\d+\.\d{8}-\d{2}_\d{2}_\d{2}-api", _EXCERPT.name)[0] in enum
+    assert spec["_provenance"]["spec_version_enum"] == enum
+
 
 def test_item_keys_are_inside_the_official_maintenance_orderable():
     """MPItem 只有 Orderable;Orderable 键集合 ⊆ 原件 20 个属性、含全部必填;
@@ -61,7 +75,11 @@ def test_payload_through_the_standard_feed_builder_keeps_the_weight():
     """走 api/feeds 唯一的载荷构造:header 三字段,条目原样(数值 ≤2 位小数)。"""
     payload = feeds.build_payload("MP_MAINTENANCE",
                                   [wf.build_item("S1", "012345678905", 11)])
-    assert set(payload["MPItemFeedHeader"]) == {"businessUnit", "locale", "version"}
+    header_spec = _spec()["MPItemFeedHeader"]
+    assert header_spec["additionalProperties"] is False
+    assert set(payload["MPItemFeedHeader"]) == set(header_spec["required"])
+    assert payload["MPItemFeedHeader"]["version"] in \
+        header_spec["properties"]["version"]["enum"]
     assert payload["MPItem"][0]["Orderable"]["ShippingWeight"] == 11.0
 
 

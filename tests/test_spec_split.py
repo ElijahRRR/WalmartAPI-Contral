@@ -101,14 +101,72 @@ def test_split_then_load_roundtrip(tmp_path, monkeypatch):
     assert pt_spec._OVERRIDE_DIR is None
 
 
-def test_refuses_to_overwrite_the_live_spec_dir(tmp_path):
+def test_refuses_to_overwrite_the_live_spec_dir(tmp_path, monkeypatch):
     """拆进上架链正在用的那份目录 = 拆坏了当场上不了架。"""
     from registry import paths
     from workflows import spec_split as wf
+    live = tmp_path / "live"
+    live.mkdir()
+    (live / "_pt_index.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(paths, "mp_item_spec_dir", lambda: live)
     src = tmp_path / "5.0.20260608-18_15_07-api_MP_ITEM_0_0_en.json"
     src.write_bytes(_spec({"W": {"required": ["a"]}}))
     with pytest.raises(ValueError, match="上架链正在用"):
-        wf.run({"src": str(src), "out": str(paths.mp_item_spec_dir())})
+        wf.run({"src": str(src), "out": str(live)})
+
+
+def test_registry_dir_not_yet_split_can_be_filled_with_base_for_diff(tmp_path, monkeypatch):
+    """先拉了改版本串的代码、新版目录还没拆(2026-10-25 换 0829 的对抗审查):
+    上架链此刻本就读不到 spec,允许直接拆进 registry 指着的空目录 —— 不必手改
+    registry 再改回来(忘了改回就静悄悄停在旧版)。差集要 -p base= 指旧目录:
+    拿新版跟自己比只会报「无变化」。"""
+    from registry import paths
+    from services import pt_spec
+    from workflows import spec_split as wf
+    monkeypatch.setattr(paths, "specs_dir", lambda: tmp_path / "specs")
+    new = tmp_path / "specs" / "MP_ITEM" / "5.0.20260829-12_49_39-api"
+    monkeypatch.setattr(paths, "mp_item_spec_dir", lambda: new)
+    old = tmp_path / "old"
+    old.mkdir()
+    (old / "_pt_index.json").write_text(json.dumps({"W": "W.json"}), encoding="utf-8")
+    (old / "_orderable.json").write_text(json.dumps({"required": ["sku"]}), encoding="utf-8")
+    (old / "W.json").write_text(json.dumps({"required": ["a", "oldOnly"]}), encoding="utf-8")
+    src = tmp_path / "5.0.20260829-12_49_39-api_MP_ITEM_0_0_en.json"
+    src.write_bytes(_spec({"W": {"required": ["a"]}, "Z": {"required": ["b"]}}))
+    with pytest.raises(ValueError, match="base="):
+        wf.run({"src": str(src), "diff": "1"})
+    assert not new.exists()                     # 拒在动手之前
+    msg = wf.run({"src": str(src), "diff": "1", "base": str(old)})
+    assert "自检:索引 2 个 PT" in msg and "新增 PT 1 个" in msg and "oldOnly" in msg
+    assert "old 1 个 PT" in msg                 # 差集的旧侧是 base,不是新目录自己
+    assert (new / "_pt_index.json").exists() and pt_spec._OVERRIDE_DIR is None
+
+
+def test_refuses_maintenance_spec_file(tmp_path):
+    """MP_MAINTENANCE 原件与 MP_ITEM 同版本号同结构,拆它会成功、目录名也一样
+    —— 上架链就拿 20 字段 / 2 必填的维护版 Orderable 去校验(2026-10-25 换 0829)。"""
+    from workflows import spec_split as wf
+    src = tmp_path / "5.0.20260829-12_49_39-api_MP_MAINTENANCE_0_0_en.json"
+    src.write_bytes(_spec({"W": {"required": ["a"]}}))
+    with pytest.raises(ValueError, match="MP_MAINTENANCE"):
+        wf.run({"src": str(src), "out": str(tmp_path / "out"), "dry_run": True})
+    assert wf._feed_from("5.0.20260829-12_49_39-api_MP_ITEM_0_0_en.json") == "MP_ITEM"
+    assert wf._feed_from("自己改过名.json") == ""
+
+
+def test_refuses_version_not_in_header_enum(tmp_path):
+    """文件名的版本串决定目录名 = 切换后 feed header 报的版本;原件 header
+    不认这个值就是改过名的文件,拆进去就名不副实。"""
+    from workflows import spec_split as wf
+    src = tmp_path / "5.0.20260829-12_49_39-api_MP_ITEM_0_0_en.json"
+    header = {"properties": {"version": {"enum": ["5.0.20260703-18_22_27-api"]}}}
+    src.write_bytes(_spec({"W": {"required": ["a"]}}, header=header))
+    with pytest.raises(ValueError, match="version enum"):
+        wf.run({"src": str(src), "out": str(tmp_path / "out"), "dry_run": True})
+    header["properties"]["version"]["enum"] = ["5.0.20260829-12_49_39-api"]
+    src.write_bytes(_spec({"W": {"required": ["a"]}}, header=header))
+    assert "发现 PT 1 个" in wf.run({"src": str(src), "out": str(tmp_path / "out"),
+                                    "dry_run": True})
 
 
 def test_refuses_nonempty_dir_without_replace(tmp_path):

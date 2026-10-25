@@ -79,6 +79,28 @@ TRO 跨仓边界(暂放)。
 maintenance/list_new)→ 按域停旧切换。
 **✅ 2026-08-17 全部完成** —— 验收记录见 `docs/production_cutover.md` §九。
 
+### 2026-10-25 MP_ITEM / MP_MAINTENANCE spec 换版 20260608 → 20260829
+
+所有者原话:「我认为应该先升级最新版再做兼容修复」。起因是 10-24 那批 `is not a valid field`
+放行前的核对 —— 报错字段几乎全是 `fabricContent` 子字段名(LLM 编的),与规范版本无关;
+但核对时发现在用的 0608 已从官方版本表整版消失(推荐 0829 / 上一版 0803 / 不推荐 0703),
+MP_MAINTENANCE 的 header 也是 0608。两个 feed 同日换到 0829。数字与换版步骤见 registry
+`FEED_SPEC_VERSIONS` 注释和 `docs/api_blueprint.md` §5.1。所有者机器实测 0608→0829:PT 6951→6973
+(+22、零消失),Orderable 23/5 不变,新增必填只涉及 5 个 PT(size 2、汽配 vehicleType 1、
+Precious Metals 2 个字段),判定可以切。顺序是**先拆后切**:新版目录没拆好就
+拉到改了版本串的代码,`pt_spec` 抛 FileNotFoundError、上架链全停(真遇上了:`spec_split -p base=<旧目录>`
+直接拆进 registry 指着的空目录,不手改 registry)。回退:MP_ITEM 改回 0608 一个串只作短期应急 ——
+0608 与 MP_MAINTENANCE 一样已不在官方表上,长期回退版是表上的 0803;MP_MAINTENANCE 不回退(维护载荷
+用到的字段 0829 一字未变)。
+顺带两道换版防呆(`spec_split`):源文件名是别的 feed(同版本号的 MP_MAINTENANCE 原件结构路径
+相同,拆它会成功)直接拒;文件名版本串不在原件 header 的 version enum 里直接拒。**这两道从下一次换版
+起才生效**:这一次在生产机上是拉代码前用旧 spec_split 拆的,文件名与「Orderable 23 / 5」靠人工核。
+兼容修复(第二个提交,详见 `docs/listing_plan.md`「2026-10-25 换 spec 0829 的兼容修复」):
+`mp_conform.evaluate_if` 补 anyOf/allOf/not —— 顺带查出 2026-08-12 起每个商品都多带了
+releaseDate(预售才需要);新字段 `condition_notes` 不交给 LLM;条件必填在类型/枚举纠正后按
+最终形态再判一遍(判对 anyOf 之后露出来的工序缺口,对抗审查实证)。三件都与版本无关,回退旧版
+也不用撤。LLM 缓存:代理口径 1104 个 PT 的提示词随新版字段块变化、各重打一次,系统提示词不变。
+
 ### 2026-10-24 上架「对象数组」字段子字段名靠猜 → 连拒三次;重提后表上回执卡旧值
 
 起因(所有者在上架表看到 feed查询日期 10-04 早于 上架日期 10-06,A109黄威威

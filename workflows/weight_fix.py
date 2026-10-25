@@ -15,7 +15,7 @@
 
 **通道:MP_MAINTENANCE 部分更新**,每条载荷只有三样:sku、productIdentifiers、
 ShippingWeight。依据是官方规范原件(摘录与出处见
-`refdata/specs/MP_MAINTENANCE_5.0.20260703-18_22_27-api.orderable_excerpt.json`):
+`refdata/specs/MP_MAINTENANCE_5.0.20260829-12_49_39-api.orderable_excerpt.json`):
 Orderable 20 个属性里有 `ShippingWeight`(Shipping Weight (lbs),number),必填只有
 sku / productIdentifiers,其余不带就不动 —— **价格、库存、标题都不碰**。
 productIdentifiers 取库里 `catalog.walmart_items.upc`,与维护链改标题同一个形态

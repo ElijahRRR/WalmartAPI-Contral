@@ -437,3 +437,115 @@ def test_conditionally_required_object_array_emptied_blocks_submission():
          "fabricContent": [{"fabricMaterialName": "Polyester"}]},
         {"sku": "S1", "price": 9.9})
     assert "fabricContent" not in v and missing == []
+
+
+# ── 条件必填的 if 组合子(2026-10-25 换 0829):anyOf / allOf / not / contains 对象 ──
+# 下面的 if 子句都是 0829 原件逐字拷贝。此前 evaluate_if 只看 required/properties,
+# 条件整个写在 anyOf/allOf 里的 if 一律判「成立」。
+
+_WRISTWATCH_IF = {"anyOf": [{"properties": {"condition": {
+    "type": "string", "enum": ["Restored Premium"]}}, "required": ["condition"]}]}
+_PREORDER_ANYOF = {"anyOf": [{"properties": {"IsPreorder": {
+    "type": "string", "enum": ["Yes"]}}, "required": ["IsPreorder"]}]}
+_GRADED_ALLOF = {"allOf": [{"properties": {"collectible_grading_type": {
+    "type": "string", "enum": ["Graded"]}}, "required": ["collectible_grading_type"]}]}
+_RACK_MOUNT_IF = {"anyOf": [{"properties": {"mountType": {"type": "array", "contains": {
+    "type": "string", "enum": ["Rack Mount"]}}}, "required": ["mountType"]}]}
+_INVENTORY_QTY_IF = {"properties": {"inventory": {"type": "array", "contains": {
+    "type": "object", "required": ["quantity"]}}}, "required": ["inventory"]}
+
+
+def test_if_anyof_wristwatch_restored_identifier_only_when_restored():
+    """0829 新增:Wristwatches「condition=Restored Premium ⇒ restoredProductIdentifier」。
+    判成恒成立 = 每块全新手表都被填一个空 ID 的 restoredProductIdentifier,必拒。"""
+    spec = {"required": [], "properties": {
+        "condition": {"type": "string", "enum": ["New", "Restored Premium"]},
+        "restoredProductIdentifier": {"type": "object", "properties": {
+            "restoredProductIdType": {"type": "string", "enum": ["GTIN", "UPC"]},
+            "restoredProductId": {"type": "string", "minLength": 1}}}},
+        "allOf": [{"if": _WRISTWATCH_IF,
+                   "then": {"required": ["restoredProductIdentifier"]}}]}
+    assert mc.evaluate_if(_WRISTWATCH_IF, {"condition": "New"}) is False
+    assert mc.evaluate_if(_WRISTWATCH_IF, {"condition": "Restored Premium"}) is True
+    v, notes = mc.fill_known_required(spec, {"condition": "New"})
+    assert "restoredProductIdentifier" not in v and notes == []
+
+
+def test_orderable_release_date_only_for_preorders():
+    """Orderable「IsPreorder=Yes ⇒ releaseDate」:此前判恒成立,每个商品都带
+    releaseDate=当天;现在只有预售才补。"""
+    ospec = {"required": [], "properties": {
+        "sku": {"type": "string"},
+        "IsPreorder": {"type": "string", "enum": ["No", "Yes"]},
+        "releaseDate": {"type": "string", "format": "date-time"}},
+        "allOf": [{"if": _PREORDER_ANYOF, "then": {"required": ["releaseDate"]}}]}
+    for o_in in ({"sku": "S1"}, {"sku": "S1", "IsPreorder": "No"}):
+        o, notes = mc.fill_known_required(ospec, o_in)
+        assert "releaseDate" not in o and notes == []
+    o, _ = mc.fill_known_required(ospec, {"sku": "S1", "IsPreorder": "Yes"})
+    assert o["releaseDate"]
+
+
+def test_if_allof_requires_every_branch():
+    assert mc.evaluate_if(_GRADED_ALLOF, {"collectible_grading_type": "Graded"}) is True
+    assert mc.evaluate_if(_GRADED_ALLOF, {"collectible_grading_type": "Ungraded"}) is False
+    assert mc.evaluate_if(_GRADED_ALLOF, {}) is False
+
+
+def test_if_contains_string_enum_inside_anyof():
+    """CD Recorders:mountType 含 'Rack Mount' ⇒ rackSize(0829 新增)。"""
+    assert mc.evaluate_if(_RACK_MOUNT_IF, {"mountType": ["Rack Mount"]}) is True
+    assert mc.evaluate_if(_RACK_MOUNT_IF, {"mountType": ["Desktop"]}) is False
+
+
+def test_if_contains_object_element_needs_required_subfield():
+    """Orderable 的 inventory:元素是对象且带 quantity 才算「含」。"""
+    assert mc.evaluate_if(_INVENTORY_QTY_IF, {"inventory": [{"quantity": 1}]}) is True
+    assert mc.evaluate_if(_INVENTORY_QTY_IF, {"inventory": [{}]}) is False
+    assert mc.evaluate_if(_INVENTORY_QTY_IF, {"inventory": ["x"]}) is False
+
+
+def test_if_not():
+    clause = {"not": {"required": ["x"]}}
+    assert mc.evaluate_if(clause, {"x": "1"}) is False
+    assert mc.evaluate_if(clause, {}) is True
+
+
+def test_if_unknown_keyword_logged_and_not_restricting(caplog):
+    """spec 换版带来新写法:按不设限处理(与支持前一致),但要记 warning + 计数。"""
+    mc.UNKNOWN_IF_KEYWORDS.pop("oneOf", None)
+    with caplog.at_level("WARNING", logger="services.mp_conform"):
+        assert mc.evaluate_if({"oneOf": [{"required": ["x"]}]}, {}) is True
+        mc.evaluate_if({"oneOf": [{"required": ["x"]}]}, {})
+    assert mc.UNKNOWN_IF_KEYWORDS["oneOf"] == 2
+    assert sum("oneOf" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_conditional_required_rejudged_after_type_and_enum_fixes():
+    """条件必填在工序 1 按 LLM 原值判;工序 2-4 改形/补值后条件才成立的,要按最终
+    形态再判一遍(2026-10-25 对抗审查:anyOf/allOf 判对之后,这个工序缺口不再被
+    「恒成立」盖住 —— ['Yes'] 拆成 'Yes'、缺的必填被兜成 enum[0],then 字段没人填,
+    沃尔玛 72600149546850 拒收,validate 只查顶层必填拦不住)。"""
+    spec = {"required": ["loadPosition"], "properties": {
+        "autographed": {"type": "string", "enum": ["No", "Yes"]},
+        "autographedBy": {"type": "string"},
+        "loadPosition": {"type": "string", "enum": ["Front Load", "Top Load"]},
+        "opening_width": {"type": "string"}},
+        "allOf": [
+            {"if": {"anyOf": [{"properties": {"autographed": {
+                "type": "string", "enum": ["Yes"]}}, "required": ["autographed"]}]},
+             "then": {"required": ["autographedBy"]}},
+            {"if": {"anyOf": [{"properties": {"loadPosition": {
+                "type": "string", "enum": ["Front Load"]}}, "required": ["loadPosition"]}]},
+             "then": {"required": ["opening_width"]}}]}
+    # 错形态的触发值:LLM 给数组,工序 3 拆成标量后条件才成立
+    v, o, notes, missing = mc.conform(spec, {}, {"autographed": ["Yes"],
+                                                  "loadPosition": "Top Load"}, {})
+    assert v["autographed"] == "Yes" and v["autographedBy"]
+    # 触发字段是 LLM 漏给的必填:工序 2 兜成 enum[0] 'Front Load' 后条件才成立
+    v, o, notes, missing = mc.conform(spec, {}, {}, {})
+    assert v["loadPosition"] == "Front Load" and v["opening_width"]
+    # 条件不成立就不补
+    v, o, notes, missing = mc.conform(spec, {}, {"autographed": "No",
+                                                  "loadPosition": "Top Load"}, {})
+    assert "autographedBy" not in v and "opening_width" not in v

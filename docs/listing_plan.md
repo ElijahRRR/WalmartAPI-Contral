@@ -169,6 +169,29 @@ UPC 撞库(运气问题,重试自愈)。所有者判断"上架这块复杂、先
 | 4 | — | `ERR_EXT_DATA_0101119` UPC 撞库 ×2 | 同上,**所有者澄清:撞库只说明该 UPC 号被占,与产品是否已在沃尔玛无关** | 重试自愈(FAILED 行重新排队,上限 3 次) |
 | 5 | 3 | `00030257670757` `[releaseDate]` 要 YYYY-MM-DD(批次二重跑,2026-08-12) | **批次二自伤**:新加的 Orderable 条件必填兜底把日期字段当普通字符串填了 'Not Available' | 日期字段感知(`_date_kind`:format 显式严格/名字推断两格式都认——endDate 要 DateTime 是同码反向实证)+ fix_type_mismatches 日期硬闸 + 提示词送 format |
 
+#### 2026-10-25 换 spec 0829 的兼容修复(上表第 5 轮那行不改,这里续记)
+
+- `mp_conform.evaluate_if` 补 anyOf / allOf / not 与「contains 对象元素」:此前只看
+  required/properties,条件整个写在 anyOf/allOf 里的 if 一律判「成立」。后果有三:
+  ① Orderable「IsPreorder=Yes ⇒ releaseDate」恒成立 —— 2026-08-12 起**每个**上架
+  商品都带着 releaseDate=当天(第 5 轮修的是它的格式,没发现它本不该出现),
+  现在只有预售才带;② 0829 新增的 Wristwatches「condition=Restored Premium ⇒
+  restoredProductIdentifier」会给每块全新手表填一个空 ID 必拒;③ 约 60 个 PT 的
+  签名/鉴定/prop65/证书类字段被占位值填上(autographedBy、grading_company 等)。
+  0829 全量 6973 个 PT 空 LLM 产出实测:新增不合规 0、新增拦截 0,Wristwatches 转好;
+  0703 同样 0 回退(回退旧版时这条不用撤)。spec 再出新的条件写法:按不设限处理
+  (与支持前一致)+ 首次出现记 warning、计数在 `UNKNOWN_IF_KEYWORDS`。
+- 条件必填在工序 2-4(必填兜底 / 类型纠正 / 枚举纠正)之后按最终形态**再判一遍**
+  (`_refill_conditional`,补了再过一遍类型与枚举)。判对 anyOf/allOf 之后,这个工序缺口
+  不再被「恒成立」盖住:LLM 给 autographed=['Yes'] 被拆成 'Yes'、漏给的必填
+  loadPosition 被兜成 'Front Load',条件在最终载荷里成立,then 字段却没人填 → 72600149546850。
+  0829 全量(空产出 6973 例 + 错形态触发 142 例)对比 origin/main:新增未拦错误 0;
+  42 例改为本地拦截(origin/main 照发、沃尔玛必拒,现在省 UPC)。
+- `condition_notes`(0829 新增,3454 个 PT 可选,minLength 25,二手/翻新成色说明):
+  不交给 LLM(`mp_mapper.VISIBLE_LLM_SKIP`,提示词与复用签名同口径),LLM 写了
+  `finalize_visible` 也丢。故意不并进 SYSTEM_OWNED_FIELDS(那个元组拼进系统提示词,
+  改它 = 全部 PT 缓存作废)。
+
 #### 攻坚期沉淀下来的通用设施(已惠及全部 feed 类型)
 
 - `ops.feed_item_errors`(一条报错一行,含 **field**)+ `ops.v_feed_error_stats`

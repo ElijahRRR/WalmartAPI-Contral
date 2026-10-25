@@ -218,8 +218,12 @@ python cli.py catmap_align                        # 路径别名对齐(无 ID �
 - **9 个准入漏了的汽配 PT 待所有者填飞书**:`pt_census` 已把清单落到
   `pt_待补准入明细.csv`(Category/PTG 按同路径兄弟或名字最近邻给了建议,
   弱依据的已标注)。所有者在飞书「沃尔玛类目表」补齐**准入状态 / 中国卖家
-  可做**两列后跑 `python cli.py risk_sync` 生效。当前 `pt_census` 已与官方
-  MP_ITEM spec 对齐到 6,951,只剩这 9 条。
+  可做**两列后跑 `python cli.py risk_sync` 生效。截至 0608(2026-08-20)`pt_census`
+  已与官方 MP_ITEM spec 对齐到 6,951,只剩这 9 条。
+  **2026-10-25 换 0829 后**:新版多出来 22 个 PT(所有者机器实测 0608→0829,零消失;
+  样例多为汽配,如 Automotive Air Conditioning Evaporators;其中 0703→0829 段的 6 个是
+  Fashion Cover-Ups、Scarves、Fresh/Frozen Fruits、Fresh/Frozen Vegetables),同样会被
+  `pt_census` 判成「准入漏了」,按同一办法补飞书准入明细(准入状态不许留空)。
 
 ## 置信度生命周期:机器自动降档 + LLM 兜底 + 自动升档(2026-08-14 定稿)
 

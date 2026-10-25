@@ -140,7 +140,9 @@ _EIGHT = ["标题", "9.9", 3, "19.9", "Yes", "F1", "2026-10-20", ""]
 
 
 def test_list_new_submit_write_is_one_request_for_two_thousand_rows(monkeypatch):
-    """list_new 回写提交结果:标题(D)+ amz价~未上架理由(J:P)两段。
+    """list_new 回写提交结果:标题(D)+ amz价~feed查询日期(J:S)两段。
+
+    提交成功的行同一次清掉回执三列(Q:S,2026-10-24),与 J:P 相邻、粘在同一段。
 
     改前逐行交错,2000 行 40 个请求;分组后 1 个请求(4000 行,在 4750 预算内)。
     含 SKU 的行 SKU 与标题相邻,粘成 C:D 段,与不带 SKU 的行各自成段。
@@ -148,7 +150,7 @@ def test_list_new_submit_write_is_one_request_for_two_thousand_rows(monkeypatch)
     rows = range(2, 2002)
     batches = _listing_requests(monkeypatch, lambda: listing_sheet.write_submit_cols(
         [(r, _EIGHT + ["A0X1Y2Z3W4V5"]) for r in rows]))
-    assert batches == [["C2:D2001", "J2:P2001"]]
+    assert batches == [["C2:D2001", "J2:S2001"]]
     batches = _listing_requests(monkeypatch, lambda: listing_sheet.write_data_cols(
         [(r, ["标题", "9.9", 3, "19.9"]) for r in rows]))
     assert batches == [["D2:D2001", "J2:L2001"]]

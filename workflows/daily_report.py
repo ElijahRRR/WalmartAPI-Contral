@@ -2,9 +2,9 @@
 
 用法:
   python cli.py daily_report                       # **默认全链**:kpi(含影刀)→ board → 推送飞书
-  python cli.py daily_report -p phase=kpi          # 只采集 KPI
+  python cli.py daily_report -p phase=kpi          # 采集 KPI(**默认含影刀**,社区版/创业版每次扣一次影刀额度)
+  python cli.py daily_report -p phase=kpi -p yingdao=0      # 只采集 KPI,不接影刀
   python cli.py daily_report -p phase=kpi -p yingdao=input  # 只产出影刀输入清单,不触发影刀
-  python cli.py daily_report -p phase=kpi -p yingdao=1   # 含影刀链(停旧调度后才可开)
   python cli.py daily_report -p phase=board [-p days=90]   # 只刷 KPI 看板(总览+历史)
   python cli.py daily_report -p phase=push -p push=1   # 生成日报并真正推送(飞书 webhook)
   python cli.py daily_report -p store=A085朱丽霖    # 单店(kpi 阶段)
@@ -35,8 +35,9 @@ report 端点,xlsx)+ 订单中心 perf_events 归 `workflows/perf_problems.py`,
   services/yingdao)→ 核对 latest.json 新鲜 → 回填当日卖家名称/销售状态。
   **不再经飞书**:原「先把总览写飞书 → 影刀读飞书拿 sellerId」已删,新影刀
   应用直接读 paths.yingdao_input_file()。`-p yingdao=input` 是接入调试档:
-  只产出清单不触发影刀,旧调度还开着时也能安全跑。默认关:切换期仍由旧系统 8 点驱动影刀,
-  **停旧 walmart-kpi-daily 之前严禁开启**(两边各触发一次互抢,新鲜度校验会
+  只产出清单不触发影刀,旧调度还开着时也能安全跑。默认开(所有者定稿 2026-08-16;
+  社区版/创业版账号每提交一次扣一次每日额度,人工补跑也算),
+  **旧 walmart-kpi-daily 没停之前必须显式 -p yingdao=0 或 input**(两边各触发一次互抢,新鲜度校验会
   反复失败到超时);未开/超时时只读现有 latest.json(新鲜才用销售状态;
   卖家名称允许 stale 补 + 跨日延续)
 - **默认全链**(所有者定稿 2026-08-16 走进生产):不带参数 = kpi(含影刀)+ 看板 +

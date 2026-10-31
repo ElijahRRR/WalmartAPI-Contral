@@ -124,6 +124,22 @@ def test_health_is_unauthenticated_and_detects_a_stale_file(instance, transport)
         yd.health()
 
 
+def test_non_shadowbot_listener_on_a_stale_port_reads_as_unreachable(instance, transport):
+    """客户端非正常退出后发现文件残留,端口(优先 5000)被别的程序占着 —— macOS 的
+    隔空播放接收器就在 5000,回 403 空体。真影刀的 health 永远回信封,所以"不是信封"
+    必须按连不上报:报成「未就绪」的话 kickstart 永远不会发生,天天卡在这里。"""
+    transport["routes"][("GET", "/api/v1/system/health")] = \
+        lambda r: httpx.Response(403, content=b"")
+    with pytest.raises(yd.YingdaoUnreachable, match="不是影刀"):
+        yd.health()
+    assert yingdao.check_ready(UUID).verdict == yingdao.V_DOWN      # → 会去 kickstart
+    # 真影刀回的错误信封(比如过载 503/4091)仍是"起来了但没准备好",不拉起
+    transport["routes"][("GET", "/api/v1/system/health")] = lambda r: httpx.Response(
+        503, json={"code": 4091, "message": "too many local API requests", "data": None})
+    with pytest.raises(yd.YingdaoApiError):
+        yd.health()
+
+
 def test_business_errors_come_back_as_http_200_and_are_still_errors(instance, transport):
     transport["routes"][("GET", "/api/v1/auth/current")] = lambda r: httpx.Response(
         200, json={"code": 4011, "message": "ShadowBot is not logged in", "data": None})
@@ -348,6 +364,37 @@ def test_ambiguous_submit_is_never_resubmitted_and_is_reconciled(env):
     res = yingdao.run_robot(env["trigger"])
     assert len(env["fake"].submits) == 1
     assert res.ok and res.task_id == "t-late" and "对账找到了任务" in res.detail
+
+
+@pytest.mark.parametrize("err", [
+    yd.YingdaoNoResponse("ReadTimeout"),
+    yd.YingdaoApiError(200, 4091, "The desktop client did not respond in time. Try again."),
+    yd.YingdaoApiError(200, 4091, "The desktop client became unavailable. Try again."),
+    {"accepted": True},                         # code 0 却没有 taskId
+], ids=["no-response", "did-not-respond", "became-unavailable", "no-task-id"])
+def test_every_ambiguous_submit_is_submitted_exactly_once(env, monkeypatch, err):
+    """⚠ 红线:四种"可能已建任务"的情形,任何一种被改成可重提都要在这里变红。"""
+    monkeypatch.setenv("YINGDAO_TIMEOUT_SEC", "60")
+    env["fake"].submit_seq = [err, {"accepted": True, "taskId": "t-2"}]
+    res = yingdao.run_robot(env["trigger"])
+    assert res.verdict == yingdao.V_UNKNOWN and len(env["fake"].submits) == 1
+
+
+@pytest.mark.parametrize("err", [
+    yd.YingdaoApiError(503, 4091, "too many local API requests"),
+    yd.YingdaoApiError(403, 4031, "invalid local API token"),       # 客户端重启,令牌已换
+], ids=["503", "token-changed"])
+def test_gateway_rejections_never_reached_the_renderer_and_may_resubmit(env, err):
+    env["fake"].submit_seq = [err, {"accepted": True, "taskId": "t-2"}]
+    _fresh(env)
+    res = yingdao.run_robot(env["trigger"])
+    assert res.ok and res.task_id == "t-2" and len(env["fake"].submits) == 2
+
+
+def test_other_403_is_a_rejection_not_a_retry_loop(env):
+    env["fake"].submit_seq = [yd.YingdaoApiError(403, 4031, "API is disabled by security policy")]
+    res = yingdao.run_robot(env["trigger"])
+    assert res.verdict == yingdao.V_REJECTED and len(env["fake"].submits) == 1
 
 
 def test_no_response_without_trace_ends_as_unknown_not_resubmitted(env, monkeypatch):

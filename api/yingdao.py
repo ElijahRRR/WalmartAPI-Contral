@@ -141,12 +141,22 @@ def _call(inst: dict, method: str, path: str, *, auth: bool = True,
 def health() -> dict:
     """输入:无 → 输出:{instanceId, pid, port}(免鉴权;核对发现文件是不是活的那份)。
 
-    客户端崩溃 / kill -9 后发现文件会残留,端口上可能已是别的东西:
-    回应里的 instanceId 与文件对不上 = 旧文件,按"连不上"报。
+    客户端崩溃 / kill -9 / 自己 app.exit 后发现文件会残留(只有正常退出才删),
+    端口上可能已是别的东西 —— 5000 是它优先选的端口,macOS 的隔空播放接收器
+    也在 5000 上。两种都按"连不上"报,调用方才会去拉起客户端:
+      · 回的不是信封(code 为空:HTML、空体、别家 JSON)= 端口上不是影刀。
+        真影刀的 health 由主进程直接回、免鉴权、不经渲染进程,永远是信封;
+      · 是信封但 instanceId 与文件对不上 = 别的影刀实例,文件是旧的。
     """
     inst = _instance()
-    data = _call(inst, "GET", "/api/v1/system/health", auth=False) or {}
-    if data.get("instanceId") != inst.get("instanceId"):
+    try:
+        data = _call(inst, "GET", "/api/v1/system/health", auth=False) or {}
+    except YingdaoApiError as e:
+        if e.code is None:
+            raise YingdaoUnreachable(f"端口 {inst['port']} 上不是影刀(HTTP {e.http_status},"
+                                     "发现文件是旧的)") from None
+        raise
+    if not isinstance(data, dict) or data.get("instanceId") != inst.get("instanceId"):
         raise YingdaoUnreachable("发现文件与正在监听的实例对不上(旧文件残留)")
     return {"instanceId": data.get("instanceId"), "pid": data.get("pid"),
             "port": inst["port"]}

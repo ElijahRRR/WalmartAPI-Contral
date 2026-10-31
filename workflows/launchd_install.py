@@ -127,10 +127,14 @@ def _yingdao_lines(dest: Path, log_dir: Path) -> list[str]:
     return out + [
         f"  已写 {p}",
         "  ⚠ plist 内容 2026-10-31 改过(去掉了旧的运行协议参数),旧的已装载就先卸再装:",
+        "     ⚠ unload 会让由这个代理拉起的影刀**一起退出**(连同它正在跑的任务),"
+        "别在机器人运行时做",
         f"     launchctl unload -w {p}",
         f"     launchctl load -w {p}",
+        f"     launchctl kickstart gui/$(id -u)/{launchd.YINGDAO_LABEL}"
+        "   # 不带 -k;load 不会自己拉起(RunAtLoad=false)",
         "  ⚠ **必须在图形登录会话里 load**(plist 声明 LimitLoadToSessionType=Aqua):",
         "     ssh 进去 load 会装不上,症状是日报那边报「客户端没开」+ kickstart 退非 0。",
-        f"  自检:先退出影刀,再 launchctl kickstart gui/$(id -u)/{launchd.YINGDAO_LABEL}"
-        " —— 影刀应当打开;然后 python cli.py yingdao_probe 看本地接口通不通",
+        "  自检:kickstart 后影刀应当打开;等它自动登录完,"
+        "python cli.py yingdao_probe 看本地接口通不通",
     ]

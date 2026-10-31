@@ -73,10 +73,15 @@
 
 上线步骤(**都在那台 Mac 的图形会话里做**;旧 `walmart-kpi-daily` 必须已停):
 
+⚠ `unload` 会让由这个代理拉起的影刀**一起退出**(连同它正在跑的任务)——别在机器人
+运行时做;`load` 不会自己拉起它(RunAtLoad=false),所以装回后要 kickstart 一次。
+
 ```bash
 python cli.py launchd_install              # 重写影刀代理 plist(去掉了协议参数)
 launchctl unload -w ~/Library/LaunchAgents/com.walmartapi.yingdao.plist
 launchctl load -w ~/Library/LaunchAgents/com.walmartapi.yingdao.plist
+launchctl kickstart gui/$(id -u)/com.walmartapi.yingdao   # 不带 -k;把影刀拉起来
+# 等影刀打开并自动登录完(几十秒)再往下
 python cli.py yingdao_probe                # 只读体检:每一项都该是 ✓,结论「可以提交」
 python cli.py daily_report -p phase=kpi -p yingdao=input   # 生成新 input.json
 python cli.py yingdao_probe -p run=1       # 真提交一次(扣一次额度),看结论是不是「成功」
@@ -92,7 +97,8 @@ python cli.py yingdao_probe -p run=1       # 真提交一次(扣一次额度),�
 **别开着设计器 Studio**(报「客户端忙」)。
 ⚠ 额度:社区版 / 创业版账号**每提交一次扣一次**云端每日额度(官方口径个人版每天
 5 次;旧协议不计额度)。日报主跑、人工补跑、`yingdao_probe -p run=1` 都算。
-⚠ 影刀会自动更新;体检里版本那一行不是 ✓ 时,先跑一遍体检再看日报。
+⚠ 影刀会自动更新;日报摘要里出现「接口不匹配」或「影刀 x.y.z 不在验证过的版本里」时,
+先跑 `yingdao_probe` 看是哪一项变了,再决定要不要改代码。
 
 ## 四、配送时长限制(已落地)
 

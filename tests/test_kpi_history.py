@@ -370,31 +370,31 @@ def test_yingdao_mode_rejects_unknown_value():
         dr._yingdao_mode("inupt")
 
 
-def test_yingdao_input_mode_writes_list_without_spawning(monkeypatch, tmp_path):
-    """接入调试档:清单要真写出来,但一次都不许 spawn。
+def test_yingdao_input_mode_writes_list_without_running(monkeypatch, tmp_path):
+    """接入调试档:清单要真写出来,但一次都不许触发影刀。
 
-    旧 walmart-kpi-daily 还开着时就靠这一条 —— spawn 了就是双 spawn 互抢,
+    旧 walmart-kpi-daily 还开着时就靠这一条 —— 触发了就是两边各跑一次互抢,
     会把旧系统那次影刀的新鲜度校验搅到超时。
     """
     from workflows import daily_report as dr
     monkeypatch.setenv("YINGDAO_INPUT_JSON", str(tmp_path / "input.json"))
-    monkeypatch.setattr(dr.yingdao, "spawn",
-                        lambda: (_ for _ in ()).throw(
-                            AssertionError("yingdao=input 不许 spawn")))
-    out = dr._yingdao_refresh(_rows_for_input(), "2026-08-15", do_spawn=False)
-    assert "输入清单 3 店" in out and "未 spawn" in out
+    monkeypatch.setattr(dr.yingdao, "run_robot",
+                        lambda trigger: (_ for _ in ()).throw(
+                            AssertionError("yingdao=input 不许触发影刀")))
+    out = dr._yingdao_refresh(_rows_for_input(), "2026-08-15", do_run=False)
+    assert "输入清单 3 店" in out and "未触发影刀" in out
     assert "⚠ 状态为空仍纳入 1 店" in out       # 警戒计数必须进摘要,不能只在日志
     data = json.loads((tmp_path / "input.json").read_text(encoding="utf-8"))
     assert data["count"] == 3
 
 
-def test_yingdao_refresh_skips_spawn_when_no_store_left(monkeypatch, tmp_path):
-    """全店 sellerId 都为空 → 清单是空的,不该再 spawn 影刀去抓个寂寞。"""
+def test_yingdao_refresh_skips_run_when_no_store_left(monkeypatch, tmp_path):
+    """全店 sellerId 都为空 → 清单是空的,不该再触发影刀去抓个寂寞(还白扣额度)。"""
     from workflows import daily_report as dr
     monkeypatch.setenv("YINGDAO_INPUT_JSON", str(tmp_path / "input.json"))
-    monkeypatch.setattr(dr.yingdao, "spawn",
-                        lambda: (_ for _ in ()).throw(
-                            AssertionError("没店可抓就不该 spawn")))
+    monkeypatch.setattr(dr.yingdao, "run_robot",
+                        lambda trigger: (_ for _ in ()).throw(
+                            AssertionError("没店可抓就不该触发影刀")))
     out = dr._yingdao_refresh([{"store": "空号店", "seller_id": "",
                                 "store_status": None, "payment_status": None}],
                               "2026-08-15")

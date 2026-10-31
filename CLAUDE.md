@@ -89,7 +89,7 @@ python cli.py skill_export              # 改 registry/schedule.py 后重新生�
 cli.py          唯一入口(锁/日志/运行记录/通知/链尾重赛)
 registry/       接线盒:resources.py(表与字段) paths.py(路径) db.py(连接) schedule.py(调度表)
 api/            外部接口适配:_client, items, prices, inventory, orders,
-                returns, feeds, reports, insights, feishu, scraper
+                returns, feeds, reports, insights, feishu, scraper, yingdao
 services/       跨 workflow 复用积木(先查重再新增)
 workflows/      每文件一个 run(),对应一条业务工作流
 refdata/        只读参考资料(schema.sql、walmart_rate_limits.tsv 等);

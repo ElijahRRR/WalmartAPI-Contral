@@ -111,18 +111,35 @@ def yingdao_input_file() -> Path:
 
 
 def yingdao_app() -> Path:
-    """输入:无 → 输出:影刀主程序可执行文件路径(spawn 直启用)。
+    """输入:无 → 输出:影刀主程序可执行文件路径(写进 launchd 代理的 plist)。
 
-    env YINGDAO_APP 覆盖。为什么是主程序不是 `open <协议URL>`(2026-08-24
-    生产实证):调度沙箱里 `open` 要经 macOS Launch Services 分发协议,正好
-    被沙箱边界拦下退 1;旧 walmart-kpi-daily 一直是拿主程序绝对路径直启的,
-    旧日志证明这条路能正常拉起 Runner 窗口。协议 URL 作为 argv 传给主程序,
-    语义与 `open` 相同,只是不再绕 Launch Services。
+    env YINGDAO_APP 覆盖。它**只负责把客户端拉起来**,不带任何参数:
+    2026-10-31 起「跑哪个机器人」改走本地任务接口(api/yingdao),
+    1.22.x 已删掉 `shadowbot:Run` 协议(见 services/yingdao 模块头注)。
     """
     override = os.environ.get("YINGDAO_APP", "").strip()
     if override:
         return Path(override).expanduser()
     return Path("/Applications/影刀.app/Contents/MacOS/影刀")
+
+
+def yingdao_instance_file() -> Path:
+    """输入:无 → 输出:影刀本地接口的发现文件 instance.json 路径。
+
+    影刀 1.22.x 客户端起来后把本地接口的端口、令牌、进程号写进这个文件
+    (官方 1.22.20 安装包代码实读,2026-10-31):根目录先取 `$APPDATA`,
+    没设就是 `~/Library/Application Support`,后接 `Shadowbot/shadowbot-cli/`。
+    ⚠ 不是 `~/Library/Application Support/影刀/`(那是 Electron 自己的目录)。
+    每次客户端重启端口与令牌都会换,所以调用方每次用前重读,不许缓存。
+    env YINGDAO_INSTANCE_JSON 覆盖(现场路径对不上时用,不要改代码)。
+    """
+    override = os.environ.get("YINGDAO_INSTANCE_JSON", "").strip()
+    if override:
+        return Path(override).expanduser()
+    root = os.environ.get("APPDATA", "").strip()
+    base = Path(root).expanduser() if root else \
+        Path.home() / "Library" / "Application Support"
+    return base / "Shadowbot" / "shadowbot-cli" / "instance.json"
 
 
 def audit_seed_file(name: str) -> Path:

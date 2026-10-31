@@ -86,6 +86,8 @@ def run(params: dict) -> str:
     if not execute:
         lines += ["", "(dry-run:未写任何文件;去掉 --dry-run 才落盘)",
                   "落盘后按批执行:"] + _load_cmds(jobs)
+        lines += ["", f"另写影刀启动代理 {dest}/{launchd.YINGDAO_LABEL}.plist"
+                  f"(只拉起 {paths.yingdao_app()},不带参数;落盘后先卸再装)"]
         return "\n".join(lines)
 
     dest.mkdir(parents=True, exist_ok=True)
@@ -104,29 +106,31 @@ def run(params: dict) -> str:
 
 
 def _yingdao_lines(dest: Path, log_dir: Path) -> list[str]:
-    """影刀启动代理:落盘 + 给出 load 命令(**不定时**,只等 kickstart)。
+    """影刀启动代理:落盘 + 给出(重新)装载命令(**不定时**,只等 kickstart)。
 
-    它不在调度表里 —— 它没有时间点,是 daily_report 写完 input.json 之后
-    按需 kickstart 的一个跳板。存在的唯一理由是**跨越进程上下文**:
+    它不在调度表里 —— 它没有时间点,只在影刀本地接口探活失败时被
+    services/yingdao 按需 kickstart。存在的唯一理由是**跨越进程上下文**:
     日报链跑在智能体上下文里,那里没有 Aqua session,直接 spawn 影刀
     必崩(2026-09-01 崩溃报告实证);launchd 的 gui/<uid> 有,所以让它代劳。
+    它只负责拉起客户端;跑哪个机器人走本地任务接口(2026-10-31 起)。
     """
-    uuid = os.environ.get("YINGDAO_ROBOT_UUID", "").strip()
     app = paths.yingdao_app()
-    out = ["", "── 影刀启动代理(不定时,只等 daily_report 按需 kickstart)──"]
-    if not uuid:
-        return out + ["  ⚠ YINGDAO_ROBOT_UUID 未配置,跳过 —— 配好再跑一次本工作流"]
+    out = ["", "── 影刀启动代理(不定时,只在客户端没开时被 kickstart 拉起)──"]
     p = Path(dest) / f"{launchd.YINGDAO_LABEL}.plist"
-    p.write_bytes(launchd.render_yingdao(str(app), uuid, log_dir))
+    p.write_bytes(launchd.render_yingdao(str(app), log_dir))
     logger.info("写 %s", p)
     if not app.exists():
         out.append(f"  ⚠ 影刀主程序不在 {app}(装在别处就设 env YINGDAO_APP "
                    f"后重跑本工作流;plist 里那条路径是写死的)")
+    if not os.environ.get("YINGDAO_ROBOT_UUID", "").strip():
+        out.append("  ⚠ YINGDAO_ROBOT_UUID 未配置:代理照写,但日报提交任务时会报「未配置」")
     return out + [
         f"  已写 {p}",
-        f"  launchctl load -w {p}",
+        "  ⚠ plist 内容 2026-10-31 改过(去掉了旧的运行协议参数),旧的已装载就先卸再装:",
+        f"     launchctl unload -w {p}",
+        f"     launchctl load -w {p}",
         "  ⚠ **必须在图形登录会话里 load**(plist 声明 LimitLoadToSessionType=Aqua):",
-        "     ssh 进去 load 会装不上,而症状是日报那边 kickstart 退非 0。",
-        f"  自检:launchctl kickstart -k gui/$(id -u)/{launchd.YINGDAO_LABEL}"
-        " —— 影刀应当弹出 Runner 窗口",
+        "     ssh 进去 load 会装不上,症状是日报那边报「客户端没开」+ kickstart 退非 0。",
+        f"  自检:先退出影刀,再 launchctl kickstart gui/$(id -u)/{launchd.YINGDAO_LABEL}"
+        " —— 影刀应当打开;然后 python cli.py yingdao_probe 看本地接口通不通",
     ]

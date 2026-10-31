@@ -9,7 +9,7 @@
 python cli.py <workflow> [-p key=value ...] [--dry-run]
 ```
 
-- **86 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
+- **87 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
   类目映射、店铺分配、KPI 日报八个业务域;
 - **13 条自动任务**在生产运行(电脑 launchd 4 条高频 + 智能体定时任务 9 条每日/每周);
 - **PostgreSQL 17** 单库五 schema(56 表 / 14 视图)为唯一权威状态;
@@ -96,6 +96,7 @@ api/          按外部系统与沃尔玛 API 域分文件,只做接口适配
               │                reports insights settings
               ├─ feishu.py    多维表格 + 电子表格(批量/串行写/重试)
               ├─ scraper.py   亚马逊采集服务
+              ├─ yingdao.py   影刀客户端本地任务接口(仅 macOS 生产机)
               └─ llm.py / llm_vision.py
                               │
 registry/     接线盒:全项目唯一允许出现 token / 表 ID / 路径 / 地址的地方
@@ -263,7 +264,7 @@ V4.1 Flash 顶替、按 Flash 计费 —— 也就是今天不报错,但拿回�
 (2026-09-10 由 `"flash" in model` 子串匹配改来 —— 缺省模型切成 v4-pro 的那一刻
 子串门控整条失效,而那正是它最该生效的时候);表里没有的模型不下发该字段并
 点名警告一次。
-| **影刀 RPA** | 日报的店铺状态抓取 | 仅生产 macOS 有效;文件交接(`input.json` / `latest.json`)。⚠ 启动**必须经 launchd 代理**(`com.walmartapi.yingdao`,`launchd_install` 落盘后在图形会话里 `launchctl load -w`):日报链跑在智能体上下文里,没有 Aqua GUI session,直接 spawn 会在 `_RegisterApplication` 崩溃(2026-09-01 实证) |
+| **影刀 RPA** | 日报的店铺状态抓取 | 仅生产 macOS 有效;文件交接(`input.json` / `latest.json`)。**两段各管一件事**:① 客户端没开时经 launchd 代理拉起(`com.walmartapi.yingdao`,`launchd_install` 落盘后在图形会话里 `launchctl load -w`;日报链跑在智能体上下文里,没有 Aqua GUI session,直接 spawn 会在 `_RegisterApplication` 崩溃,2026-09-01 实证)② 跑哪个机器人走客户端**本地任务接口**(`api/yingdao`:提交拿 taskId → 跟踪到终态 → 核对 `latest.json` 新鲜)。⚠ 影刀 1.22.x 删了 `shadowbot:Run` 协议(2026-10-31 事故),整条不留回退;体检用 `yingdao_probe`。社区版/创业版账号每提交一次扣一次每日额度 |
 | **USPTO 商标库** | **本仓当前无消费方**(2026-09-03 C 批删了 L2 R5 商标反查;连接登记 `registry/db.uspto_conn` 保留待重建) | 跨库只读 |
 
 ---
@@ -472,7 +473,8 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 
 | 工作流 | | 做什么 |
 |---|---|---|
-| `daily_report` | 调 | 店铺日报:KPI 指标 + 影刀店铺状态 + 看板两页 + 真发日报。`-p yingdao=0` / `-p push=0` 可关 |
+| `daily_report` | 调 | 店铺日报:KPI 指标 + 影刀店铺状态 + 看板两页 + 真发日报。`-p yingdao=0` / `-p push=0` 可关;影刀没跑成时摘要点名卡在哪一类(没开/未登录/被拒/跑挂/没写出…)并带 taskId |
+| `yingdao_probe` | | 影刀本地任务接口体检,**默认只读**:发现文件、探活、版本、登录与账号等级、模式与队列、应用类型核对,最后给"能不能提交"的结论(令牌不打印)。`-p run=1` 走日报同一条路径真提交一次(扣一次额度) |
 | `store_watch` | 调 | 店铺事件账本(`ops.store_events`)的**唯一推送出口**:每小时扫未推送高危 → 一轮一条飞书 → 标已推;顺带比对治理配置快照。`-p seed=1` 首次上线吞存量,`-p hours` / `-p limit` 调窗口与单轮上限 |
 | `kpi_history_import` | 一 | 旧「店铺KPI」飞书历史 → `ops.store_kpi_daily` |
 

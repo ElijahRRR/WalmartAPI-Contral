@@ -7,7 +7,6 @@ from datetime import datetime, timezone
 import httpx
 import openpyxl
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -369,101 +368,43 @@ def test_cli_default_is_execute_not_dry_run():
     assert c.dry_run is False and c.execute is True      # 兼容别名不报错
 
 
-# ── 影刀 spawn:直启主程序,不走 open(2026-08-24 生产实证)──────────────────
+# ── 影刀:launchd 只拉起客户端,运行走本地任务接口(2026-10-31)────────────────
+# 提交/跟踪/判定的细节测试在 tests/test_yingdao.py;这里只钉日报这一侧的接线。
 
-class _Run:
-    """subprocess.run 的桩:记 argv,按 rc 决定成败。"""
-
-    def __init__(self, rc=0):
-        self.rc, self.calls = rc, []
-
-    def __call__(self, argv, **kw):
-        self.calls.append(argv)
-        return SimpleNamespace(returncode=self.rc, stdout="", stderr="boom")
-
-
-def test_yingdao_spawn_hands_off_to_launchd_never_spawns_the_app_itself(
-        monkeypatch, tmp_path):
-    """⚠ 影刀**不能由本进程直接 spawn** —— 2026-09-01 生产崩溃报告实证
-    (incident 6B391891):日报链 runner=gpt,进程在智能体上下文里
-    (coalitionName=com.openai.codex / responsibleProc=ChatGPT /
-    procRole=Unspecified),没有 Aqua GUI session;影刀是 Electron/AppKit
-    应用,启动要向 LaunchServices 注册 ⇒ `_RegisterApplication` → abort()
-    → SIGABRT。同一条命令在终端手敲完全正常。
-
-    2026-08-24 那次 `open` 退 1 是**同一个根因的另一种表现**(分发被拦),
-    当时换成直启主程序 = 换汤不换药。argv 怎么写都救不了 —— 启动必须由
-    本来就在 Aqua session 里的东西发起,launchd 的 gui/<uid> 域就是它。
-
-    所以这里钉的是:发出去的是 launchctl kickstart,**而不是影刀本身**。
-    """
-    from services import launchd, yingdao
-
-    app = tmp_path / "影刀"
-    app.write_text("")
-    monkeypatch.setenv("YINGDAO_APP", str(app))
-    monkeypatch.setenv("YINGDAO_ROBOT_UUID", "abc-123")
-    run = _Run()
-    monkeypatch.setattr(yingdao.subprocess, "run", run)
-    monkeypatch.setattr(yingdao.os, "getuid", lambda: 501)
-
-    assert yingdao.spawn() is True
-    assert run.calls == [["launchctl", "kickstart", "-k",
-                          f"gui/501/{launchd.YINGDAO_LABEL}"]]
-    # 影刀主程序**不出现在任何 argv 里**:它由 plist 启动,不由我们启动
-    assert str(app) not in " ".join(run.calls[0])
-    # -k 不能省:影刀已在跑时重复触发会让 wait_fresh 的新鲜度校验反复失败
-    assert "-k" in run.calls[0]
-
-
-def test_yingdao_spawn_reports_a_missing_agent_instead_of_pretending(
-        monkeypatch, tmp_path):
-    """kickstart 退非 0(最常见 = 代理没装)⇒ 返回 False 并把补救路径写进日志。
-
-    静默返回 True 的话,wait_fresh 会白等 10 分钟再降级用旧数据,而摘要
-    看起来一切正常 —— 那正是这条链此前"每天不跑却报成功"的形态。
-    """
-    from services import yingdao
-
-    app = tmp_path / "影刀"
-    app.write_text("")
-    monkeypatch.setenv("YINGDAO_APP", str(app))
-    monkeypatch.setenv("YINGDAO_ROBOT_UUID", "abc-123")
-    monkeypatch.setattr(yingdao.subprocess, "run", _Run(rc=3))
-    monkeypatch.setattr(yingdao.os, "getuid", lambda: 501)
-    assert yingdao.spawn() is False
-
-
-def test_yingdao_spawn_fails_closed_without_binary_or_uuid(monkeypatch, tmp_path):
-    """主程序不存在 / UUID 未配置 → 返回 False 且**不发起任何进程**。
-
-    没有第二条启动路兜底:直启那条在调度里恒崩,兜它 = 每天多制造一份
-    崩溃报告,而且"哪条路在跑"从此变成猜谜。
-    """
-    from services import yingdao
-
-    run = _Run()
-    monkeypatch.setattr(yingdao.subprocess, "run", run)
-    monkeypatch.setenv("YINGDAO_APP", str(tmp_path / "不存在"))
-    monkeypatch.setenv("YINGDAO_ROBOT_UUID", "abc-123")
-    assert yingdao.spawn() is False
-    monkeypatch.setenv("YINGDAO_ROBOT_UUID", "")
-    assert yingdao.spawn() is False
-    assert run.calls == []
-
-
-def test_yingdao_agent_plist_is_session_scoped_and_untimed():
-    """代理必须 ①声明 Aqua 会话(否则又是没有 GUI session 那个崩)
-    ②**不带时间点**(它不是定时任务,只等 daily_report 写完 input.json 后
-    kickstart —— 自己定时会读到隔夜的清单,新鲜度保证就没了)。
+def test_yingdao_agent_plist_is_session_scoped_untimed_and_argless():
+    """代理必须 ①声明 Aqua 会话(否则又是没有 GUI session 那个崩,2026-09-01)
+    ②**不带时间点**(它不定时,只在客户端没开时被 kickstart)
+    ③**只有主程序、不带任何参数**:影刀 1.22.x 删了 `shadowbot:Run` 协议,
+    带着它也只会被记一行日志后忽略(2026-10-31 事故),运行改走本地任务接口。
     """
     import plistlib
 
     from services import launchd
 
-    body = plistlib.loads(launchd.render_yingdao(
-        "/Applications/影刀.app/Contents/MacOS/影刀", "u-1", Path("/tmp")))
+    app = "/Applications/影刀.app/Contents/MacOS/影刀"
+    body = plistlib.loads(launchd.render_yingdao(app, Path("/tmp")))
     assert body["LimitLoadToSessionType"] == "Aqua"
     assert "StartCalendarInterval" not in body
     assert body["RunAtLoad"] is False and body["KeepAlive"] is False
-    assert body["ProgramArguments"][1] == "shadowbot:Run?robot-uuid=u-1"
+    assert body["ProgramArguments"] == [app]
+
+
+def test_yingdao_refresh_names_the_failure_and_keeps_old_values(monkeypatch, tmp_path):
+    """运行没成 ⇒ 摘要里**原样点名卡在哪一类**(带 taskId),而且不回填。
+
+    旧写法只有「spawn 失败/未配置」「等待超时」两句话,1.22.20 那次协议被删,
+    摘要连续几天都是「等待超时」—— 看不出是没开、没登录、被拒还是根本没建任务。
+    """
+    from services import yingdao
+    from workflows import daily_report as dr
+
+    monkeypatch.setenv("YINGDAO_INPUT_JSON", str(tmp_path / "input.json"))
+    monkeypatch.setattr(dr.yingdao, "run_robot", lambda trigger: yingdao.RunResult(
+        False, yingdao.V_FAILED, "主流程 第12行 元素未找到", "t-9"))
+    monkeypatch.setattr(dr.db, "pg_conn", lambda: (_ for _ in ()).throw(
+        AssertionError("没跑成就不许回填")))
+    out = dr._yingdao_refresh([{"store": "A1", "seller_id": "101",
+                                "store_status": "ACTIVE", "payment_status": None}],
+                              "2026-10-31")
+    assert "执行失败(主流程 第12行 元素未找到),taskId=t-9" in out
+    assert "沿用旧值" in out

@@ -111,8 +111,9 @@ python cli.py catalog_sync sources_backfill product_refresh product_audit \
 KPI 窗口锚在 06:30,必须 ≥06:35。默认全链 = KPI + 影刀 + 看板 + 真发日报。
 
 ⚠ **开它之前必须先停旧的 KPI 调度**(旧 `walmart-kpi-daily`,现在挂在 GPT 侧)。
-双 spawn 互抢会让影刀新鲜度校验反复失败到超时 —— **不报错**,只表现为
-"影刀没数据",是这条链最难查的故障。
+两边同天各触发一次影刀会互抢,新鲜度校验反复失败到超时,只表现为
+"影刀没数据",是这条链最难查的故障。影刀 1.22.x 起触发方式已换成本地任务
+接口(`docs/production_cutover.md` §3.1),上线前先跑 `yingdao_probe`。
 
 ### 线 4 · 黑名单中心 —— 每日一次
 

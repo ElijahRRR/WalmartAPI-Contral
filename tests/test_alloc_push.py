@@ -253,3 +253,62 @@ def test_dry_run_writes_nothing(monkeypatch):
 def test_dangerous_is_declared():
     """会往运营天天在看的表里追加待办 —— 缺省即真跑,得让 cli 知道它危险。"""
     assert wf.DANGEROUS is True
+
+
+def test_csv_push_excludes_unselected_historical_claims(monkeypatch, tmp_path):
+    p = tmp_path / 'plan.csv'
+    p.write_text('店铺,ASIN\nA085,B0AAAA0001\n')
+    _wire(monkeypatch, held={'B0AAAA0001': 'A085', 'B0BBBB0002': 'A085'},
+          live={'A085'})
+    calls = []
+    monkeypatch.setattr(listing_sheet, 'append_assignments',
+                        lambda rows, execute, **kw: (
+                            calls.append((rows, execute, kw)) or (len(rows), 2)))
+    wf.run({'from_csv': str(p), 'execute': True, 'dry_run': False})
+    assert calls == [([('A085', 'B0AAAA0001')], True, {'pair_dedup': True})]
+
+
+@pytest.mark.parametrize('held,live', [({}, {'A085'}),
+    ({'B0AAAA0001': 'OTHER'}, {'A085'}), ({'B0AAAA0001': 'A085'}, set())])
+def test_csv_push_rejects_missing_or_foreign_claim_and_disabled_store(
+        monkeypatch, tmp_path, held, live):
+    p = tmp_path / 'plan.csv'
+    p.write_text('店铺,ASIN\nA085,B0AAAA0001\n')
+    _wire(monkeypatch, held=held, live=live)
+    monkeypatch.setattr(listing_sheet, 'append_assignments',
+                        lambda *a, **kw: pytest.fail('must not write'))
+    with pytest.raises(ValueError, match='整批拒绝'):
+        wf.run({'from_csv': str(p), 'execute': True})
+
+
+@pytest.mark.parametrize('value', ['', ' ', None])
+def test_csv_push_empty_path_never_falls_back_to_global(monkeypatch, value):
+    monkeypatch.setattr(wf.stores_svc, 'enabled_names',
+                        lambda: pytest.fail('must reject before reading scope'))
+    with pytest.raises(ValueError, match='路径为空'):
+        wf.run({'from_csv': value, 'execute': True})
+
+
+def test_csv_push_old_other_store_row_does_not_override_current_claim(monkeypatch, tmp_path):
+    p = tmp_path / 'plan.csv'
+    p.write_text('店铺,ASIN\nA085,B0AAAA0001\n')
+    written = []
+    _wire(monkeypatch, held={'B0AAAA0001': 'A085'}, live={'A085'},
+          sheet_rows=[{'rownum': 2, 'store': 'OLD', 'asin': 'B0AAAA0001'}],
+          appended=written)
+    out = wf.run({'from_csv': str(p), 'execute': True})
+    assert '已追加 1 行到上架表' in out
+    assert written
+
+
+def test_csv_push_same_store_history_still_deduplicates(monkeypatch, tmp_path):
+    p = tmp_path / 'plan.csv'
+    p.write_text('店铺,ASIN\nA085,B0AAAA0001\n')
+    written = []
+    _wire(monkeypatch, held={'B0AAAA0001': 'A085'}, live={'A085'},
+          sheet_rows=[{'rownum': 2, 'store': 'OLD', 'asin': 'B0AAAA0001'},
+                      {'rownum': 3, 'store': 'A085', 'asin': 'B0AAAA0001'}],
+          appended=written)
+    out = wf.run({'from_csv': str(p), 'execute': True})
+    assert '没有要派工的行' in out
+    assert written == []

@@ -2802,3 +2802,45 @@ def test_retry_copy_dropped_when_row_already_in_fresh():
              {"rownum": 9, "asin": "B0RETRY01"}]
     assert [r["rownum"] for r in ln._drop_dup_retry(fresh, retry)] == [9]
     assert ln._drop_dup_retry([], retry) == retry
+
+
+def test_csv_scope_filters_same_asin_other_store_and_unselected_rows(monkeypatch, tmp_path):
+    rows = [_sheet_row(2, store='T1', asin='B0AAAA0001'),
+            _sheet_row(3, store='T2', asin='B0AAAA0001'),
+            _sheet_row(4, store='T1', asin='B0BBBB0002')]
+    _wire_dry_env(monkeypatch, rows)
+    p = tmp_path / 'plan.csv'
+    p.write_text('店铺,ASIN\nT1,B0AAAA0001\n')
+    asked = []
+    monkeypatch.setattr(ln, 'load_verdicts', lambda a: (
+        asked.append(a) or fake_verdicts(rows)))
+    out = ln.run({'from_csv': str(p), 'execute': False})
+    assert asked == [['B0AAAA0001']]
+    assert '上架表 1 行' in out
+    assert '共 1 行将进入' in out
+    assert '第3行' not in out and '第4行' not in out
+
+
+def test_csv_scope_missing_pair_refuses_before_any_listing_work(monkeypatch, tmp_path):
+    p = tmp_path / 'plan.csv'
+    p.write_text('店铺,ASIN\nT1,B0AAAA0001\n')
+    monkeypatch.setattr(ln.listing_sheet, 'read_rows', lambda: [
+        _sheet_row(2, store='T2', asin='B0AAAA0001')])
+    monkeypatch.setattr(ln, 'load_verdicts', lambda a: pytest.fail('scope invalid'))
+    with pytest.raises(ValueError, match='对应店铺/ASIN'):
+        ln.run({'from_csv': str(p), 'execute': True})
+
+
+@pytest.mark.parametrize('value', ['', ' ', None])
+def test_csv_scope_empty_path_never_reads_global_sheet(monkeypatch, value):
+    monkeypatch.setattr(ln.listing_sheet, 'read_rows',
+                        lambda: pytest.fail('must not read global sheet'))
+    with pytest.raises(ValueError, match='路径为空'):
+        ln.run({'from_csv': value, 'execute': True})
+
+
+def test_misspelled_scope_parameter_cannot_submit_globally(monkeypatch):
+    monkeypatch.setattr(ln.listing_sheet, 'read_rows',
+                        lambda: pytest.fail('unknown scope must fail closed'))
+    with pytest.raises(ValueError, match='不支持参数'):
+        ln.run({'from_scv': 'plan.csv', 'execute': True})

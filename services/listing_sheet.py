@@ -237,7 +237,8 @@ def row_sku(r: dict) -> str:
             or str(r.get("asin") or "").strip())
 
 
-def append_assignments(pairs: list[tuple], execute: bool = True) -> tuple[int, int]:
+def append_assignments(pairs: list[tuple], execute: bool = True,
+                       *, pair_dedup: bool = False) -> tuple[int, int]:
     """输入:[(店铺, ASIN)] → 输出:(写入行数, 起始行号)。**只写 店铺/ASIN 两列。**
 
     分配器把定好的货追加进上架表,「审核结果」留空即「待审」—— 审核链下一轮
@@ -262,8 +263,14 @@ def append_assignments(pairs: list[tuple], execute: bool = True) -> tuple[int, i
         return 0, 0
     sheet = resources.LISTING_SHEET.require()
     have = read_rows(upto="asin")
-    seen = {r["asin"] for r in have if r["asin"]}
-    todo = [(st, a) for st, a in pairs if a not in seen]
+    # 定向模式已由 alloc_push 校验当前占用；其他店铺的历史表行只是参考，
+    # 不阻止派工给当前占用店。不改历史行，同店同 ASIN 仍去重。
+    if pair_dedup:
+        seen = {(r["store"], r["asin"]) for r in have if r["asin"]}
+        todo = [(st, a) for st, a in pairs if (st, a) not in seen]
+    else:
+        seen = {r["asin"] for r in have if r["asin"]}
+        todo = [(st, a) for st, a in pairs if a not in seen]
     if not todo:
         return 0, 0
     start = (max((r["rownum"] for r in have), default=1)) + 1

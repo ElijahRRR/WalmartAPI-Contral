@@ -2,6 +2,7 @@
 
 用法:
   python cli.py alloc_push --dry-run        # 预览:要追加多少行、被什么挡下
+  python cli.py alloc_push -p from_csv=plan.csv --dry-run  # 只推清单，逐条核验占用
   python cli.py alloc_push                  # 真写
   python cli.py alloc_push -p limit=500     # 只推前 N 条(想小步试一次)
 
@@ -37,7 +38,7 @@
 import logging
 
 from registry import db
-from services import claims, listing_sheet, stores as stores_svc
+from services import alloc_sheet, claims, listing_sheet, stores as stores_svc
 
 DANGEROUS = True
 
@@ -68,8 +69,15 @@ WHERE w.missing_since IS NULL
 
 
 def run(params: dict) -> str:
-    """输入:params(limit/execute)→ 输出:推送摘要。"""
+    """输入:params(limit/execute/from_csv)→ 输出:推送摘要。"""
     execute = bool(params.get("execute"))
+    unknown = set(params) - {"execute", "dry_run", "limit", "from_csv"}
+    if unknown:
+        raise ValueError(f"alloc_push 不支持参数:{sorted(unknown)}")
+    want = (alloc_sheet.read_fixed_plan(params["from_csv"])
+            if "from_csv" in params else None)
+    if want is not None and "limit" in params:
+        raise ValueError("from_csv 不与 limit 混用，清单范围必须完整")
     limit = int(params.get("limit", 0)) or None
 
     try:
@@ -87,6 +95,15 @@ def run(params: dict) -> str:
                       for s, sku, k in cur.fetchall()}
     online = {(s, a) for s, a in online if a}
 
+    if want is not None:
+        problems = [f"{asin}→{store}:当前产品占用={held.get(asin) or '无'}"
+                    for asin, store in want.items() if held.get(asin) != store]
+        problems.extend(f"{asin}→{store}:店铺未启用"
+                        for asin, store in want.items() if store not in live)
+        if problems:
+            raise ValueError("定向推送整批拒绝，未写上架表:\n" + "\n".join(problems))
+        held = {asin: held[asin] for asin in want}
+
     rows, off, listed = [], 0, 0
     for asin, store in sorted(held.items()):
         if store not in live:
@@ -101,7 +118,8 @@ def run(params: dict) -> str:
     if limit:
         rows = rows[:limit]
 
-    n, start = listing_sheet.append_assignments(rows, execute=execute)
+    n, start = listing_sheet.append_assignments(
+        rows, execute=execute, **({"pair_dedup": True} if want is not None else {}))
     dup = len(rows) - n if rows else 0
 
     head = [f"占用台账 {len(held):,} 条 → 待派工 {n:,} 行"]

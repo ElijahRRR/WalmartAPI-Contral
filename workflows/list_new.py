@@ -1864,8 +1864,18 @@ def _gate_by_row(cands: list[dict], products: dict, ctx: _GateCtx) -> _RowGate:
 
 
 def run(params: dict) -> str:
-    """输入:params(execute/store/check_spec/limit)→ 输出:闸门链与提交摘要。"""
+    """输入:params(execute/store/check_spec/limit/from_csv)→ 输出:闸门链与提交摘要。"""
+    unknown = set(params) - {"execute", "dry_run", "store", "limit", "from_csv",
+                             "check_spec", "gap_wait", "workers",
+                             "submit_jitter_ms", "requeue_invalid_field"}
+    if unknown:
+        raise ValueError(f"list_new 不支持参数:{sorted(unknown)}")
     execute = bool(params.get("execute"))
+    from services import alloc_sheet
+    want = (alloc_sheet.read_fixed_plan(params["from_csv"])
+            if "from_csv" in params else None)
+    if want is not None and (set(params) & {"store", "limit"}):
+        raise ValueError("from_csv 不与 store/limit 混用，清单范围必须明确")
     # 人工上限(试点闸,所有者节奏「一店一品 → 10 个 → 全店」):缺省 None =
     # 与今天逐字一致,只有显式传值才截断。缺省即真跑、一跑就是全店 ready 行
     # 全部抽码 + 提交 MP_ITEM,码已发、UPC 已 used,不可逆 —— 纪律没有默认值
@@ -1879,6 +1889,13 @@ def run(params: dict) -> str:
     # 第一轮起跑抖动(毫秒;0=关)。去同步,不降峰值 —— 见 SUBMIT_JITTER_MS 头注
     jitter_ms = int(params.get("submit_jitter_ms", SUBMIT_JITTER_MS))
     rows = listing_sheet.read_rows()
+    if want is not None:
+        present = {(r["store"], r["asin"]) for r in rows}
+        missing = [(s, a) for a, s in want.items() if (s, a) not in present]
+        if missing:
+            raise ValueError(f"定向清单有 {len(missing)} 行未在上架表找到对应店铺/ASIN，"
+                             f"拒绝提交:{missing[:20]}")
+        rows = [r for r in rows if want.get(r["asin"]) == r["store"]]
     if params.get("store"):
         rows = [r for r in rows if r["store"] == params["store"]]
     # 审核闸**读库不读表**(所有者定稿 2026-08-16)。表里「审核结果」是投影,

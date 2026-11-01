@@ -120,11 +120,12 @@ def run(params: dict) -> str:
                          f"{'/'.join(found) or '都查不到'}"
                          + ("" if atype in found or not found else
                             f" —— 把 YINGDAO_APP_TYPE 设成 {found[0]}"))
-            d = yd.app_detail(uuid, atype)
-            lines.append(f"  ✓ 应用详情({atype}):「{d.get('appName')}」版本 {d.get('version')},"
-                         f"类型 {d.get('uiaType')},接口入参 {len(d.get('inputs') or [])} 个")
+            # ⚠ 不再调「应用详情」(2026-11-01 生产实测):subscribed 的详情接口会额外
+            # 下载发布包、读包里的 .dev/main.flow.json 列入参,发布包没带这个文件就回
+            # 5000 —— 而同一时刻真提交照样成功(提交只做两项在线核对,不读包)。
+            # 体检里留着它只会天天报一个与提交无关的 ✗。
         except (yd.YingdaoUnreachable, yd.YingdaoNoResponse, yd.YingdaoApiError) as e:
-            lines.append(f"  ✗ 应用核对失败:{e}")
+            lines.append(f"  ✗ 应用列表查询失败:{e}")
 
     ready = yingdao.check_ready(uuid) if uuid else None
     lines.append("  结论:" + ("可以提交" if uuid and ready is None

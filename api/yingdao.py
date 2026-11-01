@@ -15,7 +15,6 @@ api 层只做"把接口调对":找端口与令牌、鉴权头、超时、信封�
   auth_current()                  -> {username, gradeName, ...} 未登录 = code 4011
   state()                         -> {mode, loggedIn, task:{...}, ...}
   list_apps(app_type, page)       -> {items:[{appId, ...}], pages, ...}
-  app_detail(app_id, app_type)    -> {appName, version, uiaType, inputs, ...}
   submit_task(app_id, app_type)   -> {accepted, taskId}         异步:入队即返回
   get_task(task_id)               -> {status, error, sourceKind, ...}
 
@@ -189,12 +188,6 @@ def list_apps(app_type: str, page: int = 1, page_size: int = 200) -> dict:
     return _call(_instance(), "GET", "/api/v1/apps",
                  params={"appType": app_type, "page": page,
                          "pageSize": page_size}) or {}
-
-
-def app_detail(app_id: str, app_type: str) -> dict:
-    """输入:应用 UUID + 类型 → 输出:{appName, version, uiaType, inputs, ...}。"""
-    return _call(_instance(), "GET", f"/api/v1/apps/{app_id}/detail",
-                 params={"appType": app_type}) or {}
 
 
 def submit_task(app_id: str, app_type: str, request_id: str | None = None) -> dict:

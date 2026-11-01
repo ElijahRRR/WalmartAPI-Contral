@@ -1408,38 +1408,7 @@ def _run_sheet(params: dict) -> str:
     return "\n".join(L)
 
 
-def _read_fixed_plan(path):
-    """输入:店铺/ASIN CSV → 输出:唯一 ASIN 到明确目标店的映射。
-
-    坏行一律整份拒绝并报行号(不跳过、不猜);只有**两格都空**的行跳过 —— 那是
-    Excel 清过内容但留着格式的行导出成的 `,`,不是数据。
-    """
-    import csv
-    from pathlib import Path
-    from services import sku_asin
-    try:
-        with Path(path).expanduser().open(encoding="utf-8-sig", newline="") as fh:
-            rd = csv.DictReader(fh)
-            if not {"店铺", "ASIN"} <= {(f or "").strip() for f in (rd.fieldnames or [])}:
-                raise ValueError(f"定向清单必须有 店铺/ASIN 两列(读到的表头:{rd.fieldnames})")
-            out = {}
-            for row in rd:
-                # 表头带空格也认;短行缺的格是 None(DictReader 的 restval)
-                row = {(k or "").strip(): v for k, v in row.items()}
-                store = (row.get("店铺") or "").strip()
-                asin = (row.get("ASIN") or "").strip().upper()
-                if not store and not asin:
-                    continue
-                if not store or not sku_asin.is_standard_asin(asin):
-                    raise ValueError(f"清单第 {rd.line_num} 行店铺或 ASIN 无效:{store}/{asin}")
-                if asin in out:
-                    raise ValueError(f"清单第 {rd.line_num} 行重复 ASIN:{asin}")
-                out[asin] = store
-    except UnicodeDecodeError as e:
-        raise ValueError("定向清单不是 UTF-8:Excel 请「另存为 → CSV UTF-8(逗号分隔)」") from e
-    if not out:
-        raise ValueError("定向清单为空")
-    return out
+_read_fixed_plan = alloc_sheet.read_fixed_plan
 
 
 def _fixed_claims(want, scored, cfg, registered, online_now,

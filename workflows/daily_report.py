@@ -2,9 +2,9 @@
 
 用法:
   python cli.py daily_report                       # **默认全链**:kpi(含影刀)→ board → 推送飞书
-  python cli.py daily_report -p phase=kpi          # 只采集 KPI
-  python cli.py daily_report -p phase=kpi -p yingdao=input  # 只产出影刀输入清单,不 spawn
-  python cli.py daily_report -p phase=kpi -p yingdao=1   # 含影刀链(停旧调度后才可开)
+  python cli.py daily_report -p phase=kpi          # 采集 KPI(**默认含影刀**,社区版/创业版每次扣一次影刀额度)
+  python cli.py daily_report -p phase=kpi -p yingdao=0      # 只采集 KPI,不接影刀
+  python cli.py daily_report -p phase=kpi -p yingdao=input  # 只产出影刀输入清单,不触发影刀
   python cli.py daily_report -p phase=board [-p days=90]   # 只刷 KPI 看板(总览+历史)
   python cli.py daily_report -p phase=push -p push=1   # 生成日报并真正推送(飞书 webhook)
   python cli.py daily_report -p store=A085朱丽霖    # 单店(kpi 阶段)
@@ -30,12 +30,14 @@ report 端点,xlsx)+ 订单中心 perf_events 归 `workflows/perf_problems.py`,
   双算对拍期——API 现拉仍是权威值,库算值只记日志差异;连续对平后摘除 API
   拉取,order_sync 成为本工作流的调度前置
 - 影刀接入(-p yingdao=1;2026-08-08 接入,2026-08-15 改为文件衔接):
-  写 input.json 影刀输入清单(过滤空 sellerId 行——A147 事故防线)→ spawn 影刀
-  → 等 latest.json 新鲜 → 回填当日卖家名称/销售状态。
+  写 input.json 影刀输入清单(过滤空 sellerId 行——A147 事故防线)→ 经影刀本地
+  任务接口提交并跟踪到终态(2026-10-31 起;1.22.x 删了 shadowbot:Run 协议,见
+  services/yingdao)→ 核对 latest.json 新鲜 → 回填当日卖家名称/销售状态。
   **不再经飞书**:原「先把总览写飞书 → 影刀读飞书拿 sellerId」已删,新影刀
   应用直接读 paths.yingdao_input_file()。`-p yingdao=input` 是接入调试档:
-  只产出清单不 spawn,旧调度还开着时也能安全跑。默认关:切换期仍由旧系统 8 点驱动影刀,
-  **停旧 walmart-kpi-daily 之前严禁开启**(双 spawn 互抢,新鲜度校验会
+  只产出清单不触发影刀,旧调度还开着时也能安全跑。默认开(所有者定稿 2026-08-16;
+  社区版/创业版账号每提交一次扣一次每日额度,人工补跑也算),
+  **旧 walmart-kpi-daily 没停之前必须显式 -p yingdao=0 或 input**(两边各触发一次互抢,新鲜度校验会
   反复失败到超时);未开/超时时只读现有 latest.json(新鲜才用销售状态;
   卖家名称允许 stale 补 + 跨日延续)
 - **默认全链**(所有者定稿 2026-08-16 走进生产):不带参数 = kpi(含影刀)+ 看板 +
@@ -273,7 +275,7 @@ def _collect_store_kpi(store: dict, data_date, win_start: str, win_end: str,
 _YINGDAO_MODES = {
     "": "",                                     # 不接影刀(默认)
     "0": "", "false": "", "no": "",
-    "input": "input",                           # 只产出 input.json,不 spawn
+    "input": "input",                           # 只产出 input.json,不触发影刀
     "1": "full", "true": "full", "yes": "full",  # 全链路
 }
 
@@ -281,23 +283,25 @@ _YINGDAO_MODES = {
 def _yingdao_mode(raw) -> str:
     """输入:-p yingdao 原值 → 输出:''(不接)/'input'(只产清单)/'full'(全链路)。
 
-    'input' 是接入调试档:写完清单就返回,**不 spawn**。用它可以在旧
-    walmart-kpi-daily 还开着的时候安全地跑——不 spawn 就没有双 spawn 互抢,
+    'input' 是接入调试档:写完清单就返回,**不触发影刀**。用它可以在旧
+    walmart-kpi-daily 还开着的时候安全地跑——不触发就没有两边各跑一次互抢,
     也就不会把旧系统那次影刀的新鲜度校验搅坏。
     """
     key = str(raw if raw is not None else "").strip().lower()
     if key not in _YINGDAO_MODES:
         raise ValueError(
-            f"yingdao 只接受 input(只产清单不 spawn)/1(全链路)/0(不接),收到:{raw!r}")
+            f"yingdao 只接受 input(只产清单不触发影刀)/1(全链路)/0(不接),收到:{raw!r}")
     return _YINGDAO_MODES[key]
 
 
-def _yingdao_refresh(rows: list[dict], data_date, do_spawn: bool = True) -> str:
-    """输入:当日已入库 KPI 行 + 是否 spawn → 输出:影刀链路结果行。
+def _yingdao_refresh(rows: list[dict], data_date, do_run: bool = True) -> str:
+    """输入:当日已入库 KPI 行 + 是否触发影刀 → 输出:影刀链路结果行。
 
     三步:①写 input.json 影刀输入清单(空 sellerId 行过滤——A147 事故:影刀打开
-    /seller//cp/shopall 会崩掉整条 RPA 循环)②spawn + 等 latest.json 新鲜
-    ③回填当日卖家名称/销售状态。任一步失败只降级不报错:已入库值有跨日延续兜底。
+    /seller//cp/shopall 会崩掉整条 RPA 循环)②经本地任务接口提交影刀并跟踪到
+    终态、核对 latest.json 新鲜(services/yingdao.run_robot)③回填当日卖家名称/
+    销售状态。任一步失败只降级不报错:已入库值有跨日延续兜底;失败类别与
+    taskId 原样进摘要,一眼看得出卡在"没开 / 没登录 / 被拒 / 跑挂 / 没写出"哪一步。
 
     ⚠ 输入清单只含**本轮真跑到的店**,不与任何历史合并 —— 旧的飞书投影会把
     上次的行保留下来(sheet 是长存的),于是单店跑 `-p store=X` 也会让影刀去抓
@@ -312,15 +316,14 @@ def _yingdao_refresh(rows: list[dict], data_date, do_spawn: bool = True) -> str:
     if st["unknown_status"]:     # 空状态照常纳入,但必须在摘要里看得见
         line += f",⚠ 状态为空仍纳入 {st['unknown_status']} 店(结算解析该查)"
     if not written:
-        return line + ",无可抓店铺,跳过 spawn"
-    if not do_spawn:        # -p yingdao=input:接入调试用,见下方 run() 注释
-        return line + ",仅产出清单(yingdao=input),未 spawn"
+        return line + ",无可抓店铺,未触发影刀"
+    if not do_run:          # -p yingdao=input:接入调试用,见下方 run() 注释
+        return line + ",仅产出清单(yingdao=input),未触发影刀"
 
     trigger = datetime.now(timezone.utc)
-    if not yingdao.spawn():
-        return line + ",spawn 失败/未配置,沿用旧值"
-    if not yingdao.wait_fresh(trigger):
-        return line + ",等待超时,沿用旧值(卖家名称跨日延续兜底)"
+    res = yingdao.run_robot(trigger)
+    if not res.ok:
+        return line + f",{res.line()},沿用旧值(卖家名称跨日延续兜底)"
 
     names, statuses = _load_frontend(fresh_within_hours=1)
     updated = 0
@@ -342,7 +345,7 @@ def _yingdao_refresh(rows: list[dict], data_date, do_spawn: bool = True) -> str:
                 " WHERE store = %s AND data_date = %s",
                 (new_name, new_status, row["store"], data_date))
             updated += cur.rowcount
-    return line + f",抓取新鲜,回填 {updated} 店"
+    return line + f",抓取新鲜,回填 {updated} 店({res.line()})"
 
 
 def _phase_kpi(store_list: list[dict], data_date, yingdao_mode: str = "") -> str:
@@ -405,7 +408,7 @@ def _phase_kpi(store_list: list[dict], data_date, yingdao_mode: str = "") -> str
     if yingdao_mode and rows_ok:
         try:
             line += "\n" + _yingdao_refresh(rows_ok, data_date,
-                                            do_spawn=yingdao_mode == "full")
+                                            do_run=yingdao_mode == "full")
         except Exception as e:
             logger.exception("影刀链路失败(已入库值不受影响): %s", e)
             line += f"\n影刀:链路失败({e}),沿用旧值"

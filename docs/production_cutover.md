@@ -56,6 +56,50 @@
 2026-08-16 所有者实见日志三处写着未配置、摘要却报成功。现在报
 「⚠ 日报**未发出**」并附正文(人能手动转发)。
 
+### 3.1 影刀触发方式换代(2026-10-31,影刀 1.22.x 删了 `shadowbot:Run`)
+
+症状:影刀升到 1.22.20 后,日报摘要天天是「等待超时,沿用旧值」,`latest.json`
+停在 10-25。根因:1.22.x 的协议处理只剩 Homework / View / Feedback,`Run` 分支被删
+(官方 1.22.20 安装包代码实读;1.21.9 还有),launchd 那条命令发出去、客户端记一行
+日志就没下文了 —— **触发这一步就失败了,加长超时没用**。
+
+现在两段各管一件事(细节在 `services/yingdao` 模块头注):
+
+1. **拉起客户端**:本地接口探活不通时 `launchctl kickstart`(**不带 -k**,-k 会连影刀
+   手上的任务一起杀掉)。plist 只写主程序,不再带协议参数。
+2. **提交运行**:客户端本地任务接口(`api/yingdao`)—— 预检(登录 / 模式 / 有没有
+   别的任务在跑)→ 提交拿 taskId → 轮询到终态 → `latest.json` 新鲜才算成。
+   **结果不明绝不重提**(对账找任务);失败分类原样进摘要。
+
+上线步骤(**都在那台 Mac 的图形会话里做**;旧 `walmart-kpi-daily` 必须已停):
+
+⚠ `unload` 会让由这个代理拉起的影刀**一起退出**(连同它正在跑的任务)——别在机器人
+运行时做;`load` 不会自己拉起它(RunAtLoad=false),所以装回后要 kickstart 一次。
+
+```bash
+python cli.py launchd_install              # 重写影刀代理 plist(去掉了协议参数)
+launchctl unload -w ~/Library/LaunchAgents/com.walmartapi.yingdao.plist
+launchctl load -w ~/Library/LaunchAgents/com.walmartapi.yingdao.plist
+launchctl kickstart gui/$(id -u)/com.walmartapi.yingdao   # 不带 -k;把影刀拉起来
+# 等影刀打开并自动登录完(几十秒)再往下
+python cli.py yingdao_probe                # 只读体检:每一项都该是 ✓,结论「可以提交」
+python cli.py daily_report -p phase=kpi -p yingdao=input   # 生成新 input.json
+python cli.py yingdao_probe -p run=1       # 真提交一次(扣一次额度),看结论是不是「成功」
+```
+
+`.env` 相关项:`YINGDAO_ROBOT_UUID`(已有)、`YINGDAO_APP_TYPE`(缺省 `subscribed`
+= 跑「我获取的应用」里的发布版,与旧协议一致;体检若说查不到就按它的提示改)、
+`YINGDAO_READY_SEC`(就绪等待,缺省 180)、`YINGDAO_TIMEOUT_SEC`(从提交成功算起,
+缺省 600)、`YINGDAO_INSTANCE_JSON`(发现文件路径对不上时才用)。
+
+⚠ 客户端侧三个设置要人去勾:**启动后自动登录**(否则报「未登录」)、**别让它自动
+切进调度模式**(调度模式下本地任务接口一律拒绝,报「调度模式」)、定时跑的时候
+**别开着设计器 Studio**(报「客户端忙」)。
+⚠ 额度:社区版 / 创业版账号**每提交一次扣一次**云端每日额度(官方口径个人版每天
+5 次;旧协议不计额度)。日报主跑、人工补跑、`yingdao_probe -p run=1` 都算。
+⚠ 影刀会自动更新;日报摘要里出现「接口不匹配」或「影刀 x.y.z 不在验证过的版本里」时,
+先跑 `yingdao_probe` 看是哪一项变了,再决定要不要改代码。
+
 ## 四、配送时长限制(已落地)
 
 限额表(`registry.RETIRE_LIMITS`)新增列 **`配送时长限制`**(列名一字不差,
@@ -355,8 +399,9 @@ plist 模板与四个坑、分三批灰度、四件必须先做的代码活(prod
 
 ⚠ **停旧清单见 `docs/legacy_schedules.md`**。最要紧一条:开
 `daily_report`(默认已含影刀)之前必须先停旧 `walmart-kpi-daily` ——
-双 spawn 互抢会让新鲜度校验反复失败到超时,**不报错**,只表现为
-"影刀没数据",是这条链最难查的故障。
+两边同天各触发一次影刀会互抢,新鲜度校验反复失败到超时,只表现为
+"影刀没数据",是这条链最难查的故障(2026-10-31 起新系统这边会报「客户端忙」,
+旧系统那边照旧什么都不报)。
 
 ## 八、生产侧欠账(与本役并行)
 

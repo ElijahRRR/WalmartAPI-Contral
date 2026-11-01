@@ -75,9 +75,9 @@ def render(job: dict, logs_dir: Path) -> bytes:
     return plistlib.dumps(body, sort_keys=False)
 
 
-# ── 影刀启动代理(2026-09-01 生产崩溃后加)────────────────────────────────
-# 这个 agent **没有 StartCalendarInterval**:它不定时,只等 `launchctl kickstart`
-# 按需拉起(daily_report 写完 input.json 的下一秒)。
+# ── 影刀启动代理(2026-09-01 生产崩溃后加;2026-10-31 只管拉起客户端)──────────
+# 这个 agent **没有 StartCalendarInterval**:它不定时,只等 services/yingdao 在
+# 本地接口探活失败时 `launchctl kickstart`(不带 -k)把客户端拉起来。
 #
 # ⚠ 为什么非得绕 launchd,不能由 daily_report 直接 spawn(崩溃报告实证
 # 2026-09-01,incident 6B391891):日报链的 runner 是 `gpt`,进程跑在智能体的
@@ -85,22 +85,24 @@ def render(job: dict, logs_dir: Path) -> bytes:
 # procRole=Unspecified)。影刀是 Electron/AppKit 应用,启动时要向 LaunchServices
 # 注册,那个上下文里没有 Aqua GUI session ⇒ `_RegisterApplication` → abort()
 # → SIGABRT。同一条命令在终端里手敲**完全正常**(终端有 GUI session)。
-# 2026-08-24 那次 `open` 退 1 是**同一个根因的另一种表现**(分发被拦),
-# 当时换成直启主程序 = 换汤不换药,从"起不来"变成"崩溃"。
-# 任何 argv/URL 写法都救不了 —— 启动动作必须由**本来就在 Aqua session 里**的
-# 东西发起,而 launchd 的 gui/<uid> 域正是它。
+# 2026-08-24 那次 `open` 退 1 是**同一个根因的另一种表现**(分发被拦)。
+# 启动动作必须由**本来就在 Aqua session 里**的东西发起,launchd 的 gui/<uid> 正是它。
+#
+# ⚠ ProgramArguments **只有主程序,不带任何参数**(2026-10-31):影刀 1.22.x
+# 删掉了 `shadowbot:Run?robot-uuid=` 协议,带着它也只会被记一行日志后忽略。
+# 跑哪个机器人改由 api/yingdao 走本地任务接口提交,与"怎么拉起客户端"分开。
 YINGDAO_LABEL = schedule.LABEL_PREFIX + "yingdao"
 
 
-def render_yingdao(app: str, robot_uuid: str, logs_dir: Path) -> bytes:
-    """输入:影刀主程序路径 + 机器人 UUID + 日志目录 → 输出:plist 字节串。
+def render_yingdao(app: str, logs_dir: Path) -> bytes:
+    """输入:影刀主程序路径 + 日志目录 → 输出:plist 字节串。
 
     `LimitLoadToSessionType: Aqua` 是这份 plist 的**要害**:它声明本 agent 只
     在图形会话里装载,launchd 于是把子进程放进那个会话 —— 正是崩溃时缺的东西。
     """
     return plistlib.dumps({
         "Label": YINGDAO_LABEL,
-        "ProgramArguments": [app, f"shadowbot:Run?robot-uuid={robot_uuid}"],
+        "ProgramArguments": [app],
         "LimitLoadToSessionType": "Aqua",
         "StandardOutPath": str(Path(logs_dir) / "yingdao.out"),
         "StandardErrorPath": str(Path(logs_dir) / "yingdao.err"),

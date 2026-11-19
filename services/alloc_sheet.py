@@ -163,3 +163,72 @@ def read_fixed_plan(path):
     if not out:
         raise ValueError("定向清单为空")
     return out
+
+
+def _read_csv_rows(path, need: set[str], what: str):
+    """输入:CSV 路径 + 必需表头 + 用途名 → 输出:(DictReader 行迭代结果列表[(行号, {表头: 值})])。
+
+    与 `read_fixed_plan` 同一套宽容口径:表头去空格、Excel 留下的全空行跳过、
+    非 UTF-8 明说怎么另存。坏行由调用方按自己的列语义判。
+    """
+    if path is None or not str(path).strip():
+        raise ValueError(f"{what}路径为空")
+    import csv
+    from pathlib import Path
+    out = []
+    try:
+        with Path(str(path).strip()).expanduser().open(encoding="utf-8-sig", newline="") as fh:
+            rd = csv.DictReader(fh)
+            heads = {(f or "").strip() for f in (rd.fieldnames or [])}
+            if not need <= heads:
+                raise ValueError(f"{what}必须有 {'/'.join(sorted(need))} 列(读到的表头:{rd.fieldnames})")
+            for row in rd:
+                row = {(k or "").strip(): (v or "").strip() for k, v in row.items()}
+                if not any(row.get(k) for k in need):
+                    continue
+                out.append((rd.line_num, row))
+    except UnicodeDecodeError as e:
+        raise ValueError(f"{what}不是 UTF-8:Excel 请「另存为 → CSV UTF-8(逗号分隔)」") from e
+    if not out:
+        raise ValueError(f"{what}为空")
+    return out
+
+
+def read_asin_list(path) -> list[str]:
+    """输入:只含 ASIN 列的 CSV → 输出:去重后的标准 ASIN 列表(保持首次出现顺序)。
+
+    给 `alloc_plan -p pool_csv=` 限定候选池用。重复 ASIN 合并(候选来自多次导出,
+    重叠是常态,不是错误);非标准 ASIN 整份拒绝并报行号(不猜、不跳过)。
+    """
+    from services import sku_asin
+    seen: dict[str, None] = {}
+    for line, row in _read_csv_rows(path, {"ASIN"}, "候选池清单"):
+        asin = row["ASIN"].upper()
+        if not sku_asin.is_standard_asin(asin):
+            raise ValueError(f"候选池清单第 {line} 行 ASIN 无效:{asin}")
+        seen.setdefault(asin, None)
+    return list(seen)
+
+
+def read_store_quota(path) -> dict[str, int]:
+    """输入:店铺/配额 CSV → 输出:{店铺: 非负整数配额}。
+
+    给 `alloc_plan -p quota_csv=` 覆盖每店配额用(配额口径由调用方在仓外算好,
+    例如标准选品流程的"有效目标 − 在线 − 有效待上架 + 建议下架")。
+    同店重复、配额非整数或为负 → 整份拒绝并报行号。
+    """
+    out: dict[str, int] = {}
+    for line, row in _read_csv_rows(path, {"店铺", "配额"}, "配额清单"):
+        store, raw = row["店铺"], row["配额"]
+        if not store:
+            raise ValueError(f"配额清单第 {line} 行店铺为空")
+        try:
+            n = int(float(raw)) if raw else None
+        except ValueError:
+            n = None
+        if n is None or n < 0 or (raw and float(raw) != int(float(raw))):
+            raise ValueError(f"配额清单第 {line} 行配额无效:{store}/{raw!r}(要非负整数)")
+        if store in out:
+            raise ValueError(f"配额清单第 {line} 行重复店铺:{store}")
+        out[store] = n
+    return out

@@ -10,6 +10,8 @@
   python cli.py alloc_plan -p from_sheet=1 -p cutoff=30  # 点名模式临时加一条淘汰线(缺省不设)
   python cli.py alloc_plan -p from_csv=plan.csv --dry-run  # 定向清单(表头 店铺,ASIN):只校验硬闸
   python cli.py alloc_plan -p from_csv=plan.csv            # 同上,落品牌 + 产品占用(不写上架表)
+  python cli.py alloc_plan -p pool_csv=pool.csv -p quota_csv=quota.csv --dry-run
+                              # 限定候选池(表头 ASIN)+ 覆盖每店配额(表头 店铺,配额):**只出预览**
 
 把候选池打分、组队、切批、发牌,产出**分配方案表**。真跑只多做一件事:
 把方案里的品牌与 ASIN 落成占用(`catalog.claims`)。上架表另说 —— 分配是
@@ -33,6 +35,23 @@
   那批 top 货**。实测切 `可分×1.5` 与整池逐字同结果(§7.4b)。
 
 **只写占用,不碰沃尔玛。** 上架由 list_new 按自己的节奏执行。
+
+## 限定池预览(`-p pool_csv=` / `-p quota_csv=`,2026-11-19 标准选品流程)
+
+同一个引擎、同一套闸、同一份方案表,只换两样输入,**只许 dry-run**(真落占用
+走 `-p from_csv=` 定向清单,那条路逐行过硬闸、整批成败):
+
+· `pool_csv`  —— 候选池只取清单里的 ASIN(池口在 SQL 里筛,与点名分配同一个
+  `product_pool.load(asins=…)`);与点名分配一样**缺省不设淘汰线**、发牌序按
+  缺口(`by_gap`),`-p cutoff=` 才临时加线。不在池的按原因计数报出来。
+· `quota_csv` —— 每店配额(同时作为本轮容量)用清单里的数,不再用
+  `min(剩余容量, 缺口 ÷ 单品日产出)`。清单里没有的店、配额 0 的店本轮不参与;
+  清单里写了正配额却不在分配范围(未启用 / 规划外 /「单店最大在线数」0 或未填)
+  的店直接报错 —— 静默丢掉会让人以为那家店分到了。
+
+两者可单独用。存在的理由:标准选品的缺口公式(有效目标 = min(单店最大在线数,
+商品上限),扣有效待上架)与本工作流的配额口径不同,预览必须用前者;在仓外
+重组引擎就是第二套分配实现(conventions §六 双轨禁止)。
 
 ## 点名分配(`-p from_sheet=1`,口径 #19,所有者定稿 2026-09-17)
 
@@ -71,11 +90,13 @@ FLOW_FREE, FLOW_DIRECTED, FLOW_NONE = "自由流", "定向流", "未分配"
 # 这条闸是点名分配带来的:`-p from_sheet=1` 打错一个字(fromsheet / from_sheets),
 # 静默吞掉就退化成**全库分配并真落几千条占用**,而占用撤不回。
 _KNOWN_PARAMS = {"batch", "days", "sales_days", "as_of", "export",
-                 "from_sheet", "cutoff", "from_csv"}
+                 "from_sheet", "cutoff", "from_csv", "pool_csv", "quota_csv"}
 # 定向清单(from_csv)不出方案表、不打分、不切批:这些参数在那条路上不起作用,
 # 带上了就炸 —— 静默忽略等于让人以为"窗口钉住了 / 导出了 / 封顶了"
 _CSV_EXCLUSIVE = ("from_sheet", "batch", "cutoff", "days", "sales_days",
-                  "as_of", "export")
+                  "as_of", "export", "pool_csv", "quota_csv")
+# 限定池预览的两个参数(只出预览,见模块头注「限定池预览」)
+_PREVIEW_KEYS = ("pool_csv", "quota_csv")
 # cli 自己塞进 params 的键,不是人敲的(product_audit 那边 2026-08-16 `dry_run`
 # 上线当天就炸过一次:白名单漏放行 cli 级开关,整条工作流起不来)
 _CLI_INJECTED = {"execute", "dry_run"}
@@ -215,7 +236,7 @@ def _flag(v) -> bool:
 
 
 def run(params: dict) -> str:
-    """输入:params(batch/days/sales_days/as_of/export/execute;from_sheet/cutoff;from_csv)→ 输出:方案摘要。"""
+    """输入:params(batch/days/sales_days/as_of/export/execute;from_sheet/cutoff;from_csv;pool_csv/quota_csv)→ 输出:方案摘要。"""
     unknown = sorted(set(params) - _KNOWN_PARAMS - _CLI_INJECTED)
     if unknown:
         raise ValueError(
@@ -234,11 +255,31 @@ def run(params: dict) -> str:
             raise ValueError(f"from_csv 不与 {mixed} 混用:定向清单不出方案表、"
                              f"不打分、不切批,这些参数在这条路上不起作用")
         return _run_csv({**params, "from_csv": path})
+    preview = [k for k in _PREVIEW_KEYS if k in params]
     if _flag(params.get("from_sheet")):
+        if preview:
+            raise ValueError(f"from_sheet 不与 {preview} 混用:点名分配的池子来自产品分配表")
         return _run_sheet(params)
-    if "cutoff" in params:
-        raise ValueError("-p cutoff= 只能与 -p from_sheet=1 连用:全库分配的淘汰线是 "
-                         "product_score.CUTOFF(口径 #17b),不给临时覆盖")
+    pool_asins = quota_over = None
+    if preview:
+        if params.get("execute"):
+            raise ValueError(f"{preview} 只出预览,请加 --dry-run;真落占用走 "
+                             f"-p from_csv=<店铺,ASIN 清单>(逐行过硬闸、整批成败)")
+        if params.get("batch"):
+            raise ValueError(f"-p batch= 不与 {preview} 混用:候选池/配额已由清单限定,"
+                             f"再等比缩配额等于两个上限打架")
+        for k in preview:
+            if not str(params.get(k) or "").strip():
+                raise ValueError(f"-p {k}= 给了空值(变量没展开?):宁炸不吞")
+        if "pool_csv" in params:
+            pool_asins = alloc_sheet.read_asin_list(params["pool_csv"])
+        if "quota_csv" in params:
+            quota_over = alloc_sheet.read_store_quota(params["quota_csv"])
+    if "cutoff" in params and pool_asins is None:
+        raise ValueError("-p cutoff= 只能与 -p from_sheet=1 或 -p pool_csv= 连用:全库分配的"
+                         "淘汰线是 product_score.CUTOFF(口径 #17b),不给临时覆盖")
+    # 限定池与点名分配同口径:候选是人挑的,缺省不设线(见 _run_sheet docstring ②)
+    cutoff = ps.CUTOFF if pool_asins is None else float(params.get("cutoff", 0.0))
     execute = bool(params.get("execute"))
     # 默认**不设总量上限**:每家店能接多少由容量与缺口算出来(见 `_quota`)。
     # `-p batch=` 是想小步试跑时的安全阀,不是模型的一部分
@@ -264,8 +305,10 @@ def run(params: dict) -> str:
     except Exception as e:                          # noqa: BLE001
         return f"⛔ 凭证表读不到({e}):分不清在营店与冻结行,拒绝分配"
 
+    absent_why: Counter = Counter()
     with db.pg_conn() as conn:
-        data = product_pool.load(conn, pwin)
+        data = (product_pool.load(conn, pwin) if pool_asins is None
+                else product_pool.load(conn, pwin, asins=pool_asins))
         perf_raw = store_perf.load(conn, win)
         with conn.cursor() as cur:
             cur.execute(_SQL_ONLINE_NOW)
@@ -274,6 +317,11 @@ def run(params: dict) -> str:
         held_prod = claims.load_active(conn, claims.PRODUCT)
         pending = _pending_delist(conn, cfg, registered)
         listed = _listed_asins(conn, registered)
+        if pool_asins is not None:
+            in_pool = {row[0] for row in data["pool"]}
+            gone = [a for a in pool_asins if a not in in_pool]
+            if gone:
+                absent_why = Counter(w for w, _b in _why_absent(conn, gone).values())
 
     # ── 店铺(先建,漏斗要用它们的条件)──────────────────────────────
     # ⚠ **顺序是有意的**:候选池的准入条件全部来自这批店的限额表行(渠道 /
@@ -281,7 +329,11 @@ def run(params: dict) -> str:
     #   "每一个店,对于配送时间的限制、配送方式的限制都在表格里……分配的时候
     #   会读取表,这些信息都能拿到,再拿着条件去拿品过来分配"。
     stores, basis, no_gap, at_target, total_q = _build_stores(
-        perf_raw, cfg, registered, online_now, pending, days, batch)
+        perf_raw, cfg, registered, online_now, pending, days, batch,
+        by_gap=pool_asins is not None)
+    if quota_over is not None:
+        stores, basis, total_q = _override_quota(stores, quota_over)
+        no_gap, at_target = [], []
     if not stores:
         return ("⛔ 没有一家店可以接货(在册 ∧ 规划内 ∧「单店最大在线数」> 0)。"
                 "先跑 alloc_stores 看是谁被挡下的")
@@ -291,9 +343,10 @@ def run(params: dict) -> str:
     # ⚠ 漏斗前四行的单位是**产品**,后两行是**组**。混在一列里报会骗人:
     # "60 个产品 → 20 组"会显示成 33.3%,读起来像丢了三分之二的货,
     # 其实一件没丢(每组 3 件)。所以组那两行同时给组数与货位数
-    funnel = [("候选池", len(data["pool"])), ("过硬闸", len(scored))]
-    live = [c for c in scored if c["score"] >= ps.CUTOFF]
-    funnel.append((f"≥ 淘汰线 {ps.CUTOFF:.0f}", len(live)))
+    funnel = ([("限定池清单", len(pool_asins))] if pool_asins is not None else [])
+    funnel += [("候选池", len(data["pool"])), ("过硬闸", len(scored))]
+    live = [c for c in scored if c["score"] >= cutoff]
+    funnel.append((f"≥ 淘汰线 {cutoff:.0f}", len(live)))
     # ★ 排除的是**已在架**的,不是已占位的。占位了没上架的照常进池,
     #   只是只能回它的占用店(见 alloc_groups.build 的 bound_asins)
     live = [c for c in live if c["asin"] not in listed]
@@ -344,7 +397,8 @@ def run(params: dict) -> str:
     placed_items = sum(v["items"] for v in result["by_store"].values())
     L = ["", "═══ 分配方案 ═══", "",
          f"▍本轮可分 {total_q:,} 个货位 = {len(stores)} 家店各自"
-         f"「min(剩余容量, 缺口 ÷ 单品日产出)」之和",
+         + ("「quota_csv 给定配额」之和(同时作为本轮容量)" if quota_over is not None
+            else "「min(剩余容量, 缺口 ÷ 单品日产出)」之和"),
          f"  实发 {placed_items:,} 个货位(定向流 {dir_items:,} = 补齐已占品牌"
          + (f",同轮续发 {rnd_items:,} = 品牌被切口切在两片" if rnd_items else "")
          + f",自由流 {placed_items - dir_items - rnd_items:,} = 拓新品牌)"
@@ -365,6 +419,9 @@ def run(params: dict) -> str:
         + [[k, f"{n:,}", _pct(n, len(data["pool"])), f"{c:,}"]
            for k, c, n in grouped],
         align="<>><")
+    if absent_why:
+        L.append("  限定池里不在候选池:" + " · ".join(
+            f"{k} {v:,}" for k, v in absent_why.most_common()))
     if gated:
         L.append("  硬闸淘汰:" + " · ".join(f"{k} {v:,}"
                                                 for k, v in sorted(gated.items())))
@@ -533,6 +590,23 @@ def _build_stores(perf_raw: dict, cfg: dict, registered, online_now: dict,
             stores[s]["quota"] = math.ceil(stores[s]["quota"] * batch / total_q)
         total_q = sum(v["quota"] for v in stores.values())
     return stores, basis, no_gap, at_target, total_q
+
+
+def _override_quota(stores: dict, quota: dict[str, int]) -> tuple[dict, dict, int]:
+    """输入:`_build_stores` 建好的店 + {店: 配额}(quota_csv)→ 输出:(stores, 配额依据, 总配额)。
+
+    配额同时作为本轮容量(`room`):仓外算配额时已经扣过在线与有效待上架,
+    再拿引擎自己的剩余容量去夹,两个口径会打架。清单没有的店 / 配额 0 的店
+    本轮不参与;写了正配额却不在 `stores` 里(未启用 / 规划外 / 容量 0 或未填)
+    的店**报错**,不静默丢。
+    """
+    bad = sorted(s for s, n in quota.items() if n > 0 and s not in stores)
+    if bad:
+        raise ValueError(f"quota_csv 给了正配额、但不在分配范围的店:{bad}"
+                         f"(未启用 / 规划外 /「单店最大在线数」为 0 或未填)")
+    out = {s: {**v, "quota": quota[s], "room": quota[s]}
+           for s, v in stores.items() if quota.get(s, 0) > 0}
+    return out, {s: "quota_csv 给定" for s in out}, sum(quota[s] for s in out)
 
 
 # ⚠ 与 `alloc_产品分.csv` 的同名列**必须是同一个数**(同一个 product_pool

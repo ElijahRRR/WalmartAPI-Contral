@@ -454,3 +454,30 @@ cd /Users/nextderboy/Projects/WalmartAPI-Contral
 两条路:先把它找出来停掉,或者**先从 `product_chain` 里摘掉最后那一步**
 (改 `registry/schedule.py` 后重新 `skill_export`),等定位到了再加回去。
 不要"先跑着看看" —— 这一条正是铁律说的那种破坏性并跑。
+
+
+## 2026-11-15 日报迟到订单与历史校正
+
+调度与 06:30 窗口不变。daily_report 读取本次窗口的全部订单后，核验
+meta.totalCount、唯一 PO 数与实收条数一致，再通过 services/order_ingest.persist
+落库，与 order_sync 共用详情定稿、ASIN 补齐和审核列保护。API 中断或分页不全
+时该店 KPI 保留旧值并点名失败，不再把订单列写成零。
+
+每天 KPI 阶段之后复核最近 7 个历史日报日期（history_days 可设 1~45）。
+仅当库内订单两列与已存 KPI 不一致才复查同窗口 API，补齐后 API 与库一致才
+更新 orders_count / sales_amount / updated_at；并发修改时按旧值比较拒绝覆盖。
+其它 KPI、采购信息和 WFS 范围不变。看板随后由现有 board 阶段刷新。
+
+定向修复可以先预览，再执行；不重跑影刀、不重发历史日报正文：
+
+```bash
+python cli.py daily_report -p phase=orders_reconcile -p dates=2026-11-11,2026-11-13 -p stores=A128吴梓健,A166瞿勇 --dry-run
+python cli.py daily_report -p phase=orders_reconcile -p dates=2026-11-11,2026-11-13 -p stores=A128吴梓健,A166瞿勇
+python cli.py daily_report -p phase=board
+```
+
+截图补齐：order_audit 的旧失败标记仅在采集端仍未 done 时阻止取图；同批次同
+ASIN 恢复 done 后允许取图并把失败缓存升级为 file_token，已有 token 不重复
+上传。`order_audit -p phase=screenshots -p lines=ol_x,ol_y` 只补指定行的空截图，
+不重审、不重采，先备份目标字段，写前核对行身份及空值，写后回读核验。
+支持 `--dry-run` 查看将补的数量。未指定该阶段的定时审核沿原流程运行。

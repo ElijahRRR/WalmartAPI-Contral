@@ -160,7 +160,7 @@ from decimal import Decimal
 import httpx
 
 from api import feishu, scraper
-from registry import db, resources
+from registry import db, paths, resources
 from services import (brand_key, kpi, order_audit as rules, order_center,
                       product_ingest as ingest, risk_trace,
                       scrape_batches as batches, store_events,
@@ -1048,7 +1048,7 @@ def _screenshot_token(conn, batch_name: str, asin: str, status: str) -> str | No
     三种结局分别处置:
     - done → 取图上传飞书换 file_token,记 ops.dedupe(上传接口不幂等,
       重复上传会在飞书网盘堆垃圾)
-    - 终态失败 → 记墓碑,以后不再为这张图发请求
+    - 终态失败 → 记失败,清单仍失败时不重复请求;恢复 done 时补图
     - 其余(还没好 / 清单里根本没这条)→ 本轮不写这一列,下轮再来
 
     截图是佐证材料:任何一步失败都只告警,绝不让整行审核失败。
@@ -1060,10 +1060,12 @@ def _screenshot_token(conn, batch_name: str, asin: str, status: str) -> str | No
         cur.execute("SELECT meta->>'file_token', meta->>'gone' FROM ops.dedupe "
                     "WHERE scope = %s AND key = %s", (_SCREENSHOT_SCOPE, key))
         hit = cur.fetchone()
-    if hit:
-        return hit[0] or None           # 已上传过,或已记墓碑(不再重试)
+    if hit and hit[0]:
+        return hit[0]                  # 已上传,不重复取图/上传
+    if hit and status != "done":
+        return None                    # 旧失败仍未恢复;清单变 done 才重新取图
     if status in _SHOT_DEAD:
-        logger.info("截图不会再有,记墓碑不再重试:%s(status=%s)", key, status)
+        logger.info("截图失败,等待清单恢复 done:%s(status=%s)", key, status)
         _remember(conn, key, {"gone": True, "reason": f"status={status}"})
         return None
     if status != "done":
@@ -1073,7 +1075,7 @@ def _screenshot_token(conn, batch_name: str, asin: str, status: str) -> str | No
     except scraper.ScreenshotPending:
         return None                     # 清单说好了但取图说没好:下轮再来
     except scraper.ScreenshotGone as e:
-        logger.info("截图不会再有,记墓碑不再重试:%s", e)
+        logger.info("截图暂不可取,记录失败并等待清单恢复:%s", e)
         _remember(conn, key, {"gone": True, "reason": str(e)[:200]})
         return None
     except (LookupError, RuntimeError, httpx.HTTPError) as e:
@@ -1091,10 +1093,13 @@ def _screenshot_token(conn, batch_name: str, asin: str, status: str) -> str | No
 
 
 def _remember(conn, key: str, meta: dict) -> None:
-    """输入:连接 + 防重键 + 元信息 → 输出:无(写 ops.dedupe,已存在则不动)。"""
+    """输入:连接 + 防重键 + 元信息 → 输出:无;失败可升级 token,已有 token 不覆盖。"""
     with conn.cursor() as cur:
         cur.execute("INSERT INTO ops.dedupe (scope, key, meta) "
-                    "VALUES (%s, %s, %s::jsonb) ON CONFLICT DO NOTHING",
+                    "VALUES (%s, %s, %s::jsonb) ON CONFLICT (scope,key) DO UPDATE"
+                    " SET meta=EXCLUDED.meta"
+                    " WHERE ops.dedupe.meta->>'file_token' IS NULL"
+                    " AND EXCLUDED.meta->>'file_token' IS NOT NULL",
                     (_SCREENSHOT_SCOPE, key, json.dumps(meta, ensure_ascii=False)))
     conn.commit()
 
@@ -1229,7 +1234,7 @@ def _payload(conn, rows: list[dict]) -> tuple[dict[str, dict], dict]:
     取图却只认本链台账)。没记的是老行,回落台账按 (ASIN,邮编) 查 —— 兜底
     三要件:同函数内、日志计数、条件明确(detail 缺 batch_name)。
     - `not_settled` —— 批次还在跑,或 ops.scrape_batches 里没这批的行。下轮再来。
-    - `waiting` —— 图还没截好 / 已记墓碑。下轮再来或就这样了。
+    - `waiting` —— 图还没截好 / 已记失败。后续清单恢复 done 时自动补图。
     - `ok` —— 拿到 file_token 写进去了。
     """
     f = resources.ORDER_SALES_AUDIT.fields
@@ -1469,8 +1474,82 @@ def _yes(v) -> bool:
     return str(v).lower() in {"1", "true", "yes"}
 
 
+def _repair_screenshots(params: dict) -> str:
+    """输入:精确订单行列表 → 输出:仅补空截图的结果;不重审、不建批、不建行。"""
+    keys = sorted({s.strip() for s in str(params.get("lines", "")).split(",") if s.strip()})
+    if not keys or len(keys) > 50:
+        raise ValueError("screenshots 阶段需要 lines=订单行标识列表(1~50 行)")
+    with db.pg_conn() as conn:
+        rows = conn.execute(
+            "SELECT order_line_id,audit_detail FROM orders.order_lines"
+            " WHERE order_line_id=ANY(%s)", (keys,)).fetchall()
+    if len(rows) != len(keys):
+        raise ValueError("指定订单行未全部在库,未写截图")
+    details = {key: detail for key, detail in rows}
+    f = resources.ORDER_SALES_AUDIT.fields
+    query = {"conjunction": "or", "conditions": [
+        {"field_name": f.key, "operator": "is", "value": [key]} for key in keys]}
+
+    def read():
+        records = feishu.list_records(resources.ORDER_SALES_AUDIT, filter_=query,
+                                      field_names=[f.key, f.screenshot])
+        by_key = {}
+        for rec in records:
+            value = rec["fields"].get(f.key)
+            key = ("".join(x.get("text", "") for x in value)
+                   if isinstance(value, list) else str(value or ""))
+            if key not in keys or key in by_key or not rec.get("record_id"):
+                raise RuntimeError("飞书订单行身份不唯一,未继续写入")
+            by_key[key] = rec
+        if set(by_key) != set(keys):
+            raise RuntimeError("飞书未找到全部指定订单行,未继续写入")
+        return by_key
+
+    before = read()
+    names = {d.get("batch_name") for d in details.values() if d.get("batch_name")}
+    shots = _shot_index(names)
+    todo = [key for key in keys if not before[key]["fields"].get(f.screenshot)
+            and shots.get((details[key].get("batch_name"), details[key].get("asin"))) == "done"]
+    if params.get("dry_run"):
+        return f"DRY-RUN:指定 {len(keys)} 行,原批次图片已生成且飞书为空 {len(todo)} 行;未上传/写回"
+    backup = paths.backups_dir() / ("order_screenshots_" + datetime.now().strftime("%Y%m%d_%H%M%S_%f") + ".json")
+    backup.write_text(json.dumps(before, ensure_ascii=False, indent=2), encoding="utf-8")
+    tokens = {}
+    with db.pg_conn() as conn:
+        for key in todo:
+            d = details[key]
+            token = _screenshot_token(conn, d["batch_name"], d["asin"], "done")
+            if not token:
+                raise RuntimeError(f"{key} 图片未取到;已缓存成功上传项,尚未写飞书")
+            tokens[key] = token
+    # 上传期间人工可能已补图;再次核对身份和空值,不覆盖已有附件。
+    current = read()
+    updates = []
+    for key, token in tokens.items():
+        if current[key]["record_id"] != before[key]["record_id"]:
+            raise RuntimeError("飞书记录身份在补图期间变化,未写入")
+        if not current[key]["fields"].get(f.screenshot):
+            updates.append({"record_id": current[key]["record_id"],
+                            "fields": {f.screenshot: [{"file_token": token}]}})
+    if updates:
+        feishu.batch_update(resources.ORDER_SALES_AUDIT, updates)
+    after = read()
+    by_id = {r["record_id"]: r for r in after.values()}
+    for update in updates:
+        actual = by_id[update["record_id"]]["fields"].get(f.screenshot) or []
+        expected = update["fields"][f.screenshot][0]["file_token"]
+        if expected not in {a.get("file_token") for a in actual}:
+            raise RuntimeError(f"截图写后核验失败:{update['record_id']}")
+    filled = sum(bool(r["fields"].get(f.screenshot)) for r in after.values())
+    return f"截图定向补齐:写回 {len(updates)} 行,回读有图 {filled}/{len(keys)};备份 {backup}"
+
+
 def run(params: dict) -> str:
     """输入:params(days/stores/line/recheck/scrape/wait/push)→ 输出:审核摘要。"""
+    if params.get("phase") == "screenshots":
+        return _repair_screenshots(params)
+    if params.get("dry_run"):
+        return "DRY-RUN:订单审核将判定、采集并回写;未执行写入"
     days = int(params.get("days", _DEFAULT_DAYS))
     stores = [s.strip() for s in str(params.get("stores", "")).split(",") if s.strip()]
     line_id = str(params.get("line", "")).strip()

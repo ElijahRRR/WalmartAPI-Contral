@@ -5,6 +5,7 @@
   python cli.py daily_report -p phase=kpi          # 采集 KPI(**默认含影刀**,社区版/创业版每次扣一次影刀额度)
   python cli.py daily_report -p phase=kpi -p yingdao=0      # 只采集 KPI,不接影刀
   python cli.py daily_report -p phase=kpi -p yingdao=input  # 只产出影刀输入清单,不触发影刀
+  python cli.py daily_report -p phase=orders_reconcile -p dates=2026-11-11,2026-11-13 -p stores=店1,店2
   python cli.py daily_report -p phase=board [-p days=90]   # 只刷 KPI 看板(总览+历史)
   python cli.py daily_report -p phase=push -p push=1   # 生成日报并真正推送(飞书 webhook)
   python cli.py daily_report -p store=A085朱丽霖    # 单店(kpi 阶段)
@@ -27,8 +28,8 @@ report 端点,xlsx)+ 订单中心 perf_events 归 `workflows/perf_problems.py`,
 - 在线商品/有库存/无库存 三列直接读 catalog.walmart_items(catalog_sync 的产出),
   不再翻页调 /v3/items——中央库复用,省 60/min 配额
 - 昨日出单/销售额两列改读 orders.order_lines(所有者认可 2026-08-08):当前为
-  双算对拍期——API 现拉仍是权威值,库算值只记日志差异;连续对平后摘除 API
-  拉取,order_sync 成为本工作流的调度前置
+  API 本轮完整拉取后先补齐订单库,再对拍;失败保留原 KPI、不写零。
+  每天复核最近 7 天历史差异,用同窗口 API 与库交叉确认后只校正单量/销售额
 - 影刀接入(-p yingdao=1;2026-08-08 接入,2026-08-15 改为文件衔接):
   写 input.json 影刀输入清单(过滤空 sellerId 行——A147 事故防线)→ 经影刀本地
   任务接口提交并跟踪到终态(2026-10-31 起;1.22.x 删了 shadowbot:Run 协议,见
@@ -49,14 +50,14 @@ report 端点,xlsx)+ 订单中心 perf_events 归 `workflows/perf_problems.py`,
 import json
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 
 import httpx
 
 from api import _client, feishu, insights, orders as orders_api, reports
 from registry import db, paths, resources
-from services import kpi, order_lines, settlements, store_events, \
+from services import kpi, order_lines, order_reporting, settlements, store_events, \
     store_retry, stores as stores_svc, yingdao
 
 DANGEROUS = False
@@ -173,14 +174,8 @@ def _pg_order_stats(store_name: str, win_start: str, win_end: str) -> tuple[int,
     订单数 = 窗口内下单的 PO 数(meta.totalCount 的库等价 = COUNT(DISTINCT po_id)),
     销售额 = 行 PRODUCT 费用合计(order_lines.product_amount 同源)。
     """
-    with db.pg_conn() as conn, conn.cursor() as cur:
-        cur.execute(
-            "SELECT count(DISTINCT po_id), coalesce(sum(product_amount), 0)"
-            " FROM orders.order_lines"
-            " WHERE store = %s AND order_date >= %s AND order_date < %s",
-            (store_name, win_start, win_end))
-        row = cur.fetchone()
-    return int(row[0]), round(float(row[1]), 2)
+    count, amount = order_reporting.pg_stats(store_name, win_start, win_end)
+    return count, float(amount)
 
 
 def _collect_store_kpi(store: dict, data_date, win_start: str, win_end: str,
@@ -210,15 +205,8 @@ def _collect_store_kpi(store: dict, data_date, win_start: str, win_end: str,
 
     settle = kpi.extract_settlement(reports.payment_statement(store))
 
-    stats: dict = {}
-    sales = 0.0
-    try:
-        for order in orders_api.iter_orders(store, created_start=win_start,
-                                            created_end=win_end, stats=stats):
-            sales += orders_api.order_product_sales(order)
-    except Exception as e:
-        logger.warning("店铺 %s 订单窗口拉取失败(单量/销售额置 0): %s", name, e)
-        stats["total"] = 0
+    # 同一轮完整 API 结果先落订单库,再对拍;失败向上抛,不拿 0 覆盖 KPI。
+    api_orders, sales = order_reporting.sync_window(store, win_start, win_end)
 
     online, in_stock, out_stock = _pg_item_counts(name)
 
@@ -226,8 +214,7 @@ def _collect_store_kpi(store: dict, data_date, win_start: str, win_end: str,
     orders_diff = None
     try:
         db_orders, db_sales = _pg_order_stats(name, win_start, win_end)
-        api_orders = stats.get("total", 0)
-        if db_orders != api_orders or abs(db_sales - sales) > 0.01:
+        if db_orders != api_orders or abs(Decimal(str(db_sales)) - sales) > Decimal("0.01"):
             orders_diff = (f"API {api_orders} 单/${sales:.2f}"
                            f" vs 库 {db_orders} 单/${db_sales:.2f}")
             logger.info("对拍[订单列] %s:%s", name, orders_diff)
@@ -249,7 +236,7 @@ def _collect_store_kpi(store: dict, data_date, win_start: str, win_end: str,
         "payment_status": settle["payment_status"],
         "items_online": online, "items_in_stock": in_stock,
         "items_out_stock": out_stock,
-        "orders_count": stats.get("total", 0), "sales_amount": round(sales, 2),
+        "orders_count": api_orders, "sales_amount": sales,
         "otd_rate": rates.get("otd"), "cancel_rate": rates.get("cancellations"),
         "vtr_rate": rates.get("vtr"), "srr_rate": rates.get("srr"),
         "refund_rate": rates.get("refunds"),
@@ -601,14 +588,26 @@ def run(params: dict) -> str:
     # 默认全链(所有者定稿 2026-08-16):kpi + 影刀 + 看板 + 推送。
     # 调度里只写工作流名就是完整一轮,不必逐个 phase 拼命令。
     phase = str(params.get("phase", "all"))
-    if phase not in ("all", "kpi", "board", "push", "settle_debug"):
+    if phase not in ("all", "kpi", "board", "push", "settle_debug", "orders_reconcile"):
         if phase == "problems":     # 已摘出为独立工作流(2026-08-08)
             return "问题订单已独立:改跑 python cli.py perf_problems"
         if phase == "settlement":   # 已摘出为独立工作流(2026-08-10)
             return "对账明细已独立:改跑 python cli.py settlement_sync"
-        return ("phase 只接受 all/kpi/board/push/"
+        return ("phase 只接受 all/kpi/board/push/orders_reconcile/"
                 f"settle_debug,收到:{phase}")
     data_date = datetime.now(kpi.CN_TZ).date()
+
+    dry_run = bool(params.get("dry_run", False))
+    if dry_run and phase != "orders_reconcile":
+        return "DRY-RUN:日报将先补齐窗口订单、复核最近 7 天历史订单两列,再刷新看板;未执行写入"
+    if phase == "orders_reconcile":
+        names = [n.strip() for n in str(params.get("stores", params.get("store", ""))).split(",") if n.strip()]
+        store_list = stores_svc.load_stores(names or None)
+        dates = ([date.fromisoformat(d.strip()) for d in str(params["dates"]).split(",")]
+                 if params.get("dates") else None)
+        return order_reporting.reconcile_history(
+            store_list, data_date, dates=dates,
+            days=int(params.get("history_days", 7)), dry_run=dry_run)
 
     if phase == "settle_debug":     # 结算解析诊断:单店打点关键键全部出现位置
         if not params.get("store"):
@@ -635,6 +634,8 @@ def run(params: dict) -> str:
         except ValueError as e:
             return str(e)
         lines.append(_phase_kpi(store_list, data_date, mode))
+        lines.append(order_reporting.reconcile_history(
+            store_list, data_date, days=int(params.get("history_days", 7))))
     if phase in ("all", "board"):
         try:
             lines.append(_phase_board(int(params.get("days", 90))))

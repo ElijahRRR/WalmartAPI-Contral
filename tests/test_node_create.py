@@ -153,7 +153,12 @@ def test_create_ship_node_posts_official_envelope_without_retries_and_clears_cac
     (400, {"errors": ["bad"]}, RuntimeError),                    # 确认未达
     (403, None, RuntimeError),
     (None, None, settings_api.ShipNodeOutcomeUnknown),           # 网络中断
-    (503, None, settings_api.ShipNodeOutcomeUnknown),            # 5xx
+    (503, None, settings_api.ShipNodeOutcomeUnknown),            # 5xx 无体:不知道到没到
+    (502, {"errors": [{"description": "gateway", "category": "SYSTEM"}]},
+     settings_api.ShipNodeOutcomeUnknown),                       # 5xx 系统侧:同上
+    # 5xx 但沃尔玛明说是请求侧(2026-10-24 第三次真跑实见 520 HV000028):确认未达
+    (520, {"errors": [{"description": "HV000028: Unexpected exception during isValid call.",
+                       "severity": "ERROR", "category": "REQUEST"}]}, RuntimeError),
     (200, [], settings_api.ShipNodeOutcomeUnknown),              # 200 却读不出节点
     (200, [{"shipNode": "1"}, {"shipNode": "2"}], settings_api.ShipNodeOutcomeUnknown),
 ])
@@ -338,11 +343,15 @@ _OK = {"shipNode": "1011159562695573505", "nodeType": "PHYSICAL"}
 
 
 
-def test_dry_run_reads_but_writes_nothing(monkeypatch):
-    seen = _wire_wf(monkeypatch, stores=[_store("T1")], create=_OK)
+def test_dry_run_reads_but_writes_nothing_and_lists_carriers(monkeypatch):
+    seen = _wire_wf(monkeypatch, stores=[_store("T1")], create=_OK,
+                    carriers=[{"carrierMethodName": "FEDEX", "carrierMethodType": "GROUND"},
+                              {"carrierMethodName": "UPS", "carrierMethodType": "GROUND"}])
     out = nc.run({**_MIN, "store": "T1", "dry_run": True, "execute": False})
     assert out.startswith("[DRY-RUN] 建仓「中山仓」:1 店 → 将新建 1 家")
     assert "一个字都没发" in out
+    assert "可用承运方法" in out and "FEDEX/GROUND,UPS/GROUND" in out   # 没填承运商就把能填的列出来
+    assert seen["carriers_called"] == 1
     assert not seen["posted"] and not seen["opened"] and not seen["events"]
 
 

@@ -1412,3 +1412,14 @@ ORDER BY id DESC LIMIT 1)`,`feed_id` 上没有索引 ⇒ 每个候选把 65.8 �
 `walmartapi:<工作流>`(`pg_stat_activity` 里认得出是谁的查询);附属步骤自带更紧的 `SET LOCAL`;
 `db_init` 不限语句时长但等锁 30 秒即退。**写逐行 / 逐候选关联之前,先确认被探的列有索引**;
 不许在 LATERAL 里读 `latest_snapshot` 视图(直接读 `catalog.snapshots`)。
+
+
+### 2026-11-15 日报订单历史修正（无 schema 变更）
+
+`ops.store_kpi_daily` 的 orders_count、sales_amount 允许由 daily_report 的
+orders_reconcile 阶段或每日最近 7 天复核校正。仅当完整 API 窗口与补齐后的
+orders.order_lines 汇总一致时更新，比较旧两列防并发覆盖，其余 KPI 原样保留。
+日期沿用报告日 06:30 截止的 24 小时窗口，详见 schedule_plan.md。
+
+`ops.dedupe(scope='order_audit:screenshot')` 的 gone 标记可在采集端同批次同
+ASIN 恢复 done 且图片成功上传后升级为 file_token；已存在 file_token 不覆盖。

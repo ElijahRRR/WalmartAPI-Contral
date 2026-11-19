@@ -829,6 +829,64 @@ def test_screenshot_uploads_and_dedupes(wired, monkeypatch):
     assert len(uploads) == 1
 
 
+def test_screenshot_failed_marker_recovers_only_when_remote_done(wired, monkeypatch):
+    wf, _ = wired
+    conn = FakeConn({"FROM ops.dedupe": (["file_token", "gone"], [(None, "true")])})
+    fetched, saved = [], []
+    monkeypatch.setattr(wf.scraper, "fetch_screenshot", lambda b, a: fetched.append((b, a)) or b"png")
+    monkeypatch.setattr(wf.feishu, "upload_media", lambda *a, **kw: "ft_recovered")
+    monkeypatch.setattr(wf, "_remember", lambda c, k, m: saved.append(m))
+    assert wf._screenshot_token(conn, "batch", "ASIN", "failed") is None
+    assert fetched == []
+    assert wf._screenshot_token(conn, "batch", "ASIN", "done") == "ft_recovered"
+    assert fetched == [("batch", "ASIN")]
+    assert saved == [{"file_token": "ft_recovered", "batch_name": "batch", "asin": "ASIN"}]
+
+
+@pytest.mark.parametrize("mode", ["write", "preview", "already_filled"])
+def test_targeted_screenshot_repair_only_changes_empty_attachment(wired, monkeypatch, tmp_path, mode):
+    import copy
+    from types import SimpleNamespace
+    wf, calls = wired
+    f = wf.resources.ORDER_SALES_AUDIT.fields
+    fields = {f.key: [{"text": "ol_one"}], f.screenshot: [], "采购备注": "人工信息保留"}
+    if mode == "already_filled":
+        fields[f.screenshot] = [{"file_token": "manual_existing"}]
+    record = {"record_id": "rec_one", "fields": fields}
+
+    class Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            pass
+
+        def execute(self, sql, args):
+            return SimpleNamespace(fetchall=lambda: [("ol_one", {"batch_name": "original", "asin": "ASIN"})])
+
+    monkeypatch.setattr(wf.db, "pg_conn", Conn)
+    monkeypatch.setattr(wf.paths, "backups_dir", lambda: tmp_path)
+    monkeypatch.setattr(wf.feishu, "list_records", lambda *a, **k: [copy.deepcopy(record)])
+    monkeypatch.setattr(wf, "_shot_index", lambda names: {("original", "ASIN"): "done"})
+    uploads, writes = [], []
+    monkeypatch.setattr(wf, "_screenshot_token", lambda *a: uploads.append(a[1:]) or "ft_new")
+
+    def update(table, rows):
+        assert rows == [{"record_id": "rec_one", "fields": {f.screenshot: [{"file_token": "ft_new"}]}}]
+        writes.extend(rows)
+        fields.update(rows[0]["fields"])
+    monkeypatch.setattr(wf.feishu, "batch_update", update)
+    monkeypatch.setattr(wf, "_load_config", lambda: pytest.fail("补图不应重审"))
+    out = wf.run({"phase": "screenshots", "lines": "ol_one", "dry_run": mode == "preview"})
+    assert fields["采购备注"] == "人工信息保留" and calls["batches"] == []
+    if mode == "write":
+        assert "回读有图 1/1" in out and len(writes) == 1 and len(uploads) == 1
+    else:
+        assert writes == [] and uploads == []
+        if mode == "preview":
+            assert not list(tmp_path.glob("*.json"))
+
+
 def test_shot_index_keys_by_batch_and_asin(wired, monkeypatch):
     """按批次一次拿清单(不逐 ASIN 试探),键含批次名——同一 ASIN 的两个邮编
     批次各有各的图,少了批次名就会互相顶掉。"""

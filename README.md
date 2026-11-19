@@ -9,7 +9,7 @@
 python cli.py <workflow> [-p key=value ...] [--dry-run]
 ```
 
-- **87 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
+- **88 条工作流**,覆盖订单、产品数据、审核、上架、维护清理、风控黑名单、
   类目映射、店铺分配、KPI 日报八个业务域;
 - **13 条自动任务**在生产运行(电脑 launchd 4 条高频 + 智能体定时任务 9 条每日/每周);
 - **PostgreSQL 17** 单库五 schema(56 表 / 14 视图)为唯一权威状态;
@@ -399,6 +399,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 | `error_reclass` | | **存量报错按新码重新归类并回填**(手动跑;所有者 2026-09-03「标准不统一,审核误差很大」)。写 `audit.walmart_error_records` 与 `catalog.asin_blacklist` 的 `taxonomy_*` 新列,**老列与判定行为一个字不动**;原文四级优先(records 全文 → events 病历 → items 当前值 → 本表 200 字符样本,都没有就留 NULL 不猜);`taxonomy_version` 天然分页,跑一半可直接重跑。⚠ 报出「依据在新码下站不住」的黑名单行,但**不放行任何一条** —— 那是另一次裁决 |
 | `blacklist_route` | ⚠ | **存量 ASIN 黑名单按新码裁决重新路由**(手动跑,**删行不可逆**;所有者 2026-09-03 逐码裁决,表在 `docs/error_taxonomy.md` §十二)。留下 = 七个永久码(PROHIBITED_FINAL/POLICY/IP/BRAND/RECALL/FLAGGED/GATED)+ `OTHER` 的 business decision / trust & safety 两个词条 + **判不出来的**(查不出理由就继续禁);其余全删,主体是 `PT_WRONG`。三道闸:只动回填过的行、删前整行落 `backups/`、`--dry-run` 一行不动。⚠ 删完要跑 `blacklist_push` 才同步飞书 |
 | `product_clear` | 危 调 | 飞书停用/删除表驱动的商品清理 |
+| `retire_push` | 危 | 已确认的停用/删除清单(店铺,SKU,动作,原因)→ 追加进停用删除表 A~D,交给 product_clear 执行 |
 | `node_clear` | 危 调 | 把**受管仓以外**的节点库存清零(搬仓收尾,一次性,不进调度):切到受管仓后旧节点的存量货自动链一律不碰,等受管仓充起来再用它清空旧仓。2026-09-25 起**不调接口读库存、不逐条写**:从库里的分仓库存(`catalog.item_node_inventory`)查出要清的「SKU × 旧仓」,按「店 × 旧仓」分批用分仓库存 feed(MP_INVENTORY)写 0,结果由 feed_poll 回写。判断条件:**维护仓以外有货就清**(不再区分维护仓是否已接管,2026-09-25 所有者定稿;维护仓还没有记录的商品清完在所有仓都是 0,靠维护链往维护仓补货,非亚马逊来源的就此停售);维护仓永不清;同步时没给 shipNode 的数量不碰。不带 `-p store` = 所有填了「维护仓库」且校验通过的店;第一次真跑先只跑一家店看回执 |
 | `weight_fix` | 危 调 | **按名单改已上架商品的发货重量**(临时工具,不进调度;所有者 2026-10-16):读 `-p file=` 的 xlsx/csv,只认「店铺」「SKU」两列,把名单里的品的发货重量统一改成 `-p weight=`(缺省 11 磅)。走 MP_MAINTENANCE 部分更新,载荷只有 sku + UPC + ShippingWeight,价格、库存、标题都不碰(字段依据官方规范原件,摘录在 `refdata/specs/`)。目录里查不到 / 已缺席 / 没 UPC 的不发并点名。回执成功不等于改成了:**第一次真跑先 `-p store=<店> -p limit=1`**,后台确认重量变了再跑全量。只改线上值,不改上架链「> 11 磅写 1 磅」的规则 |
 | `node_create` | 危 | 给店铺账户**新建一个自发货物流中心**(发货节点,`POST shipnodes`;2026-10-24 所有者定稿,推翻 multi_node_plan §8「不自动建仓」:建仓是在有需要时**人给信息、人手动执行**,永不进调度)。信息全走 `-p`(清单见 `services/ship_nodes.PARAM_HELP`,必填 name/address1/city/state/country/postal/tz;L001 实证国内仓 country=CN、tz=CST;`distributorSupportedServices` 缺省发 `[]`,首跑实证不能为 null),`-p store=A,B` 可多店同一个仓(共用地址点名不拦)。防重:发前 `GET shipnodes` 同名不重建、先落 `ops.ship_node_requests` pending 再 POST、结局不明留 pending 下次反查收编(宽限 10 分钟内按兵不动);填了 `carrier` 先对该店 `GET carriers` 校验。建完**不替你填**「维护仓库」、不做运费模板(两件人工,摘要提醒;顺序:配模板 → 等 4 小时 → 再填 FC ID) |
@@ -463,7 +464,7 @@ UPC 标已用;`failed`(4xx 拒)→ 理由回填、UPC 回收;`unknown` → K=Unk
 | `alloc_audit` | | 动工前的存量审计 + 数据探针(只读) |
 | `alloc_products` | | 产品分体检 |
 | `alloc_stores` | | 店铺经营水平体检 |
-| `alloc_plan` | 危 | 产品分配方案。`-p from_sheet=1` 点名分配(产品分配表);`-p from_csv=<店铺,ASIN 清单>` 定向清单只落占用、不写上架表(先 `--dry-run`;不过闸一次报全、整批拒绝) |
+| `alloc_plan` | 危 | 产品分配方案。`-p from_sheet=1` 点名分配(产品分配表);`-p from_csv=<店铺,ASIN 清单>` 定向清单只落占用、不写上架表(先 `--dry-run`;不过闸一次报全、整批拒绝);`-p pool_csv=<ASIN 清单> -p quota_csv=<店铺,配额>` 限定池 + 覆盖配额,**只出预览**(标准选品流程用) |
 | `alloc_push` | 危 | 已落占用 → 追加进飞书上架表 A/B 两列(分配链与上架链的接口) |
 | `alloc_backfill` | 危 一 | 存量在线商品 → 占用台账 |
 | `claim_audit` | | 占用台账对账:已落的占用现在还站得住吗 |

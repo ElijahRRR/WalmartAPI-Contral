@@ -116,3 +116,47 @@ def sync_from_ledger(execute: bool = True) -> str | None:
                 f"(在途 {len(pollable)})")
     n = writeback(updates)
     return f"停用/删除表回写 {n} 行(在途 {len(pollable)})"
+
+
+#: 运营域 C 列(动作)允许的值。**不含空串**:product_clear 把 C 列留空当 DELETE_ITEM
+#: (所有者定稿 2026-08-06),程序追加的行必须把动作写明,不能借这个缺省。
+APPEND_ACTIONS = ("停用", "下架", "删除")
+#: 单次写飞书的行数上限(与上架表追加同一档,一次裹上千行会被 90202 拒)
+_APPEND_BLOCK = 500
+
+
+def append_rows(rows: list[tuple[str, str, str, str]], start: int,
+                execute: bool = True) -> int:
+    """输入:[(店铺, SKU, 动作, 原因)] + 起始行号 → 输出:写入行数。**只写 A~D 运营域。**
+
+    E~H(feedid/日期/结果/报错)是 product_clear 与 feed_poll 的专属域,这里一格不碰;
+    起始行号由调用方读表算出(表尾最后一个有店铺或 SKU 的行 + 1),追加不覆盖历史行。
+    动作必须是 `APPEND_ACTIONS` 之一 —— 写空就等于让 product_clear 按缺省删除。
+    """
+    if not rows:
+        return 0
+    bad = [r for r in rows if len(r) != 4 or r[2] not in APPEND_ACTIONS
+           or not all(str(x).strip() for x in r)]
+    if bad:
+        raise ValueError(f"停用/删除表追加行不合法(四格必填、动作限 {APPEND_ACTIONS}):{bad[:5]}")
+    if not execute:
+        for i, r in enumerate(rows[:20]):
+            logger.info("[DRY-RUN] 将追加 第%d行 %s", start + i, r)
+        if len(rows) > 20:
+            logger.info("[DRY-RUN] …另有 %d 行省略", len(rows) - 20)
+        return 0
+    sheet = resources.RETIRE_SHEET.require()
+    feishu.sheet_ensure_rows(sheet, start + len(rows))
+    written = 0
+    for i in range(0, len(rows), _APPEND_BLOCK):
+        block = rows[i:i + _APPEND_BLOCK]
+        r0 = start + i
+        try:
+            feishu.sheet_write_ranges(sheet, [(f"A{r0}:D{r0 + len(block) - 1}",
+                                               [list(r) for r in block])])
+        except Exception:
+            logger.error("停用/删除表追加到第 %d 行时失败,已写 %d 行 —— 重跑即可,"
+                         "已写的行会按(店铺, SKU)在途去重跳过", r0, written)
+            raise
+        written += len(block)
+    return written

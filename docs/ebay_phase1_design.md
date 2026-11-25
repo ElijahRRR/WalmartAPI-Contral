@@ -233,6 +233,25 @@
 > ⚠ #161 只是把选品技能挪进 `.agents/skills/` 并把 20MB 类目 CSV 改为引用
 > `<DATA_ROOT>/reference/`,与本文 §5.2 的"原件按版本归档 `<DATA_ROOT>`、归档零
 > 消费"同向,只作印证不改稿。三条提交都没动 CLAUDE.md 与 conventions.md。
+> **2026-11-25 对齐 main #163**:🔴 这条改的是 **§2.1 的前提**。所有者当日拍板
+> 「**产品占用和品牌占用已由其他流程做,取消这个限制**」,main 把归属判据整条上移:
+> **只在分配链(alloc_plan / alloc_push)写上架表之前判,行上了上架表就照上**;
+> `list_new` 删了产品占用闸与品牌占用闸、`_GateState` 去掉两个字段、
+> `_load_gate_state` **一次都不再读 `catalog.claims`**(回归测试钉死"台账一次都不读")。
+> ⚠ eBay 对位有坑并已写死:沃尔玛敢把判据上移是因为**上游有分配链**,而 **eBay 一期
+> 没有分配链**,§6.1 入料是唯一上游——照抄"上架链不判"而不落到入料,**拍板 ①
+> 每平台唯一在 eBay 侧就没人执行**。定稿:`ebay_list_new` 同形不读占用表 + 判据与
+> 领用落在"入料→写上架表"那一步(= 本节 `try_claim` 原有的"与领 UPC 同一事务",
+> 现在成了唯一落点)+ **brand 与 product 同处判**(#163 对抗审查核出 `alloc_push`
+> 只查产品不查品牌,别继承这个不对称)。代价照抄:**上架表存量行不再复核**,过了
+> 边界之后归属变了不会被拦,上线首轮旧「占用」理由的行一次性放行。并写明它与
+> §3.4 ⑤「用时重核不信清单」**不矛盾**:重核在"写表之前"那个边界,撤掉的是"表写好
+> 之后"那道 ⇒ **判据在一个边界上判死、那个边界自己用时重核、下游消费表不再判**。
+> 📉 §2.1 调用面随之重核:读侧 `load_active` 由 **6 文件 13 处降为 5 文件 11 处**
+> (`list_new:463,466` 整条删除),写侧 4 处与事件桥 4 处不变;其余行号按 main 现状
+> 重定位(alloc_push 91、alloc_plan 316/317·506·510、1322/1323·1400·1401、
+> 1583/1584·1606·1610)。§八 P1-2 的预期红清单同步改成 **11 读 + 4 写 + 4 事件桥**。
+> #163 没动 CLAUDE.md 与 conventions.md。
 > ⚠ 本文引用的仓库行号以 **2026-09-23 的 main(06140c3)** 为快照(§2.1/§2.2/
 > §3.2 已按它重定位;其余节仍是 09-07 快照),批次实施时现场重定位。
 
@@ -289,20 +308,21 @@ SKU↔offerId/listingId 权威在 `ops.feed_items`)。
   **必填关键字参数**;每平台唯一后 `_LOAD` 的 `dict(cur.fetchall())` 塌陷坑
   真实存在(同 key 两平台各一行),谓词本身就是修复。
 - **调用面全量**(2026-10-22 对齐 main #149 后现场重核;P1-2 验收写明
-  "以下红/改是预期内的"):读侧 `load_active` **6 文件 13 处**
-  (alloc_push:83 / alloc_plan:258,259 **+1233,1234 +1485,1486** /
-  claim_audit:96 / alloc_audit:188,189 / alloc_products:102 /
-  list_new:463,466)全部显式传 walmart 常量;写侧 `claim_many` **4 处**
-  (alloc_plan:434 **+1311 +1492**、alloc_backfill:162)——⚠ 它在 #85 后
+  "以下红/改是预期内的"):读侧 `load_active` **5 文件 11 处**
+  (alloc_push:91 / alloc_plan:316,317 **+1322,1323 +1583,1584** /
+  claim_audit:96 / alloc_audit:188,189 / alloc_products:102)全部显式传
+  walmart 常量——🔴 **`list_new:463,466` 已随 main #163 删除,见本节末尾那条
+  「上架链不再读占用表」**;写侧 `claim_many` **4 处**
+  (alloc_plan:506 **+1400 +1606**、alloc_backfill:162)——⚠ 它在 #85 后
   **返回三元组 `(ok, conflicts, landed)`**,两处调用点已按三元组解包,平台化
   不改这个形态;测试替身 test_alloc_push:43、test_alloc_plan:221/265/326…、
   test_claims:104/186 等。**`try_claim` 仍返回 store 字符串**(同平台性由
   `_OWNER` 的 platform 谓词保证;Owner 具名改形留二期)。
 - 🔴 **alloc_plan 现在有 _三_ 条并列的领用路径(2026-10-22 对齐 main #149;
-  #133 时是两条)**:① 缺省全库分配(258/259 读、434 写、438 记事件、`SOURCE`);
-  ② `-p from_sheet=1` 点名分配(口径 #19;1233/1234 读、1311 写、1312 记事件、
+  #133 时是两条)**:① 缺省全库分配(316/317 读、506 写、510 记事件、`SOURCE`);
+  ② `-p from_sheet=1` 点名分配(口径 #19;1322/1323 读、1400 写、1401 记事件、
   `SOURCE_SHEET` = `alloc_plan_sheet`);③ **#149 新增的 CSV 点名**
-  (1485/1486 读、1492 写、1496 记事件)。平台化改造**三条都要改**——它们不是
+  (1583/1584 读、1606 写、1610 记事件)。平台化改造**三条都要改**——它们不是
   同一段代码的三个分支,是并列的三段;漏掉任一条,那条路径就会拿**不带
   platform 谓词**的占用表去判冲突(eBay 行会挡住沃尔玛点名),而且
   **事件桥那条 🔴 "跳过 eBay" 的规则要落三遍**。
@@ -310,11 +330,12 @@ SKU↔offerId/listingId 权威在 `ops.feed_items`)。
   (`SOURCE` / `SOURCE_SHEET`),而 #149 这条的 source 是**裸字面量**
   `"alloc_plan_csv"` —— 按常量名搜会**正好漏掉第三条**。按
   `claims.claim_created_rows(` 搜才齐。
-  P1-2 验收的"预期红清单"按 **13 读 + 4 写 + 4 事件桥** 数,不是 11+3+3,
-  更不是旧稿的 9+2+2。
+  P1-2 验收的"预期红清单"按 **11 读 + 4 写 + 4 事件桥** 数(2026-11-25 随
+  main #163 由 13 读降为 11:`list_new` 那两处整条删了),不是 13+4+4,也不是
+  更旧稿的 9+2+2。
 - 🔴 **事件桥必须显式跳过 eBay(#99 新增,本设计原稿完全没有)**:`claims`
-  在 #99 后多了两个桥函数 `claim_created_rows`(alloc_plan:438 **+1312
-  +1496**、alloc_backfill:165)与 `released_rows`(store_release:216/325/385),
+  在 #99 后多了两个桥函数 `claim_created_rows`(alloc_plan:510 **+1401
+  +1610**、alloc_backfill:165)与 `released_rows`(store_release:216/325/385),
   它们把
   占用/释放写进 **`ops.store_events`**——而那张账本的身份键是 `store`、
   语义是**沃尔玛店铺状态迁移与 TRO 封店预警**(`store_watch` 按 store 扫描
@@ -330,6 +351,34 @@ SKU↔offerId/listingId 权威在 `ops.feed_items`)。
   释放了哪个平台;runbook 的 eBay 账号释放条目同步(连同 `-p mark_offline=0`)。
 - try_claim 写侧时机:放在**领 UPC 的同一事务里**(入料到提交之间隔着构造
   与校验,期间可能被同平台另一账号占走)。
+- 🔴 **上架链不再读占用表:判据整条上移到"写上架表之前"(2026-11-25 对齐
+  main #163,所有者当日拍板)**——这条改的是本节的**前提**,不是增补。
+  所有者原话:「**产品占用和品牌占用已由其他流程做,取消这个限制**」;main 的
+  落法是「**归属只在分配链(alloc_plan / alloc_push)写上架表之前判,行上了
+  上架表就照上**」:`list_new` 删掉「产品占用:已属于 X」「品牌占用:K 已属于 X」
+  两道闸与 `claimed` 计数,`_GateState` 去掉 `owned_asin`/`owned_brand`,
+  `_load_gate_state` **一次都不再读 `catalog.claims`**,连 `claims`/`brand_key`/
+  `alloc_survey` 的 import 都撤了(回归测试就钉这句:「台账里别店占着也不拦、
+  **台账一次都不读**」)。**没动**的是:claims 台账本身与分配链对它的读写、
+  本店去重闸、黑名单品牌闸(`risk_gate`)。
+  ⚠ **eBay 对位有一个坑,必须写死**:沃尔玛能把判据上移,是因为**上游有分配链**
+  接着这件事;而 **eBay 一期没有分配链**,§6.1 的入料是**唯一**的上游边界。
+  所以照抄"上架链不判"而不把判据落到入料,结果是**拍板 ①(每平台唯一)在 eBay
+  侧根本没人执行**。定稿:① `ebay_list_new` **与沃尔玛同形、不读占用表**;
+  ② 每平台唯一的判据与领用**落在 §6.1 入料→写上架表那一步**(正是本节
+  `try_claim` 那条"放在领 UPC 的同一事务里"说的位置,口径不变、现在它成了
+  **唯一**的落点);③ **brand 与 product 必须在同一处判**——#163 的对抗审查
+  逐处核出 `alloc_push` 写上架表时**只查产品占用、不查品牌**,eBay 侧别继承
+  这个不对称,要么两样都判、要么把"不判品牌"写进注释与摘要。
+  ⚠ **代价照抄原文、不许悄悄继承**:「**上架表存量行不再复核**(归属换店后
+  旧店的开口行会照上,上线首轮旧「占用」理由的行**一次性放行**)」。eBay 对位:
+  一旦某行过了入料边界进了上架表/清单,**之后归属变了不会被拦**;这是所有者
+  认过的代价,写进 §6.1 头注与上线首轮的人眼确认项,别让后来人以为有闸。
+  ⚠ **与 §3.4 ⑤「用时重核,不信清单」的关系(别读成矛盾)**:#158 那条重核
+  发生在**分配链、写上架表之前**(清单点名的行要核占用仍属指定在营店);
+  #163 撤掉的是**上架链、表已经写好之后**的那道。合起来就是一句话:
+  **判据在"写表"这一个边界上判死,而那个边界自己必须用时重核;下游消费表,
+  不再判。** eBay 侧同理——入料边界重核,`ebay_list_new` 不重判。
 - **账号名互斥硬约束**:`services/ebay_accounts._normalize` 断言
   `stores.registered_names() ∩ eBay 账号名 == ∅`,不满足即抛。🔴 用
   **registered**(在册)不用 enabled——被守的表按 `store` 圈定与启用位无关,
@@ -1455,7 +1504,7 @@ api 留签名。要做=+4~5 人日,**五项**前置:①UPC 结构裁决落地(�
 | 批次 | 内容 | 人日 | 验收要点 |
 |---|---|---|---|
 | P1-1 | _http 抽取+registry(含 platforms.py/飞书两表)+ebay_accounts+_client+tokens+authorize+runbook+文档勘误回改 | 7 | 沃尔玛 pytest 全绿(18 处 monkeypatch 例外清单)/sandbox 与 production 各铸令牌+getRateLimits/进程超时 90.0 冒烟/账号互斥断言单测(含停用店名反例)/state 不符抛错单测/**`is_enabled` 字段缺失 ⇒ 不启用单测(§3.4)**/**代理三岔单测:填齐必走 / 全空直连 / 半配整账号拒跑,外加「没勾启用 ⇒ 配了代理也不连」的顺序回归**/**出口预览(对位 `egress_preview`)跑一次,人眼核对每账号最终走哪个出口** |
-| P1-2 | 全部 DDL(**含 `upc_usage` 对位部分索引,§2.2**)+claims/upc 改造+台账谓词补全+**risk_trace 四证据源谓词(§4.4)**+events 契约 | 7 | db_init 两跑(**记录是否踩到 `lock_timeout 30s`,§4.5**)+六格对拍+读 SQL count·md5 对拍+**取号/烧号 EXPLAIN 走 `upc_usage` 部分索引**/沃尔玛上架与分配链 --dry-run 摘要逐字一致(claims 13 读+4 写+4 事件桥、upc 7 写+6 读投影,**含 `alloc_plan` 的 `-p from_sheet=1` 点名与 #149 的 CSV 点名两条额外路径**——预期红清单按 §2.1/§2.2 的现场重核数,别按旧稿的 9+2)/UPC 三级取号+烧号保护+「烧后重上领新号」单测/飞书 UPC 表投影逐行对拍/browse_node_id 空行占比落数+**「沃尔玛在架但 audit_status 为 NULL/pending」的条数落数(§2.3)**/**risk_trace 展开结果不含 eBay 账号**(造 claims+listing_sources+product_events 三条 eBay 行) |
+| P1-2 | 全部 DDL(**含 `upc_usage` 对位部分索引,§2.2**)+claims/upc 改造+台账谓词补全+**risk_trace 四证据源谓词(§4.4)**+events 契约 | 7 | db_init 两跑(**记录是否踩到 `lock_timeout 30s`,§4.5**)+六格对拍+读 SQL count·md5 对拍+**取号/烧号 EXPLAIN 走 `upc_usage` 部分索引**/沃尔玛上架与分配链 --dry-run 摘要逐字一致(claims **11** 读+4 写+4 事件桥(#163 删掉 `list_new` 两处后由 13 降为 11)、upc 7 写+6 读投影,**含 `alloc_plan` 的 `-p from_sheet=1` 点名与 #149 的 CSV 点名两条额外路径**——预期红清单按 §2.1/§2.2 的现场重核数,别按旧稿的 9+2)/UPC 三级取号+烧号保护+「烧后重上领新号」单测/飞书 UPC 表投影逐行对拍/browse_node_id 空行占比落数+**「沃尔玛在架但 audit_status 为 NULL/pending」的条数落数(§2.3)**/**risk_trace 展开结果不含 eBay 账号**(造 claims+listing_sources+product_events 三条 eBay 行) |
 | P1-3 | bootstrap+taxonomy+catmap 测试链+account_health | 6 | sandbox 户口链重入两遍/生产拉真树+版本哨兵/aspects 解耦拉取(新 promote 类目当日拿到 aspects)/promote 三格(缺省中、入料只吃高、置高路径逐条点名)/refresh 探活停链 |
 | P1-4 | 中立抽取(3)+admission/conform/pricing+api 两文件+list_new+submit_poll+**`refdata/ebay_slas.tsv`(官方期限登记表,§6.5)**+飞书投影 | 15 | 沙箱清单 13 项完成/sandbox 端到端 3 SKU PUBLISHED/防重三态+熔断+双闸+重试闸单测/**抽码即登记单测**(eBay 行落 `listing_sources` 且 `abandoned_at IS NULL`、码形符 `OPAQUE_SQL_PREDICATE`、`-p dry_run` 走 `DRYRUN_PLACEHOLDER` 不落码)/**残局单测:造一条「`feed_log` pending 但无 `feed_items` 行」,断言 `list_new` 下一轮不选中该 SKU、`submit_poll` 的选行面选得中它**/**终检跑在「即将发出的 body」上单测**(造一条归一化才触发的条件必填:`['Yes']`→`'Yes'` 或枚举兜缺省,断言拦下而不是照发,§6.4)/**「请求没发出」与「eBay 拒收」分档单测**(取令牌/代理阶段失败 ⇒ 串行补试一遍并首行点名;4xx+errors[] ⇒ 不补试,§6.5)/**出参拒绝清单单测**(ASIN 等另一平台标识符在载荷落地前被丢弃并计数,§6.4)/**同载荷撞车单测**(造两个只差一个 eBay 类目不收的维度的兄弟 ASIN,断言第二条**不上架**并点名、留痕;另造一条「一个区分维度都发不出」的行断言不算撞;尺码 `'00'`/`'0'` 不许被归一成同值,§6.4)/--dry-run 人眼确认/中立抽取后沃尔玛输出逐字不变 |
 | P1-5 | 生产单账号试点 | 2+观察 | 首批 ≤10 条人工放行类目/真实 PUBLISHED/错误账收官/两周观察后再谈放量。**界定:试点 ≠ ebay_plan 批次 10;试点期不拉订单、库内无买家数据,不触发合规订阅义务;放量、拉订单、提额之前批次 11 仍是硬门槛** |

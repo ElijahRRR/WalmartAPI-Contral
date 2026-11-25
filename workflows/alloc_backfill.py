@@ -23,8 +23,8 @@
 4. **落快照**:每条占用记下当时的 PT/pt_source/audit_version,回答"当初
    按什么分的"。
 
-回填之后 list_new 的占用闸才有数据可查(在此之前它恒放行,靠原有的
-在线快照去重兜着)。
+回填的占用给分配链用(alloc_plan / alloc_push 按它判归属)。
+⚠ list_new 的占用闸 2026-11-25 已撤(所有者:占用由分配流程把关),上架链不读这张台账。
 """
 
 import logging
@@ -169,4 +169,4 @@ def run(params: dict) -> str:
     return (f"✅ 回填完成:{head}{ties_note};落库 {ok} 条"
             + (f";与已有占用冲突 {len(conflicts)} 条(保持原归属不动):{csample}"
                if conflicts else ";无冲突")
-            + ";接着可开 list_new 的占用闸")
+            + ";占用已可供分配链使用")

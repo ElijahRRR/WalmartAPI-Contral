@@ -457,7 +457,7 @@ CREATE TABLE catalog.brand_err_hits (brand_key PK, brand, source,
 -- 怎么抖都不影响(店铺暂停、商品下架、从没上架成功,占用都不动)。排他性由
 -- 部分唯一索引 claims_active_uniq (kind, claim_key) WHERE status='active' 保证,
 -- 不靠代码自觉;released 行永久保留 —— 它是「这个品牌当初属于谁、什么时候为什么
--- 放出来」的唯一答案。读写唯一出处 services/claims.py;消费方含 list_new 占用闸。
+-- 放出来」的唯一答案。读写唯一出处 services/claims.py;消费方是分配链(alloc_plan / alloc_push 等)。list_new 的占用闸 2026-11-25 已撤,本表不再被上架链读。
 CREATE TABLE catalog.claims (
     id         bigint IDENTITY PRIMARY KEY,
     kind       text NOT NULL,            -- brand / product

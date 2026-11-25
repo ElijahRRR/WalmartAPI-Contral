@@ -403,11 +403,21 @@ carrierMethodType} / calendarDayConfiguration{standardProcessingSchedule.<sunday
    被拒就只能 `-p services=TWO_DAY_DELIVERY`,那时要所有者拍板承诺不承诺。
 2. ✅ **`shippingDetails` 也不能为 null**(第二次真跑 14:27,400 原文:`shippingDetails
    can't be null`;同次证实 `distributorSupportedServices: []` **被收**,校验才走到了下一项)。
-   同款处理:不填 `-p carrier=` 就发 `shippingDetails: []`。`[]` 收不收是**第三次真跑要验的**;
-   官方 schema 里它的子键只有 `twoDayShipping`,填承运商 = 声明两日达的承运方式,国内仓
-   不该缺省声明。Seller Center 建的中山仓(谭总12)是唯一被收过的实体仓样本,`node_probe`
-   能打出它这两个键的真实取值,照抄最稳。被拒原文进摘要与台账(首版只进日志,已修:
-   `safe_post_ex(error_body=True)` opt-in,老调用方契约不变)。
+   同款处理:不填 `-p carrier=` 就发 `shippingDetails: []`。❌ **第三次真跑(14:36)`[]` 让
+   沃尔玛校验器自己炸了**:HTTP 520 `HV000028: Unexpected exception during isValid call`
+   (category=REQUEST)—— 空数组被它的校验代码越界访问,请求没走到创建。结论:**shippingDetails
+   必须至少一个元素**,而官方 schema 里元素的唯一子键是 `twoDayShipping[]{carrierMethodName,
+   carrierMethodType}`,即绕不开填一个承运方法。`node_probe` 对谭总12 实证:GET 不回
+   `shippingDetails`(两个节点都没这个键),所以 Seller Center 建的中山仓当初填了什么**查不到**;
+   能查到的是它 `distributorSupportedServices: ["TWO_DAY_DELIVERY"]`(Seller Center 表单在有
+   TwoDay 资格的账号上多半默认勾了),而谭总12 的 VIRTUAL 节点是 `[]` —— 空数组是沃尔玛自己也在
+   用的合法值,与第二次真跑它被收一致。
+   **配套改动**:① 5xx 但响应体 `errors[].category ∈ REQUEST/DATA` 的按确认未达(`RuntimeError`)
+   而不是不明 —— 校验阶段拒掉的没进创建;判错的代价由发前按名查重兜住;② dry-run 没填承运商时
+   顺带打出该店 `GET carriers` 的可用承运方法,人先知道能填什么。被拒原文进摘要与台账(首版只进
+   日志,已修:`safe_post_ex(error_body=True)` opt-in,老调用方契约不变)。
+   **待所有者拍板**:`-p carrier=` 填哪个(carriers 列表里选);`distributorSupportedServices`
+   继续 `[]`(不声明两日达,第二次真跑已证实可收)。
 3. 官方 schema(reference/createfulfillmentcenter,2026-10-24 核验):`timeZone` 枚举
    PST/MST/CST/EST/PDT/MDT/CDT/EDT/ADT/NDT/GMT/CET/TRT/IST/CTT/HKT/SGT/ICT/JST/KST/VST/CLT
    (`services/ship_nodes.TIME_ZONES`,发前校验);`postalAddress` 还有 `addressLine2`

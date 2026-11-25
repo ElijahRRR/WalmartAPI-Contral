@@ -33,18 +33,17 @@ UPC 重发同一 SKU 也会失败(legacy_survey.md:1667),不是永久放弃。
     (ops.feed_items MP_ITEM,北京日界);超配额行不写终态,次日自动续上
   ③ PT spec 存在(pt_spec;无 spec 淘汰)+ 风控否决闸(risk_gate:禁售 PT)
   ④ 本店 ASIN 去重(**同店**已在架才拦;所有者定稿 2026-08-28「取消全局
-    去重」——跨店不再互拦,跨店分布由分配链 + 占用闸治理。改因:2026-08-28
+    去重」——跨店不再互拦,跨店分布由分配链治理。改因:2026-08-28
     沃尔玛把全账号退市档案翻回 items 响应集,任何店的死档案行都会把该 ASIN
-    对全船队封死)+ **占用闸**(catalog.claims:该 ASIN 或其品牌已被
-    **别的店**占用即拦;占用是决策台账,商品下架也不释放,这正是快照闸
-    补不上的那半边——见 docs/allocation_plan.md §二)+ ASIN 黑名单
+    对全船队封死)+ ASIN 黑名单
     (catalog.asin_blacklist 永久禁止六类 + 黑名单品牌,见③)。
     **防呆=黑名单,不看删除史**(所有者口径 2026-08-12:拦"出现过侵权/
     审查等拉黑类别"的,不拦"因产品问题删过"的——可修复类删除后重上是
     正常经营,曾按删除史一刀切拦过,当日拆除);
     "不明原因消失"史=疑似平台下架,只在摘要报警不拦截(积累观察后再定)
-    ⚠ 占用闸与快照闸**并存**(A1 阶段):台账回填完整前,快照闸仍是主力;
-    两道都过才放行,理由分开写,谁拦的一目了然
+    ⚠ **占用闸已撤**(所有者 2026-11-25:「产品占用和品牌占用已由其他流程做,
+    取消这个限制」):产品/品牌归谁由分配链(alloc_plan / alloc_push)在写
+    上架表之前把关,本链不再读 catalog.claims —— 行上了上架表就是该这家店上
   ⑤ 数据源(services/amz_source):**上架必须用当天最新数据**(所有者定稿
     2026-08-19;2026-09-10 收敛为「12 小时内采过的不再刷」,判据与审核链
     共用、只在 amz_source 出生)——候选里 12 小时内没有快照的先推采集刷新
@@ -112,7 +111,7 @@ from typing import NamedTuple
 
 from api import feeds, feishu, llm, scraper, settings as settings_api
 from registry import db, paths, resources
-from services import alloc_survey, amz_source, blacklist, brand_key, claims, \
+from services import amz_source, blacklist, \
     db_guard, kpi, listing_sheet, listing_sources, llm_cache, mp_conform, \
     mp_mapper, notify_fmt as nf, pricing, product_events, product_ingest, \
     pt_spec, risk_gate, scrape_batches, sku_codec, store_limits, \
@@ -427,16 +426,16 @@ class _GateState(NamedTuple):
     banned: dict                # ASIN → (拉黑类别, 说明)
     unexplained: set            # 有"不明原因消失"史的 ASIN(只报警不拦)
     gate: dict                  # risk_gate 否决表(禁售 PT / 黑名单品牌)
-    owned_asin: dict            # ASIN → 持有店(占用台账 A1)
-    owned_brand: dict           # 品牌键 → 持有店(占用台账 A1)
     # ⚠ 下面这个是**追加在末尾**的(批次 2):本类按位置构造,往中间插字段会
     # 让后面全部错位,而错位不报错(集合与字典长得都一样,见类头注)。
-    # 末尾曾还有一个 `over_gen`(代际上限闸),所有者 2026-09-06 连闸删除。
+    # 末尾曾还有一个 `over_gen`(代际上限闸),所有者 2026-09-06 连闸删除;
+    # gate 与 cooling 之间曾有 `owned_asin` / `owned_brand`(占用闸),
+    # 所有者 2026-11-25 连闸删除(占用归分配链管)。
     cooling: dict               # (店, ASIN) → 最近一次退役回执成功时刻
 
 
 def _load_gate_state(asins: list[str]) -> _GateState:
-    """输入:本轮待上架行的 ASIN(读 PG)→ 输出:`_GateState`,闸门链要的九份库侧快照。
+    """输入:本轮待上架行的 ASIN(读 PG)→ 输出:`_GateState`,闸门链要的七份库侧快照。
 
     `asins` 只用来限定「不明原因消失」那一份(提示只打在本轮的行上,不必聚合整本账)。
     """
@@ -458,26 +457,14 @@ def _load_gate_state(asins: list[str]) -> _GateState:
         unexplained = {r[0] for r in cur.fetchall()}
         banned = blacklist.load_banned_asins(conn)
         gate = risk_gate.load_gate(conn)
-        # 占用台账(A1):台账为空时两个 dict 都是空的,闸门恒放行——
-        # 回填前后行为一致,不会因为"还没回填"而误拦。
-        # 规划外店(谭总系)**双向豁免**(所有者定稿 2026-08-15,2026-08-19
-        # 生产实证补全:此前只豁免了快照闸一个方向,占用/品牌闸仍在拦):
-        # 持有人是规划外店的占用行剔除(它们不拦别人);行侧闸门另按
-        # 上架店豁免(它们上架也不被别人拦、不做品牌归属)
-        owned_asin = {a: s for a, s in
-                      claims.load_active(conn, claims.PRODUCT).items()
-                      if not alloc_survey.is_excluded(s)}
-        owned_brand = {b: s for b, s in
-                       claims.load_active(conn, claims.BRAND).items()
-                       if not alloc_survey.is_excluded(s)}
-        # 退役冷却闸的数据面(批次 2)与上面八份**同一次读完**:逐行查库会在几百
+        # 退役冷却闸的数据面(批次 2)与上面六份**同一次读完**:逐行查库会在几百
         # 行的轮次里打出几百条 SQL,而 _load_gate_state 是闸门链唯一的库侧取数点
         cur.execute(_SQL_RETIRE_COOLDOWN,
                     {"event": product_events.RETIRE_FEED_SUCCESS,
                      "hours": sku_codec.RETIRE_COOLDOWN_HOURS})
         cooling = {(store, key): at for store, key, at in cur.fetchall()}
     return _GateState(inactive, today_used, listed_pairs, banned, unexplained,
-                      gate, owned_asin, owned_brand, cooling)
+                      gate, cooling)
 
 
 def _load_quota(default: int = 999) -> dict[str, int]:
@@ -1602,7 +1589,7 @@ def _gate_by_store(rows: list[dict], ctx: _GateCtx) -> _StoreGate:
     """输入:待上架行 + 闸门上下文 → 输出:`_StoreGate`(候选行/理由/计数/配额/报警/摘要行)。
 
     闸门链 ①③④ 的按店那半边:凭证 → 非 ACTIVE 店 → PT spec → 风控 →
-    本店去重 → 产品占用 → ASIN 黑名单 →(不明消失史只报警)。
+    本店去重 → 退役冷却 → ASIN 黑名单 →(不明消失史只报警)。
     **判据顺序即业务语义,逐条不许挪**(顺序改了 N 列理由就换一个,
     运营看到的"为什么没上"跟着变)。
 
@@ -1637,11 +1624,8 @@ def _gate_by_store(rows: list[dict], ctx: _GateCtx) -> _StoreGate:
             continue
         allow_by_store[store_name] = max(0, ctx.quota.get(store_name, 999)
                                          - st.today_used.get(store_name, 0))
-        # 规划外店(谭总系)**不受产品/品牌占用管**(所有者定稿 2026-08-15
-        # 「既不占用、也不拦别人」,2026-08-19 生产实证补全行侧方向)。
-        # 去重闸对它们照常生效:2026-08-28 起去重是**本店**语义(自己拦自己
-        # 防重复上架),不存在"被别人拦"的问题
-        unplanned = alloc_survey.is_excluded(store_name)
+        # 去重闸对规划外店(谭总系)照常生效:2026-08-28 起去重是**本店**语义
+        # (自己拦自己防重复上架),不存在"被别人拦"的问题
         for r in srows:
             if pt_spec.load_pt(r["product_type"]) is None:
                 counts["no_spec"] += 1
@@ -1654,13 +1638,13 @@ def _gate_by_store(rows: list[dict], ctx: _GateCtx) -> _StoreGate:
                 continue
             if (store_name, r["asin"]) in st.listed_pairs:
                 # 本店已在架(2026-08-28 取消全局去重:只拦同店重复,
-                # 跨店同 ASIN 交给分配链 + 占用闸决定)
+                # 跨店同 ASIN 交给分配链决定)
                 counts["dedup"] += 1
                 reasons.append((r["rownum"], "本店已在架:同店重复上架拦截"))
                 continue
             # ── 退役冷却闸(批次 2):位置就是语义 ──────────────────────────
             # 在去重闸**之后**:已在架的行压根不是"再上架",不该走到这儿;
-            # 在占用/黑名单闸**之前**:那两道问"这个产品该不该由这家店上",
+            # 在黑名单闸**之前**:那一道问"这个产品该不该上",
             # 这一道问"这个 (店, 产品) 现在能不能上"——后者是更硬的时序事实。
             # 命中只写 N 理由**不写终态**(与既有闸门同语义:冷却期满
             # 之后下一轮自动续上)。
@@ -1673,13 +1657,6 @@ def _gate_by_store(rows: list[dict], ctx: _GateCtx) -> _StoreGate:
                 # 后不等冷却就重上,沃尔玛侧那条记录还在,必然再失败一次
                 counts["cooldown"] += 1
                 reasons.append((r["rownum"], "退役冷却中"))
-                continue
-            holder = None if unplanned else st.owned_asin.get(r["asin"])
-            if holder and holder != store_name:
-                # 占用闸:与快照闸的区别是**下架也不释放**——"店没了产品还
-                # 被占着"正是所有者要的语义(§二);同店占用放行(本来就是它的)
-                counts["claimed"] += 1
-                reasons.append((r["rownum"], f"产品占用:已属于 {holder}"))
                 continue
             bl = st.banned.get(r["asin"])
             if bl:
@@ -1704,7 +1681,7 @@ def _gate_by_row(cands: list[dict], products: dict, ctx: _GateCtx) -> _RowGate:
     """输入:按店闸的候选行 + 采集数据 + 闸门上下文 → 输出:`_RowGate`(幸存行/理由/计数/回显)。
 
     闸门链 ⑤⑥ 的按行那半边:数据源 → 定制品 → 库存三态 → 库存门槛与本店最大库存 →
-    品牌风控 → 品牌占用 → 产品渠道 → 店铺渠道 → 运费 → 落地价倍率 →
+    品牌风控 → 产品渠道 → 店铺渠道 → 运费 → 落地价倍率 →
     配送时长 → 素材。
     **判据顺序即业务语义,逐条不许挪**(每道闸都假设前面那道已经拦掉了它
     处理不了的形状,例如店铺渠道闸靠"产品渠道未采到"上一行先拦)。
@@ -1773,20 +1750,6 @@ def _gate_by_row(cands: list[dict], products: dict, ctx: _GateCtx) -> _RowGate:
         if why:
             counts["risk"] += 1
             reasons.append((r["rownum"], why))
-            continue
-        # 品牌占用闸(A1):品牌排他 ⇒ 同品牌只能在一家店。放在这里而不是
-        # 前面那批闸,是因为品牌要等 amz_source 取回产品数据才知道。
-        # 键与占用侧同一套归一算法(brand_key 唯一出处),否则大小写差一点
-        # 就漏拦;真·无品牌(两字段皆占位符)不参与品牌排他,只受产品占用管
-        bkey = brand_key.brand_key(p.get("brand"), p.get("manufacturer"))
-        # 规划外店(谭总系)不做品牌归属:上架不受品牌占用管(也不占,
-        # load 侧已剔;所有者定稿 2026-08-15,2026-08-19 补全行侧)
-        bholder = (st.owned_brand.get(bkey)
-                   if bkey and not alloc_survey.is_excluded(r["store"])
-                   else None)
-        if bholder and bholder != r["store"]:
-            counts["claimed"] += 1
-            reasons.append((r["rownum"], f"品牌占用:{bkey} 已属于 {bholder}"))
             continue
         # 配送方式决定用哪套区间(FBA 0-30/30-1000 vs FBM 15-80/80-1000)。
         # **未知不猜**(所有者 2026-08-09:这是必须要获取的信息)——猜错一档
@@ -1974,7 +1937,7 @@ def run(params: dict) -> str:
     stores_by_name = ctx.stores_by_name
     n = {"inactive": 0, "quota": 0, "no_spec": 0, "risk": 0, "dedup": 0,
          "cooldown": 0,
-         "blacklist": 0, "claimed": 0, "no_data": 0, "filtered": 0,
+         "blacklist": 0, "no_data": 0, "filtered": 0,
          "no_upc": 0, "stock_assumed": 0, "invalid": 0,
          "lead_days": 0, "no_material": 0, "channel": 0, "custom": 0,
          "stock_capped": 0,

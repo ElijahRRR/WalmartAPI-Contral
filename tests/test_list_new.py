@@ -283,8 +283,7 @@ def test_list_new_dry_run_gate_chain(monkeypatch):
         {"B0BANNED01": ("E", "沃尔玛-知产")},
         {"B0ASIN0002"},                # 不明消失史:放行但报警(第 2 行)
         {"banned_pts": {"BannedPT"}, "brands": set()},
-        {}, {},                        # 占用台账为空 = 占用闸恒放行
-        {}))                           # 退役冷却闸也恒放行
+        {}))                           # 退役冷却闸恒放行
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {})
     monkeypatch.setattr(ln.stores_svc, "load_stores", lambda names=None: [
@@ -552,7 +551,7 @@ def test_list_new_skips_when_shipping_missing(monkeypatch):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {},
+        {"banned_pts": set(), "brands": set()},
         {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
@@ -585,7 +584,7 @@ def test_lead_cap_uses_this_rows_store_not_the_last_one(monkeypatch):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {},
+        {"banned_pts": set(), "brands": set()},
         {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
@@ -630,7 +629,7 @@ def test_store_channel_gate(monkeypatch):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {},
+        {"banned_pts": set(), "brands": set()},
         {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {
@@ -666,7 +665,7 @@ def test_silent_buckets_now_write_reasons(monkeypatch):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         {"T_OFF"}, {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {},
+        {"banned_pts": set(), "brands": set()},
         {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {})
@@ -699,7 +698,7 @@ def test_custom_product_gate(monkeypatch):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {},
+        {"banned_pts": set(), "brands": set()},
         {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
@@ -719,7 +718,7 @@ def test_custom_product_gate(monkeypatch):
 def test_other_stores_presence_no_longer_blocks_listing(monkeypatch):
     """取消全局去重(所有者定稿 2026-08-28)的正面钉死:该 ASIN 在**别的店**
     在架(含死档案行)不再拦本店上架 —— 2026-08-28 事件里任何店的退市档案
-    都会把 ASIN 对全船队封死,这正是要拆掉的那半边。跨店纪律归占用闸。"""
+    都会把 ASIN 对全船队封死,这正是要拆掉的那半边。跨店纪律归分配链(2026-11-25 占用闸已撤)。"""
     rows = [_sheet_row(rownum=2, store="T1", asin="B0FREE0001")]
     base = {"title": "T", "price": 20.0, "stock": 50, "shipping": 3.0,
             "stock_state": "in_stock", "lead_days": 2, "channel": "FBM"}
@@ -728,7 +727,7 @@ def test_other_stores_presence_no_longer_blocks_listing(monkeypatch):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, {("A109", "B0FREE0001"), ("A102", "B0FREE0001")},
-        {}, set(), {"banned_pts": set(), "brands": set()}, {}, {},
+        {}, set(), {"banned_pts": set(), "brands": set()},
         {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
@@ -762,7 +761,7 @@ def test_quota_slices_after_filters(monkeypatch):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {},
+        {"banned_pts": set(), "brands": set()},
         {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {"T1": 1})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
@@ -812,7 +811,7 @@ def test_material_gate_drops_before_llm_and_quota(monkeypatch):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {},
+        {"banned_pts": set(), "brands": set()},
         {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
@@ -1063,7 +1062,7 @@ def test_fresh_filter_excludes_prohibited(monkeypatch):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {},
+        {"banned_pts": set(), "brands": set()},
         {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {})
@@ -1075,48 +1074,43 @@ def test_fresh_filter_excludes_prohibited(monkeypatch):
     assert "待上架 1" in out          # PROHIBITED 行不领任务
 
 
-def test_claim_gates_block_other_stores_only(monkeypatch):
-    """占用闸:别店占着就拦,自家占着放行,真·无品牌不受品牌排他管。
-
-    与快照闸的分工:快照闸看"现在在不在架",占用闸看"归谁"——商品下架后
-    快照闸失守而占用闸仍在,这正是所有者要的"店没停运就不许别店碰"。
+def test_claims_no_longer_gate_listing(monkeypatch):
+    """占用闸已撤(所有者 2026-11-25:「产品占用和品牌占用已由其他流程做,取消这个
+    限制」):产品/品牌归谁由分配链在写上架表之前把关,行上了上架表就照上。
+    本链不再读 catalog.claims —— 台账里别店占着同一个 ASIN / 同一个品牌也不拦。
     """
-    rows = [
-        _sheet_row(2, asin="B0OWNED001"),                  # 产品被别店占
-        _sheet_row(3, asin="B0MINE0001"),                  # 自家占着 → 放行
-        _sheet_row(4, asin="B0BRANDED1"),                  # 品牌被别店占
-        _sheet_row(5, asin="B0NOBRAND1"),                  # 无品牌 → 不受品牌闸管
-    ]
+    rows = [_sheet_row(2, asin="B0OWNED001"),      # 台账里产品属于别店
+            _sheet_row(3, asin="B0BRANDED1")]      # 台账里品牌属于别店
     monkeypatch.setattr(ln.listing_sheet, "read_rows", lambda: rows)
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
+    read_claims = []
+    from services import claims
+    monkeypatch.setattr(claims, "load_active",
+                        lambda conn, kind: read_claims.append(kind) or (
+                            {"B0OWNED001": "OTHER"} if kind == claims.PRODUCT
+                            else {"acme": "OTHER"}))
     monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
         {"banned_pts": set(), "brands": set()},
-        {"B0OWNED001": "OTHER", "B0MINE0001": "T1"},        # 产品占用
-        {"acme": "OTHER"},                                  # 品牌占用
         {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
-    monkeypatch.setattr(ln.store_limits, "price_multipliers", lambda: {})
     monkeypatch.setattr(ln.stores_svc, "load_stores", lambda names=None: [{"name": "T1"}])
     monkeypatch.setattr(ln.pt_spec, "load_pt", lambda pt: {"properties": {}})
     base = {"title": "T", "price": 20.0, "stock": 50, "shipping": 0.0,
             "stock_state": "in_stock", "lead_days": 2, "channel": "FBM"}
     monkeypatch.setattr(ln.amz_source, "fetch_products", lambda asins: {
-        "B0MINE0001": {**base, "asin": "B0MINE0001", "brand": "beta"},
+        "B0OWNED001": {**base, "asin": "B0OWNED001", "brand": "beta"},
         "B0BRANDED1": {**base, "asin": "B0BRANDED1", "brand": "Acme"},
-        "B0NOBRAND1": {**base, "asin": "B0NOBRAND1", "brand": "Generic"},
     })
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
                         lambda: {"T1": {"fbm_range1": "200%"}})
     out = ln.run({"execute": False})
 
-    assert "产品占用:已属于 OTHER" in out          # 别店占的产品被拦
-    assert "品牌占用:acme 已属于 OTHER" in out     # 别店占的品牌被拦
-    # 自家占的产品、以及无品牌(Generic 是占位符,不参与品牌排他)的,
-    # 都要走到待提交——占用闸只拦"别的店占着"的
-    assert "T1 B0MINE0001 定价" in out
-    assert "T1 B0NOBRAND1 定价" in out
+    assert "占用" not in out
+    assert "T1 B0OWNED001 定价" in out and "T1 B0BRANDED1 定价" in out
     assert "共 2 行将进入" in out
+    assert read_claims == []                     # 台账一次都没读
+    assert not hasattr(ln, "claims")             # 连 import 都撤了
 
 
 def test_listed_pairs_cover_every_store_for_self_dedup(monkeypatch):
@@ -1154,7 +1148,6 @@ def test_listed_pairs_cover_every_store_for_self_dedup(monkeypatch):
     monkeypatch.setattr(ln.blacklist, "load_banned_asins", lambda c: {})
     monkeypatch.setattr(ln.risk_gate, "load_gate",
                         lambda c: {"banned_pts": set(), "brands": set()})
-    monkeypatch.setattr(ln.claims, "load_active", lambda c, k: {})
 
     pairs = ln._load_gate_state([]).listed_pairs
     assert ("A085", "B0MINE0001") in pairs
@@ -1428,7 +1421,7 @@ def test_submit_loop_is_cross_store_concurrent(monkeypatch):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {},
+        {"banned_pts": set(), "brands": set()},
         {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
@@ -1528,7 +1521,7 @@ def _wire_execute_env(monkeypatch, rows, products):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {},
+        {"banned_pts": set(), "brands": set()},
         {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
@@ -1904,74 +1897,6 @@ def test_main_title_three_shapes():
     assert az.main_title({"title": "", "attrs": {"subtitle": "Y"}}) is None
 
 
-def test_out_of_scope_store_skips_claim_gates(monkeypatch):
-    """规划外店(谭总系)上架**不受产品/品牌占用管**(所有者定稿 2026-08-15
-    「既不占用、也不拦别人」;2026-08-19 生产实证补全这个方向)。
-    同一现状下规划内的店照旧被占用闸拦,豁免不外溢。
-    2026-08-28 取消全局去重后,「别店在架」本身不再拦任何人 —— T1 被拦
-    只因占用闸(跨店纪律由 claims 台账独自承担)。
-    """
-    rows = [_sheet_row(2, store="谭总4", asin="B0AAAAAOK1"),
-            _sheet_row(3, store="T1", asin="B0AAAAAOK1")]
-    products = {"B0AAAAAOK1": {**_PRODUCT_OK, "asin": "B0AAAAAOK1",
-                               "brand": "SomeBrand"}}
-    seen = _wire_execute_env(monkeypatch, rows, products)
-    # 该 ASIN 已在**别店**在架(不构成拦截)+ 产品/品牌都被别店占用(拦 T1)
-    monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
-        set(), {}, {("A085", "B0AAAAAOK1")}, {}, set(),
-        {"banned_pts": set(), "brands": set()},
-        {"B0AAAAAOK1": "A085"},
-        {ln.brand_key.brand_key("SomeBrand", None): "A085"},
-        {}))
-    monkeypatch.setattr(ln.stores_svc, "load_stores",
-                        lambda names=None: [{"name": "谭总4"}, {"name": "T1"}])
-    monkeypatch.setattr(ln.store_limits, "price_multipliers",
-                        lambda: {s: {"fbm_range1": "200%"}
-                                 for s in ("谭总4", "T1")})
-    out = ln.run({"execute": True})
-    # T1 被**占用闸**拦在领号之前(claimed 计数历来不进闸门行,理由走 N 列),
-    # 谭总4 豁免占用照常提交 —— 两个可观测面共同证明拦截发生在占用闸:
-    assert [w["asin"] for w in seen["claim_wants"]] == ["B0AAAAAOK1"]  # 只有谭总
-    assert seen["submitted"] == [("谭总4", 1)]
-    assert "本店已在架" not in out              # 别店在架不再是拦截理由
-
-
-def test_out_of_scope_holders_do_not_block_others(monkeypatch):
-    """占用台账里持有人是规划外店的行,加载时剔除——它们不占任何产品/品牌。"""
-    import contextlib
-
-    class _Cur:
-        def execute(self, sql, args=None):
-            self.sql = sql
-
-        def fetchall(self):
-            return []
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    class _Conn:
-        def cursor(self):
-            return _Cur()
-
-    monkeypatch.setattr(ln.db, "pg_conn",
-                        contextlib.contextmanager(lambda: iter([_Conn()])))
-    monkeypatch.setattr(ln.blacklist, "load_banned_asins", lambda c: {})
-    monkeypatch.setattr(ln.risk_gate, "load_gate",
-                        lambda c: {"banned_pts": set(), "brands": set()})
-    monkeypatch.setattr(
-        ln.claims, "load_active",
-        lambda c, kind: ({"B0TANZHELD1": "谭总4", "B0NORMAL01": "A085"}
-                         if kind == ln.claims.PRODUCT
-                         else {"somebrand": "谭总4"}))
-    gs = ln._load_gate_state([])
-    assert gs.owned_asin == {"B0NORMAL01": "A085"}   # 谭总持有的不拦别人
-    assert gs.owned_brand == {}
-
-
 # ── LLM 花费上报(所有者 2026-08-21:「上架我也希望可以输出花了多少钱」)────
 
 def test_listing_llm_purpose_is_registered_not_falling_into_default():
@@ -2147,7 +2072,7 @@ def _wire_dry_env(monkeypatch, rows, *, listed=(), cooling=None):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(listed), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {},
+        {"banned_pts": set(), "brands": set()},
         dict(cooling or {})))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
@@ -2568,12 +2493,12 @@ def test_gate_state_fields_are_appended_not_inserted():
     """新字段**追加在末尾**:_GateState 是按位置构造的,插中间全部错位,
 
     而错位不报错(集合与字典长得都一样)。末尾曾还有一个 `over_gen`
-    (代际上限闸),所有者 2026-09-06 连闸删除,末尾只剩 cooling。
+    (代际上限闸),所有者 2026-09-06 连闸删除;gate 与 cooling 之间的
+    `owned_asin` / `owned_brand`(占用闸)所有者 2026-11-25 连闸删除。
     """
-    assert ln._GateState._fields[:8] == (
+    assert ln._GateState._fields == (
         "inactive", "today_used", "listed_pairs", "banned", "unexplained",
-        "gate", "owned_asin", "owned_brand")
-    assert ln._GateState._fields[8:] == ("cooling",)
+        "gate", "cooling")
 
 
 def test_cooldown_sql_scopes_the_registry_join_to_amz():
@@ -2728,7 +2653,7 @@ def test_weight_fallbacks_are_bucketed_by_reason_in_the_summary(monkeypatch):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {},
+        {"banned_pts": set(), "brands": set()},
         {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",
@@ -2767,7 +2692,7 @@ def test_store_max_stock_gate(monkeypatch):
     monkeypatch.setattr(ln, "load_verdicts", lambda a: fake_verdicts(rows))
     monkeypatch.setattr(ln, "_load_gate_state", lambda asins: ln._GateState(
         set(), {}, set(), {}, set(),
-        {"banned_pts": set(), "brands": set()}, {}, {},
+        {"banned_pts": set(), "brands": set()},
         {}))
     monkeypatch.setattr(ln, "_load_quota", lambda: {})
     monkeypatch.setattr(ln.store_limits, "price_multipliers",

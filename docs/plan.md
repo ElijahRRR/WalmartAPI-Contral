@@ -79,6 +79,17 @@ TRO 跨仓边界(暂放)。
 maintenance/list_new)→ 按域停旧切换。
 **✅ 2026-08-17 全部完成** —— 验收记录见 `docs/production_cutover.md` §九。
 
+### 2026-11-25 上架链撤掉产品占用闸与品牌占用闸(所有者定稿)
+
+所有者:「产品占用和品牌占用已由其他流程做,取消这个限制」。`list_new` 此前在按店闸里拦
+「产品占用:已属于 X」、在按行闸里拦「品牌占用:K 已属于 X」(读 `catalog.claims`,规划外店豁免)。
+现在归属只在分配链(alloc_plan / alloc_push)写上架表之前判一次,**行上了上架表就照上**。
+撤掉的东西:`_GateState.owned_asin / owned_brand` 两个字段、`_load_gate_state` 里两次
+`claims.load_active`、两道闸与 `claimed` 计数、list_new 对 `claims / brand_key / alloc_survey`
+的 import。没动的:`catalog.claims` 台账本身与分配链对它的读写、本店去重闸、黑名单品牌闸
+(`risk_gate`,与品牌占用是两回事)。后果要知道:手工贴进上架表、没走分配链的行,不再有人
+替它查「这个 ASIN / 品牌是不是别店的」。
+
 ### 2026-10-31 影刀 1.22.x 删了 `shadowbot:Run` → 改走客户端本地任务接口
 
 **症状**:影刀升到 1.22.20 后定时任务调不动影刀 —— launchd 那条命令发出去了,

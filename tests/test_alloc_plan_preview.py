@@ -32,7 +32,7 @@ def _wire(monkeypatch, tmp_path, pool, seen):
     monkeypatch.setattr(wf.claims, "load_active", lambda conn, kind: {})
     monkeypatch.setattr(wf, "_pending_delist", lambda *a, **k: {})
     monkeypatch.setattr(wf, "_why_absent", lambda conn, asins: {
-        a: ("未审核", None) for a in asins})
+        a: (seen.get("why", "审核未过(rejected)"), None) for a in asins})
     monkeypatch.setattr(wf.claims, "claim_many",
                         lambda conn, rows: seen.setdefault("claimed", []).extend(rows))
     monkeypatch.setattr(wf.db, "pg_conn",
@@ -54,8 +54,21 @@ def test_pool_csv_limits_pool_drops_cutoff_and_reports_absent(monkeypatch, tmp_p
     assert seen["asins"] == ["B0AAAA0001", "B0AAAA0002", "B0MISS0001"]
     # 分数 20 < 全库淘汰线 40,限定池缺省不设线 ⇒ 照样进牌堆
     assert "≥ 淘汰线 0" in out and "限定池清单" in out
-    assert "限定池里不在候选池:未审核 1" in out
+    assert "限定池里不在候选池:审核未过(rejected) 1" in out
     assert "dry-run:未落任何占用" in out and "claimed" not in seen
+
+
+@pytest.mark.parametrize("why", ["未审核", "不在库(产品库没有这个 ASIN)"])
+def test_pool_csv_refuses_when_pool_not_scraped_or_audited(monkeypatch, tmp_path, why):
+    """没采 / 没审的品不是淘汰品:照出预览 = 跳过审核把它们静默丢掉。"""
+    pool = [_c(f"B0AAAA{i:04d}", f"brand{i}", 90.0) for i in range(3)]
+    seen = {"why": why}
+    _wire(monkeypatch, tmp_path, pool, seen)
+    p = _csv(tmp_path, "pool.csv", "ASIN\nB0AAAA0001\nB0MISS0002\nB0MISS0001\n")
+    out = wf.run({"pool_csv": p, "execute": False})
+    assert out.startswith("⛔") and "2 个 ASIN 还没走完采集/审核" in out
+    assert f"{why} 2" in out and "B0MISS0001,B0MISS0002" in out
+    assert not (tmp_path / "alloc_分配方案.csv").exists() and "claimed" not in seen
 
 
 def test_quota_csv_overrides_quota_and_room(monkeypatch, tmp_path):

@@ -44,6 +44,8 @@
 · `pool_csv`  —— 候选池只取清单里的 ASIN(池口在 SQL 里筛,与点名分配同一个
   `product_pool.load(asins=…)`);与点名分配一样**缺省不设淘汰线**、发牌序按
   缺口(`by_gap`),`-p cutoff=` 才临时加线。不在池的按原因计数报出来。
+  ⚠ **清单里有「不在库 / 未审核」的 ASIN 就整份拒绝、不出方案**(2026-11-26):
+  这两类是流程没走完,不是被淘汰;照出方案等于跳过审核、把它们静默丢掉。
 · `quota_csv` —— 每店配额(同时作为本轮容量)用清单里的数,不再用
   `min(剩余容量, 缺口 ÷ 单品日产出)`。清单里没有的店、配额 0 的店本轮不参与;
   清单里写了正配额却不在分配范围(未启用 / 规划外 /「单店最大在线数」0 或未填)
@@ -97,6 +99,9 @@ _CSV_EXCLUSIVE = ("from_sheet", "batch", "cutoff", "days", "sales_days",
                   "as_of", "export", "pool_csv", "quota_csv")
 # 限定池预览的两个参数(只出预览,见模块头注「限定池预览」)
 _PREVIEW_KEYS = ("pool_csv", "quota_csv")
+# 限定池里「流程没走完」的两类原因(`_why_absent` 原因文本的前缀):没采进库、
+# 没有审核结论(含 pending)。有一个就不出预览 —— 见 run() 里的拦截注释
+_UNREADY = ("不在库", "未审核")
 # cli 自己塞进 params 的键,不是人敲的(product_audit 那边 2026-08-16 `dry_run`
 # 上线当天就炸过一次:白名单漏放行 cli 级开关,整条工作流起不来)
 _CLI_INJECTED = {"execute", "dry_run"}
@@ -306,6 +311,7 @@ def run(params: dict) -> str:
         return f"⛔ 凭证表读不到({e}):分不清在营店与冻结行,拒绝分配"
 
     absent_why: Counter = Counter()
+    unready: list[str] = []
     with db.pg_conn() as conn:
         data = (product_pool.load(conn, pwin) if pool_asins is None
                 else product_pool.load(conn, pwin, asins=pool_asins))
@@ -321,7 +327,23 @@ def run(params: dict) -> str:
             in_pool = {row[0] for row in data["pool"]}
             gone = [a for a in pool_asins if a not in in_pool]
             if gone:
-                absent_why = Counter(w for w, _b in _why_absent(conn, gone).values())
+                why_gone = _why_absent(conn, gone)
+                absent_why = Counter(w for w, _b in why_gone.values())
+                unready = sorted(a for a, (w, _b) in why_gone.items()
+                                 if w.startswith(_UNREADY))
+    if unready:
+        # 限定池预览的前提是「清单里的品都已经有审核结论」。没采 / 没审的品在
+        # 池口就被筛掉,方案表照出、只在漏斗下面多一行计数 —— 读起来像是它们
+        # 被淘汰了,其实是流程没走完(所有者 2026-11-26:「未拿到审核结果时就
+        # 分配并输出预览表,相当于跳过了审核步骤并丢弃了一大部分产品」)。
+        # 宁炸不吞,不留放行开关:回去把采集 / 审核走完。
+        cnt = " · ".join(f"{k} {v:,}" for k, v in absent_why.most_common()
+                         if k.startswith(_UNREADY))
+        return (f"⛔ 限定池里有 {len(unready):,} 个 ASIN 还没走完采集/审核({cnt}),"
+                "不出预览:现在出的方案会把它们当成淘汰品丢掉。先把采集、审核走完"
+                "(审核 `product_audit -p asins=…`,只在低谷时段),再原样重跑;"
+                "不要靠删掉它们来换取通过。"
+                f"前 {min(len(unready), 20)} 个:{','.join(unready[:20])}")
 
     # ── 店铺(先建,漏斗要用它们的条件)──────────────────────────────
     # ⚠ **顺序是有意的**:候选池的准入条件全部来自这批店的限额表行(渠道 /
